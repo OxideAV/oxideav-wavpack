@@ -38,7 +38,7 @@ impl DecorrPass {
         match term {
             1..=8 => term as usize,
             17 | 18 => 2,
-            -1 | -2 | -3 => 1,
+            -3..=-1 => 1,
             _ => 0,
         }
     }
@@ -179,7 +179,7 @@ pub fn parse_decsamples(
         let stored_per_channel: usize = match *term {
             1..=8 => 2.min(depth),
             17 | 18 => 2,
-            -1 | -2 | -3 => 1,
+            -3..=-1 => 1,
             _ => unreachable!("validated in parse_decterms"),
         };
         for c in 0..channels {
@@ -292,7 +292,7 @@ fn apply_weight(weight: i32, value: i32) -> i32 {
 
 /// Push a freshly-reconstructed sample into a depth-`d` history ring.
 /// `H[0]` is the most recent; `H[1]..=H[d-1]` shift down by one.
-fn push_history(hist: &mut Vec<i32>, sample: i32) {
+fn push_history(hist: &mut [i32], sample: i32) {
     if hist.is_empty() {
         return;
     }

@@ -119,7 +119,7 @@ impl BlockHeader {
             return Err(Error::invalid("WavPack: missing 'wvpk' magic"));
         }
         let block_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        if block_size < 24 || block_size > MAX_BLOCK_SIZE {
+        if !(24..=MAX_BLOCK_SIZE).contains(&block_size) {
             return Err(Error::invalid(format!(
                 "WavPack: block_size {block_size} outside [24, {MAX_BLOCK_SIZE}]"
             )));
