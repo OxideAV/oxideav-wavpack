@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-wavpack/compare/v0.0.1...v0.0.2) - 2026-05-03
+
+### Other
+
+- drop duplicate semver_check key
+- replace never-match regex with semver_check = false
+
 ### Added
 - Initial WavPack lossless decoder: 32-byte block header parser,
   tagged sub-block walker (`DECTERMS`, `DECWEIGHTS`, `DECSAMPLES`,
