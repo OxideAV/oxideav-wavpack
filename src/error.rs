@@ -19,6 +19,18 @@ pub enum Error {
     /// The 16-bit `version` field fell outside the wiki-documented
     /// range `0x402..=0x410` of valid WavPack v.4 stream versions.
     UnsupportedVersion(u16),
+    /// A metadata sub-block declared a word-count whose byte length
+    /// (`words * 2`) overflows the platform's `usize`. Reported by
+    /// `parse_metadata_sub_block` against a malformed large-flag
+    /// sub-block whose 24-bit word-count would exceed available
+    /// addressable memory.
+    MetadataSubBlockTooLarge(u32),
+    /// A metadata sub-block had the `0x40` "odd size" flag set but
+    /// declared zero data words. The wiki "Metadata" section
+    /// guarantees every metadata block has even length and the
+    /// odd-size flag means the **last byte** of the payload is
+    /// padding — there has to be at least one byte to be padding.
+    MetadataOddSizeWithoutPayload,
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -35,6 +47,15 @@ impl core::fmt::Display for Error {
             Error::UnsupportedVersion(v) => {
                 write!(f, "oxideav-wavpack: unsupported version 0x{v:04x} (expected 0x0402..=0x0410)")
             }
+            Error::MetadataSubBlockTooLarge(words) => {
+                write!(
+                    f,
+                    "oxideav-wavpack: metadata sub-block size {words} words overflows usize byte length"
+                )
+            }
+            Error::MetadataOddSizeWithoutPayload => f.write_str(
+                "oxideav-wavpack: metadata sub-block declared 0x40 odd-size flag with zero data words",
+            ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",
             ),

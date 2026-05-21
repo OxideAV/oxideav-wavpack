@@ -1,11 +1,15 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 1 — block-header parser.** This release lands the structural
-//! 32-byte block-header parser documented in
-//! `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure listing).
-//! The wiki page is a local snapshot of the multimedia.cx WavPack
-//! reference page; this crate's round-1 scope is exactly the fields
-//! listed there:
+//! **Round 2 — block-header parser + metadata sub-block walker.**
+//! Round 1 landed the structural 32-byte block-header parser
+//! documented in `docs/audio/wavpack/wiki/WavPack.wiki`
+//! (block-structure listing). Round 2 adds the metadata sub-block
+//! walker that follows the wiki "Metadata" section: ID byte +
+//! 1- or 3-byte size field + payload, repeated to the end of the
+//! block's `ck_size`-bounded region. See [`walk_metadata`] and
+//! [`MetadataSubBlock`].
+//!
+//! Round-1 scope (preserved from the prior release):
 //!
 //! * The four-byte `'w','v','p','k'` magic.
 //! * The 32-bit little-endian `ck_size` (block size not counting the
@@ -26,14 +30,28 @@
 //!   verification requires sample decode, which lands in a later
 //!   round).
 //!
-//! No metadata sub-block walking, no decorrelation pass, no entropy
-//! decode yet — those land in subsequent rounds against the wiki
-//! "Metadata", "Decorrelation terms / weights / samples",
-//! "Entropy info" and "Samples coding" sections.
+//! Round-2 scope adds the metadata-walking API:
+//!
+//! * [`walk_metadata`] — consumes a byte slice (the post-header
+//!   payload from [`parse_block_header`]) and returns a
+//!   `Vec<MetadataSubBlock>` of typed `(SubBlockId, payload)` pairs.
+//! * [`parse_metadata_sub_block`] — single-step walker the caller
+//!   can drive themselves when validating against `ck_size`.
+//! * [`SubBlockId`] — typed enum naming every ID listed by the
+//!   wiki "IDs" section (`0x00..=0x0D` + `0x20..=0x27`). Unknown
+//!   IDs are surfaced as `Unknown(u8)` rather than rejected.
+//! * [`SubBlockFlags`] — typed view of the `0x20` / `0x40` /
+//!   `0x80` flag triple decoded from the on-disk ID byte.
+//!
+//! Still out of scope (subsequent rounds): decorrelation
+//! deserialisation, entropy decode of the `0x0A` packed-samples
+//! sub-block, float-data / large-or-shifted-int / overflow-bits
+//! interpretation, multichannel channel-mask handling, hybrid
+//! correction-stream (`.wvc`) pairing, CRC32 verification, encoder.
 //!
 //! ## Clean-room provenance
 //!
-//! Round 1 was implemented strictly against
+//! All work in this crate has been implemented strictly against
 //! `docs/audio/wavpack/wiki/WavPack.wiki`. No external library source
 //! (libwavpack, wavpack-rs, FFmpeg's `wavpack.c` /
 //! `wavpackenc.c`), no archived `old` branch of this crate, and no
@@ -45,9 +63,14 @@
 
 mod block_header;
 mod error;
+mod metadata;
 
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,
 };
 pub use crate::error::{Error, Result};
+pub use crate::metadata::{
+    parse_metadata_sub_block, walk_metadata, MetadataSubBlock, SubBlockFlags, SubBlockId,
+    ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK,
+};
