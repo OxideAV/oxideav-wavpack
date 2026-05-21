@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 3: WavPack v.4 decorrelation sub-block expanders.
+  `expand_terms` decodes the `0x02` payload into a
+  `DecorrelationTerms { terms: Vec<i8>, deltas: Vec<u8> }`, one
+  byte → one `(term, delta)` pair per the wiki "lower 5 bits
+  indicate predictor type, high 3 bits contain delta value" rule.
+  `expand_weights` decodes the `0x03` payload through the wiki's
+  log-pack recipe (`n = getchar() << 3; if (n > 0) n += (n + 64) >> 7`
+  with the byte read as signed) into a
+  `DecorrelationWeights { weights: Vec<i32> }`. `expand_samples`
+  reads the `0x04` payload as little-endian 16-bit words and applies
+  the wiki exponent / mantissa expansion (mantissa signed; exponent
+  biased by `-9`) into a `DecorrelationSamples { samples: Vec<i32> }`.
+  Out-of-range shift counts on the sample expander saturate rather
+  than panicking. A new `Error::DecorrelationSamplesOddByteCount`
+  variant rejects malformed sample payloads whose byte count is not
+  a multiple of two.
+- 15 new unit tests (38 total): low-5/high-3 term-byte split across
+  the full `0..=18` predictor range; multi-byte term order
+  preservation; zero / positive-rounding / negative-no-rounding
+  weight expansions and multi-byte order preservation; sample
+  expansion for the `exponent == 9` / `< 9` / `> 9` branches with
+  positive and negative mantissas; byte-pairing across multi-sample
+  payloads; empty-payload handling for all three expanders;
+  saturation behaviour for extreme exponents; rejection of odd-byte
+  sample payloads.
+
 - Round 2: WavPack v.4 metadata sub-block walker. `walk_metadata`
   consumes the post-header payload returned by
   `parse_block_header` and returns `Vec<MetadataSubBlock>`,

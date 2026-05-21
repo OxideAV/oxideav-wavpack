@@ -31,6 +31,14 @@ pub enum Error {
     /// odd-size flag means the **last byte** of the payload is
     /// padding — there has to be at least one byte to be padding.
     MetadataOddSizeWithoutPayload,
+    /// A `0x04` decorrelation-samples sub-block had a payload whose
+    /// byte count was not a multiple of two. The wiki "Decorrelation
+    /// samples" section states every sample is one 16-bit word on
+    /// the wire, and the round-2 metadata walker already strips the
+    /// optional odd-size padding byte, so any odd byte count here
+    /// indicates a malformed sub-block. The contained number is the
+    /// observed byte count.
+    DecorrelationSamplesOddByteCount(usize),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -55,6 +63,10 @@ impl core::fmt::Display for Error {
             }
             Error::MetadataOddSizeWithoutPayload => f.write_str(
                 "oxideav-wavpack: metadata sub-block declared 0x40 odd-size flag with zero data words",
+            ),
+            Error::DecorrelationSamplesOddByteCount(n) => write!(
+                f,
+                "oxideav-wavpack: 0x04 decorrelation-samples payload has {n} bytes (not a multiple of 2)"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",
