@@ -1,32 +1,53 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 0 — clean-room rebuild scaffold.** This is a fresh orphan
-//! `master`; the previous implementation was retired alongside the
-//! OxideAV docs audit dated 2026-05-06. See `README.md` for the
-//! rebuild scope and the strict-isolation clean-room workspace the
-//! Implementer rounds will draw from.
+//! **Round 1 — block-header parser.** This release lands the structural
+//! 32-byte block-header parser documented in
+//! `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure listing).
+//! The wiki page is a local snapshot of the multimedia.cx WavPack
+//! reference page; this crate's round-1 scope is exactly the fields
+//! listed there:
+//!
+//! * The four-byte `'w','v','p','k'` magic.
+//! * The 32-bit little-endian `ck_size` (block size not counting the
+//!   magic or this field).
+//! * The 16-bit `version` (valid range `0x0402..=0x0410`).
+//! * The 8-bit `track_number` and `track_sub_index`.
+//! * The 32-bit `total_samples` (with the `0xFFFF_FFFF` "unknown"
+//!   sentinel).
+//! * The 32-bit `block_index` and `block_samples`.
+//! * The 32-bit `flags` word, decoded into a typed [`Flags`] view that
+//!   exposes every bit-range named on the wiki "Flags meaning"
+//!   listing (bits-per-sample, mono / hybrid / joint-stereo / cross-
+//!   channel decorrelation / hybrid-shaping / float / int32 / hybrid
+//!   profile / multi-channel start-end markers / left-shift / maximum
+//!   magnitude / sampling-rate index / reserved bit 27 / robust block /
+//!   hybrid IIR noise shaping / false stereo / low-latency block).
+//! * The trailing 32-bit `crc` (preserved verbatim — checksum
+//!   verification requires sample decode, which lands in a later
+//!   round).
+//!
+//! No metadata sub-block walking, no decorrelation pass, no entropy
+//! decode yet — those land in subsequent rounds against the wiki
+//! "Metadata", "Decorrelation terms / weights / samples",
+//! "Entropy info" and "Samples coding" sections.
+//!
+//! ## Clean-room provenance
+//!
+//! Round 1 was implemented strictly against
+//! `docs/audio/wavpack/wiki/WavPack.wiki`. No external library source
+//! (libwavpack, wavpack-rs, FFmpeg's `wavpack.c` /
+//! `wavpackenc.c`), no archived `old` branch of this crate, and no
+//! online resource outside the local docs snapshot was read at any
+//! phase.
 
 #![forbid(unsafe_code)]
+#![warn(missing_debug_implementations)]
 
-/// Crate-local error type. Concrete variants land as the Implementer
-/// rounds populate the codec pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Error {
-    /// Reserved placeholder. Replaced by real variants in round 1.
-    NotImplemented,
-}
+mod block_header;
+mod error;
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::NotImplemented => f.write_str(
-                "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-/// Crate-local Result alias.
-pub type Result<T> = core::result::Result<T, Error>;
+pub use crate::block_header::{
+    parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
+    MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,
+};
+pub use crate::error::{Error, Result};
