@@ -1,15 +1,18 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 3 — block-header parser + metadata sub-block walker +
-//! decorrelation sub-block expanders.** Round 1 landed the structural
-//! 32-byte block-header parser documented in
-//! `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure listing);
-//! round 2 added the metadata sub-block walker following the wiki
-//! "Metadata" section; round 3 adds typed expanders for the three
+//! **Round 4 — block-header parser + metadata sub-block walker +
+//! decorrelation sub-block expanders + entropy-info expander.**
+//! Round 1 landed the structural 32-byte block-header parser
+//! documented in `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure
+//! listing); round 2 added the metadata sub-block walker following the
+//! wiki "Metadata" section; round 3 adds typed expanders for the three
 //! decorrelation sub-blocks — `0x02` terms, `0x03` weights, and
 //! `0x04` samples — per the wiki "Decorrelation terms",
-//! "Decorrelation weights" and "Decorrelation samples" sections.
-//! See [`expand_terms`], [`expand_weights`] and [`expand_samples`].
+//! "Decorrelation weights" and "Decorrelation samples" sections;
+//! round 4 adds [`expand_entropy`] for the `0x05` entropy-info
+//! sub-block (one or two sets of three 16-bit log-packed medians per
+//! the wiki "Entropy info" section). See [`expand_terms`],
+//! [`expand_weights`], [`expand_samples`] and [`expand_entropy`].
 //!
 //! Round-1 scope (preserved):
 //!
@@ -59,6 +62,16 @@
 //!   mantissa expansion (mantissa is signed, exponent is biased by
 //!   `-9`).
 //!
+//! Round-4 scope adds the entropy-info expander:
+//!
+//! * [`expand_entropy`] — converts a `0x05` payload into an
+//!   [`EntropyInfo`] (`medians_left: [i32; 3]`,
+//!   `medians_right: [i32; 3]`), reading three (mono) or six (stereo)
+//!   little-endian 16-bit words through the same log-pack the round-3
+//!   sample expander uses. Mono payloads (6 bytes) leave
+//!   `medians_right` at `[0; 3]`; stereo payloads (12 bytes) populate
+//!   both. Other lengths are rejected as malformed.
+//!
 //! Still out of scope (subsequent rounds): the prediction loop that
 //! consumes these typed views, entropy decode of the `0x0A`
 //! packed-samples sub-block, float-data / large-or-shifted-int /
@@ -80,6 +93,7 @@
 
 mod block_header;
 mod decorrelation;
+mod entropy;
 mod error;
 mod metadata;
 
@@ -91,6 +105,10 @@ pub use crate::decorrelation::{
     expand_samples, expand_terms, expand_weights, DecorrelationSamples, DecorrelationTerms,
     DecorrelationWeights, MAX_DOCUMENTED_TERM, SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES,
     TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK,
+};
+pub use crate::entropy::{
+    expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,
+    STEREO_PAYLOAD_BYTES,
 };
 pub use crate::error::{Error, Result};
 pub use crate::metadata::{

@@ -5,13 +5,16 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 3 — block-header parser + metadata sub-block walker +
-decorrelation sub-block expanders.** Round 1 landed the 32-byte fixed
-block-header parser; round 2 added the metadata sub-block walker
-completing the structural pass over a WavPack v.4 block; round 3 turns
-the `0x02` / `0x03` / `0x04` decorrelation sub-block payloads into
-typed views (terms, log-pack-expanded weights, exponent / mantissa
-samples). All work follows `docs/audio/wavpack/wiki/WavPack.wiki`
+**Round 4 — block-header parser + metadata sub-block walker +
+decorrelation sub-block expanders + entropy-info expander.** Round 1
+landed the 32-byte fixed block-header parser; round 2 added the
+metadata sub-block walker completing the structural pass over a
+WavPack v.4 block; round 3 turns the `0x02` / `0x03` / `0x04`
+decorrelation sub-block payloads into typed views (terms, log-pack-
+expanded weights, exponent / mantissa samples); round 4 adds the
+`0x05` entropy-info sub-block (one or two sets of three 16-bit
+log-packed medians, decoded through the same log-pack as the round-3
+sample expander). All work follows `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local snapshot of the multimedia.cx WavPack reference page).
 
 Public API:
@@ -51,6 +54,12 @@ Public API:
   `DecorrelationSamples { samples: Vec<i32> }`, reading
   little-endian 16-bit words and applying the wiki exponent /
   mantissa expansion (mantissa signed; exponent biased by `-9`).
+- [`expand_entropy`] — converts a `0x05` payload into an
+  `EntropyInfo { medians_left: [i32; 3], medians_right: [i32; 3] }`,
+  reading three (mono / 6-byte) or six (stereo / 12-byte) 16-bit
+  log-packed medians via the same word format as `expand_samples`.
+  Mono payloads leave `medians_right` at `[0; 3]`. Other lengths are
+  rejected as malformed via `Error::EntropyInfoLength`.
 
 ### Out of scope (later rounds)
 
@@ -69,19 +78,20 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1, 2 and 3 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 4 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 38-test unit suite synthesises minimal valid headers and
+The 50-test unit suite synthesises minimal valid headers and
 sub-blocks and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
 words, large-size 24-bit size field, decorrelation-term low-5-bit /
 high-3-bit field splitting, weight log-pack expansion across zero /
 positive / negative bytes, sample exponent / mantissa expansion for
-the equal / less / greater-than-9 branches, and odd-byte-count
-sample-payload rejection).
+the equal / less / greater-than-9 branches, odd-byte-count
+sample-payload rejection, and entropy-info mono / stereo length
+gating with both the shift-left and shift-right log-pack branches).

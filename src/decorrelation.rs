@@ -248,7 +248,13 @@ pub fn expand_samples(payload: &[u8]) -> Result<DecorrelationSamples> {
 }
 
 /// Single-word expander used by [`expand_samples`].
-fn expand_sample_word(mantissa_byte: u8, exponent_byte: u8) -> i32 {
+///
+/// Exposed `pub(crate)` so the round-4 entropy-info expander
+/// ([`crate::entropy::expand_entropy`]) can re-use the same 16-bit
+/// log-pack — the wiki "Entropy info" section's
+/// "log-packed into 16 bits as described above" cross-reference points
+/// back to this routine.
+pub(crate) fn expand_sample_word(mantissa_byte: u8, exponent_byte: u8) -> i32 {
     // The mantissa half is signed (so negative samples sign-extend
     // through the shift); the exponent half is unsigned and biased
     // by 9 per the wiki "exponent-9" shorthand.

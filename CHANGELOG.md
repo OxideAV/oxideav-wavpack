@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 4: WavPack v.4 entropy-info sub-block expander.
+  `expand_entropy` decodes the `0x05` payload into an
+  `EntropyInfo { medians_left: [i32; 3], medians_right: [i32; 3] }`
+  per the wiki "Entropy info" section ("one or two sets of medians …
+  log-packed into 16 bits as described above"). Each median is a
+  little-endian 16-bit log-packed word in the same format as the
+  round-3 decorrelation-samples expander (`[mantissa_lo, exponent_hi]`,
+  mantissa signed, exponent biased by `-9`); the shared expander is
+  re-used via a new `pub(crate)` accessor on `decorrelation`. Mono
+  payloads (6 bytes) populate `medians_left` and leave `medians_right`
+  at `[0; 3]`; stereo payloads (12 bytes) populate both. A convenience
+  `EntropyInfo::mono(...)` constructor and `is_mono()` predicate are
+  exposed. Any other payload length is rejected through a new
+  `Error::EntropyInfoLength(usize)` variant. Public constants
+  (`MEDIANS_PER_CHANNEL`, `MEDIAN_ON_WIRE_BYTES`,
+  `MONO_PAYLOAD_BYTES`, `STEREO_PAYLOAD_BYTES`) document the wire
+  layout.
+- 12 new unit tests (50 total): mono single-set decode + right-set-
+  zeroed contract; stereo two-set decode in left-then-right order;
+  signed-mantissa sign-extension on negative medians; both the
+  shift-left and shift-right log-pack branches reach the median
+  values; empty / sub-mono / between-mono-and-stereo / over-stereo
+  length rejections; `EntropyInfo::mono` helper; `is_mono()`
+  predicate returning false on any non-zero right-set median;
+  all-zero stereo payload decoded sanely.
+
 - Round 3: WavPack v.4 decorrelation sub-block expanders.
   `expand_terms` decodes the `0x02` payload into a
   `DecorrelationTerms { terms: Vec<i8>, deltas: Vec<u8> }`, one

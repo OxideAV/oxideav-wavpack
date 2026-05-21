@@ -39,6 +39,12 @@ pub enum Error {
     /// indicates a malformed sub-block. The contained number is the
     /// observed byte count.
     DecorrelationSamplesOddByteCount(usize),
+    /// A `0x05` entropy-info sub-block had a payload whose byte count
+    /// matched neither the mono layout (one set of three 16-bit
+    /// log-packed medians = 6 bytes) nor the stereo layout (two sets
+    /// = 12 bytes) documented in the wiki "Entropy info" section.
+    /// The contained number is the observed byte count.
+    EntropyInfoLength(usize),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -67,6 +73,10 @@ impl core::fmt::Display for Error {
             Error::DecorrelationSamplesOddByteCount(n) => write!(
                 f,
                 "oxideav-wavpack: 0x04 decorrelation-samples payload has {n} bytes (not a multiple of 2)"
+            ),
+            Error::EntropyInfoLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x05 entropy-info payload has {n} bytes (expected 6 for mono or 12 for stereo)"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",
