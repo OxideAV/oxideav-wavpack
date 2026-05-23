@@ -8,6 +8,40 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 5: WavPack v.4 sample-coding bit reader + run-length decoder
+  (first half of the wiki "Samples coding" section). A new `samples`
+  module adds `BitReader` — a least-significant-bit-first reader over
+  the `0x0A` packed-samples payload exposing the three wiki primitives
+  `get_unary()` (count of leading `1` bits up to the terminating
+  `0`), `get_bit()` and `get_bits(n)` (assembled LSB-first into a
+  `u32`, `get_bits(0) == 0`). Reads past the buffer report
+  `Error::Truncated` rather than zero-filling, and `bits_remaining()`
+  / `is_empty()` expose the cursor. `decode_run_length` transcribes
+  the wiki pseudocode's run-length half: it short-circuits to `n = 0`
+  when the carried `last_zero` flag is set, otherwise reads the unary
+  prefix, applies the `n == 16` escape (second unary `n2`; `n += n2`
+  for `n2 < 2` else `n += (1 << (n2-1)) | getbits(n2-1)`), halves `n`
+  with the odd-round-up rule, and updates the adaptive `last_zero` /
+  `last_one` carry held in a new `RunState`. Public constant
+  `UNARY_ESCAPE = 16`. The second half (Golomb `(base, add)` interval
+  selection + median adaptation) is deferred: the wiki names the
+  median "increase" / "decrease" steps without quantifying them, so
+  per-sample reconstruction is not yet bit-exact from this page —
+  documented as a docs gap on the `samples` module. The `0x0A` bit
+  order (LSB-first, matching WavPack's little-endian container) is
+  likewise a documented assumption pending a real-payload check.
+- 19 new unit tests (69 total): LSB-first `get_bit` ordering and
+  byte-boundary crossing; `get_bits` LSB-first assembly, zero-count
+  no-op, full 32-bit width and truncation; `get_unary` against the
+  wiki worked examples (`111110b → 5`, `10b → 1`), the immediate-
+  terminator zero run, terminator-only consumption, and unterminated
+  truncation; and the run-length decoder's `last_zero` short-circuit
+  (no bits consumed, flag cleared), even / odd unary halving with the
+  matching `last_one` / `last_zero` carry, both escape arms
+  (`n2 < 2` direct add and `n2 >= 2` LSB-first mantissa, two distinct
+  mantissa values), the all-zero unary case, the multi-sample adaptive
+  carry sequence, and unary truncation.
+
 - Round 4: WavPack v.4 entropy-info sub-block expander.
   `expand_entropy` decodes the `0x05` payload into an
   `EntropyInfo { medians_left: [i32; 3], medians_right: [i32; 3] }`

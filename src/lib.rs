@@ -1,7 +1,8 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 4 — block-header parser + metadata sub-block walker +
-//! decorrelation sub-block expanders + entropy-info expander.**
+//! **Round 5 — block-header parser + metadata sub-block walker +
+//! decorrelation sub-block expanders + entropy-info expander +
+//! sample-coding bit reader & run-length decoder.**
 //! Round 1 landed the structural 32-byte block-header parser
 //! documented in `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure
 //! listing); round 2 added the metadata sub-block walker following the
@@ -11,8 +12,13 @@
 //! "Decorrelation weights" and "Decorrelation samples" sections;
 //! round 4 adds [`expand_entropy`] for the `0x05` entropy-info
 //! sub-block (one or two sets of three 16-bit log-packed medians per
-//! the wiki "Entropy info" section). See [`expand_terms`],
-//! [`expand_weights`], [`expand_samples`] and [`expand_entropy`].
+//! the wiki "Entropy info" section); round 5 adds the [`BitReader`]
+//! primitives (`get_unary` / `get_bit` / `get_bits`) and
+//! [`decode_run_length`] — the first half of the wiki "Samples coding"
+//! pseudocode (the unary-prefix `n`-decoder with the `n == 16` escape
+//! and the adaptive `last_zero` / `last_one` carry). See
+//! [`expand_terms`], [`expand_weights`], [`expand_samples`],
+//! [`expand_entropy`] and [`decode_run_length`].
 //!
 //! Round-1 scope (preserved):
 //!
@@ -72,12 +78,27 @@
 //!   `medians_right` at `[0; 3]`; stereo payloads (12 bytes) populate
 //!   both. Other lengths are rejected as malformed.
 //!
-//! Still out of scope (subsequent rounds): the prediction loop that
-//! consumes these typed views, entropy decode of the `0x0A`
-//! packed-samples sub-block, float-data / large-or-shifted-int /
-//! overflow-bits interpretation, multichannel channel-mask handling,
-//! hybrid correction-stream (`.wvc`) pairing, CRC32 verification,
-//! encoder.
+//! Round-5 scope adds the sample-coding bit reader and run-length
+//! decoder (first half of the wiki "Samples coding" section):
+//!
+//! * [`BitReader`] — least-significant-bit-first reader over a `0x0A`
+//!   payload exposing the three wiki primitives `get_unary()`,
+//!   `get_bit()` and `get_bits(n)`. Reads past the buffer report
+//!   [`Error::Truncated`].
+//! * [`decode_run_length`] — turns the unary prefix (with the
+//!   `n == 16` escape) into the halved run-length index `n`, carrying
+//!   the adaptive `last_zero` / `last_one` state in [`RunState`]. The
+//!   second half of the pseudocode — the `(base, add)` Golomb interval
+//!   selection and median adaptation — is deferred because the wiki
+//!   names the median "increase" / "decrease" steps without quantifying
+//!   them (see the `samples` module docs-gap note).
+//!
+//! Still out of scope (subsequent rounds): the median-adaptation
+//! second half of the sample decode (blocked on a docs gap), the
+//! prediction loop that consumes these typed views, float-data /
+//! large-or-shifted-int / overflow-bits interpretation, multichannel
+//! channel-mask handling, hybrid correction-stream (`.wvc`) pairing,
+//! CRC32 verification, encoder.
 //!
 //! ## Clean-room provenance
 //!
@@ -96,6 +117,7 @@ mod decorrelation;
 mod entropy;
 mod error;
 mod metadata;
+mod samples;
 
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
@@ -115,3 +137,4 @@ pub use crate::metadata::{
     parse_metadata_sub_block, walk_metadata, MetadataSubBlock, SubBlockFlags, SubBlockId,
     ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK,
 };
+pub use crate::samples::{decode_run_length, BitReader, RunState, UNARY_ESCAPE};
