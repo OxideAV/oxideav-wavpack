@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 6: WavPack v.4 Golomb sample-value reconstruction — the value
+  part of the wiki "Samples coding" second half. New public items in
+  the `samples` module: `Medians` (a channel's three `median[0..=2]` in
+  wiki order, `Copy`), `GolombInterval { base, add }`, `golomb_interval`
+  (pure `n` + `Medians` → `(base, add)` per the wiki's `n == 0` /
+  `n == 1` / `n >= 2` branch — reads no bits, mutates no median), and
+  `decode_sample_value` which picks the interval, reads `getbits(k - 1)`
+  with `k = log2(add)`, applies the `if(t2 >= ex) t2 = t2*2 - ex +
+  getbit()` fixup, reads the sign bit, and returns `base + t2` (or its
+  ones-complement when sign is set). `k` is the **bit-length** of `add`
+  — the only `log2` reading that keeps the wiki's own
+  `ex = (1 << k) - add - 1` non-negative (a derivation from the wiki's
+  next two lines, not an external reference; documented as a resolved
+  docs gap). `decode_sample_value` takes `Medians` **by value** and does
+  not mutate them: the median "increase" / "decrease" *amount* is still
+  unspecified by the wiki, so the stateful loop over a whole `0x0A`
+  payload is deferred. The degenerate `add == 0` interval (a median of
+  `1`, where `log2(0)` / `getbits(-1)` are undefined) returns the new
+  `Error::GolombDegenerateInterval(add)` rather than guessing.
+- 15 new unit tests (84 total): `golomb_interval` across the three `n`
+  branches (n0 → median[0], n1 → median[1], n2 → median sum with zero
+  extra, large-n median[2] scaling); `golomb_k` bit-length values and a
+  sweep proving `ex >= 0` across `add` 1..=1024; `decode_sample_value`
+  short-mantissa (no extra bit), long-mantissa (`t2 >= ex` extra bit),
+  `ex == 0` always-long branch, positive and ones-complement sign,
+  `n == 0` interval, degenerate `add == 0` rejection (no bits consumed),
+  mantissa- and sign-truncation reporting, and an end-to-end compose of
+  `decode_run_length` then `decode_sample_value` over one contiguous
+  bitstream.
 - Round 5: WavPack v.4 sample-coding bit reader + run-length decoder
   (first half of the wiki "Samples coding" section). A new `samples`
   module adds `BitReader` — a least-significant-bit-first reader over

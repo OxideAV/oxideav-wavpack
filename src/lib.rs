@@ -1,8 +1,9 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 5 — block-header parser + metadata sub-block walker +
+//! **Round 6 — block-header parser + metadata sub-block walker +
 //! decorrelation sub-block expanders + entropy-info expander +
-//! sample-coding bit reader & run-length decoder.**
+//! sample-coding bit reader, run-length decoder & Golomb sample-value
+//! reconstruction.**
 //! Round 1 landed the structural 32-byte block-header parser
 //! documented in `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure
 //! listing); round 2 added the metadata sub-block walker following the
@@ -16,9 +17,13 @@
 //! primitives (`get_unary` / `get_bit` / `get_bits`) and
 //! [`decode_run_length`] — the first half of the wiki "Samples coding"
 //! pseudocode (the unary-prefix `n`-decoder with the `n == 16` escape
-//! and the adaptive `last_zero` / `last_one` carry). See
-//! [`expand_terms`], [`expand_weights`], [`expand_samples`],
-//! [`expand_entropy`] and [`decode_run_length`].
+//! and the adaptive `last_zero` / `last_one` carry); round 6 adds the
+//! second (value) half — [`golomb_interval`] and [`decode_sample_value`]
+//! — that maps `n` + [`Medians`] onto a `(base, add)` interval and reads
+//! the mantissa / sign, leaving the median-update *amount* (an open docs
+//! gap) for a later round. See [`expand_terms`], [`expand_weights`],
+//! [`expand_samples`], [`expand_entropy`], [`decode_run_length`] and
+//! [`decode_sample_value`].
 //!
 //! Round-1 scope (preserved):
 //!
@@ -87,18 +92,32 @@
 //!   [`Error::Truncated`].
 //! * [`decode_run_length`] — turns the unary prefix (with the
 //!   `n == 16` escape) into the halved run-length index `n`, carrying
-//!   the adaptive `last_zero` / `last_one` state in [`RunState`]. The
-//!   second half of the pseudocode — the `(base, add)` Golomb interval
-//!   selection and median adaptation — is deferred because the wiki
-//!   names the median "increase" / "decrease" steps without quantifying
-//!   them (see the `samples` module docs-gap note).
+//!   the adaptive `last_zero` / `last_one` state in [`RunState`].
+//!
+//! Round-6 scope adds the Golomb *value* half of the same section — the
+//! `(base, add)` interval selection plus the mantissa / sign
+//! reconstruction — stopping short only of the median adaptation:
+//!
+//! * [`Medians`] — a channel's three medians (`median[0..=2]`) as the
+//!   `0x05` entropy-info expander produces them.
+//! * [`golomb_interval`] — pure `n` + [`Medians`] → [`GolombInterval`]
+//!   `(base, add)` mapping per the wiki's three-way branch.
+//! * [`decode_sample_value`] — reads `getbits(k - 1)` (with `k =
+//!   log2(add)` under the wiki-derived bit-length reading), the
+//!   `t2 >= ex` extra bit, and the sign, returning the reconstructed
+//!   sample. Takes [`Medians`] **by value** and does not mutate them:
+//!   the median "increase" / "decrease" *amount* is still an open docs
+//!   gap, so the stateful full-payload loop is deferred. The degenerate
+//!   `add == 0` (median `1`) interval is rejected via
+//!   [`Error::GolombDegenerateInterval`] rather than guessed.
 //!
 //! Still out of scope (subsequent rounds): the median-adaptation
-//! second half of the sample decode (blocked on a docs gap), the
-//! prediction loop that consumes these typed views, float-data /
-//! large-or-shifted-int / overflow-bits interpretation, multichannel
-//! channel-mask handling, hybrid correction-stream (`.wvc`) pairing,
-//! CRC32 verification, encoder.
+//! *amount* that turns `decode_sample_value` into a stateful payload
+//! loop (blocked on a docs gap), the prediction loop that consumes the
+//! decorrelation typed views, float-data / large-or-shifted-int /
+//! overflow-bits interpretation, multichannel channel-mask handling,
+//! hybrid correction-stream (`.wvc`) pairing, CRC32 verification,
+//! encoder.
 //!
 //! ## Clean-room provenance
 //!
@@ -137,4 +156,7 @@ pub use crate::metadata::{
     parse_metadata_sub_block, walk_metadata, MetadataSubBlock, SubBlockFlags, SubBlockId,
     ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK,
 };
-pub use crate::samples::{decode_run_length, BitReader, RunState, UNARY_ESCAPE};
+pub use crate::samples::{
+    decode_run_length, decode_sample_value, golomb_interval, BitReader, GolombInterval, Medians,
+    RunState, UNARY_ESCAPE,
+};

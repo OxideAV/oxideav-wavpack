@@ -45,6 +45,15 @@ pub enum Error {
     /// = 12 bytes) documented in the wiki "Entropy info" section.
     /// The contained number is the observed byte count.
     EntropyInfoLength(usize),
+    /// The Golomb mantissa decode of a `0x0A` sample reached `add == 0`
+    /// (a median of `1`), where the wiki "Samples coding" pseudocode's
+    /// `k = log2(add)` and `getbits(k - 1)` are undefined (`log2(0)` and
+    /// `getbits(-1)`). The wiki does not specify the degenerate
+    /// single-codeword interval, so the reconstruction is rejected
+    /// rather than guessed. The contained value is the offending `add`
+    /// (always `0` today; reserved for a future docs revision that
+    /// quantifies the degenerate interval).
+    GolombDegenerateInterval(i32),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -77,6 +86,10 @@ impl core::fmt::Display for Error {
             Error::EntropyInfoLength(n) => write!(
                 f,
                 "oxideav-wavpack: 0x05 entropy-info payload has {n} bytes (expected 6 for mono or 12 for stereo)"
+            ),
+            Error::GolombDegenerateInterval(add) => write!(
+                f,
+                "oxideav-wavpack: 0x0A Golomb mantissa hit add={add} (median 1); log2(add)/getbits(-1) undefined by the wiki"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

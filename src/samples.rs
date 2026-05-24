@@ -22,12 +22,17 @@
 //!    medians** (the wiki's "increase median[x]" / "decrease
 //!    median[x]" steps).
 //!
-//! Round 5 lands the first half — the bit reader and the `n`-decoder —
-//! plus the [`BitReader`] primitives the second half will reuse. The
-//! second half is **not** implemented this round because the wiki does
-//! not quantify its "increase" / "decrease" verbs (see the docs-gap
-//! note below); decoding a real `0x0A` stream is gated on that gap
-//! being closed.
+//! Round 5 landed the first half — the bit reader and the `n`-decoder.
+//! Round 6 lands the value part of the second half:
+//! [`golomb_interval`] (`(base, add)` selection) and
+//! [`decode_sample_value`] (mantissa + sign). The one piece still
+//! missing is the median **adaptation amount** — the wiki names the
+//! "increase" / "decrease" verbs without quantifying them — so
+//! [`decode_sample_value`] decodes a single value against a fixed,
+//! caller-supplied median set and does not mutate it. The stateful loop
+//! that walks a whole `0x0A` payload (feeding each `n` back into a
+//! mutating median set) stays gated on that gap being closed (see the
+//! docs-gap notes below).
 //!
 //! ## Bit-reader primitives
 //!
@@ -58,18 +63,64 @@
 //! tests synthesise their own bitstreams in that order. A future docs
 //! revision should state the bit order explicitly.
 //!
-//! ### Docs-gap: median adaptation amount (second half, deferred)
+//! ### Golomb mantissa / sign reconstruction (round 6)
+//!
+//! Round 6 lands the *value* half of the wiki pseudocode — everything
+//! after the `n`-decoder up to (but not including) the median update:
+//!
+//! ```text
+//! if(n == 0){      base = 0;                                  add = median[0] - 1; }
+//! else if(n == 1){ base = median[0];                          add = median[1] - 1; }
+//! else {           base = median[0]+median[1]+median[2]*(n-2); add = median[2] - 1; }
+//! k  = log2(add);
+//! ex = (1 << k) - add - 1;
+//! t2 = getbits(k - 1);
+//! if(t2 >= ex) t2 = t2 * 2 - ex + getbit();
+//! sign = getbit();
+//! if(sign==0) result = base + t2; else result = ~(base + t2);
+//! ```
+//!
+//! [`golomb_interval`] computes the `(base, add)` pair from `n` and a
+//! three-median set; [`decode_sample_value`] consumes the mantissa /
+//! sign bits and returns the reconstructed `result`. The **median
+//! update** that follows in the encoder loop is *not* applied here —
+//! [`decode_sample_value`] takes the medians by value and leaves the
+//! caller's set untouched (see the median-adaptation gap below).
+//!
+//! ### Docs-gap: meaning of `k = log2(add)` (resolved by derivation)
+//!
+//! The wiki writes `k = log2(add)` without saying floor, ceil, or
+//! bit-length. The choice is pinned **from the wiki's own next two
+//! lines**, not from any external source: `ex = (1 << k) - add - 1`
+//! feeds `if(t2 >= ex)`, and that branch can only ever be taken (rather
+//! than dead) when `ex >= 0`, i.e. `(1 << k) >= add + 1`. The smallest
+//! such `k` is the **bit-length of `add`** (`k` = position of the
+//! highest set bit `+ 1`, e.g. `add = 5` → `k = 3`, `add = 1` → `k = 1`).
+//! Round 6 uses that bit-length reading. A future docs revision should
+//! state the `log2` rounding explicitly.
+//!
+//! ### Docs-gap: degenerate `add == 0` interval (rejected, not guessed)
+//!
+//! When the selected median is `1`, `add = median - 1 = 0`, so
+//! `k = log2(0)` and `getbits(k - 1) = getbits(-1)` are both undefined
+//! by the wiki. This is the single-codeword interval; the wiki gives no
+//! recipe for it, so [`decode_sample_value`] returns
+//! [`Error::GolombDegenerateInterval`] rather than inventing a behaviour.
+//! Closing this needs the degenerate-interval rule added to
+//! `docs/audio/wavpack/`.
+//!
+//! ### Docs-gap: median adaptation amount (deferred)
 //!
 //! The wiki's "increase median[0]" / "decrease median[0]" steps name a
 //! direction but not an amount. Real WavPack updates each median by a
-//! fraction of itself (a documented `±(median/128 + …)` style step in
-//! the format's own `format.txt`, which the wiki cites but does **not**
-//! reproduce), so the per-sample reconstruction cannot be made
-//! bit-exact from this wiki page alone. Round 5 therefore stops at the
-//! `n`-decoder. The second half — `(base, add)` interval selection,
-//! `getbits(k-1)` mantissa, sign, and median adaptation — needs the
-//! adaptation formula added to `docs/audio/wavpack/` before it can be
-//! implemented without guessing.
+//! fraction of itself (a documented step in the format's own
+//! `format.txt`, which the wiki cites but does **not** reproduce), so
+//! the *stateful* loop that walks a whole `0x0A` payload — feeding each
+//! decoded sample's `n` back into a mutating median set — cannot be made
+//! bit-exact from this wiki page alone. Round 6 therefore decodes a
+//! single sample value against a *caller-supplied, fixed* median set and
+//! stops short of mutating it. The adaptation amount needs to be added
+//! to `docs/audio/wavpack/` before the full payload loop can be wired.
 //!
 //! ### Docs-gap: escape `getbits(n2 - 1)` when `n2 < 2`
 //!
@@ -266,6 +317,134 @@ pub fn decode_run_length(reader: &mut BitReader<'_>, state: &mut RunState) -> Re
     state.last_one = last_one;
     state.last_zero = !last_one;
     Ok(n)
+}
+
+/// The three medians (`median[0]`, `median[1]`, `median[2]`) for one
+/// channel, as produced by [`expand_entropy`](crate::expand_entropy) and
+/// consumed by the wiki "Samples coding" Golomb interval selection.
+///
+/// The set is `Copy` because [`decode_sample_value`] reads it by value:
+/// round 6 deliberately does **not** mutate the medians (the median
+/// "increase" / "decrease" amount is an open docs gap — see the module
+/// docs). A future round that closes that gap will take `&mut Medians`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Medians {
+    /// `median[0]`, `median[1]`, `median[2]` in wiki order.
+    pub values: [i32; 3],
+}
+
+impl Medians {
+    /// Wrap a three-median array in wiki order.
+    pub const fn new(values: [i32; 3]) -> Self {
+        Self { values }
+    }
+}
+
+/// The `(base, add)` Golomb interval the wiki selects from the
+/// run-length index `n` and a channel's three medians.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GolombInterval {
+    /// The interval base (`base` in the wiki pseudocode).
+    pub base: i32,
+    /// The interval span minus one (`add` in the wiki pseudocode); the
+    /// mantissa is read across `add + 1` codewords.
+    pub add: i32,
+}
+
+/// Map the run-length index `n` onto a `(base, add)` Golomb interval
+/// using a channel's three medians, exactly as the wiki "Samples coding"
+/// pseudocode specifies:
+///
+/// ```text
+/// n == 0: base = 0;                                       add = median[0] - 1
+/// n == 1: base = median[0];                               add = median[1] - 1
+/// else:   base = median[0] + median[1] + median[2]*(n-2); add = median[2] - 1
+/// ```
+///
+/// This is a pure function of `n` and the medians — no bits are read and
+/// no median is mutated. The median "increase" / "decrease" updates that
+/// the wiki pairs with each branch are deferred (docs gap; see the
+/// module docs).
+pub fn golomb_interval(n: u32, medians: Medians) -> GolombInterval {
+    let m = medians.values;
+    match n {
+        0 => GolombInterval {
+            base: 0,
+            add: m[0] - 1,
+        },
+        1 => GolombInterval {
+            base: m[0],
+            add: m[1] - 1,
+        },
+        _ => {
+            // n >= 2; (n - 2) is the count of full median[2] intervals
+            // past the median[0] + median[1] floor.
+            let extra = (n - 2) as i32;
+            GolombInterval {
+                base: m[0] + m[1] + m[2] * extra,
+                add: m[2] - 1,
+            }
+        }
+    }
+}
+
+/// Bit-length of a non-negative `add`: the smallest `k` with
+/// `(1 << k) > add` (so `(1 << k) >= add + 1`). `add == 0` → `0`.
+///
+/// This is the wiki's `k = log2(add)` under the bit-length reading the
+/// module docs derive from the wiki's own `ex = (1 << k) - add - 1 >= 0`
+/// requirement. Callers guard `add == 0` before relying on `k - 1`.
+fn golomb_k(add: i32) -> u32 {
+    debug_assert!(add >= 0, "golomb_k expects non-negative add");
+    32 - (add as u32).leading_zeros()
+}
+
+/// Decode one sample *value* from the bitstream, given its already-
+/// decoded run-length index `n` and a channel's (fixed) medians.
+///
+/// This is the value half of the wiki "Samples coding" pseudocode: pick
+/// the `(base, add)` interval (via [`golomb_interval`]), then read the
+/// Golomb mantissa and sign:
+///
+/// ```text
+/// k  = log2(add);
+/// ex = (1 << k) - add - 1;
+/// t2 = getbits(k - 1);
+/// if(t2 >= ex) t2 = t2 * 2 - ex + getbit();
+/// sign = getbit();
+/// result = sign==0 ? base + t2 : ~(base + t2);
+/// ```
+///
+/// The medians are taken **by value and not mutated** — the wiki's
+/// per-branch median update amount is an open docs gap, so round 6
+/// decodes a single value against a caller-supplied fixed set. When the
+/// selected median is `1` (`add == 0`) the interval degenerates to a
+/// single codeword whose `log2(0)` / `getbits(-1)` are undefined by the
+/// wiki; that case returns [`Error::GolombDegenerateInterval`].
+pub fn decode_sample_value(reader: &mut BitReader<'_>, n: u32, medians: Medians) -> Result<i32> {
+    let GolombInterval { base, add } = golomb_interval(n, medians);
+
+    if add <= 0 {
+        // add == 0 → single-codeword interval (median == 1): log2(0) and
+        // getbits(-1) are undefined by the wiki. add < 0 would mean a
+        // median of 0, which the wiki never produces; treat both as the
+        // degenerate case rather than guessing.
+        return Err(Error::GolombDegenerateInterval(add));
+    }
+
+    let k = golomb_k(add);
+    // k >= 1 here because add >= 1, so getbits(k - 1) has a non-negative
+    // argument and the degenerate getbits(-1) path is unreachable.
+    let ex = (1i32 << k) - add - 1;
+    let mut t2 = reader.get_bits(k - 1)? as i32;
+    if t2 >= ex {
+        t2 = t2 * 2 - ex + reader.get_bit()? as i32;
+    }
+
+    let sign = reader.get_bit()?;
+    let magnitude = base + t2;
+    let result = if sign == 0 { magnitude } else { !magnitude };
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -569,5 +748,205 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let mut state = RunState::new();
         assert_eq!(decode_run_length(&mut r, &mut state), Err(Error::Truncated));
+    }
+
+    // ---- golomb_interval (base, add) selection ----
+
+    #[test]
+    fn interval_n0_uses_median0() {
+        // n == 0 → base = 0, add = median[0] - 1.
+        let m = Medians::new([10, 20, 30]);
+        let GolombInterval { base, add } = golomb_interval(0, m);
+        assert_eq!(base, 0);
+        assert_eq!(add, 9);
+    }
+
+    #[test]
+    fn interval_n1_uses_median1() {
+        // n == 1 → base = median[0], add = median[1] - 1.
+        let m = Medians::new([10, 20, 30]);
+        let GolombInterval { base, add } = golomb_interval(1, m);
+        assert_eq!(base, 10);
+        assert_eq!(add, 19);
+    }
+
+    #[test]
+    fn interval_n2_uses_median_sum_with_zero_extra() {
+        // n == 2 → base = m0 + m1 + m2*(2-2) = m0 + m1, add = m2 - 1.
+        let m = Medians::new([10, 20, 30]);
+        let GolombInterval { base, add } = golomb_interval(2, m);
+        assert_eq!(base, 30);
+        assert_eq!(add, 29);
+    }
+
+    #[test]
+    fn interval_n_large_scales_median2() {
+        // n == 5 → base = m0 + m1 + m2*(5-2) = 10 + 20 + 30*3 = 120,
+        // add = m2 - 1 = 29.
+        let m = Medians::new([10, 20, 30]);
+        let GolombInterval { base, add } = golomb_interval(5, m);
+        assert_eq!(base, 120);
+        assert_eq!(add, 29);
+    }
+
+    // ---- golomb_k = log2(add) bit-length reading ----
+
+    #[test]
+    fn golomb_k_is_bit_length() {
+        // Bit-length: smallest k with (1<<k) > add.
+        assert_eq!(golomb_k(1), 1); // 0b1
+        assert_eq!(golomb_k(2), 2); // 0b10
+        assert_eq!(golomb_k(3), 2); // 0b11
+        assert_eq!(golomb_k(4), 3); // 0b100
+        assert_eq!(golomb_k(5), 3); // 0b101
+        assert_eq!(golomb_k(29), 5); // 0b11101
+        assert_eq!(golomb_k(0), 0);
+    }
+
+    #[test]
+    fn golomb_k_keeps_ex_non_negative() {
+        // The whole point of the bit-length reading: ex = (1<<k)-add-1
+        // must be >= 0 so the `if(t2 >= ex)` branch is reachable.
+        for add in 1..=1024i32 {
+            let k = golomb_k(add);
+            let ex = (1i32 << k) - add - 1;
+            assert!(ex >= 0, "ex went negative for add={add} (k={k})");
+            // ...and ex < (1<<(k-1)) when k >= 1, so the short-mantissa
+            // region exists.
+            assert!(
+                ex < (1i32 << (k - 1)) || add == 1,
+                "ex too large for add={add}"
+            );
+        }
+    }
+
+    // ---- decode_sample_value ----
+
+    #[test]
+    fn sample_value_short_mantissa_no_extra_bit() {
+        // n = 2, medians [10,20,30] → base=30, add=29, k=5, ex=2.
+        // getbits(k-1)=getbits(4). Encode t2 = 1 (< ex=2) → no extra
+        // bit. sign = 0 → result = base + t2 = 31.
+        // Bits (LSB-first): getbits(4)=1 → "1000", then sign bit "0".
+        let bits = "10000"; // t2 nibble "1000" (=1) + sign "0"
+        let bytes = bits_to_bytes(bits);
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([10, 20, 30]);
+        let v = decode_sample_value(&mut r, 2, m).unwrap();
+        assert_eq!(v, 31);
+    }
+
+    #[test]
+    fn sample_value_long_mantissa_reads_extra_bit() {
+        // Same interval: base=30, add=29, k=5, ex=2.
+        // getbits(4) = 3 (>= ex=2): t2 = 3*2 - 2 + getbit().
+        // 3 in 4 bits LSB-first = "1100". Then extra bit = 1 →
+        // t2 = 6 - 2 + 1 = 5. Then sign = 0 → result = 30 + 5 = 35.
+        let bits = "1100" /* t2=3 */ .to_string() + "1" /* extra */ + "0" /* sign */;
+        let bytes = bits_to_bytes(&bits);
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([10, 20, 30]);
+        let v = decode_sample_value(&mut r, 2, m).unwrap();
+        assert_eq!(v, 35);
+    }
+
+    #[test]
+    fn sample_value_negative_sign_ones_complements() {
+        // base=30, add=29, k=5, ex=2. t2=1 (< ex), sign=1 →
+        // result = !(base + t2) = !(31) = -32.
+        let bits = "1000" /* t2=1 */ .to_string() + "1" /* sign=1 */;
+        let bytes = bits_to_bytes(&bits);
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([10, 20, 30]);
+        let v = decode_sample_value(&mut r, 2, m).unwrap();
+        assert_eq!(v, !31);
+        assert_eq!(v, -32);
+    }
+
+    #[test]
+    fn sample_value_n0_interval() {
+        // n = 0, medians [4, _, _] → base=0, add=3, k=2, ex=(1<<2)-3-1=0.
+        // getbits(k-1)=getbits(1). t2 read = 1; ex=0 so t2 >= ex always:
+        // t2 = 1*2 - 0 + getbit(). extra bit = 0 → t2 = 2. sign=0 →
+        // result = 0 + 2 = 2.
+        // Bits LSB-first: getbits(1)="1", extra="0", sign="0".
+        let bits = "100";
+        let bytes = bits_to_bytes(bits);
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([4, 99, 99]);
+        let v = decode_sample_value(&mut r, 0, m).unwrap();
+        assert_eq!(v, 2);
+    }
+
+    #[test]
+    fn sample_value_ex_zero_always_takes_long_branch() {
+        // When ex == 0 every t2 takes the `t2 >= ex` branch and reads an
+        // extra bit. add=3 → k=2, ex=0. getbits(1)=0, extra=1, sign=0:
+        // t2 = 0*2 - 0 + 1 = 1 → result = base(0) + 1 = 1.
+        let bits = "0" /* getbits(1)=0 */ .to_string() + "1" /* extra */ + "0" /* sign */;
+        let bytes = bits_to_bytes(&bits);
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([4, 99, 99]);
+        let v = decode_sample_value(&mut r, 0, m).unwrap();
+        assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn sample_value_degenerate_add_zero_is_rejected() {
+        // median[0] == 1 → add = 0 → log2(0)/getbits(-1) undefined.
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([1, 20, 30]);
+        assert_eq!(
+            decode_sample_value(&mut r, 0, m),
+            Err(Error::GolombDegenerateInterval(0))
+        );
+        // No bits should have been consumed before the rejection.
+        assert_eq!(r.bits_remaining(), 8);
+    }
+
+    #[test]
+    fn sample_value_truncated_mantissa_is_reported() {
+        // An empty buffer can't supply the very first getbits(k-1) bit.
+        let bytes: [u8; 0] = [];
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([10, 20, 30]);
+        assert_eq!(decode_sample_value(&mut r, 2, m), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn sample_value_truncated_sign_is_reported() {
+        // Size the mantissa to consume exactly one whole byte so the sign
+        // bit lands past the buffer. n=0, median[0]=301 → add=300,
+        // k=bitlen(300)=9, getbits(8); ex=(1<<9)-300-1=211. An all-zero
+        // byte gives t2=0 (< ex) so no extra bit is read — the 8 mantissa
+        // bits exactly drain the buffer, then the sign getbit() fails.
+        let bytes = [0x00u8];
+        let mut r = BitReader::new(&bytes);
+        let m = Medians::new([301, 99, 99]);
+        assert_eq!(decode_sample_value(&mut r, 0, m), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn run_length_then_sample_value_compose() {
+        // End-to-end of the two halves against a fixed median set:
+        // decode n via decode_run_length, then the value via
+        // decode_sample_value, from one contiguous bitstream.
+        //
+        // Stream: unary "1110" → run-length raw n=3 (odd) → n = (3>>1)+1
+        // = 2. Then interval for n=2 with medians [10,20,30]: base=30,
+        // add=29, k=5, ex=2. getbits(4)="1000"=1 (< ex), sign "0" →
+        // result = 31.
+        let bits = "1110" /* unary=3 → n=2 */ .to_string()
+            + "1000" /* getbits(4)=1 */
+            + "0"; /* sign=0 */
+        let bytes = bits_to_bytes(&bits);
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState::new();
+        let n = decode_run_length(&mut r, &mut state).unwrap();
+        assert_eq!(n, 2);
+        let m = Medians::new([10, 20, 30]);
+        let v = decode_sample_value(&mut r, n, m).unwrap();
+        assert_eq!(v, 31);
     }
 }
