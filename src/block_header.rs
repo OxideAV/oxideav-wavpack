@@ -231,6 +231,126 @@ impl Flags {
     pub fn is_final_block(&self) -> bool {
         (self.multichannel_marker & 0b10) != 0
     }
+
+    /// `true` when this block is both the first and last block of a
+    /// multi-channel set — i.e. the set has exactly one block, the
+    /// stand-alone mono / stereo case the wiki "multi-channel start
+    /// and end blocks" pair degenerates to when there is no multi-
+    /// channel grouping. Mathematically `multichannel_marker == 0b11`.
+    ///
+    /// This is the common case for plain stereo `.wv` files: every
+    /// block carries both markers because every block is its own
+    /// (single-block) set.
+    pub fn is_standalone_block(&self) -> bool {
+        self.multichannel_marker == 0b11
+    }
+
+    /// `true` when this block is part of a multi-block multi-channel
+    /// set — i.e. it is **not** both first and last simultaneously.
+    /// Inverse of [`Self::is_standalone_block`]. The wiki "multi-channel
+    /// start and end blocks" pair is degenerate (both bits set) when
+    /// the set contains a single block; any other marker combination
+    /// (`0b00`, `0b01`, `0b10`) means this block participates in a
+    /// multi-block channel grouping whose layout is conveyed via the
+    /// `0x0D` multichannel-info sub-block.
+    pub fn is_multichannel_member(&self) -> bool {
+        self.multichannel_marker != 0b11
+    }
+
+    /// `true` when the stream is encoded with the **lossless** profile —
+    /// the wiki bit 3 "hybrid profile (lossy compression)" is **not**
+    /// set. WavPack's two profiles are lossless and hybrid; the absence
+    /// of the hybrid bit is the lossless indicator.
+    pub fn is_lossless(&self) -> bool {
+        !self.hybrid
+    }
+
+    /// `true` when the stream is encoded with the **hybrid** (lossy)
+    /// profile. Equivalent to [`Self::hybrid`]; provided as the natural
+    /// counterpart to [`Self::is_lossless`] for callers that want to
+    /// branch on profile by name.
+    pub fn is_lossy(&self) -> bool {
+        self.hybrid
+    }
+
+    /// `true` when the wiki bits 23..=26 sampling-rate index is the
+    /// sentinel value `15` documented as "unknown/custom". When set the
+    /// actual sample rate is carried out-of-band in metadata sub-block
+    /// `0x27` ("non-standard sampling rate" per the wiki IDs listing).
+    pub fn has_custom_sample_rate(&self) -> bool {
+        self.sample_rate_index == 15
+    }
+
+    /// `true` when the wiki bit 31 "low-latency block (experimental,
+    /// **do not decode if encountered**)" is set. The wiki gates the
+    /// decode-time response on this bit explicitly; the parser preserves
+    /// the flag and this accessor surfaces the wiki contract for the
+    /// decode layer.
+    pub fn should_skip_decode(&self) -> bool {
+        self.low_latency_block
+    }
+
+    /// `true` when **any** of the two wiki-labelled experimental bits
+    /// — bit 28 "robust block (experimental, okay to ignore)" and
+    /// bit 31 "low-latency block (experimental, do not decode if
+    /// encountered)" — is set. Use this for diagnostic surfaces;
+    /// callers gating decode should use [`Self::should_skip_decode`]
+    /// (only bit 31 carries the wiki "do not decode" instruction).
+    pub fn is_experimental(&self) -> bool {
+        self.robust_block || self.low_latency_block
+    }
+
+    /// Effective sample bit-depth, derived from the container width
+    /// minus the [`Self::left_shift`] correction documented in the wiki
+    /// "left-shift places when bitdepth is not a multiple of 8 (e.g.
+    /// 12-bit, 20-bit)" entry on bits 13..=17.
+    ///
+    /// For a 16-bit container (`bytes_per_sample = 2`) with `left_shift
+    /// = 4`, the effective bit-depth is `16 - 4 = 12`. Returns `0` when
+    /// `left_shift` exceeds the container width (a malformed combination
+    /// the wiki does not specifically forbid but the parser does not
+    /// reject either — it preserves the raw fields verbatim).
+    pub fn effective_bit_depth(&self) -> u8 {
+        let container_bits = self.bytes_per_sample() * 8;
+        container_bits.saturating_sub(self.left_shift)
+    }
+}
+
+impl WavPackBlockHeader {
+    /// `true` when this block carries audio samples — the wiki
+    /// "block samples" field on the block-structure listing is
+    /// non-zero. The wiki notes block_samples "may be 0 if no audio
+    /// present", i.e. a metadata-only block (RIFF chunks, MD5 sums,
+    /// etc.). Decoders should typically skip the decorrelation /
+    /// samples-coding pipeline for non-audio blocks.
+    pub fn is_audio_block(&self) -> bool {
+        self.block_samples != 0
+    }
+
+    /// `true` when the on-disk `total_samples` field carried a real
+    /// count rather than the [`TOTAL_SAMPLES_UNKNOWN`] sentinel the
+    /// wiki documents as "may be 0xFFFFFFFF if unknown". A streaming
+    /// encoder that cannot know the total at write time emits the
+    /// sentinel.
+    pub fn is_total_samples_known(&self) -> bool {
+        self.total_samples != TOTAL_SAMPLES_UNKNOWN
+    }
+
+    /// Number of payload bytes the block-header `ck_size` field
+    /// advertises — i.e. the byte count of the metadata sub-block
+    /// region that follows the 32-byte fixed header.
+    ///
+    /// The wiki defines `ck_size` as "total block size (not counting
+    /// this field or 'wvpk')" — the 24 fixed bytes after `ck_size`
+    /// itself (version through CRC) plus whatever metadata sub-blocks
+    /// trail. This accessor subtracts the 24 fixed bytes to give
+    /// callers the metadata region length directly.
+    ///
+    /// `ck_size` is validated to be at least 24 by [`parse_block_header`]
+    /// so this subtraction never underflows on a parser-returned header.
+    pub fn payload_bytes(&self) -> u32 {
+        self.ck_size - 24
+    }
 }
 
 /// Parse the 32-byte WavPack block header at the start of `bytes`.
@@ -475,6 +595,181 @@ mod tests {
         let (h, tail) = parse_block_header(&buf).unwrap();
         assert_eq!(h.ck_size, MIN_CK_SIZE + 8);
         assert_eq!(tail, &[0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn is_standalone_block_requires_both_markers() {
+        // Both bits 11 and 12 set — the wiki degenerate "single-block
+        // set" case (also the natural state for a plain stereo file).
+        let f = Flags::from_raw(0b11 << 11);
+        assert!(f.is_standalone_block());
+        assert!(!f.is_multichannel_member());
+    }
+
+    #[test]
+    fn is_multichannel_member_when_any_marker_combo_other_than_both() {
+        for raw_marker in [0b00u32, 0b01, 0b10] {
+            let f = Flags::from_raw(raw_marker << 11);
+            assert!(
+                f.is_multichannel_member(),
+                "marker {raw_marker:02b} should mark this block as a multichannel member"
+            );
+            assert!(
+                !f.is_standalone_block(),
+                "marker {raw_marker:02b} should NOT be standalone"
+            );
+        }
+    }
+
+    #[test]
+    fn is_lossless_when_hybrid_bit_clear() {
+        // Bit 3 clear → lossless profile per the wiki "hybrid profile
+        // (lossy compression)" labelling.
+        let f = Flags::from_raw(0);
+        assert!(f.is_lossless());
+        assert!(!f.is_lossy());
+        // And vice-versa: bit 3 set → lossy / hybrid.
+        let f = Flags::from_raw(1 << 3);
+        assert!(!f.is_lossless());
+        assert!(f.is_lossy());
+        assert!(f.hybrid);
+    }
+
+    #[test]
+    fn has_custom_sample_rate_only_at_sentinel_15() {
+        // bits 23..=26 = 15 → unknown/custom per the wiki sentinel.
+        let f = Flags::from_raw(15u32 << 23);
+        assert_eq!(f.sample_rate_index, 15);
+        assert!(f.has_custom_sample_rate());
+        // Every other index in the 4-bit range is a regular table entry.
+        for idx in 0u32..15 {
+            let f = Flags::from_raw(idx << 23);
+            assert_eq!(f.sample_rate_index as u32, idx);
+            assert!(
+                !f.has_custom_sample_rate(),
+                "sample_rate_index {idx} should not be 'custom'"
+            );
+        }
+    }
+
+    #[test]
+    fn should_skip_decode_tracks_bit_31_only() {
+        // Wiki: bit 31 carries the "do not decode if encountered"
+        // instruction. Bit 28 ("experimental, okay to ignore") does
+        // NOT instruct a skip — it's tolerated.
+        let f = Flags::from_raw(1u32 << 31);
+        assert!(f.should_skip_decode());
+        let f = Flags::from_raw(1u32 << 28);
+        assert!(!f.should_skip_decode());
+        let f = Flags::from_raw(0);
+        assert!(!f.should_skip_decode());
+    }
+
+    #[test]
+    fn is_experimental_is_union_of_robust_and_low_latency() {
+        // Both wiki "experimental" bits feed the diagnostic predicate.
+        let f = Flags::from_raw(0);
+        assert!(!f.is_experimental());
+        let f = Flags::from_raw(1u32 << 28);
+        assert!(f.is_experimental());
+        let f = Flags::from_raw(1u32 << 31);
+        assert!(f.is_experimental());
+        let f = Flags::from_raw((1u32 << 28) | (1u32 << 31));
+        assert!(f.is_experimental());
+    }
+
+    #[test]
+    fn effective_bit_depth_subtracts_left_shift() {
+        // 16-bit container, left_shift = 4 → 12-bit effective depth
+        // per the wiki "left-shift places when bitdepth is not a
+        // multiple of 8 (e.g. 12-bit, 20-bit)" entry.
+        let raw = 0b01u32 // bytes_per_sample_minus_one = 1 → 2 bytes
+            | (4u32 << 13); // left_shift = 4
+        let f = Flags::from_raw(raw);
+        assert_eq!(f.bytes_per_sample(), 2);
+        assert_eq!(f.left_shift, 4);
+        assert_eq!(f.effective_bit_depth(), 12);
+
+        // 24-bit container, left_shift = 4 → 20-bit effective depth
+        // (the other wiki worked example).
+        let raw = 0b10u32 // bytes_per_sample_minus_one = 2 → 3 bytes
+            | (4u32 << 13); // left_shift = 4
+        let f = Flags::from_raw(raw);
+        assert_eq!(f.bytes_per_sample(), 3);
+        assert_eq!(f.effective_bit_depth(), 20);
+
+        // No left-shift → effective bit-depth matches the container.
+        let f = Flags::from_raw(0b11); // 4 bytes/sample, no shift
+        assert_eq!(f.effective_bit_depth(), 32);
+    }
+
+    #[test]
+    fn effective_bit_depth_saturates_when_left_shift_overflows() {
+        // 1-byte container with left_shift = 31 → saturate to 0 rather
+        // than underflow. The wiki does not specifically forbid this
+        // combination so the parser preserves the raw fields; the
+        // accessor degrades gracefully.
+        let raw = (31u32 << 13) & ((1u32 << 18) - 1); // left_shift = 31
+        let f = Flags::from_raw(raw);
+        assert_eq!(f.bytes_per_sample(), 1);
+        assert_eq!(f.left_shift, 31);
+        assert_eq!(f.effective_bit_depth(), 0);
+    }
+
+    #[test]
+    fn is_audio_block_keys_on_block_samples_field() {
+        // block_samples > 0 → audio block.
+        let mut buf = synthesise_minimal_header(0);
+        buf[20..24].copy_from_slice(&1024u32.to_le_bytes());
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert!(h.is_audio_block());
+
+        // block_samples == 0 → metadata-only block per the wiki note
+        // "may be 0 if no audio present".
+        let buf = synthesise_minimal_header(0);
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert!(!h.is_audio_block());
+        assert_eq!(h.block_samples, 0);
+    }
+
+    #[test]
+    fn is_total_samples_known_distinguishes_sentinel() {
+        // The minimal header uses the sentinel by construction.
+        let buf = synthesise_minimal_header(0);
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert!(!h.is_total_samples_known());
+        assert_eq!(h.total_samples, TOTAL_SAMPLES_UNKNOWN);
+
+        // Any other value → "known".
+        let mut buf = synthesise_minimal_header(0);
+        buf[12..16].copy_from_slice(&123_456u32.to_le_bytes());
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert!(h.is_total_samples_known());
+        assert_eq!(h.total_samples, 123_456);
+
+        // And the boundary case `0` (a real count of zero samples) is
+        // also "known" — it differs from the sentinel.
+        let mut buf = synthesise_minimal_header(0);
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert!(h.is_total_samples_known());
+    }
+
+    #[test]
+    fn payload_bytes_subtracts_fixed_header_minimum() {
+        // Minimum ck_size = 24 → zero payload bytes (metadata-empty
+        // block).
+        let buf = synthesise_minimal_header(0);
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(h.payload_bytes(), 0);
+
+        // ck_size = 24 + 100 → 100 payload bytes.
+        let mut buf = vec![0u8; HEADER_LEN + 100];
+        let hdr = synthesise_minimal_header(0);
+        buf[..HEADER_LEN].copy_from_slice(&hdr);
+        buf[4..8].copy_from_slice(&(MIN_CK_SIZE + 100).to_le_bytes());
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(h.payload_bytes(), 100);
     }
 
     #[test]

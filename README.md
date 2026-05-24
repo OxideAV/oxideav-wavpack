@@ -5,11 +5,13 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 7 — block-header parser + metadata sub-block walker +
+**Round 8 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
 sample-coding bit reader, run-length decoder, Golomb sample-value
 reconstruction & single-call per-sample decode + entropy→median
-bridge.** Round 1
+bridge + 11 new header-accessor helpers (lossless / sample-rate
+sentinel / experimental / effective bit-depth / audio-block / total-
+samples-known / payload-bytes / standalone-block).** Round 1
 landed the 32-byte fixed block-header parser; round 2 added the
 metadata sub-block walker completing the structural pass over a
 WavPack v.4 block; round 3 turns the `0x02` / `0x03` / `0x04`
@@ -119,6 +121,30 @@ Public API:
   pull a channel's three medians straight out of a round-4
   `EntropyInfo` value so the entropy-info expander output feeds the
   Golomb decoder without the caller re-typing the array.
+- [`Flags::is_lossless`] / [`Flags::is_lossy`] — symmetric predicates
+  around the wiki bit 3 "hybrid profile (lossy compression)" label.
+- [`Flags::has_custom_sample_rate`] — `true` when bits 23..=26 hold
+  the wiki sentinel `15` ("unknown/custom"); when set, the actual
+  rate is in metadata sub-block `0x27`.
+- [`Flags::should_skip_decode`] — surfaces the wiki bit 31 "do not
+  decode if encountered" decode-gating instruction; bit 28
+  ("experimental, okay to ignore") is deliberately **not** included.
+- [`Flags::is_experimental`] — diagnostic union of the two wiki-
+  labelled experimental bits (28 + 31).
+- [`Flags::effective_bit_depth`] — `bytes_per_sample * 8 - left_shift`
+  per the wiki "12-bit / 20-bit" worked examples; saturates to `0`
+  rather than underflowing on a malformed `left_shift > container_bits`.
+- [`Flags::is_standalone_block`] / [`Flags::is_multichannel_member`]
+  — distinguishes the wiki "multi-channel start and end blocks"
+  degenerate `0b11` marker (a plain stereo file's single-block
+  set) from any other marker combination (which signals participation
+  in a multi-block channel grouping).
+- [`WavPackBlockHeader::is_audio_block`] — `block_samples > 0`,
+  per the wiki "may be 0 if no audio present" note.
+- [`WavPackBlockHeader::is_total_samples_known`] — distinguishes the
+  wiki [`TOTAL_SAMPLES_UNKNOWN`] sentinel from a real count.
+- [`WavPackBlockHeader::payload_bytes`] — bytes of metadata sub-block
+  payload the `ck_size` field advertises (`ck_size - 24`).
 
 ### Out of scope (later rounds)
 
@@ -153,14 +179,14 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 7 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 8 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 92-test unit suite synthesises minimal valid headers, sub-blocks
+The 103-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
@@ -186,4 +212,15 @@ value halves over one contiguous bitstream, the round-7
 stereo and mono inputs, and `decode_sample` chained-call coverage —
 run-length-then-value, `last_zero` short-circuit honoured,
 degenerate-interval and truncation error propagation, and the
-entropy-info → median → sample end-to-end path).
+entropy-info → median → sample end-to-end path; and the round-8
+block-header accessor sweep — `is_standalone_block` /
+`is_multichannel_member` across all four marker combinations,
+`is_lossless` / `is_lossy` symmetry around the hybrid bit,
+`has_custom_sample_rate` sentinel pin sweep across all 16
+sample_rate_index values, `should_skip_decode` discriminating bit 31
+from bit 28, `is_experimental` union, `effective_bit_depth` for the
+wiki 12-bit / 20-bit worked examples plus the no-shift baseline
+plus the saturation case, `is_audio_block` keyed on a non-zero
+`block_samples`, `is_total_samples_known` against the sentinel and
+the boundary `0`, and `payload_bytes` subtracting the 24-byte fixed
+header floor).

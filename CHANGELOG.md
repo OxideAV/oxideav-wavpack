@@ -8,6 +8,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 8 (header accessor coverage): non-prediction-loop advancement
+  while the median-adaptation amount remains a docs gap. Eleven
+  block-header convenience accessors derived rigorously from the wiki
+  "Flags meaning" / "Block structure" listings. On `Flags`:
+  `is_standalone_block` / `is_multichannel_member` (degenerate-marker
+  `0b11` vs everything else, exposing the wiki "multi-channel start
+  and end blocks" pair); `is_lossless` / `is_lossy` (around the wiki
+  bit 3 "hybrid profile (lossy compression)" label); `has_custom_sample_rate`
+  (wiki bits 23..=26 sentinel `15` = "unknown/custom"); `should_skip_decode`
+  (wiki bit 31 "do not decode if encountered" — bit 28 "okay to ignore"
+  deliberately excluded); `is_experimental` (union of the two wiki-
+  labelled experimental bits 28 + 31, diagnostic-only);
+  `effective_bit_depth` (container width minus `left_shift`, saturating
+  per the wiki "12-bit / 20-bit" worked examples). On `WavPackBlockHeader`:
+  `is_audio_block` (wiki "may be 0 if no audio present" on `block_samples`),
+  `is_total_samples_known` (sentinel-vs-real on `total_samples`), and
+  `payload_bytes` (the metadata-region length advertised by `ck_size`).
+  None of these touch the prediction loop or the median-adaptation
+  amount — those remain gated on the open docs gap.
+- 11 new unit tests (103 total): standalone vs multichannel marker
+  matrix (all four `0b00..=0b11` combinations); lossless / lossy
+  predicate symmetry around the hybrid bit; `has_custom_sample_rate`
+  sweep across all 16 sample_rate_index values pinning the sentinel
+  to `15`; `should_skip_decode` discriminating bit 31 from bit 28;
+  `is_experimental` union of the two experimental bits;
+  `effective_bit_depth` for the wiki 12-bit / 20-bit worked examples
+  plus the no-shift baseline plus the `left_shift > container_bits`
+  saturation; `is_audio_block` keyed on a non-zero `block_samples`;
+  `is_total_samples_known` distinguishing the `0xFFFF_FFFF` sentinel
+  from real counts (including the boundary `0`); `payload_bytes`
+  subtracting the 24-byte fixed-header floor.
 - Round 7: WavPack v.4 per-sample single-call decode + entropy-info →
   median bridge. New public items in the `samples` module: `decode_sample`
   fuses `decode_run_length` and `decode_sample_value` into one call per
