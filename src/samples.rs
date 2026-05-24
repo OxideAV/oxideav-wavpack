@@ -25,14 +25,18 @@
 //! Round 5 landed the first half — the bit reader and the `n`-decoder.
 //! Round 6 lands the value part of the second half:
 //! [`golomb_interval`] (`(base, add)` selection) and
-//! [`decode_sample_value`] (mantissa + sign). The one piece still
-//! missing is the median **adaptation amount** — the wiki names the
-//! "increase" / "decrease" verbs without quantifying them — so
-//! [`decode_sample_value`] decodes a single value against a fixed,
-//! caller-supplied median set and does not mutate it. The stateful loop
-//! that walks a whole `0x0A` payload (feeding each `n` back into a
-//! mutating median set) stays gated on that gap being closed (see the
-//! docs-gap notes below).
+//! [`decode_sample_value`] (mantissa + sign). Round 7 joins the two
+//! halves into [`decode_sample`] — one call per sample, matching the
+//! wiki's single contiguous pseudocode block — and adds the
+//! [`Medians::from_entropy_left`] / [`Medians::from_entropy_right`]
+//! bridge from the round-4 [`EntropyInfo`](crate::EntropyInfo) output.
+//! The one piece still missing is the median **adaptation amount** — the
+//! wiki names the "increase" / "decrease" verbs without quantifying them
+//! — so [`decode_sample`] (like [`decode_sample_value`]) decodes against
+//! a fixed, caller-supplied median set and does not mutate it. The
+//! stateful loop that walks a whole `0x0A` payload (feeding each `n` back
+//! into a mutating median set) stays gated on that gap being closed (see
+//! the docs-gap notes below).
 //!
 //! ## Bit-reader primitives
 //!
@@ -131,6 +135,7 @@
 //! from the escape path; [`BitReader::get_bits`] still defines
 //! `get_bits(0) == 0` for completeness.
 
+use crate::entropy::EntropyInfo;
 use crate::error::{Error, Result};
 
 /// The unary prefix value at which the wiki escape kicks in: when
@@ -338,6 +343,32 @@ impl Medians {
     pub const fn new(values: [i32; 3]) -> Self {
         Self { values }
     }
+
+    /// The first (left / mono) channel's medians from a round-4
+    /// [`EntropyInfo`] expansion.
+    ///
+    /// The wiki "Entropy info" section produces "one or two sets of
+    /// medians for samples decoding"; this is the first set —
+    /// `EntropyInfo::medians_left` — which is the only set on a mono
+    /// block and the left channel on a stereo block.
+    pub const fn from_entropy_left(info: &EntropyInfo) -> Self {
+        Self {
+            values: info.medians_left,
+        }
+    }
+
+    /// The second (right) channel's medians from a round-4
+    /// [`EntropyInfo`] expansion.
+    ///
+    /// This is `EntropyInfo::medians_right` — the second set, present on
+    /// stereo blocks only. On a mono block (where the wiki put only one
+    /// set on the wire) this is `[0, 0, 0]`, the value the expander
+    /// leaves it at.
+    pub const fn from_entropy_right(info: &EntropyInfo) -> Self {
+        Self {
+            values: info.medians_right,
+        }
+    }
 }
 
 /// The `(base, add)` Golomb interval the wiki selects from the
@@ -445,6 +476,43 @@ pub fn decode_sample_value(reader: &mut BitReader<'_>, n: u32, medians: Medians)
     let magnitude = base + t2;
     let result = if sign == 0 { magnitude } else { !magnitude };
     Ok(result)
+}
+
+/// Decode one complete sample from the bitstream — the wiki "Samples
+/// coding" per-sample pseudocode as a single call.
+///
+/// The wiki presents the run-length `n` decoder and the Golomb
+/// value decoder as one contiguous pseudocode block run once per
+/// sample. [`decode_run_length`] and [`decode_sample_value`] split that
+/// block into its two halves for unit testing; `decode_sample` chains
+/// them back together so a caller decodes one sample with one call:
+///
+/// 1. [`decode_run_length`] reads the unary prefix (with the `n == 16`
+///    escape) and advances the adaptive [`RunState`], yielding the
+///    run-length index `n`.
+/// 2. [`decode_sample_value`] selects the `(base, add)` interval for
+///    that `n`, reads the Golomb mantissa and sign, and returns the
+///    reconstructed sample.
+///
+/// The medians are taken **by value and not mutated**: the wiki names
+/// the per-branch "increase" / "decrease" median update but not its
+/// *amount*, so the stateful loop that walks a whole `0x0A` payload —
+/// feeding each decoded `n` back into a mutating median set — stays
+/// gated on that docs gap (see the module-level docs). `decode_sample`
+/// is therefore a single-sample primitive against a caller-supplied
+/// fixed median set, exactly like [`decode_sample_value`]; it adds only
+/// the run-length step in front.
+///
+/// Errors propagate unchanged: [`Error::Truncated`] when the bitstream
+/// is exhausted mid-sample, and [`Error::GolombDegenerateInterval`] when
+/// the selected median is `1` (`add == 0`).
+pub fn decode_sample(
+    reader: &mut BitReader<'_>,
+    state: &mut RunState,
+    medians: Medians,
+) -> Result<i32> {
+    let n = decode_run_length(reader, state)?;
+    decode_sample_value(reader, n, medians)
 }
 
 #[cfg(test)]
@@ -947,6 +1015,120 @@ mod tests {
         assert_eq!(n, 2);
         let m = Medians::new([10, 20, 30]);
         let v = decode_sample_value(&mut r, n, m).unwrap();
+        assert_eq!(v, 31);
+    }
+
+    // ---- Medians from EntropyInfo bridge ----
+
+    #[test]
+    fn medians_from_entropy_left_takes_first_set() {
+        let info = EntropyInfo {
+            medians_left: [10, 20, 30],
+            medians_right: [40, 50, 60],
+        };
+        assert_eq!(Medians::from_entropy_left(&info).values, [10, 20, 30]);
+    }
+
+    #[test]
+    fn medians_from_entropy_right_takes_second_set() {
+        let info = EntropyInfo {
+            medians_left: [10, 20, 30],
+            medians_right: [40, 50, 60],
+        };
+        assert_eq!(Medians::from_entropy_right(&info).values, [40, 50, 60]);
+    }
+
+    #[test]
+    fn medians_from_entropy_right_is_zero_for_mono() {
+        // A mono EntropyInfo leaves the right set at [0; 3]; the bridge
+        // surfaces exactly that (no special-casing).
+        let info = EntropyInfo::mono([7, 8, 9]);
+        assert_eq!(Medians::from_entropy_left(&info).values, [7, 8, 9]);
+        assert_eq!(Medians::from_entropy_right(&info).values, [0, 0, 0]);
+    }
+
+    // ---- decode_sample (run-length + value in one call) ----
+
+    #[test]
+    fn decode_sample_chains_run_length_and_value() {
+        // Same bitstream as `run_length_then_sample_value_compose`, but
+        // driven through the single-call `decode_sample`.
+        // unary "1110" → raw n=3 (odd) → n=2; interval for n=2 with
+        // medians [10,20,30]: base=30, add=29, k=5, ex=2;
+        // getbits(4)="1000"=1 (< ex), sign "0" → result = 31.
+        let bits = "1110".to_string() + "1000" + "0";
+        let bytes = bits_to_bytes(&bits);
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState::new();
+        let m = Medians::new([10, 20, 30]);
+        let v = decode_sample(&mut r, &mut state, m).unwrap();
+        assert_eq!(v, 31);
+        // The run-length step left the adaptive state as the odd path
+        // would: last_one set, last_zero clear.
+        assert!(state.last_one);
+        assert!(!state.last_zero);
+    }
+
+    #[test]
+    fn decode_sample_honours_last_zero_short_circuit() {
+        // With last_zero set, decode_sample must skip the unary read and
+        // decode the value against n = 0. medians [4,99,99] → base=0,
+        // add=3, k=2, ex=0; getbits(1)="1", extra "0", sign "0" → 2.
+        // (Matches `sample_value_n0_interval`.)
+        let bits = "100";
+        let bytes = bits_to_bytes(bits);
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState {
+            last_zero: true,
+            last_one: false,
+        };
+        let m = Medians::new([4, 99, 99]);
+        let v = decode_sample(&mut r, &mut state, m).unwrap();
+        assert_eq!(v, 2);
+        // last_zero consumed; no unary was read so only the value bits
+        // ("100" = 3 bits) were taken.
+        assert!(!state.last_zero);
+    }
+
+    #[test]
+    fn decode_sample_propagates_degenerate_interval() {
+        // n decodes to 0 (unary "0"), then median[0] == 1 → add = 0 →
+        // the degenerate interval error surfaces unchanged.
+        let bits = "0";
+        let bytes = bits_to_bytes(bits);
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState::new();
+        let m = Medians::new([1, 20, 30]);
+        assert_eq!(
+            decode_sample(&mut r, &mut state, m),
+            Err(Error::GolombDegenerateInterval(0))
+        );
+    }
+
+    #[test]
+    fn decode_sample_propagates_truncation() {
+        // Empty buffer: even the first unary bit can't be read.
+        let bytes: [u8; 0] = [];
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState::new();
+        let m = Medians::new([10, 20, 30]);
+        assert_eq!(decode_sample(&mut r, &mut state, m), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn decode_sample_feeds_from_entropy_info() {
+        // End-to-end of the round-4 → round-6 → round-7 chain: take a
+        // stereo EntropyInfo, pull the left channel's Medians, and decode
+        // one sample. Left medians [10,20,30]; bits as in the chain test.
+        let info = EntropyInfo {
+            medians_left: [10, 20, 30],
+            medians_right: [40, 50, 60],
+        };
+        let bits = "1110".to_string() + "1000" + "0";
+        let bytes = bits_to_bytes(&bits);
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState::new();
+        let v = decode_sample(&mut r, &mut state, Medians::from_entropy_left(&info)).unwrap();
         assert_eq!(v, 31);
     }
 }

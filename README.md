@@ -5,10 +5,11 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 6 — block-header parser + metadata sub-block walker +
+**Round 7 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
-sample-coding bit reader, run-length decoder & Golomb sample-value
-reconstruction.** Round 1
+sample-coding bit reader, run-length decoder, Golomb sample-value
+reconstruction & single-call per-sample decode + entropy→median
+bridge.** Round 1
 landed the 32-byte fixed block-header parser; round 2 added the
 metadata sub-block walker completing the structural pass over a
 WavPack v.4 block; round 3 turns the `0x02` / `0x03` / `0x04`
@@ -26,10 +27,15 @@ into the run-length index `n`, carrying the adaptive `last_zero` /
 `(base, add)` interval, and `decode_sample_value` reads `getbits(k-1)`
 (with `k = log2(add)` under the bit-length reading the wiki's own
 `ex >= 0` requirement forces), the `t2 >= ex` extra bit, and the sign,
-returning the reconstructed sample. The medians are taken by value and
-**not** mutated — the median-adaptation *amount* is still an open docs
-gap. All work follows `docs/audio/wavpack/wiki/WavPack.wiki`
-(the local snapshot of the multimedia.cx WavPack reference page).
+returning the reconstructed sample; round 7 fuses the two halves into
+`decode_sample` (one call per sample, matching the wiki's single
+pseudocode block) and adds `Medians::from_entropy_left` /
+`Medians::from_entropy_right` so the round-4 `EntropyInfo` expander
+output feeds the round-6 Golomb decoder directly. The medians are
+still taken by value and **not** mutated — the median-adaptation
+*amount* is still an open docs gap. All work follows
+`docs/audio/wavpack/wiki/WavPack.wiki` (the local snapshot of the
+multimedia.cx WavPack reference page).
 
 Public API:
 
@@ -102,18 +108,29 @@ Public API:
   (a median of `1`, where `log2(0)` / `getbits(-1)` are undefined)
   returns `Error::GolombDegenerateInterval` rather than a guessed
   value.
+- [`decode_sample`] — fuses the run-length and value halves into one
+  per-sample call, matching the wiki's contiguous pseudocode block:
+  reads the unary prefix (and `n == 16` escape) through
+  `decode_run_length`, then the Golomb mantissa / sign through
+  `decode_sample_value`. Carries the adaptive `RunState` and takes the
+  three medians by value — the median-adaptation *amount* docs gap still
+  blocks the stateful payload loop.
+- [`Medians::from_entropy_left`] / [`Medians::from_entropy_right`] —
+  pull a channel's three medians straight out of a round-4
+  `EntropyInfo` value so the entropy-info expander output feeds the
+  Golomb decoder without the caller re-typing the array.
 
 ### Out of scope (later rounds)
 
-- The median **adaptation amount** that turns `decode_sample_value`
-  into a stateful loop over a whole `0x0A` payload (feeding each
-  decoded `n` back into a mutating median set). **Blocked on a docs
-  gap:** the wiki names the median update direction
+- The median **adaptation amount** that turns `decode_sample` /
+  `decode_sample_value` into a stateful loop over a whole `0x0A` payload
+  (feeding each decoded `n` back into a mutating median set). **Blocked
+  on a docs gap:** the wiki names the median update direction
   ("increase" / "decrease") but not the amount (it cites WavPack's
   `format.txt` for the fraction-of-self step without reproducing it),
   so the per-sample *sequence* cannot be made bit-exact from this page
-  alone. Round 6 decodes a single value against a fixed, caller-supplied
-  median set instead.
+  alone. Round 7 decodes a single sample (run-length + value) against a
+  fixed, caller-supplied median set instead.
 - The degenerate `add == 0` Golomb interval (selected median `1`),
   where the wiki's `k = log2(0)` and `getbits(-1)` are undefined.
   `decode_sample_value` rejects it via `Error::GolombDegenerateInterval`
@@ -136,14 +153,14 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 6 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 7 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 84-test unit suite synthesises minimal valid headers, sub-blocks
+The 92-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
@@ -163,5 +180,10 @@ adaptive carry across a multi-sample sequence, the Golomb
 `ex >= 0` invariant swept across `add` 1..=1024, the short- and
 long-mantissa `t2 >= ex` paths, positive / ones-complement sign
 reconstruction, the degenerate `add == 0` rejection, mantissa- and
-sign-truncation reporting, and an end-to-end compose of the run-length
-and value halves over one contiguous bitstream).
+sign-truncation reporting, an end-to-end compose of the run-length and
+value halves over one contiguous bitstream, the round-7
+`Medians::from_entropy_left` / `from_entropy_right` bridges for
+stereo and mono inputs, and `decode_sample` chained-call coverage —
+run-length-then-value, `last_zero` short-circuit honoured,
+degenerate-interval and truncation error propagation, and the
+entropy-info → median → sample end-to-end path).

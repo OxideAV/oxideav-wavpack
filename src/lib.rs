@@ -1,9 +1,10 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 6 — block-header parser + metadata sub-block walker +
+//! **Round 7 — block-header parser + metadata sub-block walker +
 //! decorrelation sub-block expanders + entropy-info expander +
-//! sample-coding bit reader, run-length decoder & Golomb sample-value
-//! reconstruction.**
+//! sample-coding bit reader, run-length decoder, Golomb sample-value
+//! reconstruction & single-call per-sample decode + entropy→median
+//! bridge.**
 //! Round 1 landed the structural 32-byte block-header parser
 //! documented in `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure
 //! listing); round 2 added the metadata sub-block walker following the
@@ -111,6 +112,20 @@
 //!   `add == 0` (median `1`) interval is rejected via
 //!   [`Error::GolombDegenerateInterval`] rather than guessed.
 //!
+//! Round-7 scope joins the two halves into a single per-sample call and
+//! bridges the round-4 entropy-info output into the round-6 median set:
+//!
+//! * [`decode_sample`] — runs the whole wiki "Samples coding" per-sample
+//!   pseudocode in one call: [`decode_run_length`] (with its adaptive
+//!   [`RunState`] carry) followed by [`decode_sample_value`]. Still takes
+//!   [`Medians`] by value and does not mutate them — the median
+//!   adaptation amount remains the open docs gap — so it is a
+//!   single-sample primitive, not yet the full payload loop.
+//! * [`Medians::from_entropy_left`] / [`Medians::from_entropy_right`] —
+//!   pull a channel's three medians straight out of an
+//!   [`EntropyInfo`] so the round-4 expander output feeds the round-6
+//!   Golomb decoder without the caller re-typing the array.
+//!
 //! Still out of scope (subsequent rounds): the median-adaptation
 //! *amount* that turns `decode_sample_value` into a stateful payload
 //! loop (blocked on a docs gap), the prediction loop that consumes the
@@ -157,6 +172,6 @@ pub use crate::metadata::{
     ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK,
 };
 pub use crate::samples::{
-    decode_run_length, decode_sample_value, golomb_interval, BitReader, GolombInterval, Medians,
-    RunState, UNARY_ESCAPE,
+    decode_run_length, decode_sample, decode_sample_value, golomb_interval, BitReader,
+    GolombInterval, Medians, RunState, UNARY_ESCAPE,
 };

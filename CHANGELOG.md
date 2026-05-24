@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 7: WavPack v.4 per-sample single-call decode + entropy-info →
+  median bridge. New public items in the `samples` module: `decode_sample`
+  fuses `decode_run_length` and `decode_sample_value` into one call per
+  sample, matching the wiki's contiguous "Samples coding" pseudocode
+  block (carries the adaptive `RunState`, takes `Medians` by value).
+  `Medians::from_entropy_left` and `Medians::from_entropy_right` pull a
+  channel's three medians directly out of a round-4 `EntropyInfo` value
+  so the entropy-info expander output feeds the Golomb decoder without
+  the caller re-typing the array. No median is mutated — the median
+  adaptation amount remains the open docs gap blocking the multi-sample
+  payload loop.
+- 8 new unit tests (92 total): `Medians::from_entropy_left` and
+  `from_entropy_right` for stereo input, the mono case (right set zeroed),
+  `decode_sample` end-to-end through the run-length-then-value chain,
+  `last_zero` short-circuit honoured (no unary bits consumed),
+  degenerate-interval and truncation error propagation, and the
+  `EntropyInfo` → `Medians` → `decode_sample` full chain.
 - Round 6: WavPack v.4 Golomb sample-value reconstruction — the value
   part of the wiki "Samples coding" second half. New public items in
   the `samples` module: `Medians` (a channel's three `median[0..=2]` in
