@@ -45,6 +45,11 @@ pub enum Error {
     /// = 12 bytes) documented in the wiki "Entropy info" section.
     /// The contained number is the observed byte count.
     EntropyInfoLength(usize),
+    /// A `0x26` MD5-checksum sub-block had a payload whose byte count
+    /// did not match the fixed 16-byte MD5 digest length documented in
+    /// the wiki "IDs" listing ("16-byte MD5 sum of raw audio data").
+    /// The contained number is the observed byte count.
+    Md5ChecksumLength(usize),
     /// The Golomb mantissa decode of a `0x0A` sample reached `add == 0`
     /// (a median of `1`), where the wiki "Samples coding" pseudocode's
     /// `k = log2(add)` and `getbits(k - 1)` are undefined (`log2(0)` and
@@ -86,6 +91,10 @@ impl core::fmt::Display for Error {
             Error::EntropyInfoLength(n) => write!(
                 f,
                 "oxideav-wavpack: 0x05 entropy-info payload has {n} bytes (expected 6 for mono or 12 for stereo)"
+            ),
+            Error::Md5ChecksumLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x26 MD5-checksum payload has {n} bytes (expected 16)"
             ),
             Error::GolombDegenerateInterval(add) => write!(
                 f,

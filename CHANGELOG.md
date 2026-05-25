@@ -8,6 +8,48 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 10 (metadata sub-block extras: MD5 typed view + walker finders
+  + remaining payload-kind predicates + `SubBlockId` classifiers):
+  another non-prediction-loop advancement while the median-adaptation
+  amount remains a docs gap. New `Md5Checksum([u8; 16])` typed view of
+  the `0x26` sub-block payload — the wiki "16-byte MD5 sum of raw audio
+  data" — together with `parse_md5_checksum(&[u8]) -> Result<Md5Checksum>`
+  enforcing the fixed 16-byte length and a new
+  `Error::Md5ChecksumLength(usize)` variant rejecting other lengths.
+  Public constant `MD5_DIGEST_BYTES = 16`. New walker finders over the
+  round-2 `Vec<MetadataSubBlock>`: `find_first(subs, id)` linear scan
+  by `SubBlockId`; specialised wrappers `find_audio_payload` (`0x0A`),
+  `find_entropy_info` (`0x05`), `find_md5_checksum_block` (`0x26`),
+  `find_multichannel_info` (`0x0D`); and `find_decorrelation_triple`
+  which returns the three sub-blocks `(0x02, 0x03, 0x04)` in wiki order
+  or `None` if any one is missing. Eight new `MetadataSubBlock`
+  payload-kind predicates filling out the wiki "IDs" listing:
+  `is_dummy_payload` (`0x00`), `is_hybrid_profile_payload` (`0x06`),
+  `is_float_payload` (`0x08`), `is_int32_payload` (`0x09`),
+  `is_overflow_bits_payload` (`0x0C`), `is_multichannel_info_payload`
+  (`0x0D`), `is_encoding_details_payload` (`0x25`), `is_md5_payload`
+  (`0x26`), `is_sample_rate_payload` (`0x27`). Four new `SubBlockId`
+  classifiers — `is_decorrelation`, `is_correction_stream`,
+  `is_riff_wrapper`, `is_audio` — for callers that branch on the ID
+  enum directly rather than on a sub-block. None of these read bits,
+  mutate state, or touch the prediction loop; they elaborate the
+  round-2 walker output for callers staging the deferred decode pass.
+- 17 new unit tests (135 total): `SubBlockId` classifier coverage
+  across all four buckets (decorrelation `0x02/0x03/0x04`,
+  correction-stream `0x07/0x0B`, RIFF wrapper `0x20/0x21` with
+  same-family `0x25/0x26/0x27` negative cases, audio-only `0x0A`);
+  one-hot kind-predicate sweep across the eight new MetadataSubBlock
+  predicates (with the four "main bucket" predicates pinned false on
+  each); `is_md5_payload` discriminating `0x06` HybridProfile from
+  `0x26` Md5Checksum on the low-5-bit overlap; `is_dummy_payload`
+  discriminating `0x00` Dummy from `0x20` RiffHeader on the same
+  overlap; `parse_md5_checksum` accept (MD5 of `""` test vector) and
+  reject (0/15/17/64-byte rejections); end-to-end round-trip from a
+  synthesised `0x26` sub-block through `walk_metadata` → `find_md5_*`
+  → `parse_md5_checksum` (MD5 of the "quick brown fox" test vector);
+  walker finder coverage for `find_first` (hit + miss), the four
+  specialised finders, and `find_decorrelation_triple` (full triple
+  hit + miss when either of weights / samples is dropped).
 - Round 9 (decorrelation-term classification + metadata-payload kind
   predicates): non-prediction-loop advancement while the median-
   adaptation amount remains a docs gap. New `TermKind` enum classifies

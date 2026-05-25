@@ -117,6 +117,45 @@ pub enum SubBlockId {
 }
 
 impl SubBlockId {
+    /// `true` when this ID names one of the **decorrelation** payloads
+    /// the wiki "IDs" listing places at `0x02` / `0x03` / `0x04`
+    /// (terms, weights, samples). The decode layer's prediction loop
+    /// consumes exactly these three sub-block kinds in lockstep, so
+    /// the predicate is useful for callers picking the decorrelation
+    /// triple out of a walk.
+    pub fn is_decorrelation(&self) -> bool {
+        matches!(
+            self,
+            SubBlockId::DecorrelationTerms
+                | SubBlockId::DecorrelationWeights
+                | SubBlockId::DecorrelationSamples
+        )
+    }
+
+    /// `true` when this ID names a payload the wiki "IDs" listing
+    /// annotates with "(wvc file)" — `0x07` noise-shaping profile or
+    /// `0x0B` packed correction data. The lossless decoder ignores
+    /// these; a hybrid decoder pairs them with the main stream.
+    pub fn is_correction_stream(&self) -> bool {
+        matches!(
+            self,
+            SubBlockId::NoiseShapingProfile | SubBlockId::PackedCorrectionData
+        )
+    }
+
+    /// `true` when this ID names a **RIFF wrapper** payload (`0x20`
+    /// header before audio, `0x21` trailer after audio) the wiki "IDs"
+    /// listing carries verbatim from the original `.wav` framing.
+    pub fn is_riff_wrapper(&self) -> bool {
+        matches!(self, SubBlockId::RiffHeader | SubBlockId::RiffTrailer)
+    }
+
+    /// `true` when this ID is `0x0A` packed samples — the entropy-coded
+    /// audio payload the wiki "Samples coding" section consumes.
+    pub fn is_audio(&self) -> bool {
+        matches!(self, SubBlockId::PackedSamples)
+    }
+
     /// Decode the sub-block ID from the on-disk ID byte. Only the
     /// low 5 bits and the `0x20` optional-flag bit are inspected;
     /// the `0x40` odd-size and `0x80` large-size structural flags
@@ -281,6 +320,72 @@ impl<'a> MetadataSubBlock<'a> {
     pub fn is_riff_payload(&self) -> bool {
         matches!(self.id, SubBlockId::RiffHeader | SubBlockId::RiffTrailer)
     }
+
+    /// `true` when this sub-block is the wiki `0x00` "dummy (used for
+    /// padding)" payload — the encoder uses it to align an even-byte
+    /// boundary, the decoder discards the body.
+    pub fn is_dummy_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::Dummy)
+    }
+
+    /// `true` when this sub-block is the wiki `0x06` "hybrid profile"
+    /// payload. The lossless decoder ignores it; a hybrid decoder
+    /// consumes it alongside the matching `0x07` noise-shaping data.
+    pub fn is_hybrid_profile_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::HybridProfile)
+    }
+
+    /// `true` when this sub-block is the wiki `0x08` "floating-point
+    /// data profile" payload — present when the enclosing block's
+    /// [`crate::Flags::float_data`] bit is set.
+    pub fn is_float_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::FloatInfo)
+    }
+
+    /// `true` when this sub-block is the wiki `0x09` "large or shifted
+    /// integer profile" payload — present for `>24`-bit / non-byte-
+    /// aligned integer streams.
+    pub fn is_int32_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::Int32Info)
+    }
+
+    /// `true` when this sub-block is the wiki `0x0C` "packed overflow
+    /// bits from floating-point or large integers" payload, paired
+    /// with either [`Self::is_float_payload`] or [`Self::is_int32_payload`].
+    pub fn is_overflow_bits_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::PackedOverflowBits)
+    }
+
+    /// `true` when this sub-block is the wiki `0x0D` "multichannel
+    /// information (including Microsoft channel mask)" payload — the
+    /// global channel-layout descriptor for multi-block multi-channel
+    /// files.
+    pub fn is_multichannel_info_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::MultichannelInfo)
+    }
+
+    /// `true` when this sub-block is the wiki `0x25` "some encoding
+    /// details for info purposes" payload. The decoder treats it as
+    /// opaque diagnostic text — it does not affect the reconstructed
+    /// samples.
+    pub fn is_encoding_details_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::EncodingDetails)
+    }
+
+    /// `true` when this sub-block is the wiki `0x26` "16-byte MD5 sum
+    /// of raw audio data" payload. Pair with [`parse_md5_checksum`]
+    /// to recover the typed [`Md5Checksum`] view.
+    pub fn is_md5_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::Md5Checksum)
+    }
+
+    /// `true` when this sub-block is the wiki `0x27` "non-standard
+    /// sampling rate" payload — carried when the enclosing block's
+    /// [`crate::Flags::has_custom_sample_rate`] sentinel (sample-rate
+    /// index `15`) is set.
+    pub fn is_sample_rate_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::NonStandardSampleRate)
+    }
 }
 
 /// Walk all metadata sub-blocks in the given byte slice (typically
@@ -365,6 +470,116 @@ pub fn parse_metadata_sub_block(bytes: &[u8]) -> Result<(MetadataSubBlock<'_>, &
         },
         &bytes[total..],
     ))
+}
+
+/// On-disk byte length of an MD5 message-digest value (the size of an
+/// MD5 hash; the wiki "IDs" listing names sub-block `0x26` as
+/// "16-byte MD5 sum of raw audio data" — the byte count is the
+/// hash's natural length and is fixed by RFC 1321, not by WavPack).
+pub const MD5_DIGEST_BYTES: usize = 16;
+
+/// Typed view of a `0x26` metadata sub-block payload — the wiki
+/// "16-byte MD5 sum of raw audio data". The bytes are stored
+/// verbatim as they appear on disk; comparing two `Md5Checksum`
+/// values is the same as comparing the raw digests.
+///
+/// The MD5 covers the **raw audio data** that the WavPack stream
+/// reconstructs; verifying it requires running a full sample-decode
+/// pass over the stream and re-hashing the result. The walker exposes
+/// only the parse + typed-view layer here; the verification pass is
+/// gated on the full sample loop (which itself remains gated on the
+/// median-adaptation docs gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Md5Checksum(pub [u8; MD5_DIGEST_BYTES]);
+
+impl Md5Checksum {
+    /// Return the digest bytes as a slice.
+    pub fn as_bytes(&self) -> &[u8; MD5_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+/// Parse a `0x26` MD5 sub-block payload into a typed [`Md5Checksum`].
+///
+/// The wiki "IDs" listing fixes the on-disk length at 16 bytes (one
+/// MD5 digest). Any other length is rejected as
+/// [`Error::Md5ChecksumLength`].
+pub fn parse_md5_checksum(payload: &[u8]) -> Result<Md5Checksum> {
+    if payload.len() != MD5_DIGEST_BYTES {
+        return Err(Error::Md5ChecksumLength(payload.len()));
+    }
+    let mut digest = [0u8; MD5_DIGEST_BYTES];
+    digest.copy_from_slice(payload);
+    Ok(Md5Checksum(digest))
+}
+
+/// Find the first metadata sub-block matching `id` in `subs`, returning
+/// the matching [`MetadataSubBlock`] borrow or `None` if no sub-block
+/// has that ID. A linear scan over the round-2 walker output that lets
+/// callers pull out a specific payload (e.g. the `0x0A` audio data or
+/// the `0x26` MD5 digest) without re-implementing the match arm.
+///
+/// Matches are by [`SubBlockId`] equality — the `0x20` optional flag
+/// is part of the ID identifier, so e.g. `SubBlockId::RiffHeader`
+/// matches only the `0x20`-prefixed entry and not the bare `0x00`
+/// `SubBlockId::Dummy`.
+pub fn find_first<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+    id: SubBlockId,
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    subs.iter().find(|s| s.id == id)
+}
+
+/// Convenience wrapper for [`find_first`] specialised to the `0x0A`
+/// packed-samples payload — the entropy-coded audio stream the wiki
+/// "Samples coding" section consumes.
+pub fn find_audio_payload<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::PackedSamples)
+}
+
+/// Convenience wrapper for [`find_first`] specialised to the `0x05`
+/// entropy-info payload — the medians the round-4 expander consumes.
+pub fn find_entropy_info<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::EntropyInfo)
+}
+
+/// Convenience wrapper for [`find_first`] specialised to the `0x26`
+/// MD5 payload — the wiki "16-byte MD5 sum of raw audio data".
+pub fn find_md5_checksum_block<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::Md5Checksum)
+}
+
+/// Convenience wrapper for [`find_first`] specialised to the `0x0D`
+/// multichannel-info payload — the wiki "(including Microsoft channel
+/// mask)" descriptor.
+pub fn find_multichannel_info<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::MultichannelInfo)
+}
+
+/// Locate the **decorrelation triple** in a metadata walk and return
+/// the three sub-blocks in wiki order — `0x02` terms, `0x03` weights,
+/// `0x04` samples. Returns `None` when any one of the three is missing
+/// (a malformed lossless block; the decoder's prediction loop needs
+/// all three to be present).
+pub fn find_decorrelation_triple<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<(
+    &'walk MetadataSubBlock<'a>,
+    &'walk MetadataSubBlock<'a>,
+    &'walk MetadataSubBlock<'a>,
+)> {
+    let terms = find_first(subs, SubBlockId::DecorrelationTerms)?;
+    let weights = find_first(subs, SubBlockId::DecorrelationWeights)?;
+    let samples = find_first(subs, SubBlockId::DecorrelationSamples)?;
+    Some((terms, weights, samples))
 }
 
 #[cfg(test)]
@@ -721,6 +936,323 @@ mod tests {
         let wire = synth_small(0x25, b"oxideav-");
         let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
         assert!(!sub.is_riff_payload());
+    }
+
+    // ---- SubBlockId classification helpers ----
+
+    #[test]
+    fn sub_block_id_is_decorrelation_covers_terms_weights_samples() {
+        for id in [
+            SubBlockId::DecorrelationTerms,
+            SubBlockId::DecorrelationWeights,
+            SubBlockId::DecorrelationSamples,
+        ] {
+            assert!(id.is_decorrelation(), "{id:?} should be a decorrelation ID");
+            assert!(!id.is_correction_stream());
+            assert!(!id.is_riff_wrapper());
+            assert!(!id.is_audio());
+        }
+        // EntropyInfo (0x05) shares the lossless main-stream family but
+        // isn't one of the three decorrelation IDs.
+        assert!(!SubBlockId::EntropyInfo.is_decorrelation());
+    }
+
+    #[test]
+    fn sub_block_id_is_correction_stream_covers_0x07_and_0x0b() {
+        for id in [
+            SubBlockId::NoiseShapingProfile,
+            SubBlockId::PackedCorrectionData,
+        ] {
+            assert!(
+                id.is_correction_stream(),
+                "{id:?} should be correction-stream"
+            );
+            assert!(!id.is_audio());
+            assert!(!id.is_decorrelation());
+        }
+        // 0x0A audio is not a correction-stream payload.
+        assert!(!SubBlockId::PackedSamples.is_correction_stream());
+    }
+
+    #[test]
+    fn sub_block_id_is_riff_wrapper_only_for_0x20_and_0x21() {
+        assert!(SubBlockId::RiffHeader.is_riff_wrapper());
+        assert!(SubBlockId::RiffTrailer.is_riff_wrapper());
+        // Adjacent IDs that share the 0x20 optional flag (0x25/0x26/0x27)
+        // are NOT RIFF wrappers — they carry their own payloads.
+        assert!(!SubBlockId::EncodingDetails.is_riff_wrapper());
+        assert!(!SubBlockId::Md5Checksum.is_riff_wrapper());
+        assert!(!SubBlockId::NonStandardSampleRate.is_riff_wrapper());
+        // Dummy (0x00) shares the low-5-bit value with RiffHeader (0x20)
+        // but lacks the optional flag — it's not a RIFF wrapper.
+        assert!(!SubBlockId::Dummy.is_riff_wrapper());
+    }
+
+    #[test]
+    fn sub_block_id_is_audio_only_for_packed_samples() {
+        assert!(SubBlockId::PackedSamples.is_audio());
+        // Adjacent IDs are not audio.
+        assert!(!SubBlockId::PackedCorrectionData.is_audio());
+        assert!(!SubBlockId::PackedOverflowBits.is_audio());
+        assert!(!SubBlockId::EntropyInfo.is_audio());
+    }
+
+    // ---- Additional MetadataSubBlock kind predicates ----
+
+    /// Helper: parse a small sub-block from synthesised bytes and assert
+    /// the four "main bucket" predicates (decorrelation / audio /
+    /// correction / RIFF) are all false, and the MD5 predicate is also
+    /// false (MD5 has its own test that uses 16-byte payloads). Returns
+    /// the parsed sub-block so the caller can run its specific kind
+    /// predicate.
+    fn parse_non_main_bucket(id_byte: u8, payload: &[u8]) -> Vec<u8> {
+        let wire = synth_small(id_byte, payload);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(
+            !sub.is_decorrelation_payload(),
+            "id 0x{id_byte:02x} should not be decorrelation"
+        );
+        assert!(
+            !sub.is_audio_payload(),
+            "id 0x{id_byte:02x} should not be audio"
+        );
+        assert!(
+            !sub.is_correction_payload(),
+            "id 0x{id_byte:02x} should not be correction"
+        );
+        assert!(
+            !sub.is_riff_payload(),
+            "id 0x{id_byte:02x} should not be RIFF"
+        );
+        if id_byte != 0x26 {
+            assert!(
+                !sub.is_md5_payload(),
+                "id 0x{id_byte:02x} should not be MD5"
+            );
+        }
+        wire
+    }
+
+    #[test]
+    fn metadata_kind_predicates_one_hot() {
+        // Every documented ID lights exactly one of the per-kind
+        // predicates (except dummy + RIFF which have separate buckets).
+        // We assert the predicate inline so the function-pointer table
+        // doesn't have to satisfy the higher-ranked lifetime bound.
+        let stub = [0u8; 2];
+
+        let wire = parse_non_main_bucket(0x00, &[]);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_dummy_payload());
+
+        let wire = parse_non_main_bucket(0x06, &stub);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_hybrid_profile_payload());
+
+        let wire = parse_non_main_bucket(0x08, &stub);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_float_payload());
+
+        let wire = parse_non_main_bucket(0x09, &stub);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_int32_payload());
+
+        let wire = parse_non_main_bucket(0x0C, &stub);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_overflow_bits_payload());
+
+        let wire = parse_non_main_bucket(0x0D, &stub);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_multichannel_info_payload());
+
+        let wire = parse_non_main_bucket(0x25, &stub);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_encoding_details_payload());
+
+        let wire = parse_non_main_bucket(0x27, &stub);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_sample_rate_payload());
+    }
+
+    #[test]
+    fn is_md5_payload_only_for_0x26() {
+        let md5 = [0xABu8; 16];
+        let wire = synth_small(0x26, &md5);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_md5_payload());
+        assert!(sub.is_optional()); // 0x20 bit set on 0x26
+                                    // 0x06 has the same low-5-bit value but no optional flag, so
+                                    // SubBlockId::from_id_byte resolves it to HybridProfile, not MD5.
+        let wire = synth_small(0x06, &[0u8; 2]);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(!sub.is_md5_payload());
+        assert!(sub.is_hybrid_profile_payload());
+    }
+
+    #[test]
+    fn is_dummy_payload_only_for_0x00() {
+        let wire = synth_small(0x00, &[]);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_dummy_payload());
+        assert!(!sub.is_riff_payload()); // 0x20 is RiffHeader, NOT dummy.
+                                         // 0x20 (low-5-bit 0 + optional flag) is RiffHeader, not Dummy.
+        let wire = synth_small(0x20, b"RIFF");
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(!sub.is_dummy_payload());
+        assert!(sub.is_riff_payload());
+    }
+
+    // ---- MD5 typed view ----
+
+    #[test]
+    fn parse_md5_checksum_accepts_exact_16_bytes() {
+        let digest = [
+            0xD4u8, 0x1D, 0x8C, 0xD9, 0x8F, 0x00, 0xB2, 0x04, 0xE9, 0x80, 0x09, 0x98, 0xEC, 0xF8,
+            0x42, 0x7E,
+        ]; // MD5("") for a recognisable test vector
+        let md5 = parse_md5_checksum(&digest).unwrap();
+        assert_eq!(md5.as_bytes(), &digest);
+        assert_eq!(md5.0, digest);
+    }
+
+    #[test]
+    fn parse_md5_checksum_rejects_other_lengths() {
+        // Empty payload.
+        assert_eq!(parse_md5_checksum(&[]), Err(Error::Md5ChecksumLength(0)));
+        // Too short.
+        assert_eq!(
+            parse_md5_checksum(&[0u8; 15]),
+            Err(Error::Md5ChecksumLength(15))
+        );
+        // Too long (one byte past).
+        assert_eq!(
+            parse_md5_checksum(&[0u8; 17]),
+            Err(Error::Md5ChecksumLength(17))
+        );
+        // Way too long.
+        assert_eq!(
+            parse_md5_checksum(&[0u8; 64]),
+            Err(Error::Md5ChecksumLength(64))
+        );
+    }
+
+    #[test]
+    fn md5_checksum_round_trips_through_sub_block_payload() {
+        // End-to-end: synthesise a 0x26 sub-block, walk it, and pull
+        // the MD5 back out through parse_md5_checksum.
+        let digest = [
+            0x9Eu8, 0x10, 0x7D, 0x9D, 0x37, 0x2B, 0xB6, 0x82, 0x6B, 0xD8, 0x1D, 0x35, 0x42, 0xA4,
+            0x19, 0xD6,
+        ]; // MD5("The quick brown fox jumps over the lazy dog")
+        let wire = synth_small(0x26, &digest);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_md5_payload());
+        let md5 = parse_md5_checksum(sub.payload).unwrap();
+        assert_eq!(md5.as_bytes(), &digest);
+    }
+
+    // ---- Walker convenience finders ----
+
+    fn synth_full_stream() -> Vec<u8> {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x02, &[0x01, 0x02])); // terms
+        stream.extend(synth_small(0x03, &[0x10, 0x20, 0x30, 0x40])); // weights
+        stream.extend(synth_small(0x04, &[0u8; 4])); // samples (2 words)
+        stream.extend(synth_small(0x05, &[0u8; 6])); // mono entropy
+        stream.extend(synth_small(0x0A, &[0xAA, 0xBB, 0xCC, 0xDD])); // audio
+        stream.extend(synth_small(0x0D, &[0x01, 0x02, 0x03, 0x04])); // multichannel info
+        stream.extend(synth_small(0x26, &[0x42u8; 16])); // md5
+        stream
+    }
+
+    #[test]
+    fn find_first_returns_matching_sub_block() {
+        let stream = synth_full_stream();
+        let subs = walk_metadata(&stream).unwrap();
+
+        let entropy = find_first(&subs, SubBlockId::EntropyInfo);
+        assert!(entropy.is_some());
+        assert_eq!(entropy.unwrap().id, SubBlockId::EntropyInfo);
+
+        // Unrelated ID returns None.
+        let missing = find_first(&subs, SubBlockId::HybridProfile);
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn find_audio_payload_returns_packed_samples_block() {
+        let stream = synth_full_stream();
+        let subs = walk_metadata(&stream).unwrap();
+        let audio = find_audio_payload(&subs).expect("audio block present");
+        assert_eq!(audio.id, SubBlockId::PackedSamples);
+        assert_eq!(audio.payload, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        // Walk a stream without 0x0A — finder returns None.
+        let mut without_audio = Vec::new();
+        without_audio.extend(synth_small(0x02, &[0x01, 0x02]));
+        without_audio.extend(synth_small(0x05, &[0u8; 6]));
+        let subs = walk_metadata(&without_audio).unwrap();
+        assert!(find_audio_payload(&subs).is_none());
+    }
+
+    #[test]
+    fn find_entropy_info_returns_0x05_block() {
+        let stream = synth_full_stream();
+        let subs = walk_metadata(&stream).unwrap();
+        let entropy = find_entropy_info(&subs).expect("entropy block present");
+        assert_eq!(entropy.id, SubBlockId::EntropyInfo);
+        assert_eq!(entropy.payload.len(), 6);
+    }
+
+    #[test]
+    fn find_md5_checksum_block_returns_0x26_block() {
+        let stream = synth_full_stream();
+        let subs = walk_metadata(&stream).unwrap();
+        let md5_block = find_md5_checksum_block(&subs).expect("md5 block present");
+        assert_eq!(md5_block.id, SubBlockId::Md5Checksum);
+        let md5 = parse_md5_checksum(md5_block.payload).unwrap();
+        assert_eq!(md5.0, [0x42u8; 16]);
+    }
+
+    #[test]
+    fn find_multichannel_info_returns_0x0d_block() {
+        let stream = synth_full_stream();
+        let subs = walk_metadata(&stream).unwrap();
+        let info = find_multichannel_info(&subs).expect("multichannel-info present");
+        assert_eq!(info.id, SubBlockId::MultichannelInfo);
+        assert_eq!(info.payload, &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn find_decorrelation_triple_returns_terms_weights_samples_in_order() {
+        let stream = synth_full_stream();
+        let subs = walk_metadata(&stream).unwrap();
+        let (terms, weights, samples) = find_decorrelation_triple(&subs).expect("triple present");
+        assert_eq!(terms.id, SubBlockId::DecorrelationTerms);
+        assert_eq!(weights.id, SubBlockId::DecorrelationWeights);
+        assert_eq!(samples.id, SubBlockId::DecorrelationSamples);
+        assert_eq!(terms.payload, &[0x01, 0x02]);
+        assert_eq!(weights.payload, &[0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(samples.payload.len(), 4);
+    }
+
+    #[test]
+    fn find_decorrelation_triple_returns_none_when_any_id_is_missing() {
+        // Drop the weights (0x03) sub-block — triple finder should fail.
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x02, &[0x01, 0x02]));
+        // (no 0x03)
+        stream.extend(synth_small(0x04, &[0u8; 4]));
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_decorrelation_triple(&subs).is_none());
+
+        // Conversely, drop the samples — same failure.
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x02, &[0x01, 0x02]));
+        stream.extend(synth_small(0x03, &[0x10, 0x20, 0x30, 0x40]));
+        // (no 0x04)
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_decorrelation_triple(&subs).is_none());
     }
 
     #[test]

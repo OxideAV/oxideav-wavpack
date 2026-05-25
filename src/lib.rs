@@ -188,8 +188,10 @@ pub use crate::entropy::{
 };
 pub use crate::error::{Error, Result};
 pub use crate::metadata::{
-    parse_metadata_sub_block, walk_metadata, MetadataSubBlock, SubBlockFlags, SubBlockId,
-    ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK,
+    find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
+    find_md5_checksum_block, find_multichannel_info, parse_md5_checksum, parse_metadata_sub_block,
+    walk_metadata, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE,
+    ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
 };
 pub use crate::samples::{
     decode_run_length, decode_sample, decode_sample_value, golomb_interval, BitReader,

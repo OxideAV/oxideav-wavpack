@@ -5,15 +5,16 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 9 — block-header parser + metadata sub-block walker +
+**Round 10 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
 sample-coding bit reader, run-length decoder, Golomb sample-value
 reconstruction & single-call per-sample decode + entropy→median
-bridge + 11 header-accessor helpers + new `TermKind` classifier on
-the wiki "Possible predictor values" listing + 6 new
+bridge + 11 header-accessor helpers + `TermKind` classifier + 6
 `DecorrelationTerms` accessors + `weights_per_term` mono/stereo split
-+ 5 new `MetadataSubBlock` payload-kind predicates (decorrelation /
-correction / audio / RIFF / optional).** Round 1
++ 13 `MetadataSubBlock` payload-kind predicates covering every wiki
+"IDs" entry + 4 `SubBlockId` classifier helpers + 6 walker finders
+(`find_first` + four specialised + decorrelation-triple) + 16-byte
+`Md5Checksum` typed view with strict-length `parse_md5_checksum`.** Round 1
 landed the 32-byte fixed block-header parser; round 2 added the
 metadata sub-block walker completing the structural pass over a
 WavPack v.4 block; round 3 turns the `0x02` / `0x03` / `0x04`
@@ -167,10 +168,33 @@ Public API:
   [`MetadataSubBlock::is_decorrelation_payload`] /
   [`MetadataSubBlock::is_correction_payload`] /
   [`MetadataSubBlock::is_audio_payload`] /
-  [`MetadataSubBlock::is_riff_payload`] — payload-kind predicates
-  derived from the wiki "IDs" listing so a caller can pick the
-  decorrelation triple or the audio stream out of a walk without
+  [`MetadataSubBlock::is_riff_payload`] /
+  [`MetadataSubBlock::is_dummy_payload`] /
+  [`MetadataSubBlock::is_hybrid_profile_payload`] /
+  [`MetadataSubBlock::is_float_payload`] /
+  [`MetadataSubBlock::is_int32_payload`] /
+  [`MetadataSubBlock::is_overflow_bits_payload`] /
+  [`MetadataSubBlock::is_multichannel_info_payload`] /
+  [`MetadataSubBlock::is_encoding_details_payload`] /
+  [`MetadataSubBlock::is_md5_payload`] /
+  [`MetadataSubBlock::is_sample_rate_payload`] — payload-kind
+  predicates covering every entry in the wiki "IDs" listing so a
+  caller can pick a specific sub-block out of a walk without
   re-matching the [`SubBlockId`] enum.
+- [`SubBlockId::is_decorrelation`] / [`SubBlockId::is_correction_stream`]
+  / [`SubBlockId::is_riff_wrapper`] / [`SubBlockId::is_audio`] — the
+  same family classifiers on the enum value itself for callers that
+  branch on an ID rather than on a parsed sub-block.
+- [`Md5Checksum`] — typed view of the `0x26` payload (the wiki "16-byte
+  MD5 sum of raw audio data"), with [`parse_md5_checksum`] enforcing
+  the fixed 16-byte length (other lengths reported through new
+  [`Error::Md5ChecksumLength`]).
+- [`find_first`] / [`find_audio_payload`] / [`find_entropy_info`] /
+  [`find_md5_checksum_block`] / [`find_multichannel_info`] /
+  [`find_decorrelation_triple`] — convenience finders over a
+  [`walk_metadata`] result. The triple finder returns `(terms,
+  weights, samples)` in wiki order or `None` when any of the three is
+  missing — a malformed-block signal for the prediction loop.
 
 ### Out of scope (later rounds)
 
@@ -205,14 +229,14 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 9 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 10 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 118-test unit suite synthesises minimal valid headers, sub-blocks
+The 135-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
@@ -260,4 +284,22 @@ mixed term lists; `weights_per_term` mono/stereo split with 0- and 3-
 channel clamps; `MetadataSubBlock::is_optional` pinning the `0x20`
 flag; and per-kind payload predicates round-tripping for `0x02`/`0x03`/
 `0x04` decorrelation, `0x07`/`0x0B` correction, `0x0A` audio, and
-`0x20`/`0x21` RIFF with a non-RIFF optional negative case).
+`0x20`/`0x21` RIFF with a non-RIFF optional negative case);
+and the round-10 MD5 + walker-finder + remaining-kind-predicate
+sweep — `SubBlockId` classifier coverage across all four buckets
+(decorrelation `0x02`/`0x03`/`0x04`, correction-stream `0x07`/`0x0B`,
+RIFF-wrapper `0x20`/`0x21` with same-flag `0x25`/`0x26`/`0x27`
+negative cases, audio-only `0x0A`); one-hot kind-predicate sweep
+across the eight new `MetadataSubBlock` predicates (with the four
+main-bucket predicates pinned false on each); `is_md5_payload`
+discriminating `0x06` HybridProfile from `0x26` Md5Checksum on the
+low-5-bit overlap and `is_dummy_payload` discriminating `0x00` Dummy
+from `0x20` RiffHeader; `parse_md5_checksum` accept (MD5 of `""`
+test vector) and reject (0 / 15 / 17 / 64-byte lengths); end-to-end
+round-trip from a synthesised `0x26` sub-block through
+`walk_metadata` → `find_md5_checksum_block` → `parse_md5_checksum`
+(MD5 of the "quick brown fox" test vector); walker finder coverage —
+`find_first` hit + miss across `SubBlockId::EntropyInfo` vs
+`SubBlockId::HybridProfile`, the four specialised finders, and
+`find_decorrelation_triple` returning the full triple in order and
+`None` when either of weights / samples is dropped).
