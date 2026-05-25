@@ -126,6 +126,25 @@
 //!   [`EntropyInfo`] so the round-4 expander output feeds the round-6
 //!   Golomb decoder without the caller re-typing the array.
 //!
+//! Round-9 scope (the previous header-accessor round 8 is preserved) adds
+//! typed classification on top of the round-3 / round-2 expander output —
+//! still no bit-stream advancement past the docs-gap line:
+//!
+//! * [`TermKind`] — classifies a decorrelation predictor code per the
+//!   wiki "Possible predictor values" listing; `is_implemented()` and
+//!   `previous_samples()` surface the wiki's "only predictors 2-4 are
+//!   implemented" and "6-12 uses 1-7 samples" narrowings.
+//! * [`DecorrelationTerms`] accessors `len`/`is_empty`/`kind_at`/
+//!   `iter_kinds`/`all_implemented`/`has_reserved` classify the
+//!   round-3 term list without re-walking the bytes.
+//! * [`weights_per_term`] — wiki "Each decorrelation term should have
+//!   one or two weights depending on channels" mono/stereo split.
+//! * [`MetadataSubBlock`] payload-kind predicates `is_optional` /
+//!   `is_decorrelation_payload` / `is_correction_payload` /
+//!   `is_audio_payload` / `is_riff_payload` group the round-2 walker
+//!   output for callers picking the decorrelation triple or the audio
+//!   stream out of a walk.
+//!
 //! Still out of scope (subsequent rounds): the median-adaptation
 //! *amount* that turns `decode_sample_value` into a stateful payload
 //! loop (blocked on a docs gap), the prediction loop that consumes the
@@ -158,9 +177,10 @@ pub use crate::block_header::{
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,
 };
 pub use crate::decorrelation::{
-    expand_samples, expand_terms, expand_weights, DecorrelationSamples, DecorrelationTerms,
-    DecorrelationWeights, MAX_DOCUMENTED_TERM, SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES,
-    TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK,
+    expand_samples, expand_terms, expand_weights, weights_per_term, DecorrelationSamples,
+    DecorrelationTerms, DecorrelationWeights, TermKind, MAX_DOCUMENTED_TERM, SAMPLE_EXPONENT_BIAS,
+    SAMPLE_ON_WIRE_BYTES, TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS,
+    TERM_PREDICTOR_MASK,
 };
 pub use crate::entropy::{
     expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,

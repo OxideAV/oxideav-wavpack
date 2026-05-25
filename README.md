@@ -5,13 +5,15 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 8 — block-header parser + metadata sub-block walker +
+**Round 9 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
 sample-coding bit reader, run-length decoder, Golomb sample-value
 reconstruction & single-call per-sample decode + entropy→median
-bridge + 11 new header-accessor helpers (lossless / sample-rate
-sentinel / experimental / effective bit-depth / audio-block / total-
-samples-known / payload-bytes / standalone-block).** Round 1
+bridge + 11 header-accessor helpers + new `TermKind` classifier on
+the wiki "Possible predictor values" listing + 6 new
+`DecorrelationTerms` accessors + `weights_per_term` mono/stereo split
++ 5 new `MetadataSubBlock` payload-kind predicates (decorrelation /
+correction / audio / RIFF / optional).** Round 1
 landed the 32-byte fixed block-header parser; round 2 added the
 metadata sub-block walker completing the structural pass over a
 WavPack v.4 block; round 3 turns the `0x02` / `0x03` / `0x04`
@@ -145,6 +147,30 @@ Public API:
   wiki [`TOTAL_SAMPLES_UNKNOWN`] sentinel from a real count.
 - [`WavPackBlockHeader::payload_bytes`] — bytes of metadata sub-block
   payload the `ck_size` field advertises (`ck_size - 24`).
+- [`TermKind`] — typed classification of a decorrelation predictor
+  code per the wiki "Possible predictor values" listing: `Stereo
+  { implemented }` (`0..=5`, with `2..=4` flagged as implemented),
+  `SampleBased { sample_count }` (`6..=12`, count = `code - 5`),
+  `Reserved` (`13..=16`), `TwoSample` (`17..=18`), and `Unknown` for
+  codes outside the documented range. [`TermKind::is_implemented`]
+  and [`TermKind::previous_samples`] surface the wiki's two
+  narrowings.
+- [`DecorrelationTerms::len`] / [`DecorrelationTerms::is_empty`] /
+  [`DecorrelationTerms::kind_at`] / [`DecorrelationTerms::iter_kinds`]
+  / [`DecorrelationTerms::all_implemented`] /
+  [`DecorrelationTerms::has_reserved`] — convenience accessors that
+  classify the round-3 term list without re-walking the bytes.
+- [`weights_per_term`] — wiki "Each decorrelation term should have
+  one or two weights depending on channels" split: mono → 1, stereo →
+  2, with a defensive clamp for any higher channel count.
+- [`MetadataSubBlock::is_optional`] /
+  [`MetadataSubBlock::is_decorrelation_payload`] /
+  [`MetadataSubBlock::is_correction_payload`] /
+  [`MetadataSubBlock::is_audio_payload`] /
+  [`MetadataSubBlock::is_riff_payload`] — payload-kind predicates
+  derived from the wiki "IDs" listing so a caller can pick the
+  decorrelation triple or the audio stream out of a walk without
+  re-matching the [`SubBlockId`] enum.
 
 ### Out of scope (later rounds)
 
@@ -179,14 +205,14 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 8 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 9 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 103-test unit suite synthesises minimal valid headers, sub-blocks
+The 118-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
@@ -223,4 +249,15 @@ wiki 12-bit / 20-bit worked examples plus the no-shift baseline
 plus the saturation case, `is_audio_block` keyed on a non-zero
 `block_samples`, `is_total_samples_known` against the sentinel and
 the boundary `0`, and `payload_bytes` subtracting the 24-byte fixed
-header floor).
+header floor; and the round-9 decorrelation-term classification +
+metadata-payload kind sweep — `TermKind::from_code` across all four
+wiki categories (stereo implemented `2..=4`, stereo unimplemented
+`0/1/5`, sample-based `6..=12` with per-code sample count, reserved
+`13..=16`, two-sample `17..=18`, and undocumented `19..=31` plus a
+negative-code defensive check); `DecorrelationTerms` `len`/`is_empty`/
+`kind_at`/`iter_kinds`/`all_implemented`/`has_reserved` accessors over
+mixed term lists; `weights_per_term` mono/stereo split with 0- and 3-
+channel clamps; `MetadataSubBlock::is_optional` pinning the `0x20`
+flag; and per-kind payload predicates round-tripping for `0x02`/`0x03`/
+`0x04` decorrelation, `0x07`/`0x0B` correction, `0x0A` audio, and
+`0x20`/`0x21` RIFF with a non-RIFF optional negative case).

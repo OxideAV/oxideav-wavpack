@@ -118,6 +118,117 @@ pub const SAMPLE_ON_WIRE_BYTES: usize = 2;
 /// ("high 8 bits are exponent-9").
 pub const SAMPLE_EXPONENT_BIAS: i32 = 9;
 
+/// Classification of a single predictor term code per the wiki
+/// "Possible predictor values" listing in the
+/// `docs/audio/wavpack/wiki/WavPack.wiki` "Decorrelation terms" section:
+///
+/// ```text
+/// 0-5   - predictors for stereo, only predictors 2-4 are implemented
+/// 6-12  - predictor uses 1-7 samples for prediction
+/// 13-16 - reserved
+/// 17-18 - predictor does prediction by two samples
+/// ```
+///
+/// Codes outside `0..=18` are not described by the wiki — the parser
+/// surfaces them as [`TermKind::Unknown`] rather than rejecting them so
+/// that a future format extension does not require a code change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermKind {
+    /// `0..=5` — stereo predictor. The wiki narrows the implemented
+    /// subset to `2..=4`; the `implemented` field surfaces that.
+    Stereo {
+        /// `true` when this stereo predictor is one of `2..=4` (the
+        /// "only predictors 2-4 are implemented" subset on the wiki).
+        implemented: bool,
+    },
+    /// `6..=12` — predictor consults `1..=7` previous samples (one
+    /// sample for code `6`, two for `7`, …, seven for `12`).
+    SampleBased {
+        /// Number of previous samples the predictor consults
+        /// (`code - 5` per the wiki "uses 1-7 samples for prediction").
+        sample_count: u8,
+    },
+    /// `13..=16` — wiki-documented but reserved (no behaviour
+    /// specified). The parser does not reject the code; the decode
+    /// layer should refuse to use it.
+    Reserved,
+    /// `17..=18` — two-sample predictor per the wiki "predictor does
+    /// prediction by two samples" entry.
+    TwoSample,
+    /// Code outside the wiki-documented `0..=18` range.
+    Unknown,
+}
+
+impl TermKind {
+    /// Classify a predictor term code per the wiki "Possible predictor
+    /// values" listing.
+    pub const fn from_code(code: i8) -> Self {
+        match code {
+            // Stereo predictors `0..=5`; the wiki "only predictors 2-4 are
+            // implemented" sentence narrows the implemented subset.
+            0 | 1 | 5 => TermKind::Stereo { implemented: false },
+            2..=4 => TermKind::Stereo { implemented: true },
+            // `6..=12` use `code - 5` previous samples (`6`→1, `12`→7).
+            6..=12 => TermKind::SampleBased {
+                sample_count: (code - 5) as u8,
+            },
+            // `13..=16` reserved by the wiki.
+            13..=16 => TermKind::Reserved,
+            // `17..=18` two-sample predictor.
+            17..=18 => TermKind::TwoSample,
+            // Anything else (negative codes or `> 18`) is undocumented.
+            _ => TermKind::Unknown,
+        }
+    }
+
+    /// `true` when the wiki-documented behaviour for this code is
+    /// implementable (the stereo subset `2..=4`, the sample-based set
+    /// `6..=12`, and the two-sample set `17..=18`). Stereo codes
+    /// `0/1/5`, the `13..=16` reserved range, and codes outside
+    /// `0..=18` return `false`.
+    pub const fn is_implemented(self) -> bool {
+        match self {
+            TermKind::Stereo { implemented } => implemented,
+            TermKind::SampleBased { .. } | TermKind::TwoSample => true,
+            TermKind::Reserved | TermKind::Unknown => false,
+        }
+    }
+
+    /// Number of previous-sample slots this predictor consults, when
+    /// the wiki specifies it. `Some(n)` for sample-based predictors
+    /// (`code - 5` for `6..=12`) and for the two-sample predictors
+    /// (`17..=18` → `2`). `None` for stereo predictors (the wiki gives
+    /// no per-code sample count for `0..=5`), reserved codes, and
+    /// undocumented codes.
+    pub const fn previous_samples(self) -> Option<u8> {
+        match self {
+            TermKind::SampleBased { sample_count } => Some(sample_count),
+            TermKind::TwoSample => Some(2),
+            TermKind::Stereo { .. } | TermKind::Reserved | TermKind::Unknown => None,
+        }
+    }
+}
+
+/// Number of decorrelation **weight** bytes the wiki "Decorrelation
+/// weights" section pairs with each term, given the enclosing block's
+/// channel count:
+///
+/// > Each decorrelation term should have one or two weights depending
+/// > on channels.
+///
+/// `channels == 1` (mono) → one weight per term; `channels == 2`
+/// (stereo) → two weights per term. The function clamps any other
+/// value to `1` (no other channel count is reachable through the wiki
+/// "monaural" bit on the block header, which is binary; multi-channel
+/// blocks decompose into per-block stereo pairs).
+pub const fn weights_per_term(channels: u8) -> u8 {
+    if channels >= 2 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Typed expansion of the `0x02` decorrelation-terms sub-block.
 ///
 /// Round 3 expansion only — interpretation (mapping the predictor
@@ -134,6 +245,54 @@ pub struct DecorrelationTerms {
     /// bits per the wiki "high 3 bits contain delta value" sentence.
     /// Always in `0..=7`.
     pub deltas: Vec<u8>,
+}
+
+impl DecorrelationTerms {
+    /// Number of decoded `(term, delta)` pairs.
+    pub fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// `true` when no decorrelation passes are configured.
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// Classify the term at index `idx` per the wiki "Possible predictor
+    /// values" listing. Returns `None` when `idx` is past the end of
+    /// [`Self::terms`].
+    pub fn kind_at(&self, idx: usize) -> Option<TermKind> {
+        self.terms.get(idx).copied().map(TermKind::from_code)
+    }
+
+    /// Walk every term in order, yielding `(code, TermKind)` pairs.
+    pub fn iter_kinds(&self) -> impl Iterator<Item = (i8, TermKind)> + '_ {
+        self.terms
+            .iter()
+            .copied()
+            .map(|c| (c, TermKind::from_code(c)))
+    }
+
+    /// `true` when every term in the list is one the wiki documents an
+    /// implementable behaviour for (the stereo subset `2..=4`, the
+    /// sample-based set `6..=12`, and the two-sample set `17..=18`).
+    /// An empty term list returns `true` (vacuous truth — no
+    /// unimplemented pass to trip over).
+    pub fn all_implemented(&self) -> bool {
+        self.terms
+            .iter()
+            .copied()
+            .all(|c| TermKind::from_code(c).is_implemented())
+    }
+
+    /// `true` when **any** term in the list is one the wiki marks as
+    /// reserved (`13..=16`).
+    pub fn has_reserved(&self) -> bool {
+        self.terms
+            .iter()
+            .copied()
+            .any(|c| matches!(TermKind::from_code(c), TermKind::Reserved))
+    }
 }
 
 /// Typed expansion of the `0x03` decorrelation-weights sub-block.
@@ -440,6 +599,172 @@ mod tests {
             expand_samples(&[0x00, 0x00, 0x00]),
             Err(Error::DecorrelationSamplesOddByteCount(3))
         );
+    }
+
+    // ---- TermKind classification ----
+
+    #[test]
+    fn term_kind_stereo_implemented_subset_is_2_to_4() {
+        // Wiki: "0-5 - predictors for stereo, only predictors 2-4 are
+        // implemented".
+        for c in [2i8, 3, 4] {
+            assert_eq!(
+                TermKind::from_code(c),
+                TermKind::Stereo { implemented: true },
+                "code {c} should be implemented stereo"
+            );
+            assert!(TermKind::from_code(c).is_implemented());
+        }
+        for c in [0i8, 1, 5] {
+            assert_eq!(
+                TermKind::from_code(c),
+                TermKind::Stereo { implemented: false },
+                "code {c} should be unimplemented stereo"
+            );
+            assert!(!TermKind::from_code(c).is_implemented());
+        }
+    }
+
+    #[test]
+    fn term_kind_sample_based_runs_6_through_12() {
+        // Wiki: "6-12 - predictor uses 1-7 samples for prediction".
+        // Code 6 → 1 sample, code 12 → 7 samples.
+        for c in 6i8..=12 {
+            let expected = (c - 5) as u8;
+            assert_eq!(
+                TermKind::from_code(c),
+                TermKind::SampleBased {
+                    sample_count: expected
+                },
+                "code {c} should be sample-based with {expected} samples"
+            );
+            assert_eq!(TermKind::from_code(c).previous_samples(), Some(expected));
+            assert!(TermKind::from_code(c).is_implemented());
+        }
+    }
+
+    #[test]
+    fn term_kind_reserved_codes_13_through_16() {
+        // Wiki: "13-16 - reserved".
+        for c in 13i8..=16 {
+            assert_eq!(
+                TermKind::from_code(c),
+                TermKind::Reserved,
+                "code {c} should be reserved"
+            );
+            assert!(!TermKind::from_code(c).is_implemented());
+            assert_eq!(TermKind::from_code(c).previous_samples(), None);
+        }
+    }
+
+    #[test]
+    fn term_kind_two_sample_codes_17_and_18() {
+        // Wiki: "17-18 - predictor does prediction by two samples".
+        for c in [17i8, 18] {
+            assert_eq!(
+                TermKind::from_code(c),
+                TermKind::TwoSample,
+                "code {c} should be two-sample"
+            );
+            assert!(TermKind::from_code(c).is_implemented());
+            assert_eq!(TermKind::from_code(c).previous_samples(), Some(2));
+        }
+    }
+
+    #[test]
+    fn term_kind_codes_outside_wiki_range_are_unknown() {
+        // The 5-bit field can carry 0..=31; the wiki documents only
+        // 0..=18. Anything 19..=31 (or any negative code from a future
+        // signed re-interpretation) lands in `Unknown`.
+        for c in 19i8..=31 {
+            assert_eq!(
+                TermKind::from_code(c),
+                TermKind::Unknown,
+                "code {c} should be unknown"
+            );
+            assert!(!TermKind::from_code(c).is_implemented());
+            assert_eq!(TermKind::from_code(c).previous_samples(), None);
+        }
+        // Negative codes are not currently produced by `expand_terms`
+        // (low 5 bits land in 0..=31) but the classifier defines them
+        // defensively as Unknown so a future re-interpretation cannot
+        // panic.
+        assert_eq!(TermKind::from_code(-1), TermKind::Unknown);
+    }
+
+    // ---- DecorrelationTerms accessors ----
+
+    #[test]
+    fn decorrelation_terms_len_and_is_empty_mirror_vec() {
+        let dt = expand_terms(&[]);
+        assert_eq!(dt.len(), 0);
+        assert!(dt.is_empty());
+
+        let dt = expand_terms(&[2u8, 3, 18]);
+        assert_eq!(dt.len(), 3);
+        assert!(!dt.is_empty());
+    }
+
+    #[test]
+    fn decorrelation_terms_kind_at_indexes_into_terms() {
+        // Bytes encode codes 2, 13, 18.
+        let dt = expand_terms(&[2, 13, 18]);
+        assert_eq!(dt.kind_at(0), Some(TermKind::Stereo { implemented: true }));
+        assert_eq!(dt.kind_at(1), Some(TermKind::Reserved));
+        assert_eq!(dt.kind_at(2), Some(TermKind::TwoSample));
+        assert_eq!(dt.kind_at(3), None);
+    }
+
+    #[test]
+    fn decorrelation_terms_iter_kinds_pairs_code_and_kind() {
+        let dt = expand_terms(&[2, 6, 17]);
+        let collected: Vec<_> = dt.iter_kinds().collect();
+        assert_eq!(
+            collected,
+            vec![
+                (2i8, TermKind::Stereo { implemented: true }),
+                (6i8, TermKind::SampleBased { sample_count: 1 }),
+                (17i8, TermKind::TwoSample),
+            ]
+        );
+    }
+
+    #[test]
+    fn decorrelation_terms_all_implemented_rejects_reserved() {
+        // All wiki-implemented codes → all_implemented true.
+        let dt = expand_terms(&[2, 6, 12, 17, 18]);
+        assert!(dt.all_implemented());
+        assert!(!dt.has_reserved());
+
+        // A reserved code in the middle flips both predicates.
+        let dt = expand_terms(&[2, 14, 18]);
+        assert!(!dt.all_implemented());
+        assert!(dt.has_reserved());
+
+        // An unimplemented stereo code is also rejected.
+        let dt = expand_terms(&[0]);
+        assert!(!dt.all_implemented());
+        assert!(!dt.has_reserved());
+
+        // Empty list — vacuously all-implemented, nothing reserved.
+        let dt = expand_terms(&[]);
+        assert!(dt.all_implemented());
+        assert!(!dt.has_reserved());
+    }
+
+    // ---- weights_per_term ----
+
+    #[test]
+    fn weights_per_term_matches_wiki_channel_split() {
+        // Wiki: "Each decorrelation term should have one or two weights
+        // depending on channels."
+        assert_eq!(weights_per_term(1), 1);
+        assert_eq!(weights_per_term(2), 2);
+        // Hypothetical higher channel counts (not currently produced
+        // by the wiki "monaural" bit) clamp to the stereo case rather
+        // than panicking — the wiki binary split is the source of truth.
+        assert_eq!(weights_per_term(3), 2);
+        assert_eq!(weights_per_term(0), 1);
     }
 
     #[test]

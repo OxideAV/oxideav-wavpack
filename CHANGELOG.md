@@ -8,6 +8,46 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 9 (decorrelation-term classification + metadata-payload kind
+  predicates): non-prediction-loop advancement while the median-
+  adaptation amount remains a docs gap. New `TermKind` enum classifies
+  the wiki "Possible predictor values" listing (stereo `0..=5` with the
+  `2..=4` implemented subset, sample-based `6..=12` with the per-code
+  `previous_samples()` count = `code - 5`, reserved `13..=16`,
+  two-sample `17..=18`, and `Unknown` for codes outside the documented
+  range). New `TermKind::is_implemented()` / `previous_samples()`
+  accessors surface the wiki's two narrowings (the stereo "only
+  predictors 2-4 are implemented" subset and the per-code sample count).
+  New `DecorrelationTerms` accessors: `len()`, `is_empty()`,
+  `kind_at(idx)`, `iter_kinds()` (zips term code with its classified
+  kind), `all_implemented()`, `has_reserved()`. New stand-alone
+  `weights_per_term(channels: u8) -> u8` helper exposes the wiki
+  "Each decorrelation term should have one or two weights depending on
+  channels" split. None of these reads bits, mutates state, or touches
+  the prediction loop; they classify the round-3 expander output for
+  callers staging the deferred prediction pass.
+- New `MetadataSubBlock` payload-kind predicates derived from the wiki
+  "IDs" listing: `is_optional()` (wraps the `0x20` flag for callers
+  branching on the sub-block value directly), `is_decorrelation_payload()`
+  (`0x02` / `0x03` / `0x04`), `is_correction_payload()` (the `.wvc`
+  pair: `0x07` noise-shaping profile + `0x0B` packed correction data),
+  `is_audio_payload()` (`0x0A` packed samples), and
+  `is_riff_payload()` (`0x20` / `0x21` RIFF header / trailer). These
+  let a caller pick the decorrelation triple or the audio stream out
+  of a walk without re-matching the `SubBlockId` enum.
+- 15 new unit tests (118 total): `TermKind::from_code` across all four
+  wiki categories — stereo implemented `2..=4`, stereo unimplemented
+  `0/1/5`, sample-based `6..=12` with per-code sample count, reserved
+  `13..=16`, two-sample `17..=18`, and unknown `19..=31` plus a
+  negative-code defensive check; `DecorrelationTerms::len` /
+  `is_empty` / `kind_at` / `iter_kinds` / `all_implemented` /
+  `has_reserved` over mixed term lists including the vacuous empty
+  case; `weights_per_term` matching the wiki mono / stereo split with
+  a 0-channel and 3+-channel clamp; `MetadataSubBlock::is_optional`
+  pinning the `0x20` bit; per-kind payload predicates round-tripping
+  for `0x02` / `0x03` / `0x04` decorrelation, `0x07` / `0x0B`
+  correction, `0x0A` audio, and `0x20` / `0x21` RIFF (with non-RIFF
+  optional sub-block negative case).
 - Round 8 (header accessor coverage): non-prediction-loop advancement
   while the median-adaptation amount remains a docs gap. Eleven
   block-header convenience accessors derived rigorously from the wiki

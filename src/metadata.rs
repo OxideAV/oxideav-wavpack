@@ -233,6 +233,56 @@ pub struct MetadataSubBlock<'a> {
     pub payload: &'a [u8],
 }
 
+impl<'a> MetadataSubBlock<'a> {
+    /// `true` when the wiki "decoder may ignore data contained here"
+    /// `0x20` flag is set on the ID byte. Convenience wrapper around
+    /// [`SubBlockFlags::optional`] for callers that branch on the
+    /// `MetadataSubBlock` value directly.
+    pub fn is_optional(&self) -> bool {
+        self.flags.optional
+    }
+
+    /// `true` when this sub-block carries one of the three
+    /// **decorrelation** payloads enumerated by the wiki "IDs"
+    /// listing — terms (`0x02`), weights (`0x03`), or samples (`0x04`).
+    /// The decode layer's prediction loop consumes exactly these three
+    /// sub-block kinds in lockstep, so the predicate is useful for
+    /// callers picking the decorrelation triple out of a walk.
+    pub fn is_decorrelation_payload(&self) -> bool {
+        matches!(
+            self.id,
+            SubBlockId::DecorrelationTerms
+                | SubBlockId::DecorrelationWeights
+                | SubBlockId::DecorrelationSamples
+        )
+    }
+
+    /// `true` when this sub-block belongs to the **correction stream**
+    /// the wiki notes as living in the `.wvc` companion file:
+    /// `0x07` noise-shaping profile or `0x0B` packed correction data.
+    /// The lossless decoder ignores these; a hybrid decoder pairs them
+    /// with the main stream.
+    pub fn is_correction_payload(&self) -> bool {
+        matches!(
+            self.id,
+            SubBlockId::NoiseShapingProfile | SubBlockId::PackedCorrectionData
+        )
+    }
+
+    /// `true` when this sub-block carries the **packed samples** entropy
+    /// stream the wiki "Samples coding" section consumes — `0x0A`.
+    pub fn is_audio_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::PackedSamples)
+    }
+
+    /// `true` when this sub-block carries one of the **RIFF wrapper**
+    /// payloads (`0x20` header, `0x21` trailer) the wiki "IDs" listing
+    /// notes as the original `.wav` framing surrounding the audio.
+    pub fn is_riff_payload(&self) -> bool {
+        matches!(self.id, SubBlockId::RiffHeader | SubBlockId::RiffTrailer)
+    }
+}
+
 /// Walk all metadata sub-blocks in the given byte slice (typically
 /// the post-header payload returned by
 /// [`crate::block_header::parse_block_header`]).
@@ -593,6 +643,84 @@ mod tests {
             parse_metadata_sub_block(&[0x02, 0x01, 0xAA]),
             Err(Error::Truncated)
         );
+    }
+
+    // ---- MetadataSubBlock kind predicates ----
+
+    #[test]
+    fn is_optional_mirrors_flag_bit() {
+        // A `0x05` EntropyInfo sub-block — optional bit clear.
+        let wire = synth_small(0x05, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(!sub.is_optional());
+
+        // A `0x25` EncodingDetails sub-block — optional bit set
+        // (low-5 = 5, optional flag = 0x20, total = 0x25).
+        let wire = synth_small(0x25, b"oxideav-");
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_optional());
+    }
+
+    #[test]
+    fn is_decorrelation_payload_covers_terms_weights_samples() {
+        for id in [0x02u8, 0x03, 0x04] {
+            let wire = synth_small(id, &[0u8; 2]);
+            let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+            assert!(
+                sub.is_decorrelation_payload(),
+                "id 0x{id:02x} should be a decorrelation payload"
+            );
+            assert!(!sub.is_audio_payload());
+            assert!(!sub.is_correction_payload());
+            assert!(!sub.is_riff_payload());
+        }
+    }
+
+    #[test]
+    fn is_audio_payload_only_for_0x0a_packed_samples() {
+        let wire = synth_small(0x0A, &[0u8; 2]);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(sub.is_audio_payload());
+        assert!(!sub.is_decorrelation_payload());
+        assert!(!sub.is_correction_payload());
+        assert!(!sub.is_riff_payload());
+
+        // Adjacent IDs do not flip the predicate.
+        let wire = synth_small(0x0B, &[0u8; 2]);
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(!sub.is_audio_payload());
+    }
+
+    #[test]
+    fn is_correction_payload_covers_noise_shaping_and_packed_correction() {
+        for id in [0x07u8, 0x0B] {
+            let wire = synth_small(id, &[0u8; 2]);
+            let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+            assert!(
+                sub.is_correction_payload(),
+                "id 0x{id:02x} should be a correction-stream payload"
+            );
+            assert!(!sub.is_audio_payload());
+            assert!(!sub.is_decorrelation_payload());
+        }
+    }
+
+    #[test]
+    fn is_riff_payload_covers_0x20_and_0x21() {
+        for id in [0x20u8, 0x21] {
+            let wire = synth_small(id, b"RIFF");
+            let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+            assert!(
+                sub.is_riff_payload(),
+                "id 0x{id:02x} should be a RIFF payload"
+            );
+            assert!(sub.is_optional()); // 0x20 bit is set
+        }
+
+        // 0x25 EncodingDetails shares the optional flag but is not RIFF.
+        let wire = synth_small(0x25, b"oxideav-");
+        let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
+        assert!(!sub.is_riff_payload());
     }
 
     #[test]
