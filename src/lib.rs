@@ -1,10 +1,13 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 7 — block-header parser + metadata sub-block walker +
+//! **Round 11 — block-header parser + metadata sub-block walker +
 //! decorrelation sub-block expanders + entropy-info expander +
 //! sample-coding bit reader, run-length decoder, Golomb sample-value
 //! reconstruction & single-call per-sample decode + entropy→median
-//! bridge.**
+//! bridge + header-accessor coverage + `TermKind` classifier +
+//! `DecorrelationTerms` accessors + metadata-sub-block payload-kind
+//! predicates + walker finders + MD5 typed view + per-term
+//! `decorrelation_sample_count` + flat-payload partitioner.**
 //! Round 1 landed the structural 32-byte block-header parser
 //! documented in `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure
 //! listing); round 2 added the metadata sub-block walker following the
@@ -145,13 +148,36 @@
 //!   output for callers picking the decorrelation triple or the audio
 //!   stream out of a walk.
 //!
+//! Round-11 scope adds the per-term decorrelation-sample-count helper
+//! and the flat-payload partitioner, both derived from the wiki
+//! "Decorrelation samples" / "Possible predictor values" sections:
+//!
+//! * [`decorrelation_sample_count`] / [`TermKind::decorrelation_sample_count`]
+//!   — `Some(code - 5)` for the `6..=12` sample-based codes (one seed
+//!   sample per previous-sample slot), `Some(2)` for the `17..=18`
+//!   two-sample codes, and `None` for stereo `0..=5`, the reserved
+//!   `13..=16` range, and undocumented codes (per-term count not given
+//!   by the wiki).
+//! * [`DecorrelationTerms::expected_decorrelation_sample_count`] sums
+//!   the above across a term list and short-circuits to `None` on
+//!   any docs-gap code.
+//! * [`partition_decorrelation_samples`] splits the flat
+//!   [`DecorrelationSamples`] list `expand_samples` produces into one
+//!   `Vec<i32>` per term, refusing docs-gap codes via
+//!   [`Error::DecorrelationSampleCountUnspecified`] and length
+//!   mismatches via [`Error::DecorrelationSampleCountMismatch`].
+//! * [`MAX_DECORRELATION_SAMPLES_PER_TERM`] (= 16) surfaces the wiki
+//!   "up to 16 samples" upper bound for callers checking future docs
+//!   additions against it.
+//!
 //! Still out of scope (subsequent rounds): the median-adaptation
 //! *amount* that turns `decode_sample_value` into a stateful payload
 //! loop (blocked on a docs gap), the prediction loop that consumes the
-//! decorrelation typed views, float-data / large-or-shifted-int /
-//! overflow-bits interpretation, multichannel channel-mask handling,
-//! hybrid correction-stream (`.wvc`) pairing, CRC32 verification,
-//! encoder.
+//! decorrelation typed views, the per-term sample count for stereo
+//! predictors `0..=5` (open docs gap — round 11's partitioner refuses
+//! them), float-data / large-or-shifted-int / overflow-bits
+//! interpretation, multichannel channel-mask handling, hybrid
+//! correction-stream (`.wvc`) pairing, CRC32 verification, encoder.
 //!
 //! ## Clean-room provenance
 //!
@@ -177,10 +203,11 @@ pub use crate::block_header::{
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,
 };
 pub use crate::decorrelation::{
-    expand_samples, expand_terms, expand_weights, weights_per_term, DecorrelationSamples,
-    DecorrelationTerms, DecorrelationWeights, TermKind, MAX_DOCUMENTED_TERM, SAMPLE_EXPONENT_BIAS,
-    SAMPLE_ON_WIRE_BYTES, TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS,
-    TERM_PREDICTOR_MASK,
+    decorrelation_sample_count, expand_samples, expand_terms, expand_weights,
+    partition_decorrelation_samples, weights_per_term, DecorrelationSamples, DecorrelationTerms,
+    DecorrelationWeights, TermKind, MAX_DECORRELATION_SAMPLES_PER_TERM, MAX_DOCUMENTED_TERM,
+    SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES, TERM_DELTA_BITS, TERM_DELTA_MASK,
+    TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK,
 };
 pub use crate::entropy::{
     expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,

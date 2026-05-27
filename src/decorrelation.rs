@@ -102,6 +102,16 @@ use crate::error::{Error, Result};
 /// Maximum predictor code the wiki "Possible predictor values" listing
 /// enumerates explicitly (`17-18`). Codes above this are not described.
 pub const MAX_DOCUMENTED_TERM: i8 = 18;
+/// Upper bound the wiki "Decorrelation samples" section places on the
+/// per-term sample count: "Each decorrelation term may have up to 16
+/// samples depending on its value."
+///
+/// The documented codes (`6..=12` → `1..=7` samples and `17..=18` → 2
+/// samples) all sit well under this bound. The bound is exposed for
+/// completeness and as a sanity check: a future docs revision that
+/// quantifies the stereo predictor (`0..=5`) per-term sample count is
+/// expected to stay within it.
+pub const MAX_DECORRELATION_SAMPLES_PER_TERM: u8 = 16;
 /// Width of the delta field on a decorrelation-terms byte, in bits.
 pub const TERM_DELTA_BITS: u32 = 3;
 /// Width of the predictor (term) field on a decorrelation-terms byte,
@@ -207,6 +217,34 @@ impl TermKind {
             TermKind::Stereo { .. } | TermKind::Reserved | TermKind::Unknown => None,
         }
     }
+
+    /// Number of seed samples this term's `0x04` decorrelation-samples
+    /// payload supplies on the wire, when the wiki specifies it.
+    ///
+    /// The wiki "Decorrelation samples" section opens "Each decorrelation
+    /// term may have up to 16 samples depending on its value" without
+    /// giving a per-code table; the per-code count is derivable from the
+    /// "Possible predictor values" listing, where each predictor's prior
+    /// values are exactly what the `0x04` payload primes:
+    ///
+    /// * `6..=12` — "predictor uses 1-7 samples for prediction" → the
+    ///   payload supplies `code - 5` seed samples (one per previous-sample
+    ///   slot the predictor consults).
+    /// * `17..=18` — "predictor does prediction by two samples" → the
+    ///   payload supplies 2 seed samples.
+    ///
+    /// Stereo predictors `0..=5` are not given a per-term sample count by
+    /// the wiki (separate docs gap); the reserved `13..=16` range has no
+    /// documented behaviour; and codes outside `0..=18` are undocumented.
+    /// All three cases return `None`, mirroring
+    /// [`TermKind::previous_samples`] — the wiki ties the seed-sample
+    /// count directly to the previous-sample slot count.
+    pub const fn decorrelation_sample_count(self) -> Option<u8> {
+        // The wiki phrases the two as one number: the predictor needs N
+        // prior samples → the payload supplies N seed samples. The
+        // reuse keeps the semantic tie explicit.
+        self.previous_samples()
+    }
 }
 
 /// Number of decorrelation **weight** bytes the wiki "Decorrelation
@@ -227,6 +265,19 @@ pub const fn weights_per_term(channels: u8) -> u8 {
     } else {
         1
     }
+}
+
+/// Stand-alone shorthand for [`TermKind::from_code`] +
+/// [`TermKind::decorrelation_sample_count`] so a caller branching off
+/// a raw term code can look the per-term `0x04` seed-sample count up
+/// without re-typing the classification step.
+///
+/// `Some(n)` for the wiki-documented `6..=12` and `17..=18` codes,
+/// `None` for stereo predictors `0..=5`, the reserved `13..=16` range,
+/// and undocumented codes — same gaps [`TermKind::decorrelation_sample_count`]
+/// records.
+pub const fn decorrelation_sample_count(code: i8) -> Option<u8> {
+    TermKind::from_code(code).decorrelation_sample_count()
 }
 
 /// Typed expansion of the `0x02` decorrelation-terms sub-block.
@@ -292,6 +343,31 @@ impl DecorrelationTerms {
             .iter()
             .copied()
             .any(|c| matches!(TermKind::from_code(c), TermKind::Reserved))
+    }
+
+    /// Sum of [`decorrelation_sample_count`] across every term in the
+    /// list — the total number of seed samples a `0x04` decorrelation-
+    /// samples payload supplies for this `(0x02)` term list, per the
+    /// wiki "Decorrelation samples" / "Possible predictor values"
+    /// sections.
+    ///
+    /// Returns `Some(total)` when every term has a wiki-documented
+    /// per-term sample count (i.e. every term is in `6..=12` or
+    /// `17..=18`); returns `None` as soon as any term is a stereo
+    /// predictor `0..=5`, a reserved `13..=16` code, or an
+    /// undocumented code — those are the docs gaps where the wiki
+    /// does not give a per-term sample count, and the total cannot be
+    /// summed without inventing one.
+    ///
+    /// An empty term list returns `Some(0)` (vacuous: zero terms
+    /// require zero seed samples).
+    pub fn expected_decorrelation_sample_count(&self) -> Option<usize> {
+        let mut total = 0usize;
+        for &code in &self.terms {
+            let per_term = decorrelation_sample_count(code)? as usize;
+            total += per_term;
+        }
+        Some(total)
     }
 }
 
@@ -404,6 +480,63 @@ pub fn expand_samples(payload: &[u8]) -> Result<DecorrelationSamples> {
         samples.push(expand_sample_word(word[0], word[1]));
     }
     Ok(DecorrelationSamples { samples })
+}
+
+/// Split the flat [`DecorrelationSamples::samples`] list produced by
+/// [`expand_samples`] into one `Vec<i32>` per term in `terms`, with the
+/// per-term length given by the wiki "Decorrelation samples" / "Possible
+/// predictor values" pairing (`6..=12` → `code - 5` samples;
+/// `17..=18` → 2 samples).
+///
+/// The returned `Vec` is in term-list order: entry `i` carries the seed
+/// samples for `terms.terms[i]`. The total length of the flat input
+/// must equal the sum [`DecorrelationTerms::expected_decorrelation_sample_count`]
+/// produces; otherwise [`Error::DecorrelationSampleCountMismatch`] is
+/// returned (with the expected and observed flat lengths). A term whose
+/// per-term count the wiki does not specify (stereo `0..=5`, reserved
+/// `13..=16`, or undocumented codes) is rejected via
+/// [`Error::DecorrelationSampleCountUnspecified`] with the offending
+/// code — partitioning cannot proceed without per-term lengths.
+///
+/// The wiki does not explicitly relate the per-term sample count to the
+/// channel count (unlike weights, which are explicitly tied to channels
+/// via "one or two weights depending on channels"). The "Decorrelation
+/// samples" section ties the count to the term value only. This helper
+/// follows that wording exactly — it does not multiply by channels.
+/// Future docs clarification of the stereo (`0..=5`) per-term count or
+/// any channel multiplier will land as additions here rather than as a
+/// silent reinterpretation.
+pub fn partition_decorrelation_samples(
+    terms: &DecorrelationTerms,
+    samples: &DecorrelationSamples,
+) -> Result<Vec<Vec<i32>>> {
+    let actual = samples.samples.len();
+    let mut out = Vec::with_capacity(terms.terms.len());
+    let mut cursor = 0usize;
+    for &code in &terms.terms {
+        let per_term = match decorrelation_sample_count(code) {
+            Some(n) => n as usize,
+            None => return Err(Error::DecorrelationSampleCountUnspecified(code)),
+        };
+        let end = cursor.saturating_add(per_term);
+        if end > actual {
+            // The accumulating expected count already exceeds the flat
+            // sample list; report the same Mismatch the up-front sum
+            // would have produced, so callers see one canonical error
+            // shape regardless of which term tripped it.
+            let expected = terms.expected_decorrelation_sample_count().unwrap_or(end);
+            return Err(Error::DecorrelationSampleCountMismatch { expected, actual });
+        }
+        out.push(samples.samples[cursor..end].to_vec());
+        cursor = end;
+    }
+    if cursor != actual {
+        return Err(Error::DecorrelationSampleCountMismatch {
+            expected: cursor,
+            actual,
+        });
+    }
+    Ok(out)
 }
 
 /// Single-word expander used by [`expand_samples`].
@@ -765,6 +898,203 @@ mod tests {
         // than panicking — the wiki binary split is the source of truth.
         assert_eq!(weights_per_term(3), 2);
         assert_eq!(weights_per_term(0), 1);
+    }
+
+    // ---- decorrelation_sample_count / TermKind::decorrelation_sample_count ----
+
+    #[test]
+    fn decorrelation_sample_count_matches_sample_based_codes() {
+        // Wiki "Possible predictor values": "6-12 - predictor uses 1-7
+        // samples for prediction". The 0x04 payload supplies the same
+        // count of seed samples (one per previous-sample slot).
+        for c in 6i8..=12 {
+            let expected = (c - 5) as u8;
+            assert_eq!(decorrelation_sample_count(c), Some(expected));
+            assert_eq!(
+                TermKind::from_code(c).decorrelation_sample_count(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn decorrelation_sample_count_two_sample_codes_return_two() {
+        // Wiki "17-18 - predictor does prediction by two samples".
+        for c in [17i8, 18] {
+            assert_eq!(decorrelation_sample_count(c), Some(2));
+            assert_eq!(TermKind::from_code(c).decorrelation_sample_count(), Some(2));
+        }
+    }
+
+    #[test]
+    fn decorrelation_sample_count_is_none_for_stereo_codes() {
+        // Wiki 0..=5 are stereo predictors; the spec does not give a
+        // per-term sample count, so the helper returns None and the
+        // partitioner refuses to split.
+        for c in 0i8..=5 {
+            assert_eq!(decorrelation_sample_count(c), None, "code {c}");
+        }
+    }
+
+    #[test]
+    fn decorrelation_sample_count_is_none_for_reserved_and_unknown() {
+        // Wiki "13-16 - reserved" — no behaviour specified, no sample
+        // count derivable. Same for codes outside `0..=18`.
+        for c in 13i8..=16 {
+            assert_eq!(decorrelation_sample_count(c), None, "code {c}");
+        }
+        for c in 19i8..=31 {
+            assert_eq!(decorrelation_sample_count(c), None, "code {c}");
+        }
+        assert_eq!(decorrelation_sample_count(-1), None);
+    }
+
+    #[test]
+    fn decorrelation_sample_count_stays_under_wiki_bound() {
+        // The wiki "Decorrelation samples" section bounds the per-term
+        // sample count: "may have up to 16 samples depending on its
+        // value." Every documented count sits comfortably under that
+        // bound; the constant exists so callers can sanity-check future
+        // docs additions against it.
+        for c in 6i8..=12 {
+            let n = decorrelation_sample_count(c).unwrap();
+            assert!(n <= MAX_DECORRELATION_SAMPLES_PER_TERM, "code {c}");
+        }
+        for c in [17i8, 18] {
+            let n = decorrelation_sample_count(c).unwrap();
+            assert!(n <= MAX_DECORRELATION_SAMPLES_PER_TERM, "code {c}");
+        }
+        assert_eq!(MAX_DECORRELATION_SAMPLES_PER_TERM, 16);
+    }
+
+    // ---- DecorrelationTerms::expected_decorrelation_sample_count ----
+
+    #[test]
+    fn expected_sample_count_sums_documented_codes() {
+        // Codes 6 (1) + 8 (3) + 17 (2) + 12 (7) = 13 seed samples.
+        let dt = expand_terms(&[6, 8, 17, 12]);
+        assert_eq!(dt.expected_decorrelation_sample_count(), Some(13));
+    }
+
+    #[test]
+    fn expected_sample_count_empty_term_list_is_zero() {
+        // Vacuous: zero terms require zero seed samples.
+        let dt = expand_terms(&[]);
+        assert_eq!(dt.expected_decorrelation_sample_count(), Some(0));
+    }
+
+    #[test]
+    fn expected_sample_count_propagates_unspecified_codes() {
+        // Any stereo predictor / reserved / unknown code in the list
+        // means we cannot sum — None propagates.
+        let dt = expand_terms(&[6, 0, 18]); // 0 is stereo, unspecified
+        assert_eq!(dt.expected_decorrelation_sample_count(), None);
+        let dt = expand_terms(&[6, 14, 18]); // 14 reserved
+        assert_eq!(dt.expected_decorrelation_sample_count(), None);
+        let dt = expand_terms(&[6, 31, 18]); // 31 undocumented (5-bit max)
+        assert_eq!(dt.expected_decorrelation_sample_count(), None);
+    }
+
+    // ---- partition_decorrelation_samples ----
+
+    #[test]
+    fn partition_samples_splits_in_term_order() {
+        // Terms 6 (1 sample) + 8 (3 samples) + 17 (2 samples) = 6 total.
+        let dt = expand_terms(&[6, 8, 17]);
+        let ds = DecorrelationSamples {
+            samples: vec![10, 20, 21, 22, 30, 31],
+        };
+        let parts = partition_decorrelation_samples(&dt, &ds).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], vec![10]); // term 6 → 1 sample
+        assert_eq!(parts[1], vec![20, 21, 22]); // term 8 → 3 samples
+        assert_eq!(parts[2], vec![30, 31]); // term 17 → 2 samples
+    }
+
+    #[test]
+    fn partition_samples_empty_terms_yields_empty_parts() {
+        let dt = expand_terms(&[]);
+        let ds = DecorrelationSamples { samples: vec![] };
+        let parts = partition_decorrelation_samples(&dt, &ds).unwrap();
+        assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn partition_samples_rejects_undocumented_term() {
+        // Stereo code 2 has no wiki-documented per-term count — the
+        // partitioner must refuse rather than guess.
+        let dt = expand_terms(&[2]);
+        let ds = DecorrelationSamples {
+            samples: vec![10, 20],
+        };
+        assert_eq!(
+            partition_decorrelation_samples(&dt, &ds),
+            Err(Error::DecorrelationSampleCountUnspecified(2))
+        );
+    }
+
+    #[test]
+    fn partition_samples_rejects_reserved_term() {
+        // Reserved code 14 → DecorrelationSampleCountUnspecified.
+        let dt = expand_terms(&[6, 14]);
+        let ds = DecorrelationSamples {
+            samples: vec![10, 99, 99, 99],
+        };
+        assert_eq!(
+            partition_decorrelation_samples(&dt, &ds),
+            Err(Error::DecorrelationSampleCountUnspecified(14))
+        );
+    }
+
+    #[test]
+    fn partition_samples_rejects_short_flat_payload() {
+        // Terms expect 6 samples (6+8+17), but only 5 supplied.
+        let dt = expand_terms(&[6, 8, 17]);
+        let ds = DecorrelationSamples {
+            samples: vec![1, 2, 3, 4, 5],
+        };
+        assert_eq!(
+            partition_decorrelation_samples(&dt, &ds),
+            Err(Error::DecorrelationSampleCountMismatch {
+                expected: 6,
+                actual: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn partition_samples_rejects_long_flat_payload() {
+        // Terms expect 1 sample (term 6), but 4 supplied — trailing
+        // bytes have no term to bind to.
+        let dt = expand_terms(&[6]);
+        let ds = DecorrelationSamples {
+            samples: vec![1, 2, 3, 4],
+        };
+        assert_eq!(
+            partition_decorrelation_samples(&dt, &ds),
+            Err(Error::DecorrelationSampleCountMismatch {
+                expected: 1,
+                actual: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn partition_samples_round_trip_against_expand_samples() {
+        // Build the wire from per-term seed samples, expand it, then
+        // partition it back to the same per-term layout. terms 6 (1) +
+        // 18 (2) = 3 seed samples. Each on-disk sample is a 16-bit
+        // [mantissa_lo, exponent_hi] word with exponent=9 (no shift),
+        // so the mantissa byte is the value directly.
+        // Wire: (1, 9), (2, 9), (3, 9).
+        let wire = [0x01, 0x09, 0x02, 0x09, 0x03, 0x09];
+        let ds = expand_samples(&wire).unwrap();
+        assert_eq!(ds.samples, vec![1, 2, 3]);
+        let dt = expand_terms(&[6, 18]);
+        let parts = partition_decorrelation_samples(&dt, &ds).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], vec![1]);
+        assert_eq!(parts[1], vec![2, 3]);
     }
 
     #[test]

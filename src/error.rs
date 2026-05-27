@@ -59,6 +59,31 @@ pub enum Error {
     /// (always `0` today; reserved for a future docs revision that
     /// quantifies the degenerate interval).
     GolombDegenerateInterval(i32),
+    /// The flat `0x04` decorrelation-samples payload supplied to a
+    /// per-term partitioning helper was the wrong total length for the
+    /// term list it was paired with. The wiki "Decorrelation samples"
+    /// section ties the per-term sample count to the term value
+    /// (`6..=12` → `code - 5` samples; `17..=18` → 2 samples). The
+    /// helper sums those documented counts across the term list and
+    /// reports a mismatch when the flat payload doesn't match.
+    /// `expected` is the summed-from-the-term-list count; `actual` is
+    /// the flat sample count actually present.
+    DecorrelationSampleCountMismatch {
+        /// Sum of per-term sample counts derived from the wiki
+        /// "Possible predictor values" listing.
+        expected: usize,
+        /// Sample count actually present in the flat
+        /// [`crate::DecorrelationSamples`] payload.
+        actual: usize,
+    },
+    /// A per-term partitioning helper encountered a term whose
+    /// per-term decorrelation-sample count is not specified by the wiki
+    /// "Decorrelation samples" / "Possible predictor values" sections —
+    /// stereo predictors `0..=5`, the reserved `13..=16` range, or any
+    /// code outside the documented `0..=18` range. The contained value
+    /// is the offending term code; the helper cannot split the flat
+    /// payload without a per-term length.
+    DecorrelationSampleCountUnspecified(i8),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -99,6 +124,14 @@ impl core::fmt::Display for Error {
             Error::GolombDegenerateInterval(add) => write!(
                 f,
                 "oxideav-wavpack: 0x0A Golomb mantissa hit add={add} (median 1); log2(add)/getbits(-1) undefined by the wiki"
+            ),
+            Error::DecorrelationSampleCountMismatch { expected, actual } => write!(
+                f,
+                "oxideav-wavpack: 0x04 decorrelation-samples flat length {actual} does not match the {expected} samples summed from the 0x02 term list"
+            ),
+            Error::DecorrelationSampleCountUnspecified(code) => write!(
+                f,
+                "oxideav-wavpack: 0x02 term code {code} has no wiki-documented per-term sample count (stereo / reserved / undocumented)"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

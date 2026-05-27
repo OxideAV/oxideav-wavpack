@@ -8,6 +8,61 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 11 (per-term decorrelation-sample-count helper + flat-payload
+  partitioner): another non-prediction-loop advancement while the
+  median-adaptation amount stays a docs gap. New stand-alone
+  `decorrelation_sample_count(code: i8) -> Option<u8>` and matching
+  `TermKind::decorrelation_sample_count()` method derive the per-term
+  `0x04` seed-sample count from the wiki "Possible predictor values"
+  listing: `Some(code - 5)` for the `6..=12` sample-based predictors
+  (one per previous-sample slot the wiki cites in "uses 1-7 samples
+  for prediction") and `Some(2)` for the `17..=18` two-sample
+  predictors. Stereo predictors `0..=5`, the reserved `13..=16`
+  range, and codes outside `0..=18` all return `None` — the wiki does
+  not give a per-term count for them. New public constant
+  `MAX_DECORRELATION_SAMPLES_PER_TERM = 16` records the wiki
+  "Decorrelation samples" upper bound ("Each decorrelation term may
+  have up to 16 samples depending on its value") for callers checking
+  future docs additions against it.
+- New `DecorrelationTerms::expected_decorrelation_sample_count()`
+  sums the per-term counts above across a `(0x02)` term list and
+  returns `Some(total)` when every term is documented, `None` as
+  soon as any term lands in the docs gap. An empty term list returns
+  `Some(0)` (vacuous).
+- New `partition_decorrelation_samples(&DecorrelationTerms,
+  &DecorrelationSamples) -> Result<Vec<Vec<i32>>>` splits the flat
+  sample list `expand_samples` produces into one `Vec<i32>` per term
+  in wiki order, with the per-term length given by the new
+  `decorrelation_sample_count` helper. Two new `Error` variants
+  back it: `DecorrelationSampleCountUnspecified(i8)` carries the
+  offending term code when a term has no wiki-documented per-term
+  count (so partitioning cannot proceed), and
+  `DecorrelationSampleCountMismatch { expected, actual }` fires
+  when the summed expected count does not equal the flat payload
+  length. None of these read bits, mutate state, or advance the
+  prediction loop; they elaborate the round-3 expander output for
+  the documented predictor codes and explicitly refuse the
+  docs-gap codes rather than guessing a per-term length.
+- 15 new unit tests (150 total): `decorrelation_sample_count`
+  returning the matching `code - 5` across the full `6..=12`
+  sample-based range, `Some(2)` for `17` / `18`, and `None` across
+  stereo `0..=5`, reserved `13..=16`, undocumented `19..=31`, and
+  the negative-code defensive case; `MAX_DECORRELATION_SAMPLES_PER_TERM`
+  wiki upper-bound sanity sweep across every documented count;
+  `TermKind::decorrelation_sample_count` mirror of the stand-alone
+  helper; `DecorrelationTerms::expected_decorrelation_sample_count`
+  summing `[6, 8, 17, 12]` to `13`, the vacuous empty-list `0`, and
+  `None` propagation across stereo / reserved / undocumented term
+  presence; `partition_decorrelation_samples` splitting a
+  `[6, 8, 17]` term list with matching flat input in term order,
+  the empty-terms-empty-payload base case, rejecting the stereo
+  `[2]` and reserved `[6, 14]` lists with
+  `DecorrelationSampleCountUnspecified`, rejecting both short
+  (`expected: 6, actual: 5`) and long (`expected: 1, actual: 4`)
+  flat payloads with `DecorrelationSampleCountMismatch`, and a
+  round-trip from `expand_samples` of a synthesised `[6, 18]`
+  exponent-9 wire through the partitioner back to per-term
+  `[1]` + `[2, 3]` lists.
 - Round 10 (metadata sub-block extras: MD5 typed view + walker finders
   + remaining payload-kind predicates + `SubBlockId` classifiers):
   another non-prediction-loop advancement while the median-adaptation

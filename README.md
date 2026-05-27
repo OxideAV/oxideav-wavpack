@@ -5,14 +5,17 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 10 — block-header parser + metadata sub-block walker +
+**Round 11 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
 sample-coding bit reader, run-length decoder, Golomb sample-value
 reconstruction & single-call per-sample decode + entropy→median
-bridge + 11 header-accessor helpers + `TermKind` classifier + 6
+bridge + 11 header-accessor helpers + `TermKind` classifier + 7
 `DecorrelationTerms` accessors + `weights_per_term` mono/stereo split
-+ 13 `MetadataSubBlock` payload-kind predicates covering every wiki
-"IDs" entry + 4 `SubBlockId` classifier helpers + 6 walker finders
++ wiki-derived per-term `decorrelation_sample_count` + flat-to-per-term
+`partition_decorrelation_samples` splitter (with explicit refusal on
+the stereo / reserved / undocumented per-term-count docs gap) + 13
+`MetadataSubBlock` payload-kind predicates covering every wiki "IDs"
+entry + 4 `SubBlockId` classifier helpers + 6 walker finders
 (`find_first` + four specialised + decorrelation-triple) + 16-byte
 `Md5Checksum` typed view with strict-length `parse_md5_checksum`.** Round 1
 landed the 32-byte fixed block-header parser; round 2 added the
@@ -164,6 +167,25 @@ Public API:
 - [`weights_per_term`] — wiki "Each decorrelation term should have
   one or two weights depending on channels" split: mono → 1, stereo →
   2, with a defensive clamp for any higher channel count.
+- [`decorrelation_sample_count`] / [`TermKind::decorrelation_sample_count`]
+  — wiki "Decorrelation samples" / "Possible predictor values" per-term
+  seed-sample count: `Some(code - 5)` for `6..=12`, `Some(2)` for
+  `17..=18`, `None` for stereo predictors `0..=5` (per-term count is a
+  docs gap), the reserved `13..=16` range, and codes outside `0..=18`.
+  Public constant [`MAX_DECORRELATION_SAMPLES_PER_TERM`] = 16 surfaces
+  the wiki "up to 16 samples" upper bound.
+- [`DecorrelationTerms::expected_decorrelation_sample_count`] — sums
+  the per-term wiki count across a term list, returning
+  `Some(total)` when every term is documented and `None` as soon as
+  any one is in the docs gap (so a caller can decide whether to
+  partition or treat the block as undecodable from the wiki alone).
+- [`partition_decorrelation_samples`] — splits the flat
+  `DecorrelationSamples::samples` list produced by `expand_samples`
+  into one `Vec<i32>` per term in wiki order, using the per-term
+  counts above. Returns
+  [`Error::DecorrelationSampleCountUnspecified`] when any term lacks
+  a wiki count, and [`Error::DecorrelationSampleCountMismatch`] when
+  the summed expected count does not equal the flat payload length.
 - [`MetadataSubBlock::is_optional`] /
   [`MetadataSubBlock::is_decorrelation_payload`] /
   [`MetadataSubBlock::is_correction_payload`] /
@@ -216,8 +238,11 @@ Public API:
   container); empirical confirmation against a real payload is gated
   on the median-adaptation gap above.
 - The prediction loop that consumes the round-3 typed views.
-- Per-term grouping of the samples list (the wiki "up to 16 samples
-  depending on its value" rule).
+- Per-term grouping of the samples list for **stereo predictors
+  `0..=5`** (the wiki gives no per-term sample count for them; round 11
+  lands the per-term partitioner for the documented `6..=12` / `17..=18`
+  codes and refuses the stereo case via
+  [`Error::DecorrelationSampleCountUnspecified`]).
 - Hybrid-profile (lossy) `0x06` / noise-shaping `0x07`.
 - Float-data `0x08` / large-or-shifted-int `0x09` / overflow-bits
   `0x0C`.
@@ -229,14 +254,14 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 10 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 11 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 135-test unit suite synthesises minimal valid headers, sub-blocks
+The 150-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
@@ -302,4 +327,22 @@ round-trip from a synthesised `0x26` sub-block through
 `find_first` hit + miss across `SubBlockId::EntropyInfo` vs
 `SubBlockId::HybridProfile`, the four specialised finders, and
 `find_decorrelation_triple` returning the full triple in order and
-`None` when either of weights / samples is dropped).
+`None` when either of weights / samples is dropped); and the round-11
+per-term decorrelation-sample-count + partitioner sweep —
+`decorrelation_sample_count` returning `Some(code - 5)` across the full
+`6..=12` sample-based range, `Some(2)` for `17` / `18`, and `None`
+across stereo `0..=5`, reserved `13..=16`, and undocumented `19..=31`
+plus a negative-code defensive check; the [`MAX_DECORRELATION_SAMPLES_PER_TERM`]
+= 16 wiki upper-bound sanity sweep across every documented count;
+`DecorrelationTerms::expected_decorrelation_sample_count` summing a
+mixed `[6, 8, 17, 12]` term list to `13`, the vacuous empty-list `0`,
+and `None` propagation when a stereo / reserved / undocumented code
+appears anywhere in the list; and `partition_decorrelation_samples`
+splitting a `[6, 8, 17]` term list with matching 6-sample flat input
+in term order, the empty-terms-empty-payload base case, refusing the
+stereo `[2]` and reserved `[6, 14]` lists with
+`DecorrelationSampleCountUnspecified`, rejecting both short
+(`expected: 6, actual: 5`) and long (`expected: 1, actual: 4`) flat
+payloads with `DecorrelationSampleCountMismatch`, and a round-trip
+from `expand_samples` of a synthesised `[6, 18]` wire through the
+partitioner back to per-term `[1]` + `[2, 3]` lists.
