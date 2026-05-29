@@ -8,6 +8,79 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 13 (end-to-end `parse_block` aggregate + `BitReader` non-mutating
+  look-ahead + bulk `skip_bits`): another non-prediction-loop advancement
+  while the median-adaptation amount stays a docs gap. New stand-alone
+  `parse_block(bytes) -> Result<(WavPackBlock<'_>, &[u8])>` composes
+  round-1 `parse_block_header` and round-2 `walk_metadata` into a single
+  end-to-end call: parses the 32-byte fixed header, validates that the
+  input carries the `8 + ck_size` bytes the wiki "Block structure"
+  listing declares, walks the metadata sub-block region against the
+  exact byte count `ck_size` advertises (rather than the whole tail),
+  and returns the typed `WavPackBlock` aggregate plus the unconsumed
+  tail (i.e. the next block in a multi-block `.wv` file). New
+  `WavPackBlock<'a>` carries the typed `WavPackBlockHeader` (round 1)
+  alongside a `Vec<MetadataSubBlock<'a>>` (round 2; borrowed payload
+  slices into the input bytes). New accessors `WavPackBlock::header`,
+  `sub_blocks`, `contains_sub_block(id)` (boolean shortcut over
+  `find_first` for presence checks), `sub_block_count`,
+  `is_metadata_empty` (the `ck_size == 24` header-only edge case the
+  wiki allows when `block_samples == 0`), and `on_disk_len` (the
+  `8 + ck_size` on-disk extent in bytes — useful for callers stepping
+  across blocks without re-parsing the header). New error variant
+  `Error::CkSizeExceedsBuffer { ck_size, available }` distinguishes
+  "header parses but payload is short" from `Error::Truncated`
+  (header-boundary truncation) so a streaming caller can size the next
+  read against `8 + ck_size - available`. None of these read sample
+  bits, mutate state, or touch the prediction loop; they compose the
+  round-1 and round-2 parsers into the one-call surface a streaming
+  caller wants.
+- New `BitReader` non-mutating look-ahead primitives `peek_bit()` /
+  `peek_bits(count)` / `peek_unary()` — read a single bit, a multi-bit
+  value, or a unary run-length without advancing the cursor.
+  Implemented by reading from a clone of the reader, so the LSB-first
+  bit-order rules in `get_bit` / `get_bits` / `get_unary` carry through
+  unchanged. On `Error::Truncated` the original reader's cursor is
+  unchanged (the truncation hit the clone, not the original) so a
+  caller can retry against a freshly-extended buffer without rebuilding
+  the reader. Useful for probing the wiki `n == 16` escape pattern (the
+  leading unary indicating whether a second unary follows) before
+  committing to a real `decode_run_length` call. New bulk
+  `BitReader::skip_bits(count)` advances the cursor by `count` bits
+  without assembling a `u32`; on `Truncated` the cursor lands at the
+  buffer end (matching `get_bits`' partial-consume semantics).
+- 24 new unit tests (197 total): `parse_block` returning header + empty
+  metadata on `ck_size == 24`, walking a two-sub-block metadata region
+  (dummy + MD5) and confirming both walker entries plus the
+  `contains_sub_block` / `is_metadata_empty` predicates, chaining two
+  back-to-back blocks through the returned tail, rejecting a sub-
+  `HEADER_LEN` buffer with `Truncated`, surfacing the new
+  `CkSizeExceedsBuffer { ck_size, available }` variant on a header
+  advertising a longer payload than the buffer (with both fields
+  asserted), propagating `InvalidMagic` / `InvalidCkSize` from the
+  header parser, propagating `Truncated` from the metadata walker on a
+  malformed sub-block, `on_disk_len` equalling `8 + ck_size` and the
+  underlying byte count, `contains_sub_block` returning false on
+  header-only blocks, and `sub_block_count` matching the walker output
+  count on a four-sub-block block; `peek_bit` returning the next
+  LSB-first bit without advancing (cursor stays put; follow-up
+  `get_bit` returns the same value), `peek_bit` `Truncated` on an
+  empty buffer leaving the cursor untouched, `peek_bits` assembling
+  4 LSB-first bits of `0x0A` into `0xA` without advancing,
+  `peek_bits(0)` returning zero without advancing, `peek_bits(9)` on
+  an 8-bit buffer reporting `Truncated` with the cursor unchanged,
+  `peek_unary` matching `get_unary` on the wiki `111110b → 5` example
+  without advancing, `peek_unary` reporting `Truncated` on an
+  unterminated run with the cursor unchanged, the peek-then-get
+  pattern returning matching values across a 4-bit window;
+  `skip_bits` advancing the cursor without assembling a value (with
+  the expected `bits_consumed` / `byte_position` / `bit_position`
+  after a 5-bit skip and the next `get_bits(3)` reading the remaining
+  bits), `skip_bits(0)` no-op, a 10-bit cross-byte skip landing at
+  `byte_position == 1` / `bit_position == 2`, `skip_bits(9)` on an
+  8-bit buffer reporting `Truncated` with the cursor at the buffer
+  end, and a `skip_bits`-then-`get_unary` resume reading the second
+  of two back-to-back unary runs.
 - Round 12 (`0x0A` packed-samples typed view + `BitReader` position
   accessors + channel-indexed `EntropyInfo` / `Medians::from_entropy`
   bridges): another non-prediction-loop advancement while the

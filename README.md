@@ -5,7 +5,7 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 12 — block-header parser + metadata sub-block walker +
+**Round 13 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
 sample-coding bit reader, run-length decoder, Golomb sample-value
 reconstruction & single-call per-sample decode + entropy→median
@@ -24,7 +24,14 @@ typed view with strict-length `parse_md5_checksum` + typed
 position accessors (`byte_position` / `bit_position` /
 `bits_consumed`) + channel-indexed `EntropyInfo` accessors
 (`is_stereo` / `channels` / `medians_for_channel`) +
-`Medians::from_entropy(info, channel_idx)` channel-indexed bridge.** Round 1
+`Medians::from_entropy(info, channel_idx)` channel-indexed bridge +
+end-to-end `parse_block` aggregating header+walker into a typed
+`WavPackBlock` (header field + sub-blocks list + `contains_sub_block` /
+`sub_block_count` / `is_metadata_empty` / `on_disk_len` accessors;
+new `Error::CkSizeExceedsBuffer { ck_size, available }` distinguishing
+mid-payload truncation from header-boundary truncation) + `BitReader`
+non-mutating look-ahead (`peek_bit` / `peek_bits` / `peek_unary`) +
+bulk advance (`skip_bits`).** Round 1
 landed the 32-byte fixed block-header parser; round 2 added the
 metadata sub-block walker completing the structural pass over a
 WavPack v.4 block; round 3 turns the `0x02` / `0x03` / `0x04`
@@ -258,6 +265,41 @@ Public API:
   with the mono guard, so callers iterating per-channel medians
   (one or two iterations against `Flags::channels_in_block`) skip the
   hand-rolled mono / stereo branch.
+- [`parse_block`] — end-to-end one-call composer: parses the 32-byte
+  fixed header (round 1), validates the input carries the `8 + ck_size`
+  bytes the wiki "Block structure" listing declares, walks the metadata
+  sub-block region (round 2), and returns the typed [`WavPackBlock`]
+  aggregate plus the unconsumed tail (the next block in a multi-block
+  `.wv` file). Reports the new [`Error::CkSizeExceedsBuffer`] variant
+  when the header parses but the payload is short, so a streaming caller
+  can size the next read against `8 + ck_size - available`.
+- [`WavPackBlock`] — typed aggregate: a [`WavPackBlockHeader`] alongside
+  a `Vec<MetadataSubBlock>` (borrowed payload slices into the same
+  input bytes). Accessors: [`WavPackBlock::header`],
+  [`WavPackBlock::sub_blocks`], [`WavPackBlock::contains_sub_block`]
+  (boolean shortcut over [`find_first`] for presence checks),
+  [`WavPackBlock::sub_block_count`], [`WavPackBlock::is_metadata_empty`]
+  (the `ck_size == 24` header-only edge case the wiki allows), and
+  [`WavPackBlock::on_disk_len`] (`8 + ck_size`, the byte count of the
+  whole block on disk — useful for callers stepping across blocks
+  without re-parsing).
+- [`BitReader::peek_bit`] / [`BitReader::peek_bits`] /
+  [`BitReader::peek_unary`] — non-mutating look-ahead. Read a single
+  bit, a multi-bit value, or a unary run-length without advancing the
+  cursor; implemented by reading from a clone, so the LSB-first bit
+  order rules in `get_bit` / `get_bits` / `get_unary` carry through
+  unchanged. On [`Error::Truncated`] the original reader's cursor is
+  unchanged, so a caller can retry against a freshly-extended buffer
+  without rebuilding the reader. Useful for probing the wiki `n == 16`
+  escape pattern (the leading unary indicating whether a second unary
+  follows) before committing to a real `decode_run_length` call.
+- [`BitReader::skip_bits`] — advance the reader by `count` bits without
+  assembling a `u32`. Reports [`Error::Truncated`] when the buffer is
+  exhausted before `count` bits have been skipped; on truncation the
+  cursor lands at the buffer end (matching the partial-consume
+  semantics of `get_bits`). Useful for stepping past a known-length
+  opaque field (a padding region, an already-validated value) without
+  holding the assembled value.
 
 ### Out of scope (later rounds)
 
@@ -295,14 +337,14 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 12 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 13 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 173-test unit suite synthesises minimal valid headers, sub-blocks
+The 197-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
@@ -408,4 +450,35 @@ inverting `is_mono`, `channels` returning `1` for mono and `2` for
 stereo, `medians_for_channel` yielding the matched set for `0` / `1`
 on stereo and `None` for `1` on mono / `2+` indices; and
 `find_packed_samples` returning a typed `PackedSamples` view over a
-synthesised `0x0A` sub-block and `None` on a stream without one.
+synthesised `0x0A` sub-block and `None` on a stream without one; and
+the round-13 `parse_block` end-to-end aggregate + `BitReader`
+look-ahead / skip sweep — header-only block at `ck_size == 24`
+yielding an empty sub-blocks list, a two-sub-block walk (`0x00` dummy
++ `0x26` MD5) confirming both walker entries and `contains_sub_block`
+predicates, two back-to-back blocks chained through the returned tail,
+`Truncated` on a sub-`HEADER_LEN` buffer, the new
+`CkSizeExceedsBuffer { ck_size, available }` variant on a header
+advertising a payload longer than the buffer (with both fields
+checked), header-rejection propagation (`InvalidMagic`, `InvalidCkSize`),
+walker-error propagation on a malformed sub-block, `on_disk_len`
+equalling `8 + ck_size` and the underlying byte count, and
+`contains_sub_block` + `sub_block_count` on a synthesised four-sub-block
+block; `peek_bit` returning the next LSB-first bit without advancing
+(cursor stays at byte 0 / bit 0, follow-up `get_bit` returns the same
+value), `peek_bit` reporting `Truncated` on an empty buffer with the
+cursor unchanged, `peek_bits` assembling 4 LSB-first bits of `0x0A`
+into `0xA` without advancing, `peek_bits(0)` returning zero without
+advancing, `peek_bits(9)` on an 8-bit buffer reporting `Truncated`
+with the cursor unchanged, `peek_unary` matching `get_unary` on the
+wiki `111110b → 5` example without advancing, `peek_unary` reporting
+`Truncated` on an unterminated run with the cursor unchanged, the
+peek-then-get pattern returning matching values across a 4-bit window,
+`skip_bits` advancing the cursor without assembling a value (with the
+expected `bits_consumed` / `byte_position` / `bit_position` after a
+5-bit skip and the next `get_bits(3)` reading the remaining bits),
+`skip_bits(0)` as a no-op, a 10-bit cross-byte skip landing at
+`byte_position == 1` and `bit_position == 2`, `skip_bits(9)` on an
+8-bit buffer reporting `Truncated` with the cursor at the buffer end
+(matching `get_bits` partial-consume semantics), and a `skip_bits`-
+then-`get_unary` resume reading the second of two back-to-back unary
+runs.

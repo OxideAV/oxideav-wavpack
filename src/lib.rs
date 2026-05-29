@@ -1,6 +1,6 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 12 — block-header parser + metadata sub-block walker +
+//! **Round 13 — block-header parser + metadata sub-block walker +
 //! decorrelation sub-block expanders + entropy-info expander +
 //! sample-coding bit reader, run-length decoder, Golomb sample-value
 //! reconstruction & single-call per-sample decode + entropy→median
@@ -9,7 +9,10 @@
 //! predicates + walker finders + MD5 typed view + per-term
 //! `decorrelation_sample_count` + flat-payload partitioner + `0x0A`
 //! `PackedSamples` typed view + `BitReader` position accessors +
-//! channel-indexed `EntropyInfo` / `Medians::from_entropy` bridges.**
+//! channel-indexed `EntropyInfo` / `Medians::from_entropy` bridges +
+//! end-to-end `parse_block` / `WavPackBlock` aggregate + `BitReader`
+//! non-mutating `peek_bit` / `peek_bits` / `peek_unary` and bulk
+//! `skip_bits` advance.**
 //! Round 1 landed the structural 32-byte block-header parser
 //! documented in `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure
 //! listing); round 2 added the metadata sub-block walker following the
@@ -209,6 +212,30 @@
 //!   "up to 16 samples" upper bound for callers checking future docs
 //!   additions against it.
 //!
+//! Round-13 scope adds the end-to-end [`parse_block`] composer and the
+//! non-mutating [`BitReader::peek_bit`] / [`BitReader::peek_bits`] /
+//! [`BitReader::peek_unary`] look-ahead primitives plus the bulk
+//! [`BitReader::skip_bits`] advance — both groups stay clear of the
+//! median-adaptation docs gap and elaborate the existing structural /
+//! bit-level surfaces:
+//!
+//! * [`parse_block`] combines round 1's
+//!   [`parse_block_header`] with round 2's [`walk_metadata`], returning
+//!   a [`WavPackBlock`] aggregate (header + parsed sub-blocks) and the
+//!   tail bytes ready for the next block in a multi-block `.wv` file.
+//!   The new [`Error::CkSizeExceedsBuffer`] variant reports the
+//!   distinct "buffer ran out mid-payload" case so a streaming caller
+//!   knows how many more bytes to read.
+//! * [`BitReader::peek_bit`] / [`BitReader::peek_bits`] /
+//!   [`BitReader::peek_unary`] read a single bit, a multi-bit value or
+//!   a unary run-length without consuming the bits — implemented by
+//!   reading from a clone, so the wiki bit-order rules carry through
+//!   unchanged.
+//! * [`BitReader::skip_bits`] advances the reader by an arbitrary count
+//!   of bits without assembling a `u32`, matching the partial-consume
+//!   semantics of [`BitReader::get_bits`] on truncation (cursor lands
+//!   at the buffer end rather than reverting).
+//!
 //! Still out of scope (subsequent rounds): the median-adaptation
 //! *amount* that turns `decode_sample_value` into a stateful payload
 //! loop (blocked on a docs gap), the prediction loop that consumes the
@@ -230,6 +257,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod block;
 mod block_header;
 mod decorrelation;
 mod entropy;
@@ -238,6 +266,7 @@ mod metadata;
 mod packed_samples;
 mod samples;
 
+pub use crate::block::{parse_block, WavPackBlock};
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,

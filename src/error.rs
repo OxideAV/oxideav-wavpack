@@ -84,6 +84,28 @@ pub enum Error {
     /// is the offending term code; the helper cannot split the flat
     /// payload without a per-term length.
     DecorrelationSampleCountUnspecified(i8),
+    /// `parse_block` was given a buffer whose 32-byte fixed header
+    /// parses cleanly but whose total length is shorter than the
+    /// `8 + ck_size` extent the wiki "Block structure" listing
+    /// declares ("32 bits - total block size (not counting this field
+    /// or 'wvpk')"). The block header itself was valid, but the
+    /// metadata sub-block region the header advertises is partially
+    /// outside the buffer. Reported separately from [`Self::Truncated`]
+    /// so a streaming caller can distinguish "need more bytes for this
+    /// block's payload" (this variant) from "buffer ran out between
+    /// blocks" ([`Self::Truncated`] on the next block's header). The
+    /// `ck_size` field is the header value verbatim; `available` is
+    /// the number of bytes the input buffer actually carried for the
+    /// whole block (header + payload bytes that were present), so the
+    /// streaming caller can size the next read against
+    /// `8 + ck_size - available`.
+    CkSizeExceedsBuffer {
+        /// `ck_size` advertised by the parsed header.
+        ck_size: u32,
+        /// Bytes of the block actually carried by the input buffer
+        /// (header bytes + however many payload bytes were present).
+        available: usize,
+    },
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -132,6 +154,11 @@ impl core::fmt::Display for Error {
             Error::DecorrelationSampleCountUnspecified(code) => write!(
                 f,
                 "oxideav-wavpack: 0x02 term code {code} has no wiki-documented per-term sample count (stereo / reserved / undocumented)"
+            ),
+            Error::CkSizeExceedsBuffer { ck_size, available } => write!(
+                f,
+                "oxideav-wavpack: parse_block needs {needed} bytes (8 + ck_size {ck_size}) but the buffer only carries {available}",
+                needed = 8u64 + *ck_size as u64,
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

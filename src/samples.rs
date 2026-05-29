@@ -266,6 +266,69 @@ impl<'a> BitReader<'a> {
             count += 1;
         }
     }
+
+    /// Inspect the next bit without consuming it. Returns the bit value
+    /// (`0` or `1`); the reader's cursor is unchanged on success or
+    /// error.
+    ///
+    /// Useful for a caller deciding whether to advance based on a single
+    /// look-ahead bit (e.g. probing the leading bit of a `0x0A` payload
+    /// before committing to a decode). Reports [`Error::Truncated`] when
+    /// the buffer is exhausted, with the cursor still at its pre-call
+    /// position so the caller can recover without rebuilding a fresh
+    /// reader. Implemented by cloning the reader and reading from the
+    /// clone, which means the cursor invariants the read path keeps
+    /// (byte_pos / bit_pos coherence) hold for `peek_*` too.
+    pub fn peek_bit(&self) -> Result<u32> {
+        let mut clone = self.clone();
+        clone.get_bit()
+    }
+
+    /// Inspect the next `count` bits without consuming them. Same LSB-
+    /// first assembly rules as [`Self::get_bits`].
+    ///
+    /// `count` must be in `0..=32`. Reports [`Error::Truncated`] when
+    /// the buffer is exhausted before `count` bits are available; the
+    /// reader's cursor is unchanged on success or error so a caller can
+    /// peek-then-decide without committing.
+    pub fn peek_bits(&self, count: u32) -> Result<u32> {
+        let mut clone = self.clone();
+        clone.get_bits(count)
+    }
+
+    /// Inspect the next unary run-length without consuming it. Same
+    /// `get_unary`-style accounting (consecutive `1` bits up to but not
+    /// counting the terminating `0`).
+    ///
+    /// Reports [`Error::Truncated`] when the buffer is exhausted before
+    /// a terminating `0` is reached. Useful for a caller probing the
+    /// wiki `n == 16` escape pattern (the leading unary indicating
+    /// whether a second unary is about to be read) without committing
+    /// to a real `decode_run_length` call.
+    pub fn peek_unary(&self) -> Result<u32> {
+        let mut clone = self.clone();
+        clone.get_unary()
+    }
+
+    /// Advance the reader by `count` bits without producing a value.
+    /// Equivalent to `let _ = get_bits(count)?` but without the unused-
+    /// return diagnostic dance, and with a tighter loop that doesn't
+    /// build a `u32`.
+    ///
+    /// `count` must be in `0..=u32::MAX`. Reports [`Error::Truncated`]
+    /// when the buffer is exhausted before `count` bits are skipped; in
+    /// that case the cursor advances to the end of the buffer rather
+    /// than staying put (matching the semantics of partially-consumed
+    /// `get_bits` — the bits that were available were consumed).
+    /// Useful for a caller wanting to step past a known-length opaque
+    /// field (e.g. a padding region) without holding the assembled
+    /// value.
+    pub fn skip_bits(&mut self, count: u32) -> Result<()> {
+        for _ in 0..count {
+            self.get_bit()?;
+        }
+        Ok(())
+    }
 }
 
 /// Adaptive run-state carried between successive [`decode_run_length`]
@@ -704,6 +767,144 @@ mod tests {
         let bytes = [0xFFu8];
         let mut r = BitReader::new(&bytes);
         assert_eq!(r.get_unary(), Err(Error::Truncated));
+    }
+
+    // ---- peek_bit / peek_bits / peek_unary / skip_bits ----
+
+    #[test]
+    fn peek_bit_returns_next_bit_without_advancing() {
+        // First byte has LSB = 1 → peek_bit must return 1; the cursor
+        // stays at byte 0 / bit 0 so a follow-up get_bit gets the same
+        // value.
+        let bytes = [0b0000_0001u8];
+        let r = BitReader::new(&bytes);
+        assert_eq!(r.peek_bit().unwrap(), 1);
+        assert_eq!(r.byte_position(), 0);
+        assert_eq!(r.bit_position(), 0);
+        // A mutable read after the peek should return the same bit.
+        let mut r2 = r.clone();
+        assert_eq!(r2.get_bit().unwrap(), 1);
+    }
+
+    #[test]
+    fn peek_bit_truncated_when_buffer_empty_does_not_move_cursor() {
+        let bytes: [u8; 0] = [];
+        let r = BitReader::new(&bytes);
+        assert_eq!(r.peek_bit(), Err(Error::Truncated));
+        // The cursor is unchanged because peek operates on a clone.
+        assert_eq!(r.byte_position(), 0);
+        assert_eq!(r.bit_position(), 0);
+    }
+
+    #[test]
+    fn peek_bits_assembles_lsb_first_without_advancing() {
+        // bits 0..=3 of 0x0A = LSB-first 0,1,0,1 → assembled as 0xA.
+        let bytes = [0x0Au8];
+        let r = BitReader::new(&bytes);
+        assert_eq!(r.peek_bits(4).unwrap(), 0xA);
+        assert_eq!(r.bits_consumed(), 0);
+        // Repeated peek returns the same value.
+        assert_eq!(r.peek_bits(4).unwrap(), 0xA);
+    }
+
+    #[test]
+    fn peek_bits_zero_count_returns_zero() {
+        let bytes = [0xFFu8];
+        let r = BitReader::new(&bytes);
+        assert_eq!(r.peek_bits(0).unwrap(), 0);
+        assert_eq!(r.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn peek_bits_truncated_does_not_move_cursor() {
+        let bytes = [0u8];
+        let r = BitReader::new(&bytes);
+        assert_eq!(r.peek_bits(9), Err(Error::Truncated));
+        assert_eq!(r.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn peek_unary_matches_get_unary_without_advancing() {
+        // "111110b = 5" wiki example.
+        let bytes = bits_to_bytes("111110");
+        let r = BitReader::new(&bytes);
+        assert_eq!(r.peek_unary().unwrap(), 5);
+        assert_eq!(r.bits_consumed(), 0);
+        // Subsequent get_unary on a fresh clone yields the same value.
+        let mut r2 = r.clone();
+        assert_eq!(r2.get_unary().unwrap(), 5);
+    }
+
+    #[test]
+    fn peek_unary_truncated_when_no_terminator() {
+        let bytes = [0xFFu8];
+        let r = BitReader::new(&bytes);
+        assert_eq!(r.peek_unary(), Err(Error::Truncated));
+        assert_eq!(r.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn peek_then_get_returns_same_value_pattern() {
+        // Demonstrate the intended look-ahead pattern: peek to decide,
+        // get to commit. Confirms peek does not consume and get reads
+        // the same bits.
+        let bytes = [0b1010_1010u8];
+        let mut r = BitReader::new(&bytes);
+        let peeked = r.peek_bits(4).unwrap();
+        let got = r.get_bits(4).unwrap();
+        assert_eq!(peeked, got);
+        assert_eq!(r.bits_consumed(), 4);
+    }
+
+    #[test]
+    fn skip_bits_advances_cursor_without_assembling_value() {
+        let bytes = [0xFFu8, 0x55u8];
+        let mut r = BitReader::new(&bytes);
+        r.skip_bits(5).expect("skip 5 bits");
+        assert_eq!(r.bits_consumed(), 5);
+        assert_eq!(r.byte_position(), 0);
+        assert_eq!(r.bit_position(), 5);
+        // Continuing from the skip cursor sees the remaining bits.
+        assert_eq!(r.get_bits(3).unwrap(), 0b111); // last 3 bits of 0xFF
+    }
+
+    #[test]
+    fn skip_bits_zero_count_is_noop() {
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        r.skip_bits(0).expect("skip 0 bits");
+        assert_eq!(r.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn skip_bits_crosses_byte_boundary() {
+        let bytes = [0x00u8, 0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        r.skip_bits(10).expect("skip 10 bits");
+        assert_eq!(r.byte_position(), 1);
+        assert_eq!(r.bit_position(), 2);
+    }
+
+    #[test]
+    fn skip_bits_truncated_when_buffer_exhausted() {
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        // Skip 9 bits from an 8-bit buffer → Truncated. Matches the
+        // partial-consume semantics of get_bits — the cursor lands at
+        // the end of the buffer rather than reverting.
+        assert_eq!(r.skip_bits(9), Err(Error::Truncated));
+        assert_eq!(r.bits_consumed(), 8);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn skip_bits_then_decode_run_length_resumes_correctly() {
+        // Synthesise two unary runs back-to-back ("110" then "1110"),
+        // skip past the first three bits ("110"), then decode the second.
+        let bytes = bits_to_bytes("1101110");
+        let mut r = BitReader::new(&bytes);
+        r.skip_bits(3).expect("skip first unary");
+        assert_eq!(r.get_unary().unwrap(), 3);
     }
 
     // ---- decode_run_length ----
