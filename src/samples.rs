@@ -188,6 +188,35 @@ impl<'a> BitReader<'a> {
         self.bits_remaining() == 0
     }
 
+    /// Index of the next byte the reader will pull into the accumulator.
+    ///
+    /// Together with [`Self::bit_position`] this names the reader's
+    /// cursor in the underlying byte slice — useful for callers that
+    /// want to log the position before a [`Error::Truncated`] hits, or
+    /// resume from a known offset against a freshly-constructed reader
+    /// over the same bytes.
+    pub fn byte_position(&self) -> usize {
+        self.byte_pos
+    }
+
+    /// Index of the next bit within the current byte (`0..=7`,
+    /// LSB-first). Pairs with [`Self::byte_position`] to name the
+    /// reader's cursor.
+    pub fn bit_position(&self) -> u8 {
+        self.bit_pos
+    }
+
+    /// Total bits already consumed since the reader was constructed.
+    /// Equivalent to `byte_position() * 8 + bit_position()` but clamped
+    /// at the buffer length when the reader has advanced past the end.
+    pub fn bits_consumed(&self) -> usize {
+        if self.byte_pos >= self.bytes.len() {
+            self.bytes.len() * 8
+        } else {
+            self.byte_pos * 8 + self.bit_pos as usize
+        }
+    }
+
     /// Read one bit, LSB-first. Returns the bit value (`0` or `1`).
     ///
     /// [`Error::Truncated`] when the buffer is exhausted.
@@ -367,6 +396,26 @@ impl Medians {
     pub const fn from_entropy_right(info: &EntropyInfo) -> Self {
         Self {
             values: info.medians_right,
+        }
+    }
+
+    /// Channel-indexed bridge over [`EntropyInfo`] — `Some(medians)`
+    /// when `channel_idx` is `0` (left / mono) or `1` (right, on a
+    /// stereo block); `None` otherwise (out-of-range index, or `1` on a
+    /// mono `EntropyInfo` where the wiki put no right-channel set on the
+    /// wire).
+    ///
+    /// Equivalent to [`Self::from_entropy_left`] for `0` and to
+    /// [`Self::from_entropy_right`] for `1` on a stereo block, but with
+    /// the mono guard the typed predicates surface. Callers iterating
+    /// over per-channel medians (one or two iterations against
+    /// [`crate::Flags::channels_in_block`]) avoid hand-rolling the
+    /// mono / stereo branch.
+    pub fn from_entropy(info: &EntropyInfo, channel_idx: u8) -> Option<Self> {
+        match channel_idx {
+            0 => Some(Self::from_entropy_left(info)),
+            1 if !info.is_mono() => Some(Self::from_entropy_right(info)),
+            _ => None,
         }
     }
 }
@@ -1130,5 +1179,122 @@ mod tests {
         let mut state = RunState::new();
         let v = decode_sample(&mut r, &mut state, Medians::from_entropy_left(&info)).unwrap();
         assert_eq!(v, 31);
+    }
+
+    // ---- Round-12 BitReader position accessors ----
+
+    #[test]
+    fn bit_reader_byte_and_bit_position_track_with_get_bit() {
+        let bytes = [0b0000_0101u8, 0u8];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.byte_position(), 0);
+        assert_eq!(r.bit_position(), 0);
+        assert_eq!(r.bits_consumed(), 0);
+
+        // Consume one bit. byte_pos stays 0, bit_pos advances to 1.
+        r.get_bit().unwrap();
+        assert_eq!(r.byte_position(), 0);
+        assert_eq!(r.bit_position(), 1);
+        assert_eq!(r.bits_consumed(), 1);
+
+        // Consume seven more — should land at start of byte 1.
+        for _ in 0..7 {
+            r.get_bit().unwrap();
+        }
+        assert_eq!(r.byte_position(), 1);
+        assert_eq!(r.bit_position(), 0);
+        assert_eq!(r.bits_consumed(), 8);
+    }
+
+    #[test]
+    fn bit_reader_position_tracks_with_get_bits() {
+        let bytes = [0xFFu8; 4];
+        let mut r = BitReader::new(&bytes);
+        r.get_bits(13).unwrap();
+        // After 13 bits: byte 1, bit position 5.
+        assert_eq!(r.byte_position(), 1);
+        assert_eq!(r.bit_position(), 5);
+        assert_eq!(r.bits_consumed(), 13);
+    }
+
+    #[test]
+    fn bit_reader_bits_consumed_clamps_when_past_end() {
+        // Read every bit of a single byte. byte_pos ends at 1 (past
+        // end of a single-byte buffer); bits_consumed should report
+        // the buffer length in bits, not 1*8 + bit_pos.
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        for _ in 0..8 {
+            r.get_bit().unwrap();
+        }
+        assert_eq!(r.byte_position(), 1);
+        assert_eq!(r.bit_position(), 0);
+        assert_eq!(r.bits_consumed(), 8);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn bit_reader_position_unchanged_on_truncation() {
+        // A read that would overshoot the buffer returns Truncated and
+        // leaves the cursor at the last successfully-positioned bit.
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        for _ in 0..8 {
+            r.get_bit().unwrap();
+        }
+        let pos_before = (r.byte_position(), r.bit_position());
+        assert_eq!(r.get_bit(), Err(Error::Truncated));
+        let pos_after = (r.byte_position(), r.bit_position());
+        assert_eq!(pos_before, pos_after);
+    }
+
+    // ---- Round-12 Medians::from_entropy channel-indexed bridge ----
+
+    #[test]
+    fn medians_from_entropy_yields_left_on_zero() {
+        let info = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [4, 5, 6],
+        };
+        assert_eq!(
+            Medians::from_entropy(&info, 0),
+            Some(Medians::new([1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn medians_from_entropy_yields_right_on_one_for_stereo() {
+        let info = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [4, 5, 6],
+        };
+        assert_eq!(
+            Medians::from_entropy(&info, 1),
+            Some(Medians::new([4, 5, 6]))
+        );
+    }
+
+    #[test]
+    fn medians_from_entropy_one_is_none_on_mono() {
+        let info = EntropyInfo::mono([7, 8, 9]);
+        assert_eq!(
+            Medians::from_entropy(&info, 0),
+            Some(Medians::new([7, 8, 9]))
+        );
+        // The wiki put no right-channel set on a mono payload.
+        assert_eq!(Medians::from_entropy(&info, 1), None);
+    }
+
+    #[test]
+    fn medians_from_entropy_rejects_out_of_range_indices() {
+        let info = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [4, 5, 6],
+        };
+        // The wiki names mono and stereo — index 2 and beyond are not
+        // populated.
+        assert_eq!(Medians::from_entropy(&info, 2), None);
+        assert_eq!(Medians::from_entropy(&info, 3), None);
+        assert_eq!(Medians::from_entropy(&info, 255), None);
     }
 }

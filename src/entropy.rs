@@ -119,6 +119,51 @@ impl EntropyInfo {
     pub fn is_mono(&self) -> bool {
         self.medians_right == [0; MEDIANS_PER_CHANNEL]
     }
+
+    /// `true` when both median sets carry independent (right-set
+    /// non-zero) data — i.e. the payload was a stereo (two-set)
+    /// entropy-info sub-block. Inverse of [`Self::is_mono`].
+    ///
+    /// Like [`Self::is_mono`] this is a content-only check: an
+    /// all-zero stereo payload would look mono. Callers needing the
+    /// authoritative answer should still correlate against
+    /// [`crate::Flags::mono`] on the enclosing block header.
+    pub fn is_stereo(&self) -> bool {
+        !self.is_mono()
+    }
+
+    /// Number of populated median sets — `1` for a mono payload
+    /// (right set is all zero), `2` for a stereo payload (both sets
+    /// carry independent values).
+    ///
+    /// The wiki "Entropy info" sentence — "one or two sets of medians
+    /// for samples decoding" — is reflected here as the count of sets
+    /// actually on the wire.
+    pub fn channels(&self) -> u8 {
+        if self.is_mono() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Per-channel median accessor — `Some([m0, m1, m2])` when
+    /// `channel_idx` names a populated set (`0` for left/mono on any
+    /// payload, `1` for right on a stereo payload). Returns `None` for
+    /// `1` on a mono payload (the wiki put no second set on the wire)
+    /// and for indices `>= 2` (the wiki names mono and stereo only,
+    /// "one or two sets").
+    ///
+    /// The set ordering — left then right — is the same order the
+    /// round-4 expander reads the bytes off the wire, matching every
+    /// other left/right pairing in the WavPack v.4 stream.
+    pub fn medians_for_channel(&self, channel_idx: u8) -> Option<[i32; MEDIANS_PER_CHANNEL]> {
+        match channel_idx {
+            0 => Some(self.medians_left),
+            1 if self.is_stereo() => Some(self.medians_right),
+            _ => None,
+        }
+    }
 }
 
 /// Expand the payload of a `0x05` entropy-info sub-block into a
@@ -310,5 +355,61 @@ mod tests {
         // contract. Callers correlate against the enclosing block's
         // mono flag for the authoritative answer.
         assert!(info.is_mono());
+    }
+
+    // ---- Round-12 channel accessors ----
+
+    #[test]
+    fn is_stereo_inverts_is_mono() {
+        let mono = EntropyInfo::mono([1, 2, 3]);
+        assert!(!mono.is_stereo());
+        let stereo = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [4, 5, 6],
+        };
+        assert!(stereo.is_stereo());
+    }
+
+    #[test]
+    fn channels_returns_one_for_mono_two_for_stereo() {
+        let mono = EntropyInfo::mono([1, 2, 3]);
+        assert_eq!(mono.channels(), 1);
+        let stereo = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [4, 5, 6],
+        };
+        assert_eq!(stereo.channels(), 2);
+    }
+
+    #[test]
+    fn medians_for_channel_yields_left_on_zero_and_right_on_one_for_stereo() {
+        let stereo = EntropyInfo {
+            medians_left: [10, 20, 30],
+            medians_right: [40, 50, 60],
+        };
+        assert_eq!(stereo.medians_for_channel(0), Some([10, 20, 30]));
+        assert_eq!(stereo.medians_for_channel(1), Some([40, 50, 60]));
+    }
+
+    #[test]
+    fn medians_for_channel_one_is_none_on_mono() {
+        let mono = EntropyInfo::mono([7, 8, 9]);
+        assert_eq!(mono.medians_for_channel(0), Some([7, 8, 9]));
+        // Channel 1 on a mono payload returns None — the wiki put no
+        // second set on the wire.
+        assert_eq!(mono.medians_for_channel(1), None);
+    }
+
+    #[test]
+    fn medians_for_channel_rejects_out_of_range_indices() {
+        let stereo = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [4, 5, 6],
+        };
+        // The wiki names only mono and stereo — index 2 and beyond are
+        // not on the wire.
+        assert_eq!(stereo.medians_for_channel(2), None);
+        assert_eq!(stereo.medians_for_channel(3), None);
+        assert_eq!(stereo.medians_for_channel(255), None);
     }
 }

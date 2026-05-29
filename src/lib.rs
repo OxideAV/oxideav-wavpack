@@ -1,13 +1,15 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
-//! **Round 11 — block-header parser + metadata sub-block walker +
+//! **Round 12 — block-header parser + metadata sub-block walker +
 //! decorrelation sub-block expanders + entropy-info expander +
 //! sample-coding bit reader, run-length decoder, Golomb sample-value
 //! reconstruction & single-call per-sample decode + entropy→median
 //! bridge + header-accessor coverage + `TermKind` classifier +
 //! `DecorrelationTerms` accessors + metadata-sub-block payload-kind
 //! predicates + walker finders + MD5 typed view + per-term
-//! `decorrelation_sample_count` + flat-payload partitioner.**
+//! `decorrelation_sample_count` + flat-payload partitioner + `0x0A`
+//! `PackedSamples` typed view + `BitReader` position accessors +
+//! channel-indexed `EntropyInfo` / `Medians::from_entropy` bridges.**
 //! Round 1 landed the structural 32-byte block-header parser
 //! documented in `docs/audio/wavpack/wiki/WavPack.wiki` (block-structure
 //! listing); round 2 added the metadata sub-block walker following the
@@ -148,6 +150,43 @@
 //!   output for callers picking the decorrelation triple or the audio
 //!   stream out of a walk.
 //!
+//! Round-12 scope adds the typed `0x0A` packed-samples view, the
+//! [`BitReader`] position accessors and the channel-indexed
+//! [`Medians::from_entropy`] / [`EntropyInfo::medians_for_channel`]
+//! bridges — non-prediction-loop elaborations of the existing typed
+//! views while the median-adaptation amount stays a docs gap:
+//!
+//! * [`PackedSamples`] — typed view of the `0x0A` packed-samples
+//!   sub-block payload (the entropy-coded audio bitstream the wiki
+//!   "Samples coding" section consumes). Carries the borrowed payload
+//!   bytes; exposes [`PackedSamples::bytes`] / [`PackedSamples::len`] /
+//!   [`PackedSamples::is_empty`] introspection and a
+//!   [`PackedSamples::bit_reader`] factory that yields a fresh
+//!   [`BitReader`] positioned at bit 0 for feeding
+//!   [`decode_run_length`] / [`decode_sample_value`] / [`decode_sample`].
+//! * [`expand_packed_samples`] — the round-2 walker output ↦ typed view
+//!   bridge for the `0x0A` ID (analogous to [`expand_samples`] /
+//!   [`expand_entropy`] for `0x04` / `0x05`, but a typed wrap rather
+//!   than a byte-by-byte decode because the wiki places no internal
+//!   structure on the `0x0A` payload).
+//! * [`find_packed_samples`] — walker convenience finder returning a
+//!   [`PackedSamples`] directly (the typed counterpart to
+//!   [`find_audio_payload`]).
+//! * [`BitReader::byte_position`] / [`BitReader::bit_position`] /
+//!   [`BitReader::bits_consumed`] — cursor accessors for callers that
+//!   want to log the position before a truncation error fires or
+//!   resume from a known offset against a fresh reader.
+//! * [`EntropyInfo::is_stereo`] / [`EntropyInfo::channels`] /
+//!   [`EntropyInfo::medians_for_channel`] — typed channel introspection
+//!   pinning the wiki "one or two sets of medians" sentence as `1` or
+//!   `2` populated sets, with a channel-indexed median getter that
+//!   returns `None` for out-of-range indices and for the right channel
+//!   on a mono payload.
+//! * [`Medians::from_entropy`] — channel-indexed bridge over
+//!   [`EntropyInfo`] returning `Some(medians)` for `0` / `1` (the
+//!   latter only on stereo) so callers iterating per-channel medians
+//!   skip the mono / stereo branch.
+//!
 //! Round-11 scope adds the per-term decorrelation-sample-count helper
 //! and the flat-payload partitioner, both derived from the wiki
 //! "Decorrelation samples" / "Possible predictor values" sections:
@@ -196,6 +235,7 @@ mod decorrelation;
 mod entropy;
 mod error;
 mod metadata;
+mod packed_samples;
 mod samples;
 
 pub use crate::block_header::{
@@ -216,10 +256,11 @@ pub use crate::entropy::{
 pub use crate::error::{Error, Result};
 pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
-    find_md5_checksum_block, find_multichannel_info, parse_md5_checksum, parse_metadata_sub_block,
-    walk_metadata, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE,
-    ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
+    find_md5_checksum_block, find_multichannel_info, find_packed_samples, parse_md5_checksum,
+    parse_metadata_sub_block, walk_metadata, Md5Checksum, MetadataSubBlock, SubBlockFlags,
+    SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
 };
+pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
 pub use crate::samples::{
     decode_run_length, decode_sample, decode_sample_value, golomb_interval, BitReader,
     GolombInterval, Medians, RunState, UNARY_ESCAPE,

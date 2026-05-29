@@ -564,6 +564,19 @@ pub fn find_multichannel_info<'walk, 'a>(
     find_first(subs, SubBlockId::MultichannelInfo)
 }
 
+/// Walk a metadata list and return the first `0x0A` packed-samples
+/// sub-block already wrapped as a typed [`crate::PackedSamples`]
+/// view — the round-12 typed counterpart to [`find_audio_payload`].
+/// `None` when no `0x0A` sub-block is present in the walk.
+///
+/// Equivalent to `find_audio_payload(subs).map(|s|
+/// PackedSamples::new(s.payload()))` but spelled directly so callers
+/// staging the deferred per-sample decode loop have a one-call bridge
+/// from the walker output to the [`crate::BitReader`] factory.
+pub fn find_packed_samples<'a>(subs: &[MetadataSubBlock<'a>]) -> Option<crate::PackedSamples<'a>> {
+    find_first(subs, SubBlockId::PackedSamples).map(|s| crate::PackedSamples::new(s.payload))
+}
+
 /// Locate the **decorrelation triple** in a metadata walk and return
 /// the three sub-blocks in wiki order — `0x02` terms, `0x03` weights,
 /// `0x04` samples. Returns `None` when any one of the three is missing
@@ -1264,5 +1277,28 @@ mod tests {
             parse_metadata_sub_block(&wire),
             Err(Error::MetadataOddSizeWithoutPayload)
         );
+    }
+
+    // ---- Round-12 find_packed_samples typed-view finder ----
+
+    #[test]
+    fn find_packed_samples_returns_typed_view_over_audio_payload() {
+        let stream = synth_full_stream();
+        let subs = walk_metadata(&stream).unwrap();
+        let ps = find_packed_samples(&subs).expect("packed samples present");
+        // The fixture's 0x0A payload from synth_full_stream is the
+        // four-byte 0xAA/0xBB/0xCC/0xDD sequence.
+        assert_eq!(ps.bytes(), &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(ps.len(), 4);
+        assert!(!ps.is_empty());
+    }
+
+    #[test]
+    fn find_packed_samples_returns_none_when_no_audio_block() {
+        // A stream without a 0x0A sub-block — only entropy info (0x05).
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_packed_samples(&subs).is_none());
     }
 }

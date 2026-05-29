@@ -8,6 +8,58 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 12 (`0x0A` packed-samples typed view + `BitReader` position
+  accessors + channel-indexed `EntropyInfo` / `Medians::from_entropy`
+  bridges): another non-prediction-loop advancement while the
+  median-adaptation amount stays a docs gap. New `PackedSamples<'a>`
+  typed view of the `0x0A` packed-samples sub-block payload — the
+  entropy-coded audio bitstream the wiki "Samples coding" section
+  consumes — exposing `bytes()` / `len()` / `is_empty()` introspection
+  and a `bit_reader()` factory that produces a fresh `BitReader`
+  positioned at bit 0 for feeding `decode_run_length` /
+  `decode_sample_value` / `decode_sample`. New stand-alone
+  `expand_packed_samples(payload: &[u8]) -> PackedSamples<'_>` mirrors
+  the round-3/round-4 expanders' naming (typed wrap rather than a
+  byte-by-byte decode because the wiki places no internal structure on
+  the `0x0A` payload). New walker finder
+  `find_packed_samples(&[MetadataSubBlock]) -> Option<PackedSamples>`
+  is the typed counterpart to `find_audio_payload`. New cursor
+  accessors `BitReader::byte_position()` / `bit_position()` /
+  `bits_consumed()` name the reader's position in the underlying byte
+  slice, with `bits_consumed` clamping at the buffer length when the
+  reader has advanced past the end. New `EntropyInfo::is_stereo()` /
+  `channels()` / `medians_for_channel(idx)` typed channel introspection
+  pinning the wiki "one or two sets of medians" sentence as `1` or `2`
+  populated sets, with a channel-indexed median getter returning
+  `Some([m0, m1, m2])` for `0` (left/mono) or `1` (right, stereo only)
+  and `None` for `1` on a mono payload and indices `>= 2`. New
+  `Medians::from_entropy(info, channel_idx)` channel-indexed bridge
+  with the same mono / out-of-range guards so callers iterating
+  per-channel medians skip the hand-rolled mono / stereo branch. None
+  of these read bits, mutate state or touch the prediction loop; they
+  elaborate the round-2 walker output and the round-4 / round-5/6/7
+  expanders for callers staging the deferred decode pass.
+- 23 new unit tests (173 total): `PackedSamples` constructor
+  round-tripping a non-empty payload, the zero-byte empty payload
+  accepted and reported empty, `expand_packed_samples` round-tripping
+  the byte slice, `bit_reader()` starting at byte/bit 0 with the full
+  payload remaining and yielding the first bit LSB-first, the
+  `bit_reader()` factory returning independent readers (so a probe and
+  the real decode each start at bit 0), an empty packed-samples view
+  reporting immediate `Error::Truncated` on any read, and the view
+  being `Copy`; `BitReader::byte_position` / `bit_position` /
+  `bits_consumed` tracking 13-bit consumption across a byte boundary,
+  the `bits_consumed` clamp when the reader is past the end, and the
+  cursor staying put when a read errors with `Truncated`;
+  `Medians::from_entropy` yielding the left set on index `0` and the
+  right set on index `1` for a stereo `EntropyInfo`, returning `None`
+  for `1` on a mono `EntropyInfo`, and rejecting out-of-range indices
+  (`2`, `3`, `255`); `EntropyInfo::is_stereo` inverting `is_mono`,
+  `channels` returning `1` for mono and `2` for stereo,
+  `medians_for_channel` yielding the matched set for `0` / `1` on
+  stereo and `None` for `1` on mono / `2+` indices; and
+  `find_packed_samples` returning a typed `PackedSamples` view over
+  the synthesised `0x0A` payload and `None` on a stream without one.
 - Round 11 (per-term decorrelation-sample-count helper + flat-payload
   partitioner): another non-prediction-loop advancement while the
   median-adaptation amount stays a docs gap. New stand-alone

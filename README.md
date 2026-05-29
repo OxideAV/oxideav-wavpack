@@ -5,7 +5,7 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-**Round 11 — block-header parser + metadata sub-block walker +
+**Round 12 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
 sample-coding bit reader, run-length decoder, Golomb sample-value
 reconstruction & single-call per-sample decode + entropy→median
@@ -15,9 +15,16 @@ bridge + 11 header-accessor helpers + `TermKind` classifier + 7
 `partition_decorrelation_samples` splitter (with explicit refusal on
 the stereo / reserved / undocumented per-term-count docs gap) + 13
 `MetadataSubBlock` payload-kind predicates covering every wiki "IDs"
-entry + 4 `SubBlockId` classifier helpers + 6 walker finders
-(`find_first` + four specialised + decorrelation-triple) + 16-byte
-`Md5Checksum` typed view with strict-length `parse_md5_checksum`.** Round 1
+entry + 4 `SubBlockId` classifier helpers + 7 walker finders
+(`find_first` + four specialised + decorrelation-triple +
+typed-`PackedSamples` packed-samples finder) + 16-byte `Md5Checksum`
+typed view with strict-length `parse_md5_checksum` + typed
+`PackedSamples` view of the `0x0A` packed-samples sub-block payload
+(borrowed bytes + `bit_reader()` factory at bit 0) + `BitReader`
+position accessors (`byte_position` / `bit_position` /
+`bits_consumed`) + channel-indexed `EntropyInfo` accessors
+(`is_stereo` / `channels` / `medians_for_channel`) +
+`Medians::from_entropy(info, channel_idx)` channel-indexed bridge.** Round 1
 landed the 32-byte fixed block-header parser; round 2 added the
 metadata sub-block walker completing the structural pass over a
 WavPack v.4 block; round 3 turns the `0x02` / `0x03` / `0x04`
@@ -213,10 +220,44 @@ Public API:
   [`Error::Md5ChecksumLength`]).
 - [`find_first`] / [`find_audio_payload`] / [`find_entropy_info`] /
   [`find_md5_checksum_block`] / [`find_multichannel_info`] /
-  [`find_decorrelation_triple`] — convenience finders over a
-  [`walk_metadata`] result. The triple finder returns `(terms,
-  weights, samples)` in wiki order or `None` when any of the three is
-  missing — a malformed-block signal for the prediction loop.
+  [`find_decorrelation_triple`] / [`find_packed_samples`] —
+  convenience finders over a [`walk_metadata`] result. The triple
+  finder returns `(terms, weights, samples)` in wiki order or `None`
+  when any of the three is missing — a malformed-block signal for the
+  prediction loop. [`find_packed_samples`] returns the `0x0A` payload
+  already wrapped as a typed [`PackedSamples`] (the typed counterpart
+  to [`find_audio_payload`]).
+- [`PackedSamples`] / [`expand_packed_samples`] — typed view of the
+  `0x0A` packed-samples sub-block payload (the entropy-coded audio
+  bitstream the wiki "Samples coding" section consumes). Borrows the
+  walker's payload bytes verbatim and exposes [`PackedSamples::bytes`]
+  / [`PackedSamples::len`] / [`PackedSamples::is_empty`] introspection
+  plus a [`PackedSamples::bit_reader`] factory that yields a fresh
+  [`BitReader`] positioned at bit 0 — the round-2 walker → round-5/6/7
+  decoder handoff in one call. The wiki places no length constraint on
+  the payload (the sample count is conveyed out-of-band by the block
+  header's `block_samples`), so any byte slice, including the empty
+  one, is accepted without rejection.
+- [`BitReader::byte_position`] / [`BitReader::bit_position`] /
+  [`BitReader::bits_consumed`] — cursor accessors naming the reader's
+  position in the underlying byte slice. `bits_consumed` clamps at the
+  buffer length when the reader has advanced past the end so callers
+  computing a percentage / progress over a `0x0A` payload don't
+  overshoot.
+- [`EntropyInfo::is_stereo`] / [`EntropyInfo::channels`] /
+  [`EntropyInfo::medians_for_channel`] — typed channel introspection
+  pinning the wiki "one or two sets of medians for samples decoding"
+  sentence as `1` or `2` populated sets, with a channel-indexed median
+  getter returning `Some([m0, m1, m2])` for `0` (left/mono) or `1`
+  (right, stereo only) and `None` for `1` on a mono payload (where the
+  wiki put no second set on the wire) and for indices `>= 2`.
+- [`Medians::from_entropy`] `(info, channel_idx)` — channel-indexed
+  bridge over [`EntropyInfo`] returning `Some(Medians)` for `0` and
+  for `1` on a stereo block, `None` otherwise. Equivalent to
+  [`Medians::from_entropy_left`] / [`Medians::from_entropy_right`] but
+  with the mono guard, so callers iterating per-channel medians
+  (one or two iterations against `Flags::channels_in_block`) skip the
+  hand-rolled mono / stereo branch.
 
 ### Out of scope (later rounds)
 
@@ -254,14 +295,14 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 11 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
+Rounds 1 through 12 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
 (the local multimedia.cx snapshot under the docs repo) and
 `oxideav-core`'s public API. No external library source
 (`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
 no archived `old` branch of this crate, and no online resources
 were consulted at any phase.
 
-The 150-test unit suite synthesises minimal valid headers, sub-blocks
+The 173-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's
 accept / reject boundaries (truncated inputs, wrong magic, undersized
 `ck_size`, out-of-range version, bogus odd-size flag with zero data
@@ -345,4 +386,26 @@ stereo `[2]` and reserved `[6, 14]` lists with
 (`expected: 6, actual: 5`) and long (`expected: 1, actual: 4`) flat
 payloads with `DecorrelationSampleCountMismatch`, and a round-trip
 from `expand_samples` of a synthesised `[6, 18]` wire through the
-partitioner back to per-term `[1]` + `[2, 3]` lists.
+partitioner back to per-term `[1]` + `[2, 3]` lists; and the round-12
+`PackedSamples` typed view + `BitReader` position + channel-indexed
+`EntropyInfo` / `Medians::from_entropy` sweep — `PackedSamples`
+round-tripping a non-empty payload, the zero-byte empty payload
+accepted and reported empty (the wiki places no length constraint on
+the `0x0A` payload), `expand_packed_samples` round-tripping the byte
+slice, the `bit_reader()` factory starting at byte/bit 0 with the
+full payload remaining and yielding the first bit LSB-first, the
+factory returning independent readers across multiple calls, an
+empty packed-samples view reporting immediate `Error::Truncated` on
+any read, and the view being `Copy`; `BitReader::byte_position` /
+`bit_position` / `bits_consumed` tracking 13-bit consumption across
+a byte boundary, the `bits_consumed` clamp when the reader is past
+the end, and the cursor staying put when a read errors with
+`Truncated`; `Medians::from_entropy` yielding the left set on index
+`0` and the right set on index `1` for a stereo `EntropyInfo`,
+returning `None` for `1` on a mono `EntropyInfo`, and rejecting
+out-of-range indices (`2`, `3`, `255`); `EntropyInfo::is_stereo`
+inverting `is_mono`, `channels` returning `1` for mono and `2` for
+stereo, `medians_for_channel` yielding the matched set for `0` / `1`
+on stereo and `None` for `1` on mono / `2+` indices; and
+`find_packed_samples` returning a typed `PackedSamples` view over a
+synthesised `0x0A` sub-block and `None` on a stream without one.
