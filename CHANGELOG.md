@@ -6,6 +6,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-wavpack/releases/tag/v0.0.2) - 2026-05-30
+
+### Other
+
+- Round 14: median-adaptation amount (spec §3 + §3.2) — AdaptiveMedians + Zone
+- Round 13: end-to-end parse_block aggregate + BitReader peek/skip primitives
+- Round 12: 0x0A PackedSamples typed view + BitReader position accessors + channel-indexed EntropyInfo bridges
+- Round 11: per-term decorrelation sample-count helper + flat-payload partitioner
+- Round 10: MD5 typed view + walker finders + remaining metadata-kind predicates
+- Round 9: term-kind classifier + decorrelation/metadata kind accessors
+- round-8 block-header accessor coverage (lossless / sample-rate sentinel / experimental / effective bit-depth / audio-block / payload-bytes)
+- Round 7: single-call per-sample decode + EntropyInfo→Medians bridge
+- Golomb (base, add) interval + sample-value reconstruction (round 6)
+- Round 5: sample-coding bit reader + run-length decoder
+- Round 4: 0x05 entropy-info sub-block expander
+- Round 3: decorrelation sub-block expanders (terms / weights / samples)
+- Round 2: metadata sub-block walker
+- Round 1: WavPack v.4 block-header parser
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - Round 14 — WavPack median-adaptation amount (newly-unblocked spec
