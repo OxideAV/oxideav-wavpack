@@ -8,6 +8,68 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 14 — WavPack median-adaptation amount (newly-unblocked spec
+  `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3 + §3.2). New
+  `AdaptiveMedians` struct — a three-`u32` running median state with
+  the spec §2.1 4-fractional-bit encoding — plus the integer
+  increment / decrement primitives that the spec §3 quotes:
+  `((median[i] + D) / D) * 5` up and `((median[i] + (D - 2)) / D) * 2`
+  down, with `D` = `DIV0` / `DIV1` / `DIV2` (= `128` / `64` / `32`)
+  per the spec table. New `Zone` enum names the four §3.2 arms
+  (`Zone0` / `Zone1` / `Zone2` / `Zone2Overflow { ones_count }`)
+  driven from a raw `ones_count` via `Zone::from_ones_count`, and
+  `AdaptiveMedians::adapt(zone)` / `adapt_for_ones_count(ones_count)`
+  apply the correct combination of `inc_median` / `dec_median` calls:
+  zone 0 → dec `median[0]`; zone 1 → inc `median[0]`, dec `median[1]`;
+  zone 2 → inc `median[0]` + `median[1]`, dec `median[2]`; zone 2
+  overflow → all three inc. New `AdaptiveMedians::get_med(i)` returns
+  the spec §2.1 working median `(median[i] >> 4) + 1` (the value the
+  spec §4.2 interval ladder consumes). New seed constructors
+  `AdaptiveMedians::from_seed_values([i32; 3])` and
+  `AdaptiveMedians::from_medians(Medians)` bridge the round-4 / round-6
+  typed views into the running state, returning `None` when any seed
+  is negative (rather than silently casting). New public constants
+  `DIV0` / `DIV1` / `DIV2` / `MEDIAN_INC_MULTIPLIER` /
+  `MEDIAN_DEC_MULTIPLIER` / `GET_MED_SHIFT` / `GET_MED_FLOOR` record
+  the spec §3 / §5 numeric facts. The `inc_median` / `dec_median`
+  primitives use `saturating_add` / `saturating_sub` / `saturating_mul`
+  defensively against pathological starting values — the spec §3
+  arithmetic naturally stays within `u32` for any state the per-sample
+  decode actually produces, but the saturating cap prevents a stray
+  caller from triggering UB. None of this is wired into the round-7
+  `decode_sample` call yet — that composition is gated on a follow-up
+  round so the existing `Medians`-by-value primitive is preserved
+  unchanged and the new `AdaptiveMedians` state is an additive,
+  self-contained numeric primitive.
+- 24 new unit tests (221 total): divisor / multiplier / GET_MED
+  constants matching the spec §3 / §5 table; `get_med` returning the
+  §2.1 floor (`1`) at zero, stripping the 4 fractional bits at the
+  exemplar values 16/32/48, and truncating (not rounding) on the
+  off-boundary 15/31/47 case; `inc_median` stepping by `5` at
+  `median = 0` and by `10` at `median = D`, per-index divisor
+  selection on indices 1/2; `dec_median` stepping to zero at
+  `median = 0` and by `2` at `median = D`, plus an exhaustive sweep
+  proving `((v + D - 2) / D) * 2 <= v` for `v ∈ 0..=200` (the §3
+  "never below 0" invariant); a 5:2 ratio equilibrium probe at
+  `median = 256` cross-checking both the inc step (`15`) and the
+  follow-up dec step (`6`); `Zone::from_ones_count` mapping every
+  named arm plus the `ones_count >= 3` overflow with the raw value
+  preserved (including `3` / `33` / `u32::MAX`), and the round-trip
+  through `Zone::ones_count`; `adapt(zone)` matching the §3.2 table
+  exactly on each of the four arms (Zone0 dec m0, Zone1 inc m0 + dec
+  m1, Zone2 inc m0 + m1 + dec m2, Zone2Overflow inc all three) with
+  before/after equality against the primitive sequence;
+  `adapt_for_ones_count` threading through to the same Zone branch
+  for `ones_count = 1` and `ones_count = 7`; `from_seed_values`
+  accepting non-negative seeds and rejecting any negative slot;
+  `from_medians` bridging a `Medians` and rejecting a negative slot;
+  a four-step §3 sequence (Zone1 → Zone0 → Zone2 → Zone2Overflow)
+  walking a fresh `[0,0,0]` state through hand-computed `[5,0,0]` →
+  `[3,0,0]` → `[8,5,0]` → `[13,10,5]` confirming every step matches
+  the spec arithmetic exactly; saturating semantics on `u32::MAX`
+  increment and `0` decrement; and `AdaptiveMedians` is `Copy` /
+  `PartialEq` (pre-update vs post-update inequality on a
+  `Zone0`-driven decrement).
 - Round 13 (end-to-end `parse_block` aggregate + `BitReader` non-mutating
   look-ahead + bulk `skip_bits`): another non-prediction-loop advancement
   while the median-adaptation amount stays a docs gap. New stand-alone

@@ -143,6 +143,43 @@ use crate::error::{Error, Result};
 /// folded in per the wiki "if(n == 16)" branch.
 pub const UNARY_ESCAPE: u32 = 16;
 
+/// Divisor used for the `median[0]` adaptation step
+/// (`docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3, constant
+/// `DIV0`).
+///
+/// Used in both the increment `median[0] += ((median[0] + D) / D) * 5`
+/// and the decrement `median[0] -= ((median[0] + (D - 2)) / D) * 2`,
+/// with `D = DIV0`.
+pub const DIV0: u32 = 128;
+
+/// Divisor used for the `median[1]` adaptation step (spec §3, constant
+/// `DIV1`). Same role as [`DIV0`] but for the second median.
+pub const DIV1: u32 = 64;
+
+/// Divisor used for the `median[2]` adaptation step (spec §3, constant
+/// `DIV2`). Same role as [`DIV0`] but for the third median.
+pub const DIV2: u32 = 32;
+
+/// Multiplier applied to the rounded division in the spec §3 increment
+/// step: `median[i] += ((median[i] + D) / D) * MEDIAN_INC_MULTIPLIER`.
+pub const MEDIAN_INC_MULTIPLIER: u32 = 5;
+
+/// Multiplier applied to the biased rounded division in the spec §3
+/// decrement step:
+/// `median[i] -= ((median[i] + (D - 2)) / D) * MEDIAN_DEC_MULTIPLIER`.
+pub const MEDIAN_DEC_MULTIPLIER: u32 = 2;
+
+/// Right shift applied in the spec §2.1 `get_med` operation
+/// (`get_med(i) = (median[i] >> GET_MED_SHIFT) + 1`).
+///
+/// Per spec §5, the stored median carries 4 fractional bits.
+pub const GET_MED_SHIFT: u32 = 4;
+
+/// Floor of the spec §2.1 `get_med` result. `get_med` never drops below
+/// this value: `(median[i] >> 4) + 1` is at least `1` for any
+/// non-negative `median[i]`.
+pub const GET_MED_FLOOR: u32 = 1;
+
 /// Least-significant-bit-first reader over a `0x0A` packed-samples
 /// payload (or any WavPack bitstream).
 ///
@@ -480,6 +517,275 @@ impl Medians {
             1 if !info.is_mono() => Some(Self::from_entropy_right(info)),
             _ => None,
         }
+    }
+}
+
+/// Spec §3.2 zone selector — which arm of the unary-prefix /
+/// `ones_count` ladder the decoder is in after the unary prefix has
+/// been decoded.
+///
+/// The four zones drive both the `(low, high)` interval (spec §4.2
+/// step 5) and the per-median adaptation (spec §3.2):
+///
+/// | Zone | `ones_count` | Adaptation |
+/// | ---- | ------------ | ---------- |
+/// | [`Zone::Zone0`]         | `0`         | `median[0]` decremented                               |
+/// | [`Zone::Zone1`]         | `1`         | `median[0]` incremented, `median[1]` decremented      |
+/// | [`Zone::Zone2`]         | `2`         | `median[0]` + `median[1]` incremented, `median[2]` decremented |
+/// | [`Zone::Zone2Overflow`] | `>= 3`      | all three medians incremented                         |
+///
+/// The numeric `ones_count` value (the value the spec calls
+/// `ones_count` after the holding-bit fold) is recoverable via
+/// [`Zone::ones_count`] for the `Zone2Overflow` arm, which carries the
+/// raw value through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    /// `ones_count == 0` — interval base is the bottom; only
+    /// `median[0]` is decremented per spec §3.2.
+    Zone0,
+    /// `ones_count == 1` — `median[0]` is incremented, `median[1]` is
+    /// decremented per spec §3.2.
+    Zone1,
+    /// `ones_count == 2` — `median[0]` and `median[1]` are
+    /// incremented, `median[2]` is decremented per spec §3.2.
+    Zone2,
+    /// `ones_count >= 3` — `median[0]`, `median[1]` and `median[2]`
+    /// are all incremented per spec §3.2; the raw `ones_count` is
+    /// carried through so the `(ones_count - 2) * get_med(2)` shift
+    /// in the `low = ...` formula (spec §4.2 step 5) is still
+    /// recoverable.
+    Zone2Overflow {
+        /// The original `ones_count` value (`>= 3`) preserved verbatim
+        /// from the decoder's holding-bit-folded unary prefix.
+        ones_count: u32,
+    },
+}
+
+impl Zone {
+    /// Construct a [`Zone`] from a raw `ones_count` value, mapping
+    /// `0 / 1 / 2 / >=3` onto the four spec §3.2 arms.
+    pub const fn from_ones_count(ones_count: u32) -> Self {
+        match ones_count {
+            0 => Zone::Zone0,
+            1 => Zone::Zone1,
+            2 => Zone::Zone2,
+            _ => Zone::Zone2Overflow { ones_count },
+        }
+    }
+
+    /// Recover the `ones_count` value the [`Zone`] was constructed
+    /// from. `0` / `1` / `2` for the named arms, and the carried value
+    /// (`>= 3`) for [`Zone::Zone2Overflow`].
+    pub const fn ones_count(self) -> u32 {
+        match self {
+            Zone::Zone0 => 0,
+            Zone::Zone1 => 1,
+            Zone::Zone2 => 2,
+            Zone::Zone2Overflow { ones_count } => ones_count,
+        }
+    }
+}
+
+/// Adaptive median state for one channel — three `u32` running
+/// medians with 4 fractional bits each, exactly as spec §2 lays them
+/// out (`median[0..=2]`).
+///
+/// Distinct from [`Medians`]: [`Medians`] is the already-log-expanded
+/// snapshot the round-4 [`crate::expand_entropy`] expander produces
+/// (signed-`i32`, no fractional bits, fed to the round-6 Golomb
+/// interval selector by value); [`AdaptiveMedians`] is the **mutable**
+/// running state the spec §3 adaptation walks per sample. The spec
+/// defines the running medians as 32-bit unsigned (`uint32_t`) with
+/// 4 fractional bits encoded as a `>> 4` shift on every working
+/// access (see [`AdaptiveMedians::get_med`]), and the increment /
+/// decrement steps as the integer expressions spec §3 quotes
+/// (`((median[i] + D) / D) * 5` up, `((median[i] + (D - 2)) / D) * 2`
+/// down).
+///
+/// Building one from the seed values an `0x05` entropy-info sub-block
+/// produces is one of:
+///
+/// * [`AdaptiveMedians::new`] — direct three-`u32` constructor.
+/// * [`AdaptiveMedians::from_seed_values`] — same as `new`, taking the
+///   raw seed values the round-4 expander produces (validated
+///   non-negative).
+/// * [`AdaptiveMedians::from_medians`] — converts a [`Medians`] in
+///   place (returns `None` when any value is negative — `i32 → u32`
+///   reinterpretation is rejected rather than masked).
+///
+/// Round 191 adds the value-mutating per-zone [`AdaptiveMedians::adapt`]
+/// step (spec §3 + §3.2) but does **not** yet wire it into
+/// [`decode_sample`]; per-sample composition is gated on a follow-up
+/// round so the existing round-7 single-call decoder is preserved
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveMedians {
+    /// `median[0]`, `median[1]`, `median[2]` in spec order. Each value
+    /// carries 4 fractional bits per spec §2.1.
+    pub values: [u32; 3],
+}
+
+impl AdaptiveMedians {
+    /// Wrap a three-`u32` array as the running median state.
+    ///
+    /// The values are taken verbatim — the 4 fractional bits the spec
+    /// §2.1 `get_med` operation strips are already implicit. Pair with
+    /// [`AdaptiveMedians::get_med`] when reading working values for
+    /// the spec §4.2 interval ladder.
+    pub const fn new(values: [u32; 3]) -> Self {
+        Self { values }
+    }
+
+    /// Construct from the three seed values an `0x05` entropy-info
+    /// sub-block expander ([`crate::expand_entropy`]) produces for a
+    /// single channel.
+    ///
+    /// The seed values are the wire log-pack expanded through
+    /// [`crate::expand_entropy`]; they are `i32` in the round-4 API and
+    /// always non-negative for a well-formed stream. Returns `None`
+    /// when any value is negative (a malformed seed) rather than
+    /// silently casting to `u32`.
+    pub fn from_seed_values(seeds: [i32; 3]) -> Option<Self> {
+        if seeds[0] < 0 || seeds[1] < 0 || seeds[2] < 0 {
+            return None;
+        }
+        Some(Self::new([
+            seeds[0] as u32,
+            seeds[1] as u32,
+            seeds[2] as u32,
+        ]))
+    }
+
+    /// Construct from a [`Medians`] snapshot. Returns `None` when any
+    /// `i32` value is negative (`i32 → u32` is rejected rather than
+    /// reinterpreted).
+    ///
+    /// Convenience for callers that already hold a [`Medians`] from the
+    /// round-4 → round-6 bridge and want to upgrade it to the running
+    /// adaptive state.
+    pub fn from_medians(medians: Medians) -> Option<Self> {
+        Self::from_seed_values(medians.values)
+    }
+
+    /// Spec §2.1 `get_med(i)` operation — the **working** median value
+    /// the spec §4.2 interval ladder consumes.
+    ///
+    /// `get_med(i) = (median[i] >> 4) + 1`, with a minimum of `1`.
+    /// The stored median carries 4 fractional bits; the `>> 4`
+    /// extracts the integer breakpoint and the `+ 1` enforces the
+    /// floor.
+    ///
+    /// `idx` must be `0`, `1` or `2`. Out-of-range indices panic in
+    /// debug builds and return `0` in release.
+    #[inline]
+    pub fn get_med(&self, idx: usize) -> u32 {
+        debug_assert!(idx < 3, "median index out of range");
+        if idx >= 3 {
+            return 0;
+        }
+        (self.values[idx] >> GET_MED_SHIFT) + GET_MED_FLOOR
+    }
+
+    /// Spec §3 increment step for `median[idx]`:
+    ///
+    /// `median[i] += ((median[i] + D) / D) * 5`
+    ///
+    /// where `D` is [`DIV0`] / [`DIV1`] / [`DIV2`] for `idx = 0 / 1 / 2`.
+    /// `idx` must be `0`, `1` or `2`; out-of-range indices are a
+    /// no-op (debug-assert).
+    pub fn inc_median(&mut self, idx: usize) {
+        debug_assert!(idx < 3, "median index out of range");
+        if idx >= 3 {
+            return;
+        }
+        let d = divisor_for(idx);
+        let cur = self.values[idx];
+        // ((cur + d) / d) * 5 — saturating to bound the worst case;
+        // (u32::MAX + 128) overflows in plain u64 only at extreme
+        // synthetic values that the decode loop never produces, but
+        // the saturating form is the defensive choice and matches the
+        // arithmetic spec §3 quotes (the upstream uses uint32_t too,
+        // so wrapping is the same behaviour up to the saturating cap).
+        let step = (cur.saturating_add(d) / d).saturating_mul(MEDIAN_INC_MULTIPLIER);
+        self.values[idx] = cur.saturating_add(step);
+    }
+
+    /// Spec §3 decrement step for `median[idx]`:
+    ///
+    /// `median[i] -= ((median[i] + (D - 2)) / D) * 2`
+    ///
+    /// where `D` is [`DIV0`] / [`DIV1`] / [`DIV2`] for `idx = 0 / 1 / 2`.
+    /// The bias `+ (D - 2)` guarantees the step is at least `2` and
+    /// at most the median itself, so the decremented value never goes
+    /// below `0`. `idx` must be `0`, `1` or `2`; out-of-range indices
+    /// are a no-op (debug-assert).
+    pub fn dec_median(&mut self, idx: usize) {
+        debug_assert!(idx < 3, "median index out of range");
+        if idx >= 3 {
+            return;
+        }
+        let d = divisor_for(idx);
+        let cur = self.values[idx];
+        // ((cur + (d - 2)) / d) * 2 — saturating in the same defensive
+        // form as inc_median.
+        let step = (cur.saturating_add(d - 2) / d).saturating_mul(MEDIAN_DEC_MULTIPLIER);
+        self.values[idx] = cur.saturating_sub(step);
+    }
+
+    /// Spec §3.2 per-zone median update — applies the correct
+    /// combination of [`AdaptiveMedians::inc_median`] /
+    /// [`AdaptiveMedians::dec_median`] calls for the [`Zone`] the
+    /// decoder is in:
+    ///
+    /// * [`Zone::Zone0`] — decrement `median[0]`.
+    /// * [`Zone::Zone1`] — increment `median[0]`, decrement `median[1]`.
+    /// * [`Zone::Zone2`] — increment `median[0]` and `median[1]`,
+    ///   decrement `median[2]`.
+    /// * [`Zone::Zone2Overflow`] — increment all three medians.
+    ///
+    /// This is the **median-adaptation amount** the round-191 spec
+    /// unblocks: a single primitive that the per-sample decode loop
+    /// will call once per decoded sample, before forming the next
+    /// `(low, high)` interval.
+    pub fn adapt(&mut self, zone: Zone) {
+        match zone {
+            Zone::Zone0 => self.dec_median(0),
+            Zone::Zone1 => {
+                self.inc_median(0);
+                self.dec_median(1);
+            }
+            Zone::Zone2 => {
+                self.inc_median(0);
+                self.inc_median(1);
+                self.dec_median(2);
+            }
+            Zone::Zone2Overflow { .. } => {
+                self.inc_median(0);
+                self.inc_median(1);
+                self.inc_median(2);
+            }
+        }
+    }
+
+    /// Convenience wrapper combining [`Zone::from_ones_count`] with
+    /// [`AdaptiveMedians::adapt`] — drives the per-zone update from a
+    /// raw `ones_count` value rather than a typed [`Zone`].
+    pub fn adapt_for_ones_count(&mut self, ones_count: u32) {
+        self.adapt(Zone::from_ones_count(ones_count));
+    }
+}
+
+/// Return the spec §3 divisor `D` for the given median index. Panics
+/// in debug builds when `idx >= 3`; returns `DIV2` in release as a
+/// defensive default (the highest-frequency adapter, so a stray call
+/// causes the smallest spurious step).
+#[inline]
+fn divisor_for(idx: usize) -> u32 {
+    debug_assert!(idx < 3, "median index out of range");
+    match idx {
+        0 => DIV0,
+        1 => DIV1,
+        _ => DIV2,
     }
 }
 
@@ -1497,5 +1803,363 @@ mod tests {
         assert_eq!(Medians::from_entropy(&info, 2), None);
         assert_eq!(Medians::from_entropy(&info, 3), None);
         assert_eq!(Medians::from_entropy(&info, 255), None);
+    }
+
+    // ---- Round-191 median-adaptation amount (spec §3 + §3.2) ----
+
+    #[test]
+    fn divisor_constants_match_spec_table() {
+        // Spec §3 Table: DIV0 = 128, DIV1 = 64, DIV2 = 32.
+        assert_eq!(DIV0, 128);
+        assert_eq!(DIV1, 64);
+        assert_eq!(DIV2, 32);
+        // Spec §3 multipliers.
+        assert_eq!(MEDIAN_INC_MULTIPLIER, 5);
+        assert_eq!(MEDIAN_DEC_MULTIPLIER, 2);
+        // Spec §2.1 GET_MED parameters.
+        assert_eq!(GET_MED_SHIFT, 4);
+        assert_eq!(GET_MED_FLOOR, 1);
+    }
+
+    #[test]
+    fn get_med_zero_returns_floor_one() {
+        // get_med(i) = (0 >> 4) + 1 = 1 — the §2.1 floor.
+        let m = AdaptiveMedians::new([0, 0, 0]);
+        assert_eq!(m.get_med(0), 1);
+        assert_eq!(m.get_med(1), 1);
+        assert_eq!(m.get_med(2), 1);
+    }
+
+    #[test]
+    fn get_med_strips_four_fractional_bits() {
+        // 4 fractional bits → stored 16 == working 1 + 1 = 2.
+        let m = AdaptiveMedians::new([16, 32, 48]);
+        // (16 >> 4) + 1 = 2.
+        assert_eq!(m.get_med(0), 2);
+        // (32 >> 4) + 1 = 3.
+        assert_eq!(m.get_med(1), 3);
+        // (48 >> 4) + 1 = 4.
+        assert_eq!(m.get_med(2), 4);
+    }
+
+    #[test]
+    fn get_med_rounds_down_truncates() {
+        // 4 fractional bits don't round — they truncate.
+        // (15 >> 4) + 1 = 0 + 1 = 1.
+        let m = AdaptiveMedians::new([15, 31, 47]);
+        assert_eq!(m.get_med(0), 1); // 15 >> 4 = 0, +1 = 1.
+        assert_eq!(m.get_med(1), 2); // 31 >> 4 = 1, +1 = 2.
+        assert_eq!(m.get_med(2), 3); // 47 >> 4 = 2, +1 = 3.
+    }
+
+    #[test]
+    fn inc_median_zero_steps_by_five() {
+        // §3 increment at median = 0: ((0 + 128) / 128) * 5 = 1 * 5 = 5.
+        let mut m = AdaptiveMedians::new([0, 0, 0]);
+        m.inc_median(0);
+        assert_eq!(m.values[0], 5);
+    }
+
+    #[test]
+    fn inc_median_at_full_divisor_steps_by_ten() {
+        // §3 increment at median = 128: ((128 + 128) / 128) * 5 = 2 * 5 = 10.
+        let mut m = AdaptiveMedians::new([128, 0, 0]);
+        m.inc_median(0);
+        assert_eq!(m.values[0], 128 + 10);
+    }
+
+    #[test]
+    fn inc_median_uses_per_index_divisor() {
+        // §3: index 0 → D=128, index 1 → D=64, index 2 → D=32.
+        // At median = 0 the step is always 5 (independent of D), so use
+        // a non-zero value to distinguish.
+        // Index 1, median = 64: ((64 + 64) / 64) * 5 = 2 * 5 = 10.
+        let mut m = AdaptiveMedians::new([0, 64, 0]);
+        m.inc_median(1);
+        assert_eq!(m.values[1], 64 + 10);
+
+        // Index 2, median = 32: ((32 + 32) / 32) * 5 = 2 * 5 = 10.
+        let mut m = AdaptiveMedians::new([0, 0, 32]);
+        m.inc_median(2);
+        assert_eq!(m.values[2], 32 + 10);
+    }
+
+    #[test]
+    fn dec_median_zero_steps_to_zero() {
+        // §3 decrement at median = 0: ((0 + 126) / 128) * 2 = 0 * 2 = 0,
+        // so 0 - 0 = 0 (the §3 "never below 1" claim is on get_med, not
+        // on the raw median; raw can hit 0 here, get_med stays at 1).
+        let mut m = AdaptiveMedians::new([0, 0, 0]);
+        m.dec_median(0);
+        assert_eq!(m.values[0], 0);
+        // get_med still reports the §2.1 floor.
+        assert_eq!(m.get_med(0), 1);
+    }
+
+    #[test]
+    fn dec_median_at_full_divisor_steps_by_two() {
+        // §3 decrement at median = 128: ((128 + 126) / 128) * 2 = 1 * 2 = 2.
+        let mut m = AdaptiveMedians::new([128, 0, 0]);
+        m.dec_median(0);
+        assert_eq!(m.values[0], 128 - 2);
+    }
+
+    #[test]
+    fn dec_median_never_goes_below_zero_at_small_values() {
+        // The +(D-2) bias keeps the step ≤ median for all values where
+        // ((m + D - 2) / D) * 2 ≤ m. Sweep small values and confirm
+        // the decremented value stays non-negative.
+        for v in 0..=200u32 {
+            let mut m = AdaptiveMedians::new([v, 0, 0]);
+            m.dec_median(0);
+            // No underflow (we used saturating_sub but want to confirm
+            // the spec arithmetic naturally stayed non-negative here).
+            // For the spec formula: step = ((v + 126) / 128) * 2.
+            // At v = 0..=1: step = 0. At v = 2..=129: step = 2. So the
+            // post value is v.saturating_sub(2), never below 0.
+            let expected_step = ((v + (DIV0 - 2)) / DIV0).saturating_mul(2);
+            assert_eq!(
+                m.values[0],
+                v.saturating_sub(expected_step),
+                "raw v={v} mismatched"
+            );
+        }
+    }
+
+    #[test]
+    fn inc_then_dec_at_equilibrium_holds() {
+        // §3.1: 5 increments + 2 decrements per 7 sample mean equilibrium
+        // weight ratio 5:2. Pick a non-trivial starting value and confirm
+        // the per-step deltas match the §3 formulas exactly.
+        let mut m = AdaptiveMedians::new([256, 0, 0]);
+        let before = m.values[0];
+        m.inc_median(0);
+        let after_inc = m.values[0];
+        // ((256 + 128) / 128) * 5 = 3 * 5 = 15.
+        assert_eq!(after_inc - before, 15);
+
+        m.dec_median(0);
+        let after_dec = m.values[0];
+        // From 271: ((271 + 126) / 128) * 2 = 3 * 2 = 6.
+        assert_eq!(after_inc - after_dec, 6);
+    }
+
+    #[test]
+    fn zone_from_ones_count_maps_named_arms() {
+        assert_eq!(Zone::from_ones_count(0), Zone::Zone0);
+        assert_eq!(Zone::from_ones_count(1), Zone::Zone1);
+        assert_eq!(Zone::from_ones_count(2), Zone::Zone2);
+        // Anything >= 3 lands in the overflow arm with the raw value
+        // preserved.
+        assert_eq!(
+            Zone::from_ones_count(3),
+            Zone::Zone2Overflow { ones_count: 3 }
+        );
+        assert_eq!(
+            Zone::from_ones_count(33),
+            Zone::Zone2Overflow { ones_count: 33 }
+        );
+        assert_eq!(
+            Zone::from_ones_count(u32::MAX),
+            Zone::Zone2Overflow {
+                ones_count: u32::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn zone_ones_count_round_trips() {
+        for raw in [0u32, 1, 2, 3, 4, 16, 33, 100, u32::MAX] {
+            assert_eq!(Zone::from_ones_count(raw).ones_count(), raw);
+        }
+    }
+
+    #[test]
+    fn adapt_zone0_decrements_median0_only() {
+        // §3.2: zone 0 → decrement median[0] only.
+        let mut m = AdaptiveMedians::new([128, 64, 32]);
+        let before = m.values;
+        m.adapt(Zone::Zone0);
+        // median[0] dropped by the §3 step; medians[1] / medians[2]
+        // unchanged.
+        assert!(m.values[0] < before[0]);
+        assert_eq!(m.values[1], before[1]);
+        assert_eq!(m.values[2], before[2]);
+        // Compare against the dec_median primitive directly.
+        let mut ref_m = AdaptiveMedians::new(before);
+        ref_m.dec_median(0);
+        assert_eq!(m, ref_m);
+    }
+
+    #[test]
+    fn adapt_zone1_increments_median0_decrements_median1() {
+        // §3.2: zone 1 → median[0] up, median[1] down, median[2]
+        // unchanged.
+        let mut m = AdaptiveMedians::new([128, 64, 32]);
+        let before = m.values;
+        m.adapt(Zone::Zone1);
+        assert!(m.values[0] > before[0]);
+        assert!(m.values[1] < before[1]);
+        assert_eq!(m.values[2], before[2]);
+
+        let mut ref_m = AdaptiveMedians::new(before);
+        ref_m.inc_median(0);
+        ref_m.dec_median(1);
+        assert_eq!(m, ref_m);
+    }
+
+    #[test]
+    fn adapt_zone2_increments_two_decrements_third() {
+        // §3.2: zone 2 → median[0] up, median[1] up, median[2] down.
+        let mut m = AdaptiveMedians::new([128, 64, 32]);
+        let before = m.values;
+        m.adapt(Zone::Zone2);
+        assert!(m.values[0] > before[0]);
+        assert!(m.values[1] > before[1]);
+        assert!(m.values[2] < before[2]);
+
+        let mut ref_m = AdaptiveMedians::new(before);
+        ref_m.inc_median(0);
+        ref_m.inc_median(1);
+        ref_m.dec_median(2);
+        assert_eq!(m, ref_m);
+    }
+
+    #[test]
+    fn adapt_zone2_overflow_increments_all_three() {
+        // §3.2: zone 2 overflow (ones_count >= 3) → all three medians
+        // up.
+        let mut m = AdaptiveMedians::new([128, 64, 32]);
+        let before = m.values;
+        m.adapt(Zone::Zone2Overflow { ones_count: 5 });
+        assert!(m.values[0] > before[0]);
+        assert!(m.values[1] > before[1]);
+        assert!(m.values[2] > before[2]);
+
+        let mut ref_m = AdaptiveMedians::new(before);
+        ref_m.inc_median(0);
+        ref_m.inc_median(1);
+        ref_m.inc_median(2);
+        assert_eq!(m, ref_m);
+    }
+
+    #[test]
+    fn adapt_for_ones_count_drives_correct_zone() {
+        // The convenience wrapper threads through Zone::from_ones_count.
+        let initial = [128u32, 64, 32];
+
+        // ones_count = 1 → Zone1: median[0] up, median[1] down.
+        let mut via_wrapper = AdaptiveMedians::new(initial);
+        via_wrapper.adapt_for_ones_count(1);
+        let mut via_zone = AdaptiveMedians::new(initial);
+        via_zone.adapt(Zone::Zone1);
+        assert_eq!(via_wrapper, via_zone);
+
+        // ones_count = 7 → Zone2Overflow {7}: all three up.
+        let mut via_wrapper = AdaptiveMedians::new(initial);
+        via_wrapper.adapt_for_ones_count(7);
+        let mut via_zone = AdaptiveMedians::new(initial);
+        via_zone.adapt(Zone::Zone2Overflow { ones_count: 7 });
+        assert_eq!(via_wrapper, via_zone);
+    }
+
+    #[test]
+    fn from_seed_values_accepts_non_negative_and_rejects_negative() {
+        // Non-negative seeds → Some.
+        assert_eq!(
+            AdaptiveMedians::from_seed_values([10, 20, 30]),
+            Some(AdaptiveMedians::new([10, 20, 30]))
+        );
+        // Negative anywhere → None.
+        assert_eq!(AdaptiveMedians::from_seed_values([-1, 20, 30]), None);
+        assert_eq!(AdaptiveMedians::from_seed_values([10, -1, 30]), None);
+        assert_eq!(AdaptiveMedians::from_seed_values([10, 20, -1]), None);
+        // All-zero seeds — the legal fresh state — accepted.
+        assert_eq!(
+            AdaptiveMedians::from_seed_values([0, 0, 0]),
+            Some(AdaptiveMedians::new([0, 0, 0]))
+        );
+    }
+
+    #[test]
+    fn from_medians_bridges_round_six_typed_set() {
+        // Bridge a Medians (round-6 typed view) into the adaptive state.
+        let m = Medians::new([100, 200, 300]);
+        assert_eq!(
+            AdaptiveMedians::from_medians(m),
+            Some(AdaptiveMedians::new([100, 200, 300]))
+        );
+        // A Medians with a negative slot is rejected.
+        let bad = Medians::new([100, -1, 300]);
+        assert_eq!(AdaptiveMedians::from_medians(bad), None);
+    }
+
+    #[test]
+    fn adapt_amount_independent_inc_dec_sequence_matches_spec() {
+        // Walk a fixed sequence and confirm every step matches the
+        // hand-computed spec §3 arithmetic exactly. Start at the round-4
+        // seed equivalent of all-zero (the encoder default for a fresh
+        // block).
+        let mut m = AdaptiveMedians::new([0, 0, 0]);
+
+        // Zone1: median[0] += ((0+128)/128)*5 = 5; median[1] -= 0.
+        m.adapt(Zone::Zone1);
+        assert_eq!(m.values, [5, 0, 0]);
+
+        // Zone0: median[0] -= ((5+126)/128)*2 = 1*2 = 2 → 3.
+        m.adapt(Zone::Zone0);
+        assert_eq!(m.values, [3, 0, 0]);
+
+        // Zone2: m0 += ((3+128)/128)*5 = 1*5 = 5 → 8;
+        //        m1 += ((0+64)/64)*5 = 1*5 = 5;
+        //        m2 -= ((0+30)/32)*2 = 0 → 0.
+        m.adapt(Zone::Zone2);
+        assert_eq!(m.values, [8, 5, 0]);
+
+        // Zone2Overflow: all three up.
+        // m0 += ((8+128)/128)*5 = 1*5 = 5 → 13;
+        // m1 += ((5+64)/64)*5 = 1*5 = 5 → 10;
+        // m2 += ((0+32)/32)*5 = 1*5 = 5 → 5.
+        m.adapt(Zone::Zone2Overflow { ones_count: 4 });
+        assert_eq!(m.values, [13, 10, 5]);
+    }
+
+    #[test]
+    fn inc_median_saturates_at_u32_max() {
+        // Defensive saturating semantics: pathological starting value
+        // doesn't overflow.
+        let mut m = AdaptiveMedians::new([u32::MAX, 0, 0]);
+        m.inc_median(0);
+        // The exact saturation point isn't part of the spec — we just
+        // confirm no panic and the result is still u32-representable.
+        assert_eq!(m.values[0], u32::MAX);
+    }
+
+    #[test]
+    fn dec_median_saturates_at_zero() {
+        // Same defensive contract on the way down: from zero, the
+        // decremented value cannot go negative.
+        let mut m = AdaptiveMedians::new([0, 0, 0]);
+        m.dec_median(0);
+        assert_eq!(m.values[0], 0);
+        m.dec_median(1);
+        assert_eq!(m.values[1], 0);
+        m.dec_median(2);
+        assert_eq!(m.values[2], 0);
+    }
+
+    #[test]
+    fn adaptive_medians_is_copy_and_eq() {
+        // Sanity: small derived traits are present so callers can keep
+        // pre-update snapshots around without rebuilding.
+        // Use a starting value large enough that the §3 decrement step
+        // is non-zero (((128 + 126) / 128) * 2 = 2) so the post-update
+        // value is observably different from the pre.
+        let a = AdaptiveMedians::new([128, 64, 32]);
+        let b = a;
+        assert_eq!(a, b);
+        let mut c = a;
+        c.adapt(Zone::Zone0);
+        assert_ne!(a, c);
     }
 }

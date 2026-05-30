@@ -291,6 +291,7 @@ pub use crate::metadata::{
 };
 pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
 pub use crate::samples::{
-    decode_run_length, decode_sample, decode_sample_value, golomb_interval, BitReader,
-    GolombInterval, Medians, RunState, UNARY_ESCAPE,
+    decode_run_length, decode_sample, decode_sample_value, golomb_interval, AdaptiveMedians,
+    BitReader, GolombInterval, Medians, RunState, Zone, DIV0, DIV1, DIV2, GET_MED_FLOOR,
+    GET_MED_SHIFT, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, UNARY_ESCAPE,
 };

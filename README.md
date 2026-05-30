@@ -5,6 +5,19 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 14 — adds the WavPack median-adaptation amount (spec §3 + §3.2)
+as a self-contained `AdaptiveMedians` primitive (running `u32` state
+with the 4-fractional-bit GET_MED encoding; `inc_median` / `dec_median`
+per the spec integer formulas with `DIV0` / `DIV1` / `DIV2` = `128` /
+`64` / `32`; `Zone` enum naming the four §3.2 arms with raw
+`ones_count` carried through Zone2Overflow; `adapt` /
+`adapt_for_ones_count` applying the correct per-zone combination of
+inc / dec calls). The newly-unblocked
+`docs/audio/wavpack/spec/wavpack-entropy-decode.md` closes the
+median-adaptation-amount docs gap that previously pinned `decode_sample`
+to a fixed median set; the round-7 single-call decoder is preserved
+unchanged, with the per-sample composition gated on a follow-up round.**
+
 **Round 13 — block-header parser + metadata sub-block walker +
 decorrelation sub-block expanders + entropy-info expander +
 sample-coding bit reader, run-length decoder, Golomb sample-value
@@ -300,18 +313,47 @@ Public API:
   semantics of `get_bits`). Useful for stepping past a known-length
   opaque field (a padding region, an already-validated value) without
   holding the assembled value.
+- [`AdaptiveMedians`] (round 14, spec §3 + §3.2) — a three-`u32`
+  running median state with the spec §2.1 4-fractional-bit encoding.
+  Methods:
+  - [`AdaptiveMedians::new`] / [`AdaptiveMedians::from_seed_values`] /
+    [`AdaptiveMedians::from_medians`] — construct from raw `u32`
+    values, the round-4 expander seed values (validated non-negative)
+    or a round-6 [`Medians`] (also validated non-negative).
+  - [`AdaptiveMedians::get_med`] — the spec §2.1 working median
+    `(median[i] >> 4) + 1` (the value the spec §4.2 interval ladder
+    consumes).
+  - [`AdaptiveMedians::inc_median`] / [`AdaptiveMedians::dec_median`]
+    — single-index increment / decrement per the spec §3 integer
+    formulas (`((median[i] + D) / D) * 5` up and
+    `((median[i] + (D - 2)) / D) * 2` down with `D` =
+    [`DIV0`] / [`DIV1`] / [`DIV2`]). Saturating semantics defend
+    against pathological values.
+  - [`AdaptiveMedians::adapt`] / [`AdaptiveMedians::adapt_for_ones_count`]
+    — the spec §3.2 per-zone update — applies the correct combination
+    of `inc_median` / `dec_median` for the [`Zone`] the decoder is in:
+    zone 0 → dec `median[0]`; zone 1 → inc `median[0]`, dec
+    `median[1]`; zone 2 → inc `median[0]` + `median[1]`, dec
+    `median[2]`; zone 2 overflow → all three inc.
+- [`Zone`] / [`Zone::from_ones_count`] / [`Zone::ones_count`] — typed
+  view of the four spec §3.2 arms driven from a raw `ones_count`
+  value. Zone 2 overflow carries the raw value through so the
+  `(ones_count - 2) * get_med(2)` shift in the §4.2 `low` formula is
+  still recoverable.
+- Public constants: [`DIV0`] / [`DIV1`] / [`DIV2`] (the §3 per-median
+  divisors `128` / `64` / `32`), [`MEDIAN_INC_MULTIPLIER`] (`5`),
+  [`MEDIAN_DEC_MULTIPLIER`] (`2`), [`GET_MED_SHIFT`] (`4`),
+  [`GET_MED_FLOOR`] (`1`).
 
 ### Out of scope (later rounds)
 
-- The median **adaptation amount** that turns `decode_sample` /
-  `decode_sample_value` into a stateful loop over a whole `0x0A` payload
-  (feeding each decoded `n` back into a mutating median set). **Blocked
-  on a docs gap:** the wiki names the median update direction
-  ("increase" / "decrease") but not the amount (it cites WavPack's
-  `format.txt` for the fraction-of-self step without reproducing it),
-  so the per-sample *sequence* cannot be made bit-exact from this page
-  alone. Round 7 decodes a single sample (run-length + value) against a
-  fixed, caller-supplied median set instead.
+- Wiring [`AdaptiveMedians::adapt`] into `decode_sample` /
+  `decode_sample_value` so the per-sample call mutates the running
+  medians in place. Round 14 lands the spec §3 + §3.2 adaptation
+  amount as a self-contained primitive (`AdaptiveMedians`), unblocking
+  the previous docs gap that pinned the wiki "increase" / "decrease"
+  steps as a numeric question. Composition with the round-7 single-call
+  decoder + a real `0x0A` payload-loop driver is the next round's work.
 - The degenerate `add == 0` Golomb interval (selected median `1`),
   where the wiki's `k = log2(0)` and `getbits(-1)` are undefined.
   `decode_sample_value` rejects it via `Error::GolombDegenerateInterval`
