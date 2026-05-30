@@ -6,6 +6,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 15 — stateful per-sample `0x0A` decode loop wiring the newly
+  staged `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3 + §3.2
+  + §4.2 into the end-to-end decode path. New `decode_sample_stateful`
+  primitive runs the full spec §4.2 sequence per sample: optional
+  spec §4.2 step 1 zero-run fast path (gated on `get_med(0) <= 1` and
+  no holding bits, owing `run_length - 1` zero samples across
+  subsequent calls via a new `DecodeState::zero_run_pending` field);
+  spec §4.2 steps 2 + 3 unary prefix with the `LIMIT_ONES = 16`
+  escape and the `cbits == 33` EOF marker (new `Error::EndOfStream`);
+  spec §4.2 step 4 holding-bit fold (re-using the existing wiki-
+  compressed `RunState`); spec §4.2 step 5 `(low, high)` interval
+  with 31-bit mask and `high >= low` clamp; spec §3.2 per-zone
+  `AdaptiveMedians::adapt(Zone::from_ones_count(ones_count))` BEFORE
+  the mantissa read; spec §4.2 step 6 first paragraph truncated-binary
+  mantissa decode (`maxcode = high - low`, `bitcount` = bit-length of
+  `maxcode`, `extras = (1 << bitcount) - maxcode - 1`, short
+  `bitcount - 1`-bit form vs long `bitcount`-bit phase-in); spec §4.2
+  step 7 sign bit returning `~mid` or `mid`. New
+  `decode_packed_samples_mono(payload, &mut medians, count)` wraps the
+  per-sample primitive into an end-to-end mono single-block loop and
+  is the first public API on the crate that produces a `Vec<i32>` of
+  PCM samples from a `0x0A` payload. New constants `ESCAPE_EOF_CBITS
+  = 33`, `RUN_ESCAPE_CAP = 33` and `INTERVAL_MASK_31 = 0x7fff_ffff`
+  spell out the spec §4.2 step 3 EOF marker, the spec §4.2 step 1
+  zero-run unary cap and the spec §4.2 step 5 interval mask.
+- Round 15 — 18 new tests covering the stateful decoder via a
+  spec-derived inverse encoder (`encode_one_sample`,
+  `emit_truncated_binary`, `pick_raw_unary`, `pick_zone_for_magnitude`
+  test helpers) for bit-exact closure across zones 0 / 1 / 2 /
+  overflow, negative-sign reconstruction, a hand-traced 2-sample
+  fixture pinning the spec §4.2 step 1-7 sequence by literal bit
+  string, the zero-run fast path engaging and resting eligibility,
+  the `LIMIT_ONES`+`cbits=33` EOF escape, a 64-sample adaptive-median
+  drift sequence using a deterministic value-from-current-medians
+  simulator, the `decode_packed_samples_mono` end-to-end loop, the
+  `read_truncated_binary` primitive round-trip across every code in
+  a `maxcode = 16` interval, and the `form_interval` spec §4.2 step 5
+  ladder for the four named zones.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-wavpack/releases/tag/v0.0.2) - 2026-05-30
 
 ### Other

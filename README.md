@@ -5,6 +5,25 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 15 — stateful per-sample `0x0A` decode loop wiring the staged
+`docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3 + §3.2 + §4.2
+end to end. The new `decode_sample_stateful` primitive walks the
+spec §4.2 sequence per call (optional §4.2 step 1 zero-run fast path
+gated on `get_med(0) <= 1` and no holding bits, carrying
+`zero_run_pending` across calls; §4.2 steps 2 + 3 unary prefix with
+the `LIMIT_ONES = 16` escape and the `cbits == 33` EOF marker;
+§4.2 step 4 holding-bit fold via the existing `RunState`; §4.2 step
+5 31-bit-masked `(low, high)` interval; §3.2 per-zone median
+adaptation BEFORE the mantissa read; §4.2 step 6 first paragraph
+truncated-binary mantissa; §4.2 step 7 sign bit). The new
+`decode_packed_samples_mono(payload, &mut medians, count)` wraps it
+into the first public end-to-end mono single-block PCM decode on the
+crate, returning `Vec<i32>`. 18 new tests prove bit-exact round-trip
+via a spec-derived inverse encoder helper across zones 0 / 1 / 2 /
+overflow, negative-sign reconstruction, a hand-traced 2-sample
+fixture, the zero-run fast path engaging when eligible, and the
+EOF escape. 239 tests pass (up from 221).**
+
 **Round 14 — adds the WavPack median-adaptation amount (spec §3 + §3.2)
 as a self-contained `AdaptiveMedians` primitive (running `u32` state
 with the 4-fractional-bit GET_MED encoding; `inc_median` / `dec_median`
@@ -379,12 +398,13 @@ Public API:
 
 ## Clean-room provenance
 
-Rounds 1 through 13 read **only** `docs/audio/wavpack/wiki/WavPack.wiki`
-(the local multimedia.cx snapshot under the docs repo) and
-`oxideav-core`'s public API. No external library source
-(`libwavpack`, `wavpack-rs`, FFmpeg's `wavpack.c` / `wavpackenc.c`),
-no archived `old` branch of this crate, and no online resources
-were consulted at any phase.
+Every round through round 15 has read **only** the staged WavPack
+documentation under `docs/audio/wavpack/` (the local
+`wiki/WavPack.wiki` snapshot and, from round 15 onward, the
+`spec/wavpack-entropy-decode.md` clean-room trace) and
+`oxideav-core`'s public API. No external library source, no archived
+prior history of this crate, and no online resources were consulted
+at any phase.
 
 The 197-test unit suite synthesises minimal valid headers, sub-blocks
 and bitstreams and poisons each field in turn to exercise the parser's

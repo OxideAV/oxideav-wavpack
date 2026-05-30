@@ -106,6 +106,12 @@ pub enum Error {
         /// (header bytes + however many payload bytes were present).
         available: usize,
     },
+    /// The `0x0A` per-sample decode loop reached the wire EOF escape
+    /// (`spec/wavpack-entropy-decode.md` §4.2 step 3, "if `cbits == 33`
+    /// the word is EOF") inside the unary-prefix escape branch. The
+    /// caller stops the per-sample loop on this variant: it is a normal
+    /// end-of-stream signal, not a malformed-payload signal.
+    EndOfStream,
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -159,6 +165,9 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-wavpack: parse_block needs {needed} bytes (8 + ck_size {ck_size}) but the buffer only carries {available}",
                 needed = 8u64 + *ck_size as u64,
+            ),
+            Error::EndOfStream => f.write_str(
+                "oxideav-wavpack: 0x0A per-sample loop reached the wire EOF escape (cbits == 33 inside the unary-prefix escape branch)",
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

@@ -1,5 +1,26 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 15 — stateful per-sample `0x0A` decode loop wiring the
+//! staged `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3 +
+//! §3.2 + §4.2 end to end via [`decode_sample_stateful`] (the
+//! per-sample primitive) and [`decode_packed_samples_mono`] (the
+//! end-to-end loop returning a `Vec<i32>` of mono PCM samples). The
+//! per-sample primitive runs the full spec §4.2 sequence: optional
+//! §4.2 step 1 zero-run fast path (gated on `get_med(0) <= 1` and no
+//! holding bits, carrying `zero_run_pending` across calls in
+//! [`DecodeState`]); §4.2 steps 2 + 3 unary prefix with the
+//! `LIMIT_ONES = 16` escape and the `cbits == 33` EOF marker (new
+//! [`Error::EndOfStream`]); §4.2 step 4 holding-bit fold (via the
+//! wiki-compressed [`RunState`] embedded in [`DecodeState::run`]);
+//! §4.2 step 5 31-bit-masked `(low, high)` interval; §3.2 per-zone
+//! median adaptation BEFORE the mantissa read; §4.2 step 6 first
+//! paragraph truncated-binary mantissa; §4.2 step 7 sign bit. New
+//! constants [`ESCAPE_EOF_CBITS`] / [`RUN_ESCAPE_CAP`] /
+//! [`INTERVAL_MASK_31`] name the spec literals. Hybrid mode
+//! (`error_limit != 0`, spec §4.2 step 6 second paragraph) and
+//! multi-channel decoding stay out of scope. 18 new tests prove
+//! bit-exact round-trip via a spec-derived inverse encoder helper.**
+//!
 //! **Round 13 — block-header parser + metadata sub-block walker +
 //! decorrelation sub-block expanders + entropy-info expander +
 //! sample-coding bit reader, run-length decoder, Golomb sample-value
@@ -247,12 +268,13 @@
 //!
 //! ## Clean-room provenance
 //!
-//! All work in this crate has been implemented strictly against
-//! `docs/audio/wavpack/wiki/WavPack.wiki`. No external library source
-//! (libwavpack, wavpack-rs, FFmpeg's `wavpack.c` /
-//! `wavpackenc.c`), no archived `old` branch of this crate, and no
-//! online resource outside the local docs snapshot was read at any
-//! phase.
+//! All work in this crate has been implemented strictly against the
+//! staged WavPack documentation under `docs/audio/wavpack/` (the
+//! `wiki/WavPack.wiki` snapshot in tree and, from round 15 onward,
+//! the `spec/wavpack-entropy-decode.md` clean-room trace). No
+//! external library source, no archived prior history of this crate,
+//! and no online resource outside the staged docs were consulted at
+//! any phase.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -291,7 +313,8 @@ pub use crate::metadata::{
 };
 pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
 pub use crate::samples::{
-    decode_run_length, decode_sample, decode_sample_value, golomb_interval, AdaptiveMedians,
-    BitReader, GolombInterval, Medians, RunState, Zone, DIV0, DIV1, DIV2, GET_MED_FLOOR,
-    GET_MED_SHIFT, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, UNARY_ESCAPE,
+    decode_packed_samples_mono, decode_run_length, decode_sample, decode_sample_stateful,
+    decode_sample_value, golomb_interval, AdaptiveMedians, BitReader, DecodeState, GolombInterval,
+    Medians, RunState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT,
+    INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
 };
