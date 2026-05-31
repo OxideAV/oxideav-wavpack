@@ -1318,6 +1318,229 @@ pub fn decode_packed_samples_mono(
     Ok(out)
 }
 
+/// Stereo (two-channel) decode state — one [`RunState`] per channel plus
+/// the stream-level zero-run debt and bookkeeping.
+///
+/// Per the spec
+/// (`docs/audio/wavpack/spec/wavpack-entropy-decode.md` §2) each channel
+/// keeps its own three medians AND its own holding-bit (`last_one` /
+/// `last_zero`) state. Sample index parity selects which channel is
+/// being decoded: even indices (`0`, `2`, `4`, …) are the **left**
+/// channel; odd indices (`1`, `3`, `5`, …) are the **right** channel.
+///
+/// The §4.2 step 1 zero-run fast path is **stream-level**: its
+/// eligibility gate is "**both** channels' `median[0]` are ≤ 1 and no
+/// holding state is pending" (so it inspects both channels), the
+/// resulting non-zero run "resets **both channels'** medians to zero",
+/// and the run length itself counts samples emitted at the stream level
+/// (across both channels in interleaved order). Accordingly the
+/// `zero_run_pending` counter and the `ever_took_zero_run` flag live
+/// here at stream level, not inside the per-channel [`RunState`].
+///
+/// The `next_channel` field is the parity bookkeeping: it starts at
+/// `0` (left) and toggles after every successful sample emit. It is
+/// exposed so callers asserting partial decode progress can read the
+/// current cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StereoDecodeState {
+    /// Per-channel holding state for the **left** channel (even sample
+    /// indices). Matches spec §4.2 step 4 semantics applied to the
+    /// left-channel median set.
+    pub left_run: RunState,
+    /// Per-channel holding state for the **right** channel (odd sample
+    /// indices). Matches spec §4.2 step 4 semantics applied to the
+    /// right-channel median set.
+    pub right_run: RunState,
+    /// Remaining stream-level samples owed by an in-flight zero-run from
+    /// spec §4.2 step 1 — when non-zero, the next stereo decode call
+    /// short-circuits to a `0` sample (no bits read), toggles
+    /// `next_channel`, and decrements this counter.
+    pub zero_run_pending: u32,
+    /// `true` once the spec §4.2 step 1 fast path took a non-zero run
+    /// length and zeroed **both** channels' medians. Tests assert this
+    /// to confirm the path actually ran rather than the loop bypassing
+    /// it.
+    pub ever_took_zero_run: bool,
+    /// Channel index of the **next** sample to emit (`0` = left, `1` =
+    /// right). Starts at `0`; toggles on every successful emit.
+    pub next_channel: u8,
+}
+
+impl StereoDecodeState {
+    /// Fresh stereo decode state for the first sample of a block: both
+    /// channels' holding bits clear, no zero-run debt, no
+    /// zero-run-fast-path-seen flag, next sample = left.
+    pub const fn new() -> Self {
+        Self {
+            left_run: RunState::new(),
+            right_run: RunState::new(),
+            zero_run_pending: 0,
+            ever_took_zero_run: false,
+            next_channel: 0,
+        }
+    }
+}
+
+/// Spec §4.2 step 1 attempt for the stereo path: gate on **both**
+/// channels' `median[0] <= 1` AND **both** channels' holding state
+/// empty; on a successful non-zero run reset **both** channels' medians
+/// to zero (per the spec §4.2 step 1 "resets both channels' medians to
+/// zero" sentence).
+///
+/// Stream-level: the returned sample applies to the current
+/// `state.next_channel` (the caller toggles parity after the emit).
+fn try_zero_run_path_stereo(
+    reader: &mut BitReader<'_>,
+    medians: &mut [AdaptiveMedians; 2],
+    state: &mut StereoDecodeState,
+) -> Result<Option<i32>> {
+    // Spec §4.2 step 1 eligibility for stereo: BOTH channels' median[0]
+    // must satisfy <= 1, AND neither channel's holding state may be
+    // pending.
+    if medians[0].get_med(0) > 1 || medians[1].get_med(0) > 1 {
+        return Ok(None);
+    }
+    if state.left_run.last_one
+        || state.left_run.last_zero
+        || state.right_run.last_one
+        || state.right_run.last_zero
+    {
+        return Ok(None);
+    }
+
+    // Read the zero-run unary, capped at RUN_ESCAPE_CAP per spec.
+    let count = reader.get_unary()?;
+    if count > RUN_ESCAPE_CAP {
+        return Err(Error::Truncated);
+    }
+    let run_length = if count < 2 {
+        count
+    } else {
+        let mantissa = reader.get_bits(count - 1)?;
+        (1u32 << (count - 1)) | mantissa
+    };
+
+    if run_length > 0 {
+        // Non-zero run: spec §4.2 step 1 "resets both channels' medians
+        // to zero". This call emits the first zero sample on the
+        // current channel; run_length - 1 stream-level zero samples
+        // remain to drain across alternating channels.
+        medians[0].values = [0, 0, 0];
+        medians[1].values = [0, 0, 0];
+        state.ever_took_zero_run = true;
+        state.zero_run_pending = run_length - 1;
+    }
+    // Whether the run was zero or non-zero, the call's emitted sample is
+    // `0` per the spec §4.2 step 1 prose (the `count == 0` case is the
+    // encoder's "no zero run" signal but the path still emits one zero
+    // sample at the stream cursor).
+    Ok(Some(0))
+}
+
+/// Decode one stereo sample using the full per-sample spec §4.2 path,
+/// dispatched to the channel selected by `state.next_channel`.
+///
+/// The sample-index → channel-index parity rule comes from spec §2
+/// ("For stereo, channels alternate (sample index parity selects the
+/// channel's median set)"). The zero-run fast path is stream-level and
+/// affects both channels' medians per spec §4.2 step 1; the unary
+/// prefix, holding-bit fold, interval, adaptation, mantissa and sign
+/// are **per-channel** — they read `medians[ch]` and mutate
+/// `medians[ch]` + the matching [`RunState`] only.
+///
+/// After a successful emit `state.next_channel` toggles to the other
+/// channel. On error, `state.next_channel` is left unchanged so a
+/// retry sees the same cursor.
+pub fn decode_sample_stateful_stereo(
+    reader: &mut BitReader<'_>,
+    medians: &mut [AdaptiveMedians; 2],
+    state: &mut StereoDecodeState,
+) -> Result<i32> {
+    // 1. Zero-run debt (carry-over from a previous zero-run fast-path
+    // call). Emit a single `0` sample for the current channel; the
+    // medians stay at all-zero (the spec §4.2 step 1 reset persists
+    // until the §3 adaptation walks them back up).
+    if state.zero_run_pending > 0 {
+        state.zero_run_pending -= 1;
+        state.next_channel ^= 1;
+        return Ok(0);
+    }
+
+    // 2. Zero-run fast path (spec §4.2 step 1) — gated on BOTH channels.
+    if let Some(zero_sample) = try_zero_run_path_stereo(reader, medians, state)? {
+        state.next_channel ^= 1;
+        return Ok(zero_sample);
+    }
+
+    // 3-4. Per-channel unary prefix + escape + fold. Pick the channel
+    // (and its holding state) BEFORE reading any bits; the
+    // ones_count / interval / adaptation / mantissa / sign sequence
+    // operates on the chosen channel only.
+    let ch = state.next_channel as usize;
+    debug_assert!(ch < 2, "next_channel must be 0 or 1");
+    let ch_state = if ch == 0 {
+        &mut state.left_run
+    } else {
+        &mut state.right_run
+    };
+    let ones_count = read_folded_ones_count(reader, ch_state)?;
+
+    // 5. Form the interval from the per-channel medians.
+    let (low, high) = form_interval(&medians[ch], ones_count);
+
+    // 6. Adapt the per-channel medians (spec §3.2) — BEFORE the mantissa
+    // read, per the spec note "The medians are adapted at this point".
+    medians[ch].adapt(Zone::from_ones_count(ones_count));
+
+    // 7. Mantissa (spec §4.2 step 6 first paragraph).
+    let maxcode = high.wrapping_sub(low);
+    let code = read_truncated_binary(reader, maxcode)?;
+    let magnitude = low.wrapping_add(code);
+
+    // 8. Sign (spec §4.2 step 7).
+    let sign = reader.get_bit()?;
+    let mid = magnitude as i32;
+    let result = if sign == 0 { mid } else { !mid };
+
+    // Toggle channel parity for the next call. Toggle ONLY on a
+    // successful emit so a `?`-bubbled error leaves the cursor
+    // recoverable.
+    state.next_channel ^= 1;
+    Ok(result)
+}
+
+/// Decode `frames` stereo frames from a `0x0A` packed-samples payload,
+/// returning a `Vec<i32>` of `frames * 2` interleaved samples in
+/// (left, right, left, right, …) order.
+///
+/// Composes [`PackedSamples::bit_reader`] with
+/// [`decode_sample_stateful_stereo`] in a fixed loop. Errors propagate
+/// verbatim — see [`decode_packed_samples_mono`] for the error
+/// catalogue, all of which apply identically here.
+///
+/// The medians MUTATE in place across the loop — the caller's
+/// `[left_seed, right_seed]` array is the running state. Pair with
+/// [`AdaptiveMedians::from_seed_values`] on the `0x05` entropy-info
+/// expander's `medians_left` and `medians_right` (the round-4 expander
+/// produces both for a stereo block) to seed.
+pub fn decode_packed_samples_stereo(
+    payload: &crate::PackedSamples<'_>,
+    medians: &mut [AdaptiveMedians; 2],
+    frames: usize,
+) -> Result<Vec<i32>> {
+    let mut reader = payload.bit_reader();
+    let mut state = StereoDecodeState::new();
+    let mut out = Vec::with_capacity(frames * 2);
+    for _ in 0..(frames * 2) {
+        out.push(decode_sample_stateful_stereo(
+            &mut reader,
+            medians,
+            &mut state,
+        )?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3126,5 +3349,394 @@ mod tests {
         let v2 = decode_sample_stateful(&mut reader, &mut medians, &mut state).unwrap();
         assert_eq!(v2, 3, "sample 2 (short-circuited via last_zero)");
         assert_eq!(medians.values[0], 248, "median[0] after sample 2");
+    }
+
+    // ---- Stereo round-trip tests (round 199) ----
+    //
+    // The spec §2 channel-alternation rule maps even sample indices to
+    // the left channel and odd indices to the right channel; the
+    // §4.2 step 1 zero-run fast path inspects + zeroes BOTH channels.
+    // These tests encode interleaved (L,R,L,R,…) frames with a
+    // simulator that walks the spec §3.2 adapt steps per channel and
+    // re-checks bit-for-bit against the new
+    // `decode_sample_stateful_stereo` / `decode_packed_samples_stereo`
+    // surface.
+
+    /// Encode `frames * 2` interleaved samples into a single bitstream
+    /// using the same `encode_one_sample` helper but with per-channel
+    /// median + run-state, the way a real stereo encoder writes the
+    /// `0x0A` payload. Returns the wire bytes plus the per-channel
+    /// post-encode adaptive medians so a test can assert encoder ==
+    /// decoder end state.
+    fn stereo_encode(
+        seeds: [[u32; 3]; 2],
+        interleaved: &[i32],
+    ) -> (Vec<u8>, [AdaptiveMedians; 2], [RunState; 2]) {
+        assert!(
+            interleaved.len() % 2 == 0,
+            "interleaved sample count must be even for stereo",
+        );
+        let mut enc_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut enc_states = [RunState::new(), RunState::new()];
+        let mut w = BitWriter::new();
+        for (i, &v) in interleaved.iter().enumerate() {
+            let ch = i % 2;
+            encode_one_sample(&mut w, &mut enc_medians[ch], &mut enc_states[ch], v, true);
+        }
+        let bytes = w.finish();
+        (bytes, enc_medians, enc_states)
+    }
+
+    /// Round-trip a stereo sample sequence through encode + decode and
+    /// assert every reconstructed sample matches.
+    fn stereo_round_trip(seeds: [[u32; 3]; 2], interleaved: &[i32]) -> usize {
+        let (bytes, enc_medians, _enc_states) = stereo_encode(seeds, interleaved);
+        let mut dec_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut reader = BitReader::new(&bytes);
+        let mut dec_state = StereoDecodeState::new();
+        for (i, &expected) in interleaved.iter().enumerate() {
+            let got = decode_sample_stateful_stereo(&mut reader, &mut dec_medians, &mut dec_state)
+                .unwrap_or_else(|e| panic!("decode stereo sample {i} failed: {e:?}"));
+            assert_eq!(
+                got, expected,
+                "round-trip mismatch at interleaved index {i}: expected {expected}, got {got}",
+            );
+        }
+        assert_eq!(
+            dec_medians, enc_medians,
+            "stereo encoder and decoder finished with different per-channel medians",
+        );
+        interleaved.len()
+    }
+
+    #[test]
+    fn stereo_round_trip_zone1_per_channel() {
+        // Both channels in zone 1 with the same seed (get_med = 513).
+        // The decoder must dispatch to the correct per-channel medians
+        // by sample-index parity AND adapt EACH channel independently.
+        // Use a simulator that picks magnitudes against each channel's
+        // CURRENT medians so the sequence stays in zone 1 throughout
+        // (avoiding the encoder helper's last_zero pre-commit when a
+        // value would land in zone 0).
+        let seeds = [[8192u32, 8192, 8192], [8192u32, 8192, 8192]];
+        let mut sim = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut interleaved = Vec::new();
+        // 8 frames of L,R = 16 samples.
+        for i in 0..16 {
+            let ch = i % 2;
+            // Pick a magnitude squarely in zone 1: at the low boundary
+            // (m0) so we always land in zone 1 regardless of m1 drift.
+            let mag = sim[ch].get_med(0) as i32;
+            sim[ch].adapt(Zone::from_ones_count(1));
+            interleaved.push(mag);
+        }
+        let n = stereo_round_trip(seeds, &interleaved);
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn stereo_round_trip_different_seeds_per_channel() {
+        // Distinct seeds per channel — proves the decoder reads
+        // medians[0] for even indices and medians[1] for odd indices,
+        // and never crosses them. Simulator-driven against each
+        // channel's CURRENT medians to stay in zone 1 across the §3.2
+        // adaptation trajectory.
+        let seeds = [[8192u32, 8192, 8192], [4096u32, 4096, 4096]];
+        let mut sim = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut interleaved = Vec::new();
+        for i in 0..12 {
+            let ch = i % 2;
+            // Pick magnitude at the zone-1 low boundary (= get_med(0)).
+            // For different seeds, the left channel's magnitudes are
+            // ~513-ish while the right channel's are ~257-ish, so a
+            // confusion of channel-state would show up as an
+            // out-of-zone magnitude on the receiving channel.
+            let mag = sim[ch].get_med(0) as i32;
+            sim[ch].adapt(Zone::from_ones_count(1));
+            interleaved.push(mag);
+        }
+        let n = stereo_round_trip(seeds, &interleaved);
+        assert_eq!(n, interleaved.len());
+    }
+
+    #[test]
+    fn stereo_round_trip_mixed_zones_per_channel() {
+        // Per-channel adaptation across mixed zones: each channel
+        // walks its own §3.2 trajectory while the other channel's
+        // state stays untouched between alternating calls.
+        let seeds = [[8192u32, 8192, 8192], [8192u32, 8192, 8192]];
+        // Drive a sequence that exercises zones 1, 2, and 2-overflow
+        // on each channel independently — picking magnitudes against
+        // a per-channel simulator like the mono mixed-zones test.
+        let mut sim = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut interleaved = Vec::new();
+        for i in 0..16 {
+            let ch = i % 2;
+            let m0 = sim[ch].get_med(0) as i32;
+            let m1 = sim[ch].get_med(1) as i32;
+            let m2 = sim[ch].get_med(2) as i32;
+            let mag = match (i / 2) % 3 {
+                0 => m0 + 1,           // zone 1
+                1 => m0 + m1 + 1,      // zone 2
+                _ => m0 + m1 + m2 + 1, // zone 2 overflow
+            };
+            let (ones_count, _) = pick_zone_for_magnitude(&sim[ch], mag as u32);
+            sim[ch].adapt(Zone::from_ones_count(ones_count));
+            interleaved.push(mag);
+        }
+        let n = stereo_round_trip(seeds, &interleaved);
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn stereo_round_trip_negative_values() {
+        // Stereo negatives: the sign bit reconstruction (spec §4.2
+        // step 7) is per-sample, not per-channel; this confirms the
+        // per-channel path still produces correct ~mid values when the
+        // sign bit is set. Simulator-driven so per-channel adaptation
+        // never drives a magnitude into zone 0 (which the encoder
+        // helper's last_zero pre-commit rejects when not chained).
+        //
+        // For a negative signed value v, the decoder reconstructs it
+        // from `!magnitude`, so we have `v = !magnitude` and
+        // `magnitude = !v as u32 = (-v - 1) as u32`. To keep the
+        // ENCODED magnitude in zone 1 we pick the signed value such
+        // that `magnitude = m0 + 1` (safely above the zone-0 / zone-1
+        // boundary at `m0`): signed value = -(m0 + 2).
+        let seeds = [[8192u32, 8192, 8192], [8192u32, 8192, 8192]];
+        let mut sim = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut interleaved = Vec::new();
+        for i in 0..8 {
+            let ch = i % 2;
+            let m0 = sim[ch].get_med(0) as i32;
+            // magnitude = m0 + 1 → zone 1. signed value = !(m0+1) = -(m0+2).
+            let signed_value = -(m0 + 2);
+            sim[ch].adapt(Zone::from_ones_count(1));
+            interleaved.push(signed_value);
+        }
+        let n = stereo_round_trip(seeds, &interleaved);
+        assert_eq!(n, interleaved.len());
+    }
+
+    #[test]
+    fn stereo_round_trip_via_decode_packed_samples_stereo() {
+        // Drive the same round-trip through the public
+        // `decode_packed_samples_stereo` end-to-end loop instead of
+        // the per-call primitive — confirms the bundled loop is
+        // bit-exact identical to the manual call sequence and that
+        // the interleaved (L,R,L,R) order out of the loop matches the
+        // input order. Simulator-driven into zone 1 across the §3.2
+        // trajectory to keep the sequence well-formed under the
+        // encoder helper's zone-0 pre-commit constraint.
+        let seeds = [[8192u32, 8192, 8192], [8192u32, 8192, 8192]];
+        let mut sim = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut interleaved = Vec::new();
+        for i in 0..16 {
+            let ch = i % 2;
+            let mag = sim[ch].get_med(0) as i32;
+            sim[ch].adapt(Zone::from_ones_count(1));
+            interleaved.push(mag);
+        }
+        let (bytes, enc_medians, _) = stereo_encode(seeds, &interleaved);
+        let view = crate::PackedSamples::new(&bytes);
+        let mut dec_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let got = decode_packed_samples_stereo(&view, &mut dec_medians, interleaved.len() / 2)
+            .expect("decode stereo payload");
+        assert_eq!(got, interleaved);
+        assert_eq!(dec_medians, enc_medians);
+    }
+
+    #[test]
+    fn stereo_decode_state_default_matches_new() {
+        // `Default` is derived; spell out the equivalence so callers
+        // building with `StereoDecodeState::default()` see the same
+        // initial state `StereoDecodeState::new()` produces.
+        assert_eq!(StereoDecodeState::default(), StereoDecodeState::new());
+        let s = StereoDecodeState::new();
+        assert_eq!(s.zero_run_pending, 0);
+        assert_eq!(s.next_channel, 0);
+        assert!(!s.ever_took_zero_run);
+        assert_eq!(s.left_run, RunState::new());
+        assert_eq!(s.right_run, RunState::new());
+    }
+
+    #[test]
+    fn stereo_zero_run_zeroes_both_channels_and_drains_across_parity() {
+        // Force eligibility by seeding BOTH channels' medians at all-
+        // zero (get_med(0) = 1 for each, satisfying the spec §4.2
+        // step 1 "both channels' median[0] <= 1" gate). Pick a small
+        // run length (3) so we can hand-verify the drain across
+        // alternating channels.
+        //
+        // Wire: count = 2, mantissa bit = 1 → run_length = (1<<1)|1 = 3.
+        // Bits: unary "110" (count=2) + mantissa "1" + sign... wait, no
+        // sign bit on the zero-run fast path per spec §4.2 step 1; the
+        // emitted sample is `0` from the spec, not a sign-reconstructed
+        // value. Bits: "1101".
+        let bytes = bits_to_bytes("1101");
+        let mut reader = BitReader::new(&bytes);
+        let mut medians = [
+            AdaptiveMedians::new([0, 0, 0]),
+            AdaptiveMedians::new([0, 0, 0]),
+        ];
+        let mut state = StereoDecodeState::new();
+
+        // Sample 0 (left): zero-run fast path engages, emits 0,
+        // medians of BOTH channels stay zeroed, zero_run_pending = 2.
+        let v0 = decode_sample_stateful_stereo(&mut reader, &mut medians, &mut state).unwrap();
+        assert_eq!(v0, 0);
+        assert_eq!(state.next_channel, 1, "advanced to right channel");
+        assert_eq!(state.zero_run_pending, 2);
+        assert!(state.ever_took_zero_run);
+        assert_eq!(medians[0].values, [0, 0, 0]);
+        assert_eq!(medians[1].values, [0, 0, 0]);
+
+        // Sample 1 (right): drains from pending, no bits read.
+        let v1 = decode_sample_stateful_stereo(&mut reader, &mut medians, &mut state).unwrap();
+        assert_eq!(v1, 0);
+        assert_eq!(state.next_channel, 0);
+        assert_eq!(state.zero_run_pending, 1);
+
+        // Sample 2 (left): drains last pending sample, no bits read.
+        let v2 = decode_sample_stateful_stereo(&mut reader, &mut medians, &mut state).unwrap();
+        assert_eq!(v2, 0);
+        assert_eq!(state.next_channel, 1);
+        assert_eq!(state.zero_run_pending, 0);
+    }
+
+    #[test]
+    fn stereo_zero_run_gated_off_when_only_one_channel_eligible() {
+        // The spec §4.2 step 1 zero-run requires BOTH channels'
+        // median[0] <= 1. With only the LEFT channel zeroed (right's
+        // get_med = 17 > 1), the gate must reject and the call must
+        // proceed to the normal prefix path (which fails on an empty
+        // buffer with Truncated).
+        let bytes: [u8; 0] = [];
+        let mut reader = BitReader::new(&bytes);
+        let mut medians = [
+            AdaptiveMedians::new([0, 0, 0]),
+            AdaptiveMedians::new([256, 256, 256]),
+        ];
+        let mut state = StereoDecodeState::new();
+        let err = decode_sample_stateful_stereo(&mut reader, &mut medians, &mut state);
+        assert_eq!(err, Err(Error::Truncated));
+        assert!(!state.ever_took_zero_run);
+    }
+
+    #[test]
+    fn stereo_propagates_truncation_leaves_channel_unadvanced() {
+        // On Error::Truncated the cursor (`next_channel`) must NOT
+        // advance — a caller retrying against a freshly-extended
+        // buffer must see the same channel.
+        let bytes: [u8; 0] = [];
+        let mut reader = BitReader::new(&bytes);
+        let mut medians = [
+            AdaptiveMedians::new([256, 256, 256]),
+            AdaptiveMedians::new([256, 256, 256]),
+        ];
+        let mut state = StereoDecodeState::new();
+        let err = decode_sample_stateful_stereo(&mut reader, &mut medians, &mut state);
+        assert_eq!(err, Err(Error::Truncated));
+        assert_eq!(state.next_channel, 0, "cursor stays at left on error");
+    }
+
+    #[test]
+    fn stereo_eof_escape_returns_end_of_stream() {
+        // First sample's unary triggers the LIMIT_ONES = 16 escape
+        // and the inner cbits unary == 33, which is the spec §4.2
+        // step 3 EOF marker. The stereo path must surface it as
+        // EndOfStream just like the mono path does.
+        let mut bits = String::new();
+        bits.push_str(&"1".repeat(16));
+        bits.push('0');
+        bits.push_str(&"1".repeat(33));
+        bits.push('0');
+        let bytes = bits_to_bytes(&bits);
+        let mut reader = BitReader::new(&bytes);
+        let mut medians = [
+            AdaptiveMedians::new([256, 256, 256]),
+            AdaptiveMedians::new([256, 256, 256]),
+        ];
+        let mut state = StereoDecodeState::new();
+        let err = decode_sample_stateful_stereo(&mut reader, &mut medians, &mut state);
+        assert_eq!(err, Err(Error::EndOfStream));
+        assert_eq!(state.next_channel, 0, "cursor stays at left on EOF");
+    }
+
+    #[test]
+    fn stereo_per_channel_holding_state_independent() {
+        // After encoding a sample on the LEFT channel that sets
+        // last_zero (even raw → zone 0), the RIGHT channel's state
+        // must remain untouched, and the next RIGHT-channel decode
+        // must read its own prefix as if it were the first sample on
+        // that channel.
+        let seeds = [[256u32, 256, 256], [8192u32, 8192, 8192]];
+        // Left frame 0: 0 (zone 0, sets left_run.last_zero=true).
+        // Right frame 0: 600 (zone 1 on right with get_med=513, sets
+        // right_run.last_one=true since odd raw=1).
+        // Left frame 1: 0 (left_run.last_zero short-circuit → zone 0
+        // with NO unary read).
+        // Right frame 1: 700 (zone 1 again; right_run carries
+        // last_one from frame 0 with no short-circuit, so it reads
+        // normally).
+        let interleaved = vec![0i32, 600, 0, 700];
+        let n = stereo_round_trip(seeds, &interleaved);
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn stereo_decode_packed_samples_truncated_when_too_few_bytes() {
+        // A non-zero `frames` against an empty payload must surface
+        // Truncated on the first decode call (no successful sample),
+        // and the medians must be unchanged.
+        let bytes: [u8; 0] = [];
+        let view = crate::PackedSamples::new(&bytes);
+        let mut medians = [
+            AdaptiveMedians::new([256, 256, 256]),
+            AdaptiveMedians::new([256, 256, 256]),
+        ];
+        let pre = medians;
+        let err = decode_packed_samples_stereo(&view, &mut medians, 4);
+        assert_eq!(err, Err(Error::Truncated));
+        assert_eq!(medians, pre, "medians must not have been adapted");
+    }
+
+    #[test]
+    fn stereo_decode_packed_samples_zero_frames_returns_empty_vec() {
+        // Vacuous case: zero frames requested → empty output, no bits
+        // read. Confirms the loop's bounds are correct and the
+        // function doesn't pre-read any prefix.
+        let bytes: [u8; 0] = [];
+        let view = crate::PackedSamples::new(&bytes);
+        let mut medians = [
+            AdaptiveMedians::new([256, 256, 256]),
+            AdaptiveMedians::new([256, 256, 256]),
+        ];
+        let got = decode_packed_samples_stereo(&view, &mut medians, 0).expect("vacuous decode");
+        assert!(got.is_empty());
     }
 }

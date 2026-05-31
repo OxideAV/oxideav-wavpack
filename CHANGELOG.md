@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 199 — stereo per-sample `0x0A` decode loop wiring the
+  `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §2 channel-
+  alternation rule on top of the round-15 mono loop. New
+  `StereoDecodeState` bundles two per-channel `RunState`s (`left_run`,
+  `right_run`) for the spec §4.2 step 4 holding-bit fold applied
+  per-channel, a stream-level `zero_run_pending` counter and
+  `ever_took_zero_run` sticky bit for the spec §4.2 step 1 zero-run
+  fast path (which the spec specifies as stream-level: gated on BOTH
+  channels' `median[0] <= 1` AND BOTH channels' holding state empty,
+  resetting BOTH channels' medians on a non-zero run), and a
+  `next_channel` parity cursor (`0` = left, `1` = right) that toggles
+  only on a successful emit so a `?`-bubbled error leaves the cursor
+  recoverable. New `decode_sample_stateful_stereo(reader, &mut
+  [AdaptiveMedians; 2], &mut StereoDecodeState)` walks the spec §4.2
+  sequence for one stereo sample, dispatching reads + adaptation +
+  mantissa + sign to `medians[next_channel]` only (the other channel's
+  state stays untouched). New `decode_packed_samples_stereo(payload,
+  &mut [AdaptiveMedians; 2], frames)` returns a `Vec<i32>` of
+  `frames * 2` interleaved (L,R,L,R,…) PCM samples and is the first
+  public stereo end-to-end PCM-producing API on the crate. Pair with
+  `EntropyInfo::medians_for_channel(0/1)` + `AdaptiveMedians::from_seed_values`
+  on the round-4 expander's left + right median sets to seed.
+- 13 new unit tests (252 total): simulator-driven zone-1 round-trip
+  across 8 stereo frames with matching seeds; the same with distinct
+  per-channel seeds proving per-channel dispatch never crosses
+  medians; mixed zones (zone 1 / zone 2 / zone 2 overflow) per channel
+  with a per-channel adapt simulator picking magnitudes against the
+  current medians; negative-sign reconstruction with magnitude held in
+  zone 1 by picking `signed_value = -(get_med(0) + 2)` (so the
+  decoded `!signed_value` magnitude lands at `get_med(0) + 1`); the
+  end-to-end `decode_packed_samples_stereo` loop wrapper matching the
+  per-call sequence bit-for-bit AND finishing with identical per-
+  channel medians; the stereo zero-run path (a `1101` wire bit-string
+  decoding to run_length = 3) zeroing BOTH channels' medians on entry,
+  emitting `0` on the current channel, draining the remaining two
+  zero samples across alternating channels without consuming bits;
+  the BOTH-channel zero-run gate rejecting one-channel eligibility
+  (left zeroed, right at `[256, 256, 256]` → fast path off, normal
+  prefix path fires and reports Truncated on an empty buffer); the
+  stereo truncation path leaving `next_channel` at `0` on error; the
+  EOF escape (`LIMIT_ONES + cbits == 33` wire bit-string) surfacing
+  `Error::EndOfStream` with `next_channel` still at `0`; per-channel
+  holding-state independence (a left-channel `last_zero` short-
+  circuit doesn't touch the right channel's state); the empty-
+  payload `decode_packed_samples_stereo` rejecting with Truncated
+  AND leaving the medians unchanged; the `frames == 0` vacuous case
+  returning an empty `Vec`; and the `StereoDecodeState::default()`
+  matching `StereoDecodeState::new()` with per-channel `RunState`s
+  also matching `RunState::new()`.
 - Round 15 — stateful per-sample `0x0A` decode loop wiring the newly
   staged `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3 + §3.2
   + §4.2 into the end-to-end decode path. New `decode_sample_stateful`

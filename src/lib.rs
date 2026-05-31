@@ -1,5 +1,24 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 199 — stereo per-sample decode loop wiring the
+//! `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §2 channel-
+//! alternation rule. Adds [`StereoDecodeState`] (per-channel [`RunState`]
+//! plus stream-level zero-run debt + `next_channel` parity cursor),
+//! [`decode_sample_stateful_stereo`] (one stereo sample per call,
+//! dispatching to the channel selected by sample-index parity; the
+//! zero-run fast path is gated on BOTH channels' `median[0] <= 1` and
+//! resets BOTH channels' medians on a non-zero run per spec §4.2 step
+//! 1), and [`decode_packed_samples_stereo`] (end-to-end `frames`
+//! → `Vec<i32>` of `frames * 2` interleaved (L,R,L,R,…) PCM samples).
+//! 13 new tests prove bit-exact round-trip via per-channel adapt
+//! simulators across zone-1 mixed sequences, distinct per-channel
+//! seeds, mixed-zones, negative-sign reconstruction, the
+//! end-to-end loop wrapper, stereo zero-run BOTH-channel reset +
+//! drain across parity, the BOTH-channel zero-run gate (one-channel
+//! eligibility rejected), per-channel holding-state independence,
+//! truncation cursor preservation, and the EOF escape. 252 tests
+//! pass (up from 239).**
+//!
 //! **Round 15 — stateful per-sample `0x0A` decode loop wiring the
 //! staged `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3 +
 //! §3.2 + §4.2 end to end via [`decode_sample_stateful`] (the
@@ -313,8 +332,9 @@ pub use crate::metadata::{
 };
 pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
 pub use crate::samples::{
-    decode_packed_samples_mono, decode_run_length, decode_sample, decode_sample_stateful,
-    decode_sample_value, golomb_interval, AdaptiveMedians, BitReader, DecodeState, GolombInterval,
-    Medians, RunState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT,
-    INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
+    decode_packed_samples_mono, decode_packed_samples_stereo, decode_run_length, decode_sample,
+    decode_sample_stateful, decode_sample_stateful_stereo, decode_sample_value, golomb_interval,
+    AdaptiveMedians, BitReader, DecodeState, GolombInterval, Medians, RunState, StereoDecodeState,
+    Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT, INTERVAL_MASK_31,
+    MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
 };

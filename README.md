@@ -5,6 +5,34 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 199 — stereo per-sample decode loop wiring the
+`docs/audio/wavpack/spec/wavpack-entropy-decode.md` §2 channel-
+alternation rule on top of the round-15 mono stateful loop. New
+`StereoDecodeState` carries per-channel `RunState` for left + right
+(spec §4.2 step 4 holding-bit fold applied per-channel), a stream-
+level `zero_run_pending` counter (the §4.2 step 1 zero-run is
+stream-level: gated on BOTH channels' `median[0] <= 1` AND BOTH
+channels' holding state empty; on success resets BOTH channels'
+medians; the drained zero samples alternate across channels by parity)
+and a `next_channel` parity cursor that toggles only on a successful
+emit (so a `?`-bubbled error leaves the cursor recoverable). New
+`decode_sample_stateful_stereo(reader, &mut [AdaptiveMedians; 2],
+&mut StereoDecodeState)` produces one stereo sample per call dispatched
+to `medians[next_channel]`; new
+`decode_packed_samples_stereo(payload, &mut [AdaptiveMedians; 2],
+frames)` returns a `Vec<i32>` of `frames * 2` interleaved (L,R,L,R,…)
+samples. 13 new tests pin: simulator-driven zone-1 round-trips across
+matching and distinct per-channel seeds, mixed-zones, negative-sign
+reconstruction, the end-to-end `decode_packed_samples_stereo` loop
+matching the per-call sequence bit-for-bit, the stereo zero-run path
+zeroing BOTH channels and draining across parity, the BOTH-channel
+zero-run gate (one-channel eligibility rejected), per-channel
+holding-state independence (left's `last_zero` short-circuit doesn't
+touch right's state), truncation leaving `next_channel` unchanged,
+EOF escape, and the `StereoDecodeState::default()` /
+`StereoDecodeState::new()` equivalence. Total tests: 252 (up from
+239).**
+
 **Round 15 — stateful per-sample `0x0A` decode loop wiring the staged
 `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §3 + §3.2 + §4.2
 end to end. The new `decode_sample_stateful` primitive walks the
@@ -363,6 +391,25 @@ Public API:
   divisors `128` / `64` / `32`), [`MEDIAN_INC_MULTIPLIER`] (`5`),
   [`MEDIAN_DEC_MULTIPLIER`] (`2`), [`GET_MED_SHIFT`] (`4`),
   [`GET_MED_FLOOR`] (`1`).
+- [`StereoDecodeState`] (round 199, spec §2 channel-alternation +
+  §4.2 stream-level zero-run) — stereo decode state with two per-
+  channel [`RunState`]s (`left_run`, `right_run`), a stream-level
+  `zero_run_pending` counter, an `ever_took_zero_run` sticky bit, and
+  a `next_channel` parity cursor (`0` = left, `1` = right). Built via
+  [`StereoDecodeState::new`].
+- [`decode_sample_stateful_stereo`] — one stereo sample per call.
+  Picks the channel from `state.next_channel` and dispatches the
+  spec §4.2 sequence to `medians[ch]` and the matching per-channel
+  [`RunState`]. The §4.2 step 1 zero-run fast path is stream-level:
+  gated on BOTH channels' `get_med(0) <= 1` AND BOTH channels'
+  holding state empty, and on a non-zero run zeros BOTH channels'
+  medians. Toggles `next_channel` only on a successful emit so a
+  truncation cursor stays recoverable.
+- [`decode_packed_samples_stereo`] — end-to-end stereo loop.
+  Decodes `frames` stereo frames from a [`PackedSamples`] payload
+  into a `Vec<i32>` of `frames * 2` interleaved (L,R,L,R,…) PCM
+  samples. The `medians` array MUTATES in place across the loop —
+  the caller's `[left_seed, right_seed]` is the running state.
 
 ### Out of scope (later rounds)
 
