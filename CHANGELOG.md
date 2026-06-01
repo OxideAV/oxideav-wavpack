@@ -8,6 +8,58 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 206 — block-level `WavPackBlock::decode_samples()` composer
+  turning the round-13 [`parse_block`] aggregate into PCM samples in
+  one call. Chains [`find_entropy_info`] + [`expand_entropy`] +
+  [`find_packed_samples`] through the round-201
+  `decode_packed_samples_mono_from_entropy` /
+  `decode_packed_samples_stereo_from_entropy` wrappers depending on
+  the new [`Flags::is_block_data_mono`] accessor (the union of wiki
+  bit 2 `mono` and wiki bit 30 `false_stereo`). Returns a `Vec<i32>`
+  of `block_samples` mono samples or `block_samples * 2` interleaved
+  stereo samples. New [`UnsupportedBlockFeature`] enum names the
+  seven WavPack v.4 features the per-sample loop does not yet
+  support (`Hybrid` lossy profile / `FloatData` / `Int32Mode` /
+  `MultichannelMember` / `Decorrelation` / `LowLatencyBlock` /
+  `RobustBlock`); each is surfaced through the new
+  `Error::UnsupportedBlockFeature(feature)` variant with a Display
+  impl that names the responsible wiki flag bit or sub-block ID.
+  New structural errors `Error::BlockHasNoAudio` /
+  `Error::BlockMissingEntropyInfo` /
+  `Error::BlockMissingPackedSamples` cover the three "block doesn't
+  carry what the composer needs" shortfalls. New
+  [`WavPackBlock::has_decorrelation`] predicate detects the presence
+  of any of the `0x02` / `0x03` / `0x04` decorrelation sub-blocks so
+  the composer refuses pre-pass blocks without trying to walk the
+  round-3 typed views (which exist but lack a prediction-loop
+  consumer). New [`Flags::is_block_data_stereo`] is the inverse of
+  `is_block_data_mono`. The composer is **stateless**: each call
+  seeds a fresh [`AdaptiveMedians`] from the block's `0x05` payload
+  and drops it on return, matching how real `.wv` files carry a
+  fresh `0x05` seed per block.
+- 23 new unit tests (295 total): a mono one-sample happy path
+  (seed `[0,0,0]` + 0x0A `0x00` byte payload → `[0]` via the spec
+  §4.2 step 1 zero-run path emitting a single zero sample); the
+  matching stereo happy path with minimal-non-zero seeds (`[1,0,0]`
+  on both channels — non-zero so `EntropyInfo::is_mono()` reports
+  stereo, but still `get_med(0) == 1` so the spec §4.2 step 1 fast
+  path stays eligible) yielding `[0, 0]`; the false-stereo dispatch
+  (bit 30 set, bit 2 clear, mono-layout `0x05` → mono decode loop);
+  `BlockHasNoAudio` on `block_samples == 0`;
+  `BlockMissingEntropyInfo` on a block with only `0x0A`;
+  `BlockMissingPackedSamples` on a block with only `0x05`; each of
+  the seven `UnsupportedBlockFeature` variants triggered by the
+  matching flag bit or sub-block presence (`Hybrid` / `FloatData` /
+  `Int32Mode` / `MultichannelMember` / `Decorrelation`
+  exercised through each of `0x02` / `0x03` / `0x04` /
+  `LowLatencyBlock` / `RobustBlock`); the `EntropyInfoLength`
+  propagation from a malformed 8-byte `0x05` payload;
+  `WavPackBlock::has_decorrelation` firing on each of the three
+  sub-block IDs and clearing when none is present; the four
+  `is_block_data_mono` / `is_block_data_stereo` arms (plain mono,
+  false stereo, plain stereo, mono + false-stereo); and the
+  `UnsupportedBlockFeature` Display strings naming the relevant
+  wiki bit / sub-block ID for each variant.
 - Round 201 — `EntropyInfo` → `AdaptiveMedians` channel-indexed bridges
   and end-to-end `from_entropy` wrappers for the mono and stereo
   `0x0A` decode loops, removing the round-15/199 caller's hand-rolled

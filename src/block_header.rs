@@ -219,6 +219,33 @@ impl Flags {
         }
     }
 
+    /// `true` when this specific block's sample payload is **mono** —
+    /// either because the wiki bit 2 [`Self::mono`] flag is set
+    /// (whole-stream mono) or because the wiki bit 30
+    /// [`Self::false_stereo`] flag is set ("the stream is stereo but
+    /// this block's data is mono", version >= 0x410).
+    ///
+    /// The per-sample decoder chooses its mono / stereo loop on this
+    /// predicate rather than on [`Self::mono`] alone, because a
+    /// false-stereo block carries a single-channel `0x05`
+    /// entropy-variables payload and a single-channel `0x0A`
+    /// packed-samples bitstream — the same on-the-wire layout as a
+    /// natively-mono block. The distinction (whether the surrounding
+    /// stream is mono or stereo) shows up in the decoder's
+    /// channel-count *output* shape, not in the per-block decode call.
+    /// Round 206.
+    pub fn is_block_data_mono(&self) -> bool {
+        self.mono || self.false_stereo
+    }
+
+    /// Inverse of [`Self::is_block_data_mono`]. `true` when this block
+    /// carries an interleaved-stereo sample payload (two `0x05`
+    /// entropy-variables sets and a stereo `0x0A` bitstream the round-
+    /// 199 channel-alternation loop consumes). Round 206.
+    pub fn is_block_data_stereo(&self) -> bool {
+        !self.is_block_data_mono()
+    }
+
     /// `true` when bit 11 of the flag word is set — this block is the
     /// **first** block of a multi-channel set (wiki bits 11..=12
     /// "multi-channel start and end blocks").
@@ -788,5 +815,47 @@ mod tests {
         assert_eq!(h.ck_size, 0x0000_0100);
         assert_eq!(h.version, 0x0410);
         assert_eq!(h.total_samples, 0x1234_5678);
+    }
+
+    // ---- Round-206 is_block_data_mono / is_block_data_stereo ----
+
+    #[test]
+    fn is_block_data_mono_returns_true_when_mono_bit_is_set() {
+        let f = Flags::from_raw(1u32 << 2);
+        assert!(f.mono);
+        assert!(!f.false_stereo);
+        assert!(f.is_block_data_mono());
+        assert!(!f.is_block_data_stereo());
+    }
+
+    #[test]
+    fn is_block_data_mono_returns_true_when_false_stereo_bit_is_set() {
+        // Wiki bit 30: "stream is stereo but this block's data is mono".
+        // The per-block decode loop chooses mono for this case even
+        // though the top-level mono bit is 0.
+        let f = Flags::from_raw(1u32 << 30);
+        assert!(!f.mono);
+        assert!(f.false_stereo);
+        assert!(f.is_block_data_mono());
+        assert!(!f.is_block_data_stereo());
+    }
+
+    #[test]
+    fn is_block_data_mono_returns_false_for_plain_stereo() {
+        let f = Flags::from_raw(0);
+        assert!(!f.mono);
+        assert!(!f.false_stereo);
+        assert!(!f.is_block_data_mono());
+        assert!(f.is_block_data_stereo());
+    }
+
+    #[test]
+    fn is_block_data_mono_treats_mono_and_false_stereo_as_union() {
+        // Both bits set: still mono (the union of the two arms).
+        let f = Flags::from_raw((1u32 << 2) | (1u32 << 30));
+        assert!(f.mono);
+        assert!(f.false_stereo);
+        assert!(f.is_block_data_mono());
+        assert!(!f.is_block_data_stereo());
     }
 }

@@ -1,5 +1,33 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 206 — block-level [`WavPackBlock::decode_samples`] composer
+//! turning the round-13 [`parse_block`] aggregate into PCM samples in
+//! one call. Chains [`find_entropy_info`] + [`expand_entropy`] +
+//! [`find_packed_samples`] through the round-201
+//! [`decode_packed_samples_mono_from_entropy`] /
+//! [`decode_packed_samples_stereo_from_entropy`] wrappers depending on
+//! the new [`Flags::is_block_data_mono`] accessor (the union of wiki
+//! bit 2 `mono` and wiki bit 30 `false_stereo`). Returns a `Vec<i32>`
+//! of `block_samples` mono samples or `block_samples * 2` interleaved
+//! stereo samples. New [`UnsupportedBlockFeature`] enum names the
+//! seven gated cases ([`UnsupportedBlockFeature::Hybrid`] /
+//! [`UnsupportedBlockFeature::FloatData`] /
+//! [`UnsupportedBlockFeature::Int32Mode`] /
+//! [`UnsupportedBlockFeature::MultichannelMember`] /
+//! [`UnsupportedBlockFeature::Decorrelation`] /
+//! [`UnsupportedBlockFeature::LowLatencyBlock`] /
+//! [`UnsupportedBlockFeature::RobustBlock`]), surfaced through
+//! [`Error::UnsupportedBlockFeature`]. New structural errors
+//! [`Error::BlockHasNoAudio`] / [`Error::BlockMissingEntropyInfo`] /
+//! [`Error::BlockMissingPackedSamples`] cover the
+//! "block-doesn't-carry-what-the-composer-needs" shortfalls. New
+//! [`WavPackBlock::has_decorrelation`] predicate detects the presence
+//! of any `0x02` / `0x03` / `0x04` decorrelation sub-block. New
+//! [`Flags::is_block_data_stereo`] is the inverse of the new mono
+//! accessor. 23 new tests prove each gate fires and the two happy
+//! paths return the expected PCM zero(s) from a synthesised block.
+//! 295 tests pass (up from 272).**
+//!
 //! **Round 199 — stereo per-sample decode loop wiring the
 //! `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §2 channel-
 //! alternation rule. Adds [`StereoDecodeState`] (per-channel [`RunState`]
@@ -307,7 +335,7 @@ mod metadata;
 mod packed_samples;
 mod samples;
 
-pub use crate::block::{parse_block, WavPackBlock};
+pub use crate::block::{parse_block, UnsupportedBlockFeature, WavPackBlock};
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,

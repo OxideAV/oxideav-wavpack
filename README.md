@@ -5,6 +5,47 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 206 — block-level `WavPackBlock::decode_samples()` composer
+turning a [`parse_block`] aggregate into PCM samples in one call,
+with typed gates for every WavPack v.4 feature the round-15/199
+per-sample loop does not yet support. The composer chains
+[`find_entropy_info`] + [`expand_entropy`] + [`find_packed_samples`]
+through [`decode_packed_samples_mono_from_entropy`] or
+[`decode_packed_samples_stereo_from_entropy`] depending on
+[`Flags::is_block_data_mono`] (the new accessor combining wiki
+bit 2 `mono` with wiki bit 30 `false_stereo` — "stream is stereo but
+this block's data is mono"). New [`UnsupportedBlockFeature`] enum
+names the seven gated cases (`Hybrid` / `FloatData` / `Int32Mode` /
+`MultichannelMember` / `Decorrelation` / `LowLatencyBlock` /
+`RobustBlock`), surfaced via [`Error::UnsupportedBlockFeature`]. New
+structural errors [`Error::BlockHasNoAudio`] /
+[`Error::BlockMissingEntropyInfo`] /
+[`Error::BlockMissingPackedSamples`] cover the three "block doesn't
+carry what the composer needs" shortfalls separately from the
+feature gates. New [`WavPackBlock::has_decorrelation`] predicate
+detects the presence of any of the `0x02` / `0x03` / `0x04`
+decorrelation sub-blocks so the composer refuses pre-pass blocks
+without trying to walk the round-3 typed views (which exist but lack
+a prediction-loop consumer). 23 new tests (295 total) pin: a mono
+one-sample happy path (seed `[0,0,0]` + 0x0A payload `0x00` → `[0]`
+via the spec §4.2 step 1 zero-run path emitting a single zero); the
+matching stereo happy path with minimal non-zero seeds (`[1,0,0]`
+both channels — non-zero so `EntropyInfo::is_mono()` reports stereo,
+but still `get_med(0) == 1` so the spec §4.2 step 1 path stays
+eligible) yielding `[0, 0]`; the false-stereo mono dispatch
+(bit 30 set with bit 2 clear); `BlockHasNoAudio` on
+`block_samples == 0`; `BlockMissingEntropyInfo` /
+`BlockMissingPackedSamples` on the matching sub-block absence; each
+of the seven [`UnsupportedBlockFeature`] variants triggered by the
+corresponding flag bit or sub-block presence; the
+`EntropyInfoLength` propagation from a malformed `0x05` payload;
+[`WavPackBlock::has_decorrelation`] firing on each of the three
+sub-block IDs and clearing when none of them is present; the four
+`is_block_data_mono` / `is_block_data_stereo` arms (plain mono /
+false stereo / plain stereo / mono+false-stereo); and the
+[`UnsupportedBlockFeature`] Display strings naming the relevant
+wiki bit / sub-block ID for each variant.**
+
 **Round 201 — `EntropyInfo` → `AdaptiveMedians` channel-indexed
 bridges and end-to-end `from_entropy` wrappers for the mono + stereo
 `0x0A` decode loops. New `EntropyInfo::stereo(left, right)` symmetric
@@ -471,6 +512,37 @@ Public API:
   [`Error::InvalidEntropyInfoForStereo`] when the input is mono or
   any per-channel seed is negative; other errors propagate verbatim.
   Seeds are consumed by value.
+- [`Flags::is_block_data_mono`] / [`Flags::is_block_data_stereo`]
+  (round 206) — union of wiki bit 2 `mono` and wiki bit 30
+  `false_stereo` ("stream is stereo but this block's data is mono").
+  The per-block decoder picks its mono / stereo loop on this
+  predicate because a false-stereo block carries the same single-
+  channel `0x05` + `0x0A` layout as a natively-mono block.
+- [`WavPackBlock::has_decorrelation`] (round 206) — `true` when the
+  block carries any of the `0x02` / `0x03` / `0x04` decorrelation
+  sub-blocks. Surfaces the structural shortfall the composer uses
+  to gate decode off via [`UnsupportedBlockFeature::Decorrelation`].
+- [`WavPackBlock::decode_samples`] (round 206) — one-call
+  "block → PCM" composer. Chains [`find_entropy_info`] +
+  [`expand_entropy`] + [`find_packed_samples`] +
+  [`decode_packed_samples_mono_from_entropy`] /
+  [`decode_packed_samples_stereo_from_entropy`] with the round-206
+  mono / stereo dispatch on [`Flags::is_block_data_mono`]. Returns
+  a `Vec<i32>` of `block_samples` mono samples or
+  `block_samples * 2` interleaved stereo samples. Refuses the seven
+  WavPack v.4 features the per-sample loop does not yet support via
+  typed [`UnsupportedBlockFeature`] tags through
+  [`Error::UnsupportedBlockFeature`]; refuses structurally-incomplete
+  blocks via [`Error::BlockHasNoAudio`] /
+  [`Error::BlockMissingEntropyInfo`] /
+  [`Error::BlockMissingPackedSamples`].
+- [`UnsupportedBlockFeature`] (round 206) — typed tag naming the
+  WavPack v.4 feature [`WavPackBlock::decode_samples`] refused:
+  `Hybrid` (lossy profile, flag bit 3), `FloatData` (bit 7),
+  `Int32Mode` (bit 8), `MultichannelMember` (bits 11..=12 != 0b11),
+  `Decorrelation` (`0x02` / `0x03` / `0x04` sub-blocks present),
+  `LowLatencyBlock` (bit 31), `RobustBlock` (bit 28). Carries
+  through [`Error::UnsupportedBlockFeature`].
 
 ### Out of scope (later rounds)
 

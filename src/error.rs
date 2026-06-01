@@ -125,6 +125,38 @@ pub enum Error {
     /// or carries a negative seed in either set (same defensive
     /// rejection as the mono variant). Round 201.
     InvalidEntropyInfoForStereo,
+    /// `WavPackBlock::decode_samples` was called on a block that does
+    /// not carry a `0x05` entropy-info sub-block — the medians driving
+    /// the round-15/199 `0x0A` per-sample decode must come from the
+    /// `0x05` sub-block per the wiki "Entropy info" + "Samples coding"
+    /// listings. The block-level composer reports the structural
+    /// shortfall here rather than calling the per-sample primitive
+    /// with a hand-rolled seed. Round 206.
+    BlockMissingEntropyInfo,
+    /// `WavPackBlock::decode_samples` was called on a block that does
+    /// not carry a `0x0A` packed-samples sub-block — the entropy-coded
+    /// audio payload the per-sample loop consumes. The block-level
+    /// composer reports the structural shortfall here. Round 206.
+    BlockMissingPackedSamples,
+    /// `WavPackBlock::decode_samples` was called on a non-audio block
+    /// (the wiki "Block structure" listing allows `block_samples == 0`
+    /// for metadata-only blocks). The composer cannot return PCM samples
+    /// from a block that advertises zero of them. Use
+    /// [`crate::WavPackBlockHeader::is_audio_block`] to filter the input
+    /// stream when iterating multi-block files. Round 206.
+    BlockHasNoAudio,
+    /// `WavPackBlock::decode_samples` was called on a block that
+    /// carries one of the WavPack v.4 features the round-15/199
+    /// per-sample loop does not yet support (hybrid lossy mode,
+    /// floating-point or large-integer payload, multichannel
+    /// participation, decorrelation pre-pass, low-latency or
+    /// experimental gating). Carries a typed
+    /// [`crate::UnsupportedBlockFeature`] tag naming the specific
+    /// feature so the caller can surface a precise diagnostic. The
+    /// per-sample decode primitives themselves remain callable for
+    /// callers that have validated the block's feature set themselves.
+    /// Round 206.
+    UnsupportedBlockFeature(crate::UnsupportedBlockFeature),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -187,6 +219,19 @@ impl core::fmt::Display for Error {
             ),
             Error::InvalidEntropyInfoForStereo => f.write_str(
                 "oxideav-wavpack: decode_packed_samples_stereo_from_entropy: EntropyInfo is mono or carries a negative per-channel seed",
+            ),
+            Error::BlockMissingEntropyInfo => f.write_str(
+                "oxideav-wavpack: WavPackBlock::decode_samples: block carries no 0x05 entropy-info sub-block",
+            ),
+            Error::BlockMissingPackedSamples => f.write_str(
+                "oxideav-wavpack: WavPackBlock::decode_samples: block carries no 0x0A packed-samples sub-block",
+            ),
+            Error::BlockHasNoAudio => f.write_str(
+                "oxideav-wavpack: WavPackBlock::decode_samples: block_samples == 0 (metadata-only block, no audio)",
+            ),
+            Error::UnsupportedBlockFeature(feat) => write!(
+                f,
+                "oxideav-wavpack: WavPackBlock::decode_samples: block uses an unsupported feature ({feat})"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",
