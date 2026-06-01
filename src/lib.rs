@@ -332,9 +332,10 @@ pub use crate::metadata::{
 };
 pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
 pub use crate::samples::{
-    decode_packed_samples_mono, decode_packed_samples_stereo, decode_run_length, decode_sample,
-    decode_sample_stateful, decode_sample_stateful_stereo, decode_sample_value, golomb_interval,
-    AdaptiveMedians, BitReader, DecodeState, GolombInterval, Medians, RunState, StereoDecodeState,
-    Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT, INTERVAL_MASK_31,
-    MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
+    decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
+    decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy, decode_run_length,
+    decode_sample, decode_sample_stateful, decode_sample_stateful_stereo, decode_sample_value,
+    golomb_interval, AdaptiveMedians, BitReader, DecodeState, GolombInterval, Medians, RunState,
+    StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT,
+    INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
 };

@@ -5,6 +5,34 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 201 — `EntropyInfo` → `AdaptiveMedians` channel-indexed
+bridges and end-to-end `from_entropy` wrappers for the mono + stereo
+`0x0A` decode loops. New `EntropyInfo::stereo(left, right)` symmetric
+constructor to the existing `EntropyInfo::mono`; new
+`AdaptiveMedians::from_entropy(info, channel_idx)` returning
+`Some(state)` for channel 0 on any payload and channel 1 on stereo
+(matching the `Medians::from_entropy` shape, with `None` for
+out-of-range indices, channel 1 on mono, and negative seeds — the same
+defensive `i32 → u32` rejection `from_seed_values` performs); new
+`AdaptiveMedians::stereo_pair_from_entropy(info)` returning the
+`[left, right]` array `decode_packed_samples_stereo` consumes (or
+`None` on mono or any negative seed); and new top-level
+`decode_packed_samples_mono_from_entropy(payload, info, count)` and
+`decode_packed_samples_stereo_from_entropy(payload, info, frames)`
+wrappers composing the bridges with the round-15/199 stateful loops.
+New `Error::InvalidEntropyInfoForMono` /
+`Error::InvalidEntropyInfoForStereo` variants name the malformed-input
+arm. 20 new tests (272 total) pin: the stereo constructor populating
+both sets and matching its struct-literal form (plus the
+is_mono-by-content nuance with a zero right set); the
+`AdaptiveMedians::from_entropy` bridge across channel 0/1, out-of-
+range indices, mono right-channel rejection, and negative-seed
+rejection on both channels; the `stereo_pair_from_entropy` mono
+rejection and per-channel negative-seed rejection; and the
+`_from_entropy` wrappers proving byte-identical reconstruction to the
+explicit-seed calls, the malformed-input errors firing before any
+bits are read, and the zero-count / zero-frame vacuous cases.**
+
 **Round 199 — stereo per-sample decode loop wiring the
 `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §2 channel-
 alternation rule on top of the round-15 mono stateful loop. New
@@ -410,6 +438,39 @@ Public API:
   into a `Vec<i32>` of `frames * 2` interleaved (L,R,L,R,…) PCM
   samples. The `medians` array MUTATES in place across the loop —
   the caller's `[left_seed, right_seed]` is the running state.
+- [`EntropyInfo::stereo`] (round 201) — symmetric constructor to
+  [`EntropyInfo::mono`] taking both per-channel median sets at once;
+  matches the two-set form the wiki "one or two sets of medians"
+  sentence describes. An all-zero right set still reports
+  `is_mono() == true` (content-only check).
+- [`AdaptiveMedians::from_entropy`] (round 201) — channel-indexed
+  bridge over [`EntropyInfo`] returning `Some(state)` for channel 0
+  on any payload and channel 1 on a stereo payload, `None` for
+  out-of-range indices, channel 1 on mono (the wiki put no second
+  set on the wire), and negative seeds (`i32 → u32` defensive
+  reject). Symmetric counterpart to [`Medians::from_entropy`] for
+  the round-15 running adaptive state.
+- [`AdaptiveMedians::stereo_pair_from_entropy`] (round 201) — returns
+  the `[left, right]` two-element array
+  [`decode_packed_samples_stereo`] takes as `medians`. `None` on a
+  mono payload (no right-channel seed on the wire) or when either
+  set carries a negative seed.
+- [`decode_packed_samples_mono_from_entropy`] (round 201) — end-to-
+  end mono decode driven directly by the round-4 `0x05` expander
+  output: composes [`AdaptiveMedians::from_entropy(info, 0)`] with
+  [`decode_packed_samples_mono`]. Returns
+  [`Error::InvalidEntropyInfoForMono`] when the channel-0 seed is
+  malformed (negative); other errors propagate verbatim from the
+  inner call. Seeds are consumed by value (no caller-side state
+  carry).
+- [`decode_packed_samples_stereo_from_entropy`] (round 201) —
+  end-to-end stereo decode driven directly by the round-4 `0x05`
+  expander output: composes
+  [`AdaptiveMedians::stereo_pair_from_entropy`] with
+  [`decode_packed_samples_stereo`]. Returns
+  [`Error::InvalidEntropyInfoForStereo`] when the input is mono or
+  any per-channel seed is negative; other errors propagate verbatim.
+  Seeds are consumed by value.
 
 ### Out of scope (later rounds)
 

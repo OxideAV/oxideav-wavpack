@@ -667,6 +667,47 @@ impl AdaptiveMedians {
         Self::from_seed_values(medians.values)
     }
 
+    /// Channel-indexed bridge over [`EntropyInfo`] — `Some(state)` for
+    /// `channel_idx == 0` (left / mono) on any payload, and for
+    /// `channel_idx == 1` (right) on a stereo payload; `None` otherwise
+    /// (out-of-range index, or `1` on a mono [`EntropyInfo`] where the
+    /// wiki put no second median set on the wire).
+    ///
+    /// Also returns `None` when the selected set carries any negative
+    /// seed (same defensive rejection as [`Self::from_seed_values`]).
+    ///
+    /// Symmetric counterpart to [`Medians::from_entropy`] — the round-4
+    /// expander output → round-15 running adaptive state bridge that
+    /// removes the need to hop through [`Medians`] for the stateful
+    /// loop. Round 201.
+    pub fn from_entropy(info: &EntropyInfo, channel_idx: u8) -> Option<Self> {
+        match channel_idx {
+            0 => Self::from_seed_values(info.medians_left),
+            1 if !info.is_mono() => Self::from_seed_values(info.medians_right),
+            _ => None,
+        }
+    }
+
+    /// Build the two-element `[left, right]` array
+    /// [`decode_packed_samples_stereo`] takes as its `medians` argument
+    /// from a stereo [`EntropyInfo`].
+    ///
+    /// Returns `None` when the input is a mono payload (the wiki puts
+    /// no right-channel set on the wire — there is nothing to populate
+    /// the second slot from), or when either set has a negative seed
+    /// (same defensive rejection as [`Self::from_seed_values`]).
+    ///
+    /// Round 201 — top-level round-4 `0x05` expander → round-199 stereo
+    /// decode loop bridge.
+    pub fn stereo_pair_from_entropy(info: &EntropyInfo) -> Option<[Self; 2]> {
+        if info.is_mono() {
+            return None;
+        }
+        let left = Self::from_seed_values(info.medians_left)?;
+        let right = Self::from_seed_values(info.medians_right)?;
+        Some([left, right])
+    }
+
     /// Spec §2.1 `get_med(i)` operation — the **working** median value
     /// the spec §4.2 interval ladder consumes.
     ///
@@ -1539,6 +1580,62 @@ pub fn decode_packed_samples_stereo(
         )?);
     }
     Ok(out)
+}
+
+/// End-to-end mono decode driven by the round-4 `0x05` entropy-info
+/// expander output.
+///
+/// Wraps [`decode_packed_samples_mono`] with the
+/// [`AdaptiveMedians::from_entropy`] bridge so a caller holding a
+/// fresh [`EntropyInfo`] (typically from
+/// [`crate::find_entropy_info`] +  [`crate::expand_entropy`] on the
+/// `0x05` sub-block) can decode the matching `0x0A` payload without
+/// hand-rolling the per-channel seed extraction. Round 201.
+///
+/// Returns [`Error::InvalidEntropyInfoForMono`] when the
+/// channel-0 set carries a negative seed (the
+/// [`AdaptiveMedians::from_seed_values`] defensive rejection); errors
+/// from [`decode_packed_samples_mono`] are propagated verbatim.
+///
+/// The seeds are consumed by value — the running medians live inside
+/// the call and are dropped on return. If a caller needs to inspect
+/// the final medians (e.g. for streaming continuation across blocks)
+/// they should keep using [`decode_packed_samples_mono`] directly with
+/// an [`AdaptiveMedians`] they own.
+pub fn decode_packed_samples_mono_from_entropy(
+    payload: &crate::PackedSamples<'_>,
+    info: &EntropyInfo,
+    count: usize,
+) -> Result<Vec<i32>> {
+    let mut medians =
+        AdaptiveMedians::from_entropy(info, 0).ok_or(Error::InvalidEntropyInfoForMono)?;
+    decode_packed_samples_mono(payload, &mut medians, count)
+}
+
+/// End-to-end stereo decode driven by the round-4 `0x05` entropy-info
+/// expander output.
+///
+/// Wraps [`decode_packed_samples_stereo`] with the
+/// [`AdaptiveMedians::stereo_pair_from_entropy`] bridge so a caller
+/// holding a fresh stereo [`EntropyInfo`] can decode the matching
+/// `0x0A` payload without hand-rolling the two-channel seed
+/// extraction. Round 201.
+///
+/// Returns [`Error::InvalidEntropyInfoForStereo`] when the
+/// [`EntropyInfo`] is mono (no right-channel set on the wire) or when
+/// either channel carries a negative seed; errors from
+/// [`decode_packed_samples_stereo`] are propagated verbatim.
+///
+/// The seeds are consumed by value — the running medians live inside
+/// the call and are dropped on return.
+pub fn decode_packed_samples_stereo_from_entropy(
+    payload: &crate::PackedSamples<'_>,
+    info: &EntropyInfo,
+    frames: usize,
+) -> Result<Vec<i32>> {
+    let mut medians = AdaptiveMedians::stereo_pair_from_entropy(info)
+        .ok_or(Error::InvalidEntropyInfoForStereo)?;
+    decode_packed_samples_stereo(payload, &mut medians, frames)
 }
 
 #[cfg(test)]
@@ -3737,6 +3834,250 @@ mod tests {
             AdaptiveMedians::new([256, 256, 256]),
         ];
         let got = decode_packed_samples_stereo(&view, &mut medians, 0).expect("vacuous decode");
+        assert!(got.is_empty());
+    }
+
+    // ---- Round-201 EntropyInfo → AdaptiveMedians bridges ----
+
+    #[test]
+    fn adaptive_medians_from_entropy_yields_left_seed_on_zero() {
+        let info = EntropyInfo::stereo([10, 20, 30], [40, 50, 60]);
+        assert_eq!(
+            AdaptiveMedians::from_entropy(&info, 0),
+            Some(AdaptiveMedians::new([10, 20, 30]))
+        );
+    }
+
+    #[test]
+    fn adaptive_medians_from_entropy_yields_right_seed_on_one_for_stereo() {
+        let info = EntropyInfo::stereo([10, 20, 30], [40, 50, 60]);
+        assert_eq!(
+            AdaptiveMedians::from_entropy(&info, 1),
+            Some(AdaptiveMedians::new([40, 50, 60]))
+        );
+    }
+
+    #[test]
+    fn adaptive_medians_from_entropy_returns_none_for_right_on_mono() {
+        let info = EntropyInfo::mono([7, 8, 9]);
+        // Channel 0 still resolves (mono has the first set on the wire).
+        assert_eq!(
+            AdaptiveMedians::from_entropy(&info, 0),
+            Some(AdaptiveMedians::new([7, 8, 9]))
+        );
+        // Channel 1 is None on a mono payload — wiki put no second set
+        // on the wire, so there is no seed to wrap.
+        assert_eq!(AdaptiveMedians::from_entropy(&info, 1), None);
+    }
+
+    #[test]
+    fn adaptive_medians_from_entropy_returns_none_for_out_of_range_index() {
+        let info = EntropyInfo::stereo([1, 2, 3], [4, 5, 6]);
+        assert_eq!(AdaptiveMedians::from_entropy(&info, 2), None);
+        assert_eq!(AdaptiveMedians::from_entropy(&info, 3), None);
+        assert_eq!(AdaptiveMedians::from_entropy(&info, 255), None);
+    }
+
+    #[test]
+    fn adaptive_medians_from_entropy_rejects_negative_seed_on_left() {
+        // The defensive i32 → u32 rejection — negative seeds are
+        // malformed wire input; the bridge returns None rather than
+        // reinterpreting the sign bit.
+        let info = EntropyInfo {
+            medians_left: [-1, 0, 0],
+            medians_right: [4, 5, 6],
+        };
+        assert_eq!(AdaptiveMedians::from_entropy(&info, 0), None);
+        // The right channel is well-formed and still resolves.
+        assert_eq!(
+            AdaptiveMedians::from_entropy(&info, 1),
+            Some(AdaptiveMedians::new([4, 5, 6]))
+        );
+    }
+
+    #[test]
+    fn adaptive_medians_from_entropy_rejects_negative_seed_on_right() {
+        let info = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [0, -42, 0],
+        };
+        // Left channel still resolves.
+        assert_eq!(
+            AdaptiveMedians::from_entropy(&info, 0),
+            Some(AdaptiveMedians::new([1, 2, 3]))
+        );
+        // Right channel: defensive reject.
+        assert_eq!(AdaptiveMedians::from_entropy(&info, 1), None);
+    }
+
+    #[test]
+    fn adaptive_medians_stereo_pair_from_entropy_returns_both_channels() {
+        let info = EntropyInfo::stereo([10, 20, 30], [40, 50, 60]);
+        let pair = AdaptiveMedians::stereo_pair_from_entropy(&info).expect("stereo seeds");
+        assert_eq!(pair[0], AdaptiveMedians::new([10, 20, 30]));
+        assert_eq!(pair[1], AdaptiveMedians::new([40, 50, 60]));
+    }
+
+    #[test]
+    fn adaptive_medians_stereo_pair_from_entropy_returns_none_on_mono() {
+        // Mono payload — nothing to populate the right-channel slot
+        // from. The bridge returns None rather than guessing zeros.
+        let info = EntropyInfo::mono([1, 2, 3]);
+        assert_eq!(AdaptiveMedians::stereo_pair_from_entropy(&info), None);
+    }
+
+    #[test]
+    fn adaptive_medians_stereo_pair_from_entropy_returns_none_on_negative_left() {
+        let info = EntropyInfo {
+            medians_left: [-1, 0, 0],
+            medians_right: [4, 5, 6],
+        };
+        // Even though the right channel is well-formed, the left
+        // channel's negative seed rejects the whole pair — the call
+        // returns a single state usable for both channels or nothing.
+        assert_eq!(AdaptiveMedians::stereo_pair_from_entropy(&info), None);
+    }
+
+    #[test]
+    fn adaptive_medians_stereo_pair_from_entropy_returns_none_on_negative_right() {
+        let info = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [0, -7, 0],
+        };
+        assert_eq!(AdaptiveMedians::stereo_pair_from_entropy(&info), None);
+    }
+
+    // ---- Round-201 decode_packed_samples_*_from_entropy wrappers ----
+
+    #[test]
+    fn decode_packed_samples_mono_from_entropy_matches_explicit_seeds() {
+        // Encode a known sequence with seed [8192;3], then decode it
+        // through both the explicit-seed and the from_entropy wrappers
+        // and assert byte-identical reconstructions.
+        let seed = [8192u32, 8192, 8192];
+        let info = EntropyInfo::mono([8192, 8192, 8192]);
+        let values: Vec<i32> = (1..=8).collect();
+
+        // Encode (matching the round_trip helper).
+        let mut enc_medians = AdaptiveMedians::new(seed);
+        let mut enc_state = RunState::new();
+        let mut w = BitWriter::new();
+        for &v in &values {
+            encode_one_sample(&mut w, &mut enc_medians, &mut enc_state, v, true);
+        }
+        let bytes = w.finish();
+        let view = crate::PackedSamples::new(&bytes);
+
+        // Decode via the from_entropy wrapper.
+        let got = decode_packed_samples_mono_from_entropy(&view, &info, values.len())
+            .expect("from_entropy decode");
+        assert_eq!(got, values);
+
+        // Same payload through the explicit-seed call — must match
+        // bit-for-bit since the wrapper is purely a bridging step over
+        // AdaptiveMedians::from_entropy(info, 0).
+        let mut dec_medians = AdaptiveMedians::new(seed);
+        let got2 = decode_packed_samples_mono(&view, &mut dec_medians, values.len())
+            .expect("explicit decode");
+        assert_eq!(got, got2);
+    }
+
+    #[test]
+    fn decode_packed_samples_mono_from_entropy_rejects_negative_seed() {
+        // Negative left seed → InvalidEntropyInfoForMono. No bits are
+        // read — the bridge fails before the decode loop runs.
+        let bytes: [u8; 0] = [];
+        let view = crate::PackedSamples::new(&bytes);
+        let info = EntropyInfo {
+            medians_left: [-1, 0, 0],
+            medians_right: [0, 0, 0],
+        };
+        let err = decode_packed_samples_mono_from_entropy(&view, &info, 4);
+        assert_eq!(err, Err(Error::InvalidEntropyInfoForMono));
+    }
+
+    #[test]
+    fn decode_packed_samples_mono_from_entropy_zero_count_is_vacuous() {
+        // Zero samples requested → empty output, regardless of payload.
+        // The bridge must still validate the seed (a malformed seed
+        // would error here too), but the decode loop body never runs.
+        let bytes: [u8; 0] = [];
+        let view = crate::PackedSamples::new(&bytes);
+        let info = EntropyInfo::mono([100, 200, 300]);
+        let got = decode_packed_samples_mono_from_entropy(&view, &info, 0)
+            .expect("vacuous from_entropy decode");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn decode_packed_samples_stereo_from_entropy_matches_explicit_seeds() {
+        // Encode a stereo zone-1 sequence (well-formed under
+        // encode_one_sample's last_zero pre-commit) with both channels
+        // seeded [8192;3], then decode it through both the explicit-
+        // seed and the from_entropy wrappers and assert identical
+        // reconstructions.
+        let seeds = [[8192u32, 8192, 8192], [8192u32, 8192, 8192]];
+        let info = EntropyInfo::stereo([8192, 8192, 8192], [8192, 8192, 8192]);
+        let mut sim = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut interleaved = Vec::new();
+        for i in 0..8 {
+            let ch = i % 2;
+            let mag = sim[ch].get_med(0) as i32;
+            sim[ch].adapt(Zone::from_ones_count(1));
+            interleaved.push(mag);
+        }
+        let (bytes, _, _) = stereo_encode(seeds, &interleaved);
+        let view = crate::PackedSamples::new(&bytes);
+
+        let got = decode_packed_samples_stereo_from_entropy(&view, &info, interleaved.len() / 2)
+            .expect("stereo from_entropy decode");
+        assert_eq!(got, interleaved);
+
+        let mut dec_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let got2 = decode_packed_samples_stereo(&view, &mut dec_medians, interleaved.len() / 2)
+            .expect("explicit stereo decode");
+        assert_eq!(got, got2);
+    }
+
+    #[test]
+    fn decode_packed_samples_stereo_from_entropy_rejects_mono_info() {
+        // A mono EntropyInfo has no right-channel set on the wire, so
+        // the bridge cannot seed the right channel. The wrapper errors
+        // with InvalidEntropyInfoForStereo before reading any bits.
+        let bytes: [u8; 0] = [];
+        let view = crate::PackedSamples::new(&bytes);
+        let info = EntropyInfo::mono([100, 200, 300]);
+        let err = decode_packed_samples_stereo_from_entropy(&view, &info, 4);
+        assert_eq!(err, Err(Error::InvalidEntropyInfoForStereo));
+    }
+
+    #[test]
+    fn decode_packed_samples_stereo_from_entropy_rejects_negative_seed() {
+        let bytes: [u8; 0] = [];
+        let view = crate::PackedSamples::new(&bytes);
+        let info = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [0, -1, 0],
+        };
+        let err = decode_packed_samples_stereo_from_entropy(&view, &info, 4);
+        assert_eq!(err, Err(Error::InvalidEntropyInfoForStereo));
+    }
+
+    #[test]
+    fn decode_packed_samples_stereo_from_entropy_zero_frames_is_vacuous() {
+        // Zero frames requested → empty output. Bridge still validates
+        // the EntropyInfo shape (so a malformed one would still error).
+        let bytes: [u8; 0] = [];
+        let view = crate::PackedSamples::new(&bytes);
+        let info = EntropyInfo::stereo([100, 200, 300], [400, 500, 600]);
+        let got = decode_packed_samples_stereo_from_entropy(&view, &info, 0)
+            .expect("vacuous stereo from_entropy decode");
         assert!(got.is_empty());
     }
 }

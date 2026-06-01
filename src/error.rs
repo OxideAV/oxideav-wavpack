@@ -112,6 +112,19 @@ pub enum Error {
     /// caller stops the per-sample loop on this variant: it is a normal
     /// end-of-stream signal, not a malformed-payload signal.
     EndOfStream,
+    /// `decode_packed_samples_mono_from_entropy` was handed an
+    /// [`crate::EntropyInfo`] whose channel-0 set carried a negative
+    /// seed (`AdaptiveMedians::from_entropy` rejected the `i32 → u32`
+    /// reinterpretation per its defensive contract). The contained
+    /// values are the offending seed triple verbatim for diagnostics.
+    /// Round 201.
+    InvalidEntropyInfoForMono,
+    /// `decode_packed_samples_stereo_from_entropy` was handed an
+    /// [`crate::EntropyInfo`] that is either mono (no right-channel set
+    /// on the wire — nothing to drive the right-channel adaptive state)
+    /// or carries a negative seed in either set (same defensive
+    /// rejection as the mono variant). Round 201.
+    InvalidEntropyInfoForStereo,
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -168,6 +181,12 @@ impl core::fmt::Display for Error {
             ),
             Error::EndOfStream => f.write_str(
                 "oxideav-wavpack: 0x0A per-sample loop reached the wire EOF escape (cbits == 33 inside the unary-prefix escape branch)",
+            ),
+            Error::InvalidEntropyInfoForMono => f.write_str(
+                "oxideav-wavpack: decode_packed_samples_mono_from_entropy: channel-0 EntropyInfo set has a negative seed (i32 -> u32 rejected)",
+            ),
+            Error::InvalidEntropyInfoForStereo => f.write_str(
+                "oxideav-wavpack: decode_packed_samples_stereo_from_entropy: EntropyInfo is mono or carries a negative per-channel seed",
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

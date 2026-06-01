@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 201 — `EntropyInfo` → `AdaptiveMedians` channel-indexed bridges
+  and end-to-end `from_entropy` wrappers for the mono and stereo
+  `0x0A` decode loops, removing the round-15/199 caller's hand-rolled
+  per-channel seed extraction. New `EntropyInfo::stereo(left, right)`
+  symmetric constructor (counterpart to the existing `EntropyInfo::mono`).
+  New `AdaptiveMedians::from_entropy(info, channel_idx)` returning
+  `Some(state)` for channel 0 on any payload and channel 1 on a stereo
+  payload (the same shape as `Medians::from_entropy`), with `None` for
+  out-of-range indices, channel 1 on mono, and negative seeds (defensive
+  `i32 → u32` reject). New `AdaptiveMedians::stereo_pair_from_entropy(info)`
+  returning the `[left, right]` array `decode_packed_samples_stereo`
+  takes (returns `None` on mono or any negative seed). New top-level
+  `decode_packed_samples_mono_from_entropy(payload, info, count)` and
+  `decode_packed_samples_stereo_from_entropy(payload, info, frames)`
+  wrappers that compose the bridges with the round-15/199 stateful
+  loops, surfacing a new `Error::InvalidEntropyInfoForMono` /
+  `Error::InvalidEntropyInfoForStereo` for the malformed-input arm.
+  20 new tests (272 total): the `EntropyInfo::stereo` constructor
+  populating both sets and matching its struct-literal form (plus the
+  is_mono-by-content nuance with a zero right set); the
+  `AdaptiveMedians::from_entropy` bridge across channel 0 / 1 / out-of-
+  range indices, mono right-channel rejection, and negative-seed
+  rejection on both channels; the `stereo_pair_from_entropy` mono
+  rejection and per-channel negative-seed rejection; the
+  `_from_entropy` wrappers proving byte-identical reconstruction to
+  the explicit-seed calls, the malformed-input error paths firing
+  before any bits are read, and the zero-count / zero-frame vacuous
+  cases.
 - Round 199 — stereo per-sample `0x0A` decode loop wiring the
   `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §2 channel-
   alternation rule on top of the round-15 mono loop. New

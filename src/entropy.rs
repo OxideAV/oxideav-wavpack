@@ -112,6 +112,25 @@ impl EntropyInfo {
         }
     }
 
+    /// Construct an `EntropyInfo` with both channels populated — the
+    /// natural value for a stereo block. Symmetric counterpart to
+    /// [`Self::mono`]; matches the two-set form the wiki "one or two
+    /// sets of medians" sentence describes.
+    ///
+    /// Note: if `medians_right` is `[0; 3]` the resulting value will
+    /// still report [`Self::is_mono`] `== true` (the content-only check
+    /// the round-4 expander uses); pass non-zero seeds to model a
+    /// genuine stereo payload.
+    pub const fn stereo(
+        medians_left: [i32; MEDIANS_PER_CHANNEL],
+        medians_right: [i32; MEDIANS_PER_CHANNEL],
+    ) -> Self {
+        Self {
+            medians_left,
+            medians_right,
+        }
+    }
+
     /// `true` when the right-channel medians are all zero — i.e. the
     /// payload was a mono (single-set) entropy-info sub-block.
     /// Convenience for callers correlating against
@@ -411,5 +430,37 @@ mod tests {
         assert_eq!(stereo.medians_for_channel(2), None);
         assert_eq!(stereo.medians_for_channel(3), None);
         assert_eq!(stereo.medians_for_channel(255), None);
+    }
+
+    // ---- Round-201 EntropyInfo::stereo constructor ----
+
+    #[test]
+    fn stereo_helper_populates_both_sets() {
+        let info = EntropyInfo::stereo([10, 20, 30], [40, 50, 60]);
+        assert_eq!(info.medians_left, [10, 20, 30]);
+        assert_eq!(info.medians_right, [40, 50, 60]);
+        assert!(info.is_stereo());
+        assert_eq!(info.channels(), 2);
+    }
+
+    #[test]
+    fn stereo_helper_matches_struct_literal() {
+        let from_helper = EntropyInfo::stereo([1, 2, 3], [4, 5, 6]);
+        let from_literal = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [4, 5, 6],
+        };
+        assert_eq!(from_helper, from_literal);
+    }
+
+    #[test]
+    fn stereo_helper_with_zero_right_reports_mono_by_content() {
+        // The is_mono() check is content-only; an all-zero right set
+        // looks mono even when built through the stereo constructor.
+        // Callers correlate against the enclosing block's Flags::mono
+        // bit for the authoritative answer (see is_mono() docs).
+        let info = EntropyInfo::stereo([1, 2, 3], [0, 0, 0]);
+        assert!(info.is_mono());
+        assert_eq!(info.channels(), 1);
     }
 }
