@@ -5,6 +5,53 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 214 — block-level discovery / accessor sweep on
+[`WavPackBlock`], pairing the round-13 `parse_block` aggregate with
+the typed views the existing free finders already build over
+`self.sub_blocks`. New header passthroughs `flags()` /
+`block_samples()` / `block_index()` / `is_audio_block()` lift the
+round-1 header fields and predicates to the block surface; six new
+`has_*` presence predicates
+(`has_entropy_info` / `has_packed_samples` / `has_md5_checksum` /
+`has_riff_header` / `has_riff_trailer` / `has_multichannel_info`)
+key on [`SubBlockId`] equality; six new borrow finders
+(`find_sub_block` / `find_entropy_info_sub_block` /
+`find_md5_checksum_sub_block` /
+`find_multichannel_info_sub_block` /
+`find_riff_header_sub_block` /
+`find_riff_trailer_sub_block`) return
+`Option<&MetadataSubBlock<'a>>` borrows pairing with each predicate;
+three new typed extractors return the round-4 / round-10 / round-12
+typed views one call from the block — `packed_samples()` returns
+`Option<PackedSamples<'a>>`; `entropy_info()` returns
+`Result<Option<EntropyInfo>>` (missing `0x05` → `Ok(None)`,
+malformed → propagates [`Error::EntropyInfoLength`]);
+`md5_checksum()` returns `Result<Option<Md5Checksum>>` with the same
+shape (missing → `Ok(None)`, malformed →
+[`Error::Md5ChecksumLength`]). Round 214 composes with the round-206
+decode loop: a multi-block iterator typically pre-flights with
+`block.is_audio_block()` + `block.has_entropy_info()` +
+`block.has_packed_samples()` before calling
+`block.decode_samples()`. No new error variants and no docs-gap-
+blocked surface touched. 24 new tests (319 total) pin: the four
+header passthroughs against the underlying field / predicate; each
+of the six `has_*` predicates firing on the matching sub-block ID
+and clearing on a metadata-empty block; each of the six borrow
+finders returning the present / absent shapes with payload byte
+pins; `packed_samples()` returning a typed [`PackedSamples`] view
+with byte-array round-trip and `None` on absence; `entropy_info()`
+returning the typed `[5, 3, 7]` mono medians via an explicit-
+exponent log-pack synthesise (`[m, 0x09]` → `median = m`), the
+absent `Ok(None)` case, and the malformed-length error propagation;
+`md5_checksum()` decoding the standard "empty input" digest
+`d41d8cd98f00b204e9800998ecf8427e` as a pinned test vector, the
+absent `Ok(None)` case, and the malformed-length error propagation;
+and an end-to-end pairing of all the round-214 accessors and the
+round-206 [`WavPackBlock::decode_samples`] composer on a single
+block carrying `0x05` + `0x0A` + `0x26` returning the expected `[0]`
+PCM sample alongside the typed entropy / md5 / packed-samples views
+and `false` for the un-present predicates.**
+
 **Round 206 — block-level `WavPackBlock::decode_samples()` composer
 turning a [`parse_block`] aggregate into PCM samples in one call,
 with typed gates for every WavPack v.4 feature the round-15/199
@@ -543,6 +590,56 @@ Public API:
   `Decorrelation` (`0x02` / `0x03` / `0x04` sub-blocks present),
   `LowLatencyBlock` (bit 31), `RobustBlock` (bit 28). Carries
   through [`Error::UnsupportedBlockFeature`].
+- [`WavPackBlock::flags`] (round 214) — borrow the parsed
+  [`Flags`] view from the fixed block header. Equivalent to
+  `&block.header().flags` but spelled directly so caller code
+  picking flag predicates off a borrowed [`WavPackBlock`] doesn't
+  need to re-bind the header first.
+- [`WavPackBlock::block_samples`] / [`WavPackBlock::block_index`]
+  (round 214) — passthrough accessors for the wiki "samples in this
+  block" and "offset in samples for current block" header fields.
+- [`WavPackBlock::is_audio_block`] (round 214) — block-level lift of
+  the round-1 [`WavPackBlockHeader::is_audio_block`] predicate
+  (`block_samples != 0`). Pairs with [`Self::decode_samples`] which
+  refuses metadata-only blocks via [`Error::BlockHasNoAudio`].
+- [`WavPackBlock::has_entropy_info`] /
+  [`WavPackBlock::has_packed_samples`] /
+  [`WavPackBlock::has_md5_checksum`] /
+  [`WavPackBlock::has_riff_header`] /
+  [`WavPackBlock::has_riff_trailer`] /
+  [`WavPackBlock::has_multichannel_info`] (round 214) — presence
+  predicates keyed on the matching wiki sub-block ID (`0x05` /
+  `0x0A` / `0x26` / `0x20` / `0x21` / `0x0D`). Pair with the
+  corresponding `find_*_sub_block` borrow finders.
+- [`WavPackBlock::find_sub_block`] (round 214) — block-level
+  convenience over [`crate::find_first`] returning an
+  `Option<&MetadataSubBlock<'a>>` for the first sub-block matching
+  the supplied [`SubBlockId`].
+- [`WavPackBlock::find_entropy_info_sub_block`] /
+  [`WavPackBlock::find_md5_checksum_sub_block`] /
+  [`WavPackBlock::find_multichannel_info_sub_block`] /
+  [`WavPackBlock::find_riff_header_sub_block`] /
+  [`WavPackBlock::find_riff_trailer_sub_block`] (round 214) —
+  block-level specialised borrow finders pairing with the
+  corresponding `has_*` predicates. Each returns an
+  `Option<&MetadataSubBlock<'a>>` borrow over `self.sub_blocks()`.
+- [`WavPackBlock::packed_samples`] (round 214) — locate the `0x0A`
+  packed-samples sub-block and wrap it as a typed [`PackedSamples`]
+  view in one call. Returns `None` when no `0x0A` sub-block is
+  present.
+- [`WavPackBlock::entropy_info`] (round 214) — locate the `0x05`
+  entropy-info sub-block and expand its payload into a typed
+  [`EntropyInfo`] in one call. Returns `Ok(None)` when no `0x05`
+  sub-block is present (a structurally legal case — metadata-only
+  blocks have no medians to seed); returns
+  `Err(Error::EntropyInfoLength)` when the sub-block is present but
+  malformed.
+- [`WavPackBlock::md5_checksum`] (round 214) — locate the `0x26`
+  MD5-checksum sub-block and parse its 16-byte payload into a typed
+  [`Md5Checksum`] in one call. Returns `Ok(None)` when no `0x26`
+  sub-block is present (the wiki "IDs" listing makes the MD5
+  optional); returns `Err(Error::Md5ChecksumLength)` when the
+  sub-block is present but the payload is the wrong length.
 
 ### Out of scope (later rounds)
 

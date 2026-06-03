@@ -1,5 +1,32 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 214 — block-level discovery / accessor sweep on
+//! [`WavPackBlock`] pairing the round-13 [`parse_block`] aggregate with
+//! the typed views the existing free finders already build. Adds four
+//! header-passthrough accessors ([`WavPackBlock::flags`] /
+//! [`WavPackBlock::block_samples`] / [`WavPackBlock::block_index`] /
+//! [`WavPackBlock::is_audio_block`]), six presence predicates
+//! ([`WavPackBlock::has_entropy_info`] /
+//! [`WavPackBlock::has_packed_samples`] /
+//! [`WavPackBlock::has_md5_checksum`] /
+//! [`WavPackBlock::has_riff_header`] /
+//! [`WavPackBlock::has_riff_trailer`] /
+//! [`WavPackBlock::has_multichannel_info`]), six borrow finders
+//! ([`WavPackBlock::find_sub_block`] /
+//! [`WavPackBlock::find_entropy_info_sub_block`] /
+//! [`WavPackBlock::find_md5_checksum_sub_block`] /
+//! [`WavPackBlock::find_multichannel_info_sub_block`] /
+//! [`WavPackBlock::find_riff_header_sub_block`] /
+//! [`WavPackBlock::find_riff_trailer_sub_block`]) and three typed
+//! extractors ([`WavPackBlock::packed_samples`] →
+//! `Option<PackedSamples<'a>>`, [`WavPackBlock::entropy_info`] →
+//! `Result<Option<EntropyInfo>>`, [`WavPackBlock::md5_checksum`] →
+//! `Result<Option<Md5Checksum>>`). No new error variants and no
+//! docs-gap-blocked surface touched. 24 new tests (319 total) pin
+//! present / absent / malformed branches across each accessor and an
+//! end-to-end pairing with the round-206 [`WavPackBlock::decode_samples`]
+//! composer.**
+//!
 //! **Round 206 — block-level [`WavPackBlock::decode_samples`] composer
 //! turning the round-13 [`parse_block`] aggregate into PCM samples in
 //! one call. Chains [`find_entropy_info`] + [`expand_entropy`] +

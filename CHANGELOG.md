@@ -8,6 +8,87 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 214 — block-level discovery / accessor sweep on
+  [`WavPackBlock`], surfacing the typed views the existing free
+  finders already build over `self.sub_blocks` without making the
+  caller reach through `block.sub_blocks()`. New header passthroughs:
+  [`WavPackBlock::flags`] borrows `&self.header.flags`,
+  [`WavPackBlock::block_samples`] / [`WavPackBlock::block_index`]
+  return the wiki "samples in this block" / "offset in samples for
+  current block" fields, and [`WavPackBlock::is_audio_block`] lifts
+  the round-1 [`WavPackBlockHeader::is_audio_block`] predicate to the
+  block level so a multi-block iterator can filter without reaching
+  through the header. New presence predicates:
+  [`WavPackBlock::has_entropy_info`] /
+  [`WavPackBlock::has_packed_samples`] /
+  [`WavPackBlock::has_md5_checksum`] /
+  [`WavPackBlock::has_riff_header`] /
+  [`WavPackBlock::has_riff_trailer`] /
+  [`WavPackBlock::has_multichannel_info`] keyed on
+  [`SubBlockId`] equality. New borrow finders:
+  [`WavPackBlock::find_sub_block`] /
+  [`WavPackBlock::find_entropy_info_sub_block`] /
+  [`WavPackBlock::find_md5_checksum_sub_block`] /
+  [`WavPackBlock::find_multichannel_info_sub_block`] /
+  [`WavPackBlock::find_riff_header_sub_block`] /
+  [`WavPackBlock::find_riff_trailer_sub_block`] each pair with the
+  corresponding `has_*` predicate and return an
+  `Option<&MetadataSubBlock<'a>>` borrow. New typed extractors:
+  [`WavPackBlock::packed_samples`] returns
+  `Option<PackedSamples<'a>>` (the round-12 typed view over the
+  `0x0A` payload); [`WavPackBlock::entropy_info`] returns
+  `Result<Option<EntropyInfo>>` (the round-4 expander wrapped so
+  missing `0x05` reports `Ok(None)` rather than an error, and a
+  malformed `0x05` propagates the existing
+  [`Error::EntropyInfoLength`]); [`WavPackBlock::md5_checksum`]
+  returns `Result<Option<Md5Checksum>>` with the same shape
+  (missing → `Ok(None)`, malformed → `Error::Md5ChecksumLength`).
+  These accessors compose with the round-206 decode loop: a typical
+  pre-flight call sequence is `block.is_audio_block()` +
+  `block.has_entropy_info()` + `block.has_packed_samples()` +
+  `block.decode_samples()`, all on a borrowed
+  [`WavPackBlock`]. Round 214 adds no new error variants and does
+  not touch any docs-gap-blocked surface; the round-3 decorrelation
+  expanders still lack a prediction-loop consumer and the
+  median-adaptation amount remains the open docs gap for stateful
+  Golomb refinement (still wired only through the round-15/199
+  per-sample loop and the round-201/206 composers).
+- 24 new unit tests (319 total): [`WavPackBlock::flags`] pin against
+  `self.header.flags.raw` round-trip with the `mono` bit asserted;
+  [`WavPackBlock::block_samples`] / [`WavPackBlock::block_index`]
+  match the header values (with an explicit 12345 block_index
+  patched into the synthesised header bytes); the
+  [`WavPackBlock::is_audio_block`] predicate symmetric with
+  [`WavPackBlockHeader::is_audio_block`] across the `block_samples`
+  zero / non-zero boundary; the six `has_*` presence predicates each
+  fire on the matching sub-block ID and clear on a metadata-empty
+  block; [`WavPackBlock::find_sub_block`] returning the first
+  matching `&MetadataSubBlock<'a>` borrow with payload pin and
+  reporting `None` for an absent ID; each specialised borrow finder
+  ([`find_entropy_info_sub_block`] / [`find_md5_checksum_sub_block`]
+  / [`find_multichannel_info_sub_block`] /
+  [`find_riff_header_sub_block`] / [`find_riff_trailer_sub_block`])
+  returning the present / absent shapes with payload pins;
+  [`WavPackBlock::packed_samples`] returning a typed
+  [`PackedSamples`] view with byte-array round-trip and `None` on
+  absence; [`WavPackBlock::entropy_info`] decoding a mono `0x05`
+  payload to a typed [`EntropyInfo`] via the explicit-exponent
+  log-pack path (`[mantissa_lo, 0x09]` → `median = mantissa`)
+  returning `Ok(Some([5, 3, 7]))`, returning `Ok(None)` on a
+  block with no `0x05`, and propagating
+  `Err(Error::EntropyInfoLength(8))` for a malformed 8-byte
+  payload; [`WavPackBlock::md5_checksum`] decoding the standard
+  "empty input" digest
+  (`d41d8cd98f00b204e9800998ecf8427e`) as a pinned test vector,
+  returning `Ok(None)` on an absent `0x26`, and propagating
+  `Err(Error::Md5ChecksumLength(8))` for a wrong-length payload; and
+  an end-to-end pairing test confirming the round-214 accessors and
+  the round-206 [`decode_samples`] composer compose on a single
+  block with `0x05` + `0x0A` + `0x26` returning the expected `[0]`
+  PCM sample alongside `Some` entropy / md5 / packed-samples typed
+  views and `false` for the un-present `has_riff_*` /
+  `has_multichannel_info` / `has_decorrelation` predicates.
+
 - Round 206 — block-level `WavPackBlock::decode_samples()` composer
   turning the round-13 [`parse_block`] aggregate into PCM samples in
   one call. Chains [`find_entropy_info`] + [`expand_entropy`] +

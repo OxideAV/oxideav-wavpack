@@ -37,12 +37,15 @@
 //! per-sample loop the wiki "Samples coding" section depends on; this
 //! round adds no sample-level state and so is not impacted by that gap.
 
-use crate::block_header::{parse_block_header, WavPackBlockHeader, HEADER_LEN};
-use crate::entropy::expand_entropy;
+use crate::block_header::{parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN};
+use crate::entropy::{expand_entropy, EntropyInfo};
 use crate::error::{Error, Result};
 use crate::metadata::{
-    find_entropy_info, find_packed_samples, walk_metadata, MetadataSubBlock, SubBlockId,
+    find_entropy_info, find_first, find_md5_checksum_block, find_multichannel_info,
+    find_packed_samples, parse_md5_checksum, walk_metadata, Md5Checksum, MetadataSubBlock,
+    SubBlockId,
 };
+use crate::packed_samples::PackedSamples;
 use crate::samples::{
     decode_packed_samples_mono_from_entropy, decode_packed_samples_stereo_from_entropy,
 };
@@ -203,6 +206,178 @@ impl<'a> WavPackBlock<'a> {
         self.contains_sub_block(SubBlockId::DecorrelationTerms)
             || self.contains_sub_block(SubBlockId::DecorrelationWeights)
             || self.contains_sub_block(SubBlockId::DecorrelationSamples)
+    }
+
+    /// Convenience accessor: the parsed [`Flags`] view from the fixed
+    /// block header. Equivalent to `&self.header().flags` but spelled
+    /// directly for callers picking flag predicates off a borrowed
+    /// `WavPackBlock` without re-binding the header. Round 214.
+    pub fn flags(&self) -> &Flags {
+        &self.header.flags
+    }
+
+    /// Convenience accessor: the wiki "samples in this block" field
+    /// (`block_samples` in the round-1 header). Equivalent to
+    /// `self.header().block_samples` but spelled directly so callers
+    /// asking "how many PCM samples does this block carry?" don't need
+    /// to reach through the field. Round 214.
+    pub fn block_samples(&self) -> u32 {
+        self.header.block_samples
+    }
+
+    /// Convenience accessor: the wiki "offset in samples for current
+    /// block" field (`block_index` in the round-1 header). Round 214.
+    pub fn block_index(&self) -> u32 {
+        self.header.block_index
+    }
+
+    /// `true` when the round-1 [`WavPackBlockHeader::is_audio_block`]
+    /// predicate fires (`block_samples != 0`). The wiki "Block structure"
+    /// listing allows `block_samples == 0` for metadata-only blocks
+    /// (e.g. a RIFF-header-only block at the start of a file); this
+    /// accessor lifts the header's `is_audio_block` to the block level
+    /// so a caller iterating a multi-block stream can filter without
+    /// reaching through the header. Round 214.
+    pub fn is_audio_block(&self) -> bool {
+        self.header.is_audio_block()
+    }
+
+    /// `true` when a `0x05` entropy-info sub-block is present. Pairs
+    /// with [`Self::entropy_info`] which decodes it; this predicate lets
+    /// a caller check for presence without paying the expansion cost.
+    /// Round 214.
+    pub fn has_entropy_info(&self) -> bool {
+        self.contains_sub_block(SubBlockId::EntropyInfo)
+    }
+
+    /// `true` when a `0x0A` packed-samples sub-block is present. Pairs
+    /// with [`Self::packed_samples`] which wraps it as a typed view.
+    /// Round 214.
+    pub fn has_packed_samples(&self) -> bool {
+        self.contains_sub_block(SubBlockId::PackedSamples)
+    }
+
+    /// `true` when a `0x26` MD5-checksum sub-block is present. Pairs
+    /// with [`Self::md5_checksum`] which parses the 16-byte digest.
+    /// Round 214.
+    pub fn has_md5_checksum(&self) -> bool {
+        self.contains_sub_block(SubBlockId::Md5Checksum)
+    }
+
+    /// `true` when a `0x20` RIFF-header sub-block is present. The wiki
+    /// "IDs" listing puts this sub-block "before audio" — the original
+    /// `.wav` file's RIFF header preserved verbatim so a lossless decode
+    /// can re-emit a byte-identical `.wav`. Round 214.
+    pub fn has_riff_header(&self) -> bool {
+        self.contains_sub_block(SubBlockId::RiffHeader)
+    }
+
+    /// `true` when a `0x21` RIFF-trailer sub-block is present. The wiki
+    /// "IDs" listing puts this sub-block "after audio" — any RIFF
+    /// chunks the original `.wav` carried after the audio data
+    /// (e.g. `LIST INFO`) preserved verbatim. Round 214.
+    pub fn has_riff_trailer(&self) -> bool {
+        self.contains_sub_block(SubBlockId::RiffTrailer)
+    }
+
+    /// `true` when a `0x0D` multichannel-info sub-block is present. The
+    /// wiki "IDs" listing names this payload "multichannel information
+    /// (including Microsoft channel mask)"; the payload layout is not
+    /// documented by the wiki, so this is a presence-only predicate.
+    /// Round 214.
+    pub fn has_multichannel_info(&self) -> bool {
+        self.contains_sub_block(SubBlockId::MultichannelInfo)
+    }
+
+    /// Locate and return a borrowed reference to the first metadata
+    /// sub-block with the given ID, or `None` when no such sub-block
+    /// exists in this block. Block-level convenience over the free
+    /// [`crate::find_first`] function on `self.sub_blocks()`. Round 214.
+    pub fn find_sub_block(&self, id: SubBlockId) -> Option<&MetadataSubBlock<'a>> {
+        find_first(&self.sub_blocks, id)
+    }
+
+    /// Borrow the first `0x05` entropy-info sub-block, or `None` when
+    /// none is present. Block-level pairing with the free
+    /// [`crate::find_entropy_info`] finder on `self.sub_blocks()`.
+    /// Use [`Self::entropy_info`] to additionally decode the payload
+    /// into a typed [`EntropyInfo`]. Round 214.
+    pub fn find_entropy_info_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        find_entropy_info(&self.sub_blocks)
+    }
+
+    /// Borrow the first `0x26` MD5-checksum sub-block, or `None` when
+    /// none is present. Block-level pairing with the free
+    /// [`crate::find_md5_checksum_block`] finder on `self.sub_blocks()`.
+    /// Use [`Self::md5_checksum`] to additionally parse the 16-byte
+    /// digest into a typed [`Md5Checksum`]. Round 214.
+    pub fn find_md5_checksum_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        find_md5_checksum_block(&self.sub_blocks)
+    }
+
+    /// Borrow the first `0x0D` multichannel-info sub-block, or `None`
+    /// when none is present. Block-level pairing with the free
+    /// [`crate::find_multichannel_info`] finder on `self.sub_blocks()`.
+    /// The wiki does not specify the multichannel-info payload layout,
+    /// so this stays at "borrow the bytes" rather than a typed view.
+    /// Round 214.
+    pub fn find_multichannel_info_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        find_multichannel_info(&self.sub_blocks)
+    }
+
+    /// Borrow the first `0x20` RIFF-header sub-block, or `None` when
+    /// none is present. The wiki "IDs" listing places this before any
+    /// audio; the payload is the verbatim RIFF/WAVE header from the
+    /// source `.wav` file. Round 214.
+    pub fn find_riff_header_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        find_first(&self.sub_blocks, SubBlockId::RiffHeader)
+    }
+
+    /// Borrow the first `0x21` RIFF-trailer sub-block, or `None` when
+    /// none is present. The wiki "IDs" listing places this after the
+    /// audio; the payload carries any RIFF chunks following the source
+    /// `.wav` file's `data` chunk. Round 214.
+    pub fn find_riff_trailer_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        find_first(&self.sub_blocks, SubBlockId::RiffTrailer)
+    }
+
+    /// Locate the `0x0A` packed-samples sub-block and wrap it as a
+    /// typed [`PackedSamples`] view, or return `None` when no `0x0A`
+    /// sub-block is present. Block-level pairing with the free
+    /// [`crate::find_packed_samples`] finder. Round 214.
+    pub fn packed_samples(&self) -> Option<PackedSamples<'a>> {
+        find_packed_samples(&self.sub_blocks)
+    }
+
+    /// Locate the `0x05` entropy-info sub-block and expand its payload
+    /// into a typed [`EntropyInfo`].
+    ///
+    /// Returns `Ok(None)` when the block carries no `0x05` sub-block
+    /// (a structurally legal case — metadata-only blocks have no
+    /// medians to seed). Returns `Err` when the sub-block is present
+    /// but its payload is malformed (the round-4 [`expand_entropy`]
+    /// rejection — neither 6 nor 12 bytes; see
+    /// [`Error::EntropyInfoLength`]). Round 214.
+    pub fn entropy_info(&self) -> Result<Option<EntropyInfo>> {
+        match find_entropy_info(&self.sub_blocks) {
+            Some(sub) => Ok(Some(expand_entropy(sub.payload)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Locate the `0x26` MD5-checksum sub-block and parse its 16-byte
+    /// payload into a typed [`Md5Checksum`].
+    ///
+    /// Returns `Ok(None)` when no `0x26` sub-block is present (the wiki
+    /// "IDs" listing makes the MD5 optional — many older `.wv` files
+    /// omit it). Returns `Err(Error::Md5ChecksumLength)` when the
+    /// sub-block is present but the payload is the wrong length.
+    /// Round 214.
+    pub fn md5_checksum(&self) -> Result<Option<Md5Checksum>> {
+        match find_md5_checksum_block(&self.sub_blocks) {
+            Some(sub) => Ok(Some(parse_md5_checksum(sub.payload)?)),
+            None => Ok(None),
+        }
     }
 
     /// Compose the round-13 [`crate::parse_block`] aggregate, the
@@ -990,5 +1165,422 @@ mod tests {
                 "Display for {feat:?} should mention {substring} but rendered {rendered:?}",
             );
         }
+    }
+
+    // ---- Round-214 block-level discovery / accessor sweep ----
+
+    /// Build a 0x05 entropy-info sub-block (mono) carrying the supplied
+    /// three-median seed values as raw `median[i]` integers (no log-pack
+    /// encoding — uses the explicit `0x09` exponent path so the on-disk
+    /// median decodes to the literal seed).
+    ///
+    /// `wp_exp2s` with mantissa `m` and exponent `9` returns `m << 0 = m`,
+    /// so a 16-bit word `[mantissa_lo, 0x09]` decodes to `median = m`.
+    /// This sidesteps the log-pack helper used by
+    /// `append_entropy_info_stereo_minimal` and lets the test pick the
+    /// channel-0 median by value.
+    fn append_entropy_info_mono_seed(payload: &mut Vec<u8>, seed: [u8; 3]) {
+        let bytes = [seed[0], 0x09, seed[1], 0x09, seed[2], 0x09];
+        append_small_sub_block(payload, 0x05, &bytes);
+    }
+
+    #[test]
+    fn flags_accessor_returns_block_header_flags() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        // flags() borrows the same Flags the header carries.
+        assert!(block.flags().mono);
+        assert!(block.flags().is_block_data_mono());
+        assert_eq!(block.flags().raw, block.header.flags.raw);
+    }
+
+    #[test]
+    fn block_samples_accessor_returns_header_field() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(7, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.block_samples(), 7);
+        assert_eq!(block.block_samples(), block.header.block_samples);
+    }
+
+    #[test]
+    fn block_index_accessor_returns_header_field() {
+        // synthesise_block doesn't take block_index directly, but the
+        // round-1 synthesiser zeroes it; we patch the bytes in place
+        // to confirm the accessor passes through.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let mut bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        // Wiki "Block structure": block_index is the 32-bit LE field at
+        // offset 16 (after 4 magic + 4 ck_size + 2 version + 1 track + 1
+        // sub-index + 4 total_samples).
+        bytes[16..20].copy_from_slice(&12345u32.to_le_bytes());
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.block_index(), 12345);
+        assert_eq!(block.block_index(), block.header.block_index);
+    }
+
+    #[test]
+    fn is_audio_block_accessor_mirrors_header_predicate() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        // block_samples = 1 → audio block.
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.is_audio_block());
+        assert_eq!(block.is_audio_block(), block.header.is_audio_block());
+
+        // block_samples = 0 → metadata-only.
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.is_audio_block());
+        assert_eq!(block.is_audio_block(), block.header.is_audio_block());
+    }
+
+    #[test]
+    fn has_entropy_info_predicate_tracks_presence() {
+        // Present: 0x05 sub-block exists.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_entropy_info());
+
+        // Absent: no sub-blocks at all.
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_entropy_info());
+    }
+
+    #[test]
+    fn has_packed_samples_predicate_tracks_presence() {
+        let mut payload = Vec::new();
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_packed_samples());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_packed_samples());
+    }
+
+    #[test]
+    fn has_md5_checksum_predicate_tracks_presence() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x26, &[0u8; 16]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_md5_checksum());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_md5_checksum());
+    }
+
+    #[test]
+    fn has_riff_header_predicate_tracks_presence() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x20, b"RIFF\x00\x00\x00\x00WAVEfmt ");
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_riff_header());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_riff_header());
+    }
+
+    #[test]
+    fn has_riff_trailer_predicate_tracks_presence() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x21, &[0u8; 4]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_riff_trailer());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_riff_trailer());
+    }
+
+    #[test]
+    fn has_multichannel_info_predicate_tracks_presence() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x0D, &[0u8; 4]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_multichannel_info());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_multichannel_info());
+    }
+
+    #[test]
+    fn find_sub_block_returns_first_matching_borrow_or_none() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x00, &[0u8; 4]); // dummy
+        append_small_sub_block(&mut payload, 0x26, &[0xAAu8; 16]); // md5
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let found = block
+            .find_sub_block(SubBlockId::Md5Checksum)
+            .expect("md5 sub-block present");
+        assert_eq!(found.id, SubBlockId::Md5Checksum);
+        assert_eq!(found.payload, [0xAAu8; 16].as_slice());
+
+        // EntropyInfo not present.
+        assert!(block.find_sub_block(SubBlockId::EntropyInfo).is_none());
+    }
+
+    #[test]
+    fn find_entropy_info_sub_block_borrow_pairs_with_predicate() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let sub = block
+            .find_entropy_info_sub_block()
+            .expect("0x05 sub-block present");
+        assert_eq!(sub.id, SubBlockId::EntropyInfo);
+        assert_eq!(sub.payload.len(), 6);
+
+        // Absent case.
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.find_entropy_info_sub_block().is_none());
+    }
+
+    #[test]
+    fn find_md5_checksum_sub_block_borrow_pairs_with_predicate() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x26, &[0xBBu8; 16]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let sub = block
+            .find_md5_checksum_sub_block()
+            .expect("0x26 sub-block present");
+        assert_eq!(sub.id, SubBlockId::Md5Checksum);
+        assert_eq!(sub.payload, [0xBBu8; 16].as_slice());
+
+        // Absent case.
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.find_md5_checksum_sub_block().is_none());
+    }
+
+    #[test]
+    fn find_multichannel_info_sub_block_borrow_pairs_with_predicate() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x0D, &[0xCCu8; 4]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let sub = block
+            .find_multichannel_info_sub_block()
+            .expect("0x0D sub-block present");
+        assert_eq!(sub.id, SubBlockId::MultichannelInfo);
+        assert_eq!(sub.payload, [0xCCu8; 4].as_slice());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.find_multichannel_info_sub_block().is_none());
+    }
+
+    #[test]
+    fn find_riff_header_sub_block_borrow_pairs_with_predicate() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x20, b"RIFF\x00\x00\x00\x00WAVEfmt ");
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let sub = block
+            .find_riff_header_sub_block()
+            .expect("0x20 sub-block present");
+        assert_eq!(sub.id, SubBlockId::RiffHeader);
+        assert_eq!(sub.payload, b"RIFF\x00\x00\x00\x00WAVEfmt ".as_slice());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.find_riff_header_sub_block().is_none());
+    }
+
+    #[test]
+    fn find_riff_trailer_sub_block_borrow_pairs_with_predicate() {
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x21, &[0xDDu8; 4]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let sub = block
+            .find_riff_trailer_sub_block()
+            .expect("0x21 sub-block present");
+        assert_eq!(sub.id, SubBlockId::RiffTrailer);
+        assert_eq!(sub.payload, [0xDDu8; 4].as_slice());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.find_riff_trailer_sub_block().is_none());
+    }
+
+    #[test]
+    fn packed_samples_accessor_returns_typed_view_or_none() {
+        let mut payload = Vec::new();
+        append_packed_samples(&mut payload, &[0xAB, 0xCD]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let view = block.packed_samples().expect("0x0A typed view present");
+        assert_eq!(view.bytes(), &[0xAB, 0xCD]);
+        assert_eq!(view.len(), 2);
+        assert!(!view.is_empty());
+
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.packed_samples().is_none());
+    }
+
+    #[test]
+    fn entropy_info_returns_typed_info_for_mono_payload() {
+        // Build a mono entropy-info sub-block whose seed expands to a
+        // chosen channel-0 median (5). The other two median slots stay
+        // at the synthesiser's chosen test values (3, 7) so the test
+        // can assert the per-channel triple end-to-end.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_seed(&mut payload, [5, 3, 7]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let info = block
+            .entropy_info()
+            .expect("decode entropy")
+            .expect("entropy info sub-block present");
+        assert!(info.is_mono());
+        assert_eq!(info.medians_left, [5, 3, 7]);
+        assert_eq!(info.medians_right, [0, 0, 0]);
+    }
+
+    #[test]
+    fn entropy_info_returns_none_when_no_0x05_present() {
+        // No 0x05 sub-block on the wire — entropy_info() returns
+        // Ok(None) (the structurally legal case for metadata-only
+        // blocks).
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x00, &[0u8; 2]); // dummy
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let got = block.entropy_info().expect("no decode error");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn entropy_info_propagates_length_error_for_malformed_0x05() {
+        // 0x05 payload of 8 bytes — neither 6 (mono) nor 12 (stereo).
+        // expand_entropy reports EntropyInfoLength; entropy_info()
+        // propagates verbatim.
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x05, &[0u8; 8]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let err = block.entropy_info().expect_err("must propagate length err");
+        assert_eq!(err, Error::EntropyInfoLength(8));
+    }
+
+    #[test]
+    fn md5_checksum_returns_typed_digest_when_0x26_present() {
+        // Standard "empty input" MD5 digest as a pinned test vector
+        // ("d41d8cd98f00b204e9800998ecf8427e").
+        let digest_bytes: [u8; 16] = [
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e,
+        ];
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x26, &digest_bytes);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let md5 = block
+            .md5_checksum()
+            .expect("decode md5")
+            .expect("0x26 sub-block present");
+        assert_eq!(md5.as_bytes(), &digest_bytes);
+    }
+
+    #[test]
+    fn md5_checksum_returns_none_when_no_0x26_present() {
+        // No 0x26 sub-block on the wire — md5_checksum() returns
+        // Ok(None) (the wiki makes the MD5 optional).
+        let bytes = synthesise_block(0, flags_with(1 << 2), &[]);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let got = block.md5_checksum().expect("no decode error");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn md5_checksum_propagates_length_error_for_malformed_0x26() {
+        // 0x26 payload of 8 bytes instead of the wiki-fixed 16.
+        // parse_md5_checksum reports Md5ChecksumLength; md5_checksum()
+        // propagates verbatim.
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x26, &[0u8; 8]);
+        let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let err = block.md5_checksum().expect_err("must propagate length err");
+        assert_eq!(err, Error::Md5ChecksumLength(8));
+    }
+
+    #[test]
+    fn block_level_accessors_pair_with_round_206_decode_samples() {
+        // End-to-end pairing: a block with both 0x05 and 0x0A and a 0x26
+        // MD5 exercises the round-214 accessors alongside the round-206
+        // decode loop. has_* predicates fire; entropy_info / md5_checksum
+        // / packed_samples return typed views; decode_samples still works.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let digest = [0xFFu8; 16];
+        append_small_sub_block(&mut payload, 0x26, &digest);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        assert!(block.is_audio_block());
+        assert!(block.has_entropy_info());
+        assert!(block.has_packed_samples());
+        assert!(block.has_md5_checksum());
+        assert!(!block.has_riff_header());
+        assert!(!block.has_riff_trailer());
+        assert!(!block.has_multichannel_info());
+        assert!(!block.has_decorrelation());
+
+        // Typed views are reachable through the new accessors.
+        assert!(block.entropy_info().expect("decode entropy").is_some());
+        assert_eq!(
+            block
+                .md5_checksum()
+                .expect("decode md5")
+                .expect("md5 present")
+                .as_bytes(),
+            &digest,
+        );
+        assert!(block.packed_samples().is_some());
+
+        // The round-206 composer still works end-to-end.
+        let pcm = block.decode_samples().expect("decode samples");
+        assert_eq!(pcm, vec![0]);
     }
 }
