@@ -705,6 +705,169 @@ pub fn total_block_samples(blocks: &[WavPackBlock<'_>]) -> u64 {
     blocks.iter().map(|b| b.block_samples() as u64).sum()
 }
 
+/// Lazy iterator over the PCM samples produced by every audio block in a
+/// WavPack byte buffer.
+///
+/// Composes the round-219 [`BlockIter`] (parse) with the round-206
+/// [`WavPackBlock::decode_samples`] (decode) into a single iterator that
+/// yields `Result<Vec<i32>>` once per **audio** block (i.e. one element
+/// per block whose `block_samples > 0`; metadata-only blocks are silently
+/// skipped since they carry no PCM to return).
+///
+/// Each yielded `Vec<i32>` has the same shape
+/// [`WavPackBlock::decode_samples`] returns: `block_samples` mono PCM
+/// samples on a mono / false-stereo block, or `block_samples * 2`
+/// left-then-right interleaved samples on a stereo block. Block-to-block
+/// mono / stereo dispatch is per the wiki "Block structure" listing —
+/// each block carries its own [`Flags::is_block_data_mono`] union of bit
+/// 2 `mono` and bit 30 `false_stereo`, so the iterator does not assume a
+/// uniform shape across blocks.
+///
+/// The iterator **fuses on the first error**: parse errors from
+/// [`BlockIter`] surface verbatim ([`Error::CkSizeExceedsBuffer`] /
+/// [`Error::Truncated`] / [`Error::InvalidMagic`] / …); decode errors
+/// from [`WavPackBlock::decode_samples`] also surface verbatim
+/// ([`Error::UnsupportedBlockFeature`] /
+/// [`Error::BlockMissingEntropyInfo`] / …) — the round-219 fuse + the
+/// round-206 refusal taxonomy compose without translation. Once any
+/// error fires, subsequent `next()` calls return `None`.
+///
+/// The metadata-only-block skip is a positive contract: a `.wv` file
+/// whose first block is a RIFF-header-only block (`block_samples == 0`,
+/// the wiki "Block structure" allowance for metadata-only blocks)
+/// still surfaces every audio block's PCM, not an [`Error::BlockHasNoAudio`]
+/// refusal. Callers that want to see metadata-only blocks should drive
+/// [`iter_blocks`] directly.
+///
+/// Construction: [`iter_decoded_blocks`] for the call-shape twin, or
+/// [`StreamDecodeIter::new`] for callers that prefer the type-first form.
+///
+/// Round 224.
+#[derive(Debug, Clone)]
+pub struct StreamDecodeIter<'a> {
+    /// Underlying block iterator. Drives parse + walks the byte buffer.
+    blocks: BlockIter<'a>,
+}
+
+impl<'a> StreamDecodeIter<'a> {
+    /// Build a [`StreamDecodeIter`] over the supplied byte buffer.
+    /// Equivalent to [`iter_decoded_blocks`] but spelled as a
+    /// constructor for callers that prefer the type-first form.
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            blocks: BlockIter::new(bytes),
+        }
+    }
+
+    /// Bytes of the input buffer the underlying [`BlockIter`] has not yet
+    /// consumed. Pairs with [`BlockIter::remaining`]; on a fused-error
+    /// iterator this points at the malformed (or unsupported) block's
+    /// first byte for precise offset diagnostics.
+    pub fn remaining(&self) -> &'a [u8] {
+        self.blocks.remaining()
+    }
+
+    /// `true` when this iterator will not yield any more items — either
+    /// because the underlying [`BlockIter`] is exhausted or because a
+    /// previous `next()` call returned `Err(_)` (the iterator is fused on
+    /// error via the same mechanism [`BlockIter`] uses).
+    pub fn is_exhausted(&self) -> bool {
+        self.blocks.is_exhausted()
+    }
+}
+
+impl<'a> Iterator for StreamDecodeIter<'a> {
+    type Item = Result<Vec<i32>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Loop over the underlying block iterator skipping metadata-only
+        // blocks (block_samples == 0) until we either find an audio
+        // block to decode, hit an error to fuse on, or run out of input.
+        for parsed in self.blocks.by_ref() {
+            match parsed {
+                Ok(block) => {
+                    if !block.is_audio_block() {
+                        // Metadata-only block — the wiki "Block structure"
+                        // allowance for block_samples == 0. No PCM to
+                        // yield; advance to the next block without
+                        // surfacing an Error::BlockHasNoAudio refusal.
+                        continue;
+                    }
+                    return Some(block.decode_samples());
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
+}
+
+impl core::iter::FusedIterator for StreamDecodeIter<'_> {}
+
+/// Construct a lazy [`StreamDecodeIter`] over the supplied byte buffer.
+///
+/// Equivalent to [`StreamDecodeIter::new`]; provided as a free function
+/// for the `iter_decoded_blocks(bytes)` call shape readers expect when
+/// scanning a `.wv` file's worth of blocks and decoding each in turn.
+///
+/// Yields one `Result<Vec<i32>>` per **audio** block — metadata-only
+/// blocks (`block_samples == 0`) are silently skipped. See
+/// [`StreamDecodeIter`] for the iteration contract (empty input → zero
+/// items; first error fuses the iterator).
+///
+/// Round 224.
+pub fn iter_decoded_blocks(bytes: &[u8]) -> StreamDecodeIter<'_> {
+    StreamDecodeIter::new(bytes)
+}
+
+/// Decode every audio block in a WavPack byte buffer and concatenate the
+/// PCM into a single `Vec<i32>`.
+///
+/// Composes the round-219 [`iter_blocks`] with the round-206
+/// [`WavPackBlock::decode_samples`] into a one-call "byte buffer → PCM"
+/// surface for callers who hold the whole file in memory and want the
+/// decoded stream up front.
+///
+/// Output shape:
+///
+/// * mono / false-stereo blocks contribute `block.block_samples()` PCM
+///   `i32`s per block;
+/// * stereo blocks contribute `block.block_samples() * 2` interleaved
+///   left-then-right `i32`s per block (the round-199 channel-alternation
+///   loop's shape preserved verbatim);
+/// * metadata-only blocks (`block_samples == 0`) contribute nothing.
+///
+/// Blocks are concatenated in on-disk order. The returned `Vec<i32>`
+/// `len()` equals `sum(block_samples * (1 if mono else 2))` across all
+/// audio blocks in the input. Per-block mono / stereo dispatch is the
+/// same union of wiki bit 2 `mono` + bit 30 `false_stereo` that
+/// [`WavPackBlock::decode_samples`] uses; this composer applies no
+/// uniform shape assumption across blocks.
+///
+/// Errors are surfaced from the first block that fails to parse or
+/// decode — every previously-decoded block's PCM is discarded. Callers
+/// who want to inspect partial output should drive [`iter_decoded_blocks`]
+/// manually and collect successful elements until the iterator fuses.
+///
+/// Parse errors propagate verbatim from [`parse_block`]
+/// ([`Error::CkSizeExceedsBuffer`] / [`Error::Truncated`] /
+/// [`Error::InvalidMagic`] / [`Error::InvalidCkSize`] /
+/// [`Error::UnsupportedVersion`] / metadata-walker errors). Decode
+/// errors propagate verbatim from [`WavPackBlock::decode_samples`]
+/// ([`Error::BlockMissingEntropyInfo`] /
+/// [`Error::BlockMissingPackedSamples`] /
+/// [`Error::UnsupportedBlockFeature`] / per-sample-loop errors).
+///
+/// Round 224.
+pub fn decode_stream(bytes: &[u8]) -> Result<Vec<i32>> {
+    let mut out: Vec<i32> = Vec::new();
+    for chunk in iter_decoded_blocks(bytes) {
+        let pcm = chunk?;
+        out.extend_from_slice(&pcm);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2023,5 +2186,351 @@ mod tests {
             .collect();
         assert_eq!(lazy, eager);
         assert_eq!(lazy, vec![10, 20]);
+    }
+
+    // ---- Round-224 decode_stream / StreamDecodeIter / iter_decoded_blocks ----
+
+    /// Synthesise a complete one-sample mono audio block: header with
+    /// `block_samples = 1`, standalone-multichannel-marker + bit 2
+    /// `mono` flags, a `0x05` mono-zero entropy-info sub-block, and a
+    /// `0x0A` packed-samples payload of two zero bytes (which, with the
+    /// zero-medians seed, exercises the round-206 zero-run-eligible
+    /// path and yields the single PCM sample `0`).
+    ///
+    /// Mirrors `decode_samples_returns_one_zero_for_mono_block_with_zero_seed_and_zero_unary`
+    /// — kept local to the round-224 test module so the stream tests are
+    /// self-contained.
+    fn synthesise_decodable_mono_block_one_zero_sample() -> Vec<u8> {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with(1 << 2); // bit 2 = mono
+        synthesise_block(1, flags, &payload)
+    }
+
+    #[test]
+    fn decode_stream_on_empty_buffer_yields_empty_vec() {
+        // The wiki "WavPack file consists of blocks" sentence is plural
+        // but the empty file is a degenerate case the BlockIter accepts.
+        // decode_stream inherits that: zero blocks → zero PCM samples.
+        let pcm = decode_stream(&[]).expect("empty input is not an error");
+        assert!(pcm.is_empty());
+    }
+
+    #[test]
+    fn decode_stream_single_audio_block_yields_one_zero_pcm_sample() {
+        let bytes = synthesise_decodable_mono_block_one_zero_sample();
+        let pcm = decode_stream(&bytes).expect("decode stream");
+        assert_eq!(pcm, vec![0]);
+    }
+
+    #[test]
+    fn decode_stream_concatenates_three_audio_blocks_in_on_disk_order() {
+        // Three identical one-sample mono blocks. decode_stream should
+        // concatenate the PCM in on-disk order — three `0` samples.
+        let block = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&block);
+
+        let pcm = decode_stream(&bytes).expect("decode stream of three");
+        assert_eq!(pcm, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_stream_skips_metadata_only_blocks_between_audio_blocks() {
+        // [audio][metadata-only][audio] should decode to [0, 0]; the
+        // metadata-only block (block_samples == 0) is silently skipped
+        // rather than triggering Error::BlockHasNoAudio.
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let metadata_only = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bytes = audio.clone();
+        bytes.extend_from_slice(&metadata_only);
+        bytes.extend_from_slice(&audio);
+
+        let pcm = decode_stream(&bytes).expect("decode stream skipping metadata");
+        assert_eq!(pcm, vec![0, 0]);
+    }
+
+    #[test]
+    fn decode_stream_with_leading_metadata_only_block_does_not_error() {
+        // The wiki "Block structure" allows metadata-only blocks
+        // (block_samples == 0) at the start of a `.wv` file to carry the
+        // RIFF header. decode_stream must not surface BlockHasNoAudio
+        // for these; it must walk past and decode the audio that follows.
+        let metadata_only = synthesise_header_bytes(MIN_CK_SIZE);
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = metadata_only.clone();
+        bytes.extend_from_slice(&audio);
+
+        let pcm = decode_stream(&bytes).expect("decode stream with leading metadata");
+        assert_eq!(pcm, vec![0]);
+    }
+
+    #[test]
+    fn decode_stream_on_all_metadata_only_input_yields_empty_vec() {
+        // No audio blocks → empty PCM. Not an error.
+        let mut bytes = synthesise_header_bytes(MIN_CK_SIZE);
+        bytes.extend_from_slice(&synthesise_header_bytes(MIN_CK_SIZE));
+
+        let pcm = decode_stream(&bytes).expect("decode stream of metadata-only blocks");
+        assert!(pcm.is_empty());
+    }
+
+    #[test]
+    fn decode_stream_propagates_parse_error_from_malformed_block() {
+        // ck_size advertises 200 bytes but only the 32-byte header is
+        // present. parse_block produces CkSizeExceedsBuffer and
+        // decode_stream surfaces it verbatim.
+        let bytes = synthesise_header_bytes(200);
+        let err = decode_stream(&bytes).expect_err("must reject malformed block");
+        match err {
+            Error::CkSizeExceedsBuffer { ck_size, available } => {
+                assert_eq!(ck_size, 200);
+                assert_eq!(available, HEADER_LEN);
+            }
+            other => panic!("expected CkSizeExceedsBuffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_stream_propagates_unsupported_block_feature_from_decode_samples() {
+        // An audio block with the hybrid (bit 3) flag set: parse cleanly,
+        // but decode_samples refuses with
+        // Error::UnsupportedBlockFeature(Hybrid). decode_stream surfaces
+        // that verbatim.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with((1 << 2) | (1 << 3)); // mono + hybrid
+        let bytes = synthesise_block(1, flags, &payload);
+        let err = decode_stream(&bytes).expect_err("must refuse hybrid");
+        assert_eq!(
+            err,
+            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
+        );
+    }
+
+    #[test]
+    fn decode_stream_propagates_block_missing_entropy_info() {
+        // Audio block (block_samples > 0) but no 0x05 sub-block →
+        // decode_samples raises BlockMissingEntropyInfo. decode_stream
+        // surfaces that verbatim.
+        let mut payload = Vec::new();
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with(1 << 2);
+        let bytes = synthesise_block(1, flags, &payload);
+        let err = decode_stream(&bytes).expect_err("must require entropy info");
+        assert_eq!(err, Error::BlockMissingEntropyInfo);
+    }
+
+    #[test]
+    fn decode_stream_stops_at_first_decode_error_and_discards_prior_pcm() {
+        // [good audio block][hybrid audio block] → decode_stream should
+        // return the hybrid block's UnsupportedBlockFeature error, not
+        // the leading good block's [0] PCM (eager wrapper discards
+        // partial output, per the contract).
+        let good = synthesise_decodable_mono_block_one_zero_sample();
+        let mut hybrid_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut hybrid_payload);
+        append_packed_samples(&mut hybrid_payload, &[0x00, 0x00]);
+        let hybrid_flags = flags_with((1 << 2) | (1 << 3));
+        let bad = synthesise_block(1, hybrid_flags, &hybrid_payload);
+
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&bad);
+
+        let err = decode_stream(&bytes).expect_err("must propagate the second block's error");
+        assert_eq!(
+            err,
+            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
+        );
+    }
+
+    #[test]
+    fn iter_decoded_blocks_yields_one_item_per_audio_block() {
+        // Three audio blocks → three Ok(Vec<i32>) items.
+        let block = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&block);
+
+        let items: Vec<Vec<i32>> = iter_decoded_blocks(&bytes)
+            .map(|r| r.expect("each block decodes"))
+            .collect();
+        assert_eq!(items.len(), 3);
+        for it in &items {
+            assert_eq!(it, &vec![0]);
+        }
+    }
+
+    #[test]
+    fn iter_decoded_blocks_skips_metadata_only_blocks() {
+        // [metadata][audio][metadata][audio][metadata] → two Ok(Vec<i32>)
+        // items; the three metadata-only blocks contribute nothing.
+        let meta = synthesise_header_bytes(MIN_CK_SIZE);
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = Vec::new();
+        for chunk in [&meta, &audio, &meta, &audio, &meta] {
+            bytes.extend_from_slice(chunk);
+        }
+
+        let items: Vec<Vec<i32>> = iter_decoded_blocks(&bytes)
+            .map(|r| r.expect("must decode"))
+            .collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn iter_decoded_blocks_fuses_on_first_parse_error() {
+        // First block parses + decodes fine; second block has bad
+        // ck_size. After the first Ok, the next() must return the parse
+        // error and subsequent calls must be None (fused).
+        let good = synthesise_decodable_mono_block_one_zero_sample();
+        let bad = synthesise_header_bytes(200); // ck_size 200 but no payload
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&bad);
+
+        let mut iter = iter_decoded_blocks(&bytes);
+        assert_eq!(iter.next().expect("first ok").expect("ok"), vec![0]);
+        let second = iter.next().expect("second is the error");
+        assert!(matches!(second, Err(Error::CkSizeExceedsBuffer { .. })));
+        // Fused: third call returns None even though the underlying
+        // BlockIter would re-attempt the same malformed bytes.
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_decoded_blocks_fuses_on_first_decode_error() {
+        // First block parses + decodes fine; second block parses but
+        // raises a decode-time UnsupportedBlockFeature error. The
+        // iterator must yield the error and fuse.
+        let good = synthesise_decodable_mono_block_one_zero_sample();
+        let mut hybrid_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut hybrid_payload);
+        append_packed_samples(&mut hybrid_payload, &[0x00, 0x00]);
+        let bad = synthesise_block(1, flags_with((1 << 2) | (1 << 3)), &hybrid_payload);
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&bad);
+
+        let mut iter = iter_decoded_blocks(&bytes);
+        assert_eq!(iter.next().expect("first ok").expect("ok"), vec![0]);
+        let second = iter.next().expect("second is the error");
+        assert_eq!(
+            second,
+            Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::Hybrid
+            ))
+        );
+        // Round-219 fuse mechanism composes through: BlockIter fuses on
+        // its first error, and on a decode error the underlying iterator
+        // already advanced past the bad block — so a follow-up next() may
+        // return None without re-decoding. Whatever it returns, the
+        // iterator's is_exhausted predicate must be true once the
+        // underlying remaining-bytes slice is empty.
+        let _ = iter.next();
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_decoded_blocks_on_empty_buffer_yields_no_items() {
+        let mut iter = iter_decoded_blocks(&[]);
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_decoded_blocks_on_all_metadata_only_input_yields_no_items() {
+        let mut bytes = synthesise_header_bytes(MIN_CK_SIZE);
+        bytes.extend_from_slice(&synthesise_header_bytes(MIN_CK_SIZE));
+        let count = iter_decoded_blocks(&bytes).count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn stream_decode_iter_new_matches_iter_decoded_blocks() {
+        // Two routes to the same iterator type must yield identical
+        // sequences.
+        let block = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+
+        let from_new: Vec<Vec<i32>> = StreamDecodeIter::new(&bytes)
+            .map(|r| r.expect("ok"))
+            .collect();
+        let from_fn: Vec<Vec<i32>> = iter_decoded_blocks(&bytes)
+            .map(|r| r.expect("ok"))
+            .collect();
+        assert_eq!(from_new, from_fn);
+        assert_eq!(from_new, vec![vec![0], vec![0]]);
+    }
+
+    #[test]
+    fn stream_decode_iter_remaining_tracks_underlying_block_iter() {
+        // Before any next() call, remaining() is the full buffer.
+        // After draining a single audio block, remaining() advances to
+        // empty.
+        let block = synthesise_decodable_mono_block_one_zero_sample();
+        let buf = block.clone();
+        let mut iter = StreamDecodeIter::new(&buf);
+        assert_eq!(iter.remaining(), buf.as_slice());
+        let _ = iter.next().expect("one block");
+        assert!(iter.remaining().is_empty());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn stream_decode_iter_is_clone_and_fused_iterator_compliant() {
+        // Static traits check: the type must implement Clone + Iterator
+        // + FusedIterator. The two assertions below exercise both.
+        fn assert_clone_and_fused<T: Clone + core::iter::FusedIterator>(_t: &T) {}
+        let block = synthesise_decodable_mono_block_one_zero_sample();
+        let bytes = block.clone();
+        let iter = StreamDecodeIter::new(&bytes);
+        assert_clone_and_fused(&iter);
+    }
+
+    #[test]
+    fn decode_stream_handles_mixed_mono_and_stereo_blocks_in_one_input() {
+        // Round-224's contract pins per-block mono / stereo dispatch.
+        // A mono block followed by a stereo block must yield
+        // [mono_sample, stereo_left, stereo_right] = [0, 0, 0].
+        let mono = synthesise_decodable_mono_block_one_zero_sample();
+
+        // Stereo block carrying one frame = two interleaved samples.
+        // Mirrors decode_samples_returns_two_interleaved_zeros_for_stereo_block_with_minimal_seed.
+        let mut stereo_payload = Vec::new();
+        append_entropy_info_stereo_minimal(&mut stereo_payload);
+        append_packed_samples(&mut stereo_payload, &[0x00, 0x00]);
+        // Stereo block: flags carry standalone-multichannel-marker only
+        // (no bit 2 mono, no bit 30 false_stereo).
+        let stereo_flags = flags_with(0);
+        let stereo = synthesise_block(1, stereo_flags, &stereo_payload);
+
+        let mut bytes = mono.clone();
+        bytes.extend_from_slice(&stereo);
+
+        let pcm = decode_stream(&bytes).expect("decode mixed stream");
+        // mono: [0] (1 sample), stereo: [0, 0] (1 frame × 2 channels).
+        assert_eq!(pcm, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_stream_eager_matches_iter_decoded_blocks_flattened() {
+        // The eager decode_stream must be observationally identical to
+        // manually draining iter_decoded_blocks and concatenating each
+        // Vec<i32> in order.
+        let block = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&block);
+
+        let eager = decode_stream(&bytes).expect("eager decode");
+        let lazy: Vec<i32> = iter_decoded_blocks(&bytes)
+            .flat_map(|r| r.expect("ok"))
+            .collect();
+        assert_eq!(eager, lazy);
+        assert_eq!(eager, vec![0, 0, 0]);
     }
 }

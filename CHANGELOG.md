@@ -8,6 +8,65 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 224 — multi-block stream → PCM composer fusing the round-219
+  [`BlockIter`] with the round-206 [`WavPackBlock::decode_samples`]
+  into a single byte-buffer → `Vec<i32>` surface. New eager
+  [`decode_stream`] walks every audio block in the input and
+  concatenates the decoded PCM in on-disk order; new
+  [`StreamDecodeIter<'a>`] is the `Clone`-able,
+  `FusedIterator`-compliant lazy counterpart yielding
+  `Result<Vec<i32>>` once per **audio** block (metadata-only blocks
+  with `block_samples == 0` are silently skipped since they carry no
+  PCM to return — a positive contract preventing a spurious
+  [`Error::BlockHasNoAudio`] refusal on `.wv` files whose first block
+  is a RIFF-header-only metadata block). New free function
+  [`iter_decoded_blocks`] is the `iter_decoded_blocks(bytes)`
+  call-shape twin of [`StreamDecodeIter::new`].
+  [`StreamDecodeIter`] fuses on the first error (parse or decode) via
+  the underlying round-219 [`BlockIter`] fuse mechanism + the
+  round-206 refusal taxonomy — both compose without translation. Two
+  introspection accessors on [`StreamDecodeIter`] —
+  [`StreamDecodeIter::remaining`] (forwards [`BlockIter::remaining`])
+  and [`StreamDecodeIter::is_exhausted`] (forwards
+  [`BlockIter::is_exhausted`]) — round out the surface. No new error
+  variants and no docs-gap-blocked surface touched: every error this
+  composer surfaces is one [`parse_block`] or
+  [`WavPackBlock::decode_samples`] already raised. Per-block mono /
+  stereo dispatch (the wiki bit 2 + bit 30 union from round 206 via
+  [`Flags::is_block_data_mono`]) is preserved verbatim, so a
+  multi-block input may mix mono and stereo blocks and the
+  concatenated `Vec<i32>` reflects each block's own shape. Per-block
+  `0x05` seed re-initialisation (round 206 per-block stateless
+  contract) is preserved across the stream.
+- 21 new unit tests (358 total, up from 337): empty-buffer input
+  yielding `Ok(vec![])` (not an error — the wiki "WavPack file
+  consists of blocks" sentence is plural but [`BlockIter`] accepts the
+  degenerate empty file); single audio block yielding `[0]`; three
+  audio blocks concatenating to `[0, 0, 0]` in on-disk order;
+  metadata-only blocks silently skipped both between audio blocks and
+  at the leading position (no spurious [`Error::BlockHasNoAudio`]);
+  all-metadata-only input yielding `Ok(vec![])`;
+  [`Error::CkSizeExceedsBuffer`] propagated verbatim from a malformed
+  second block; [`Error::UnsupportedBlockFeature(Hybrid)`] propagated
+  verbatim from a hybrid-flagged audio block;
+  [`Error::BlockMissingEntropyInfo`] propagated from an audio block
+  lacking the `0x05` sub-block; eager [`decode_stream`] discarding
+  prior-block PCM on a mid-stream decode error (the documented eager
+  contract); [`iter_decoded_blocks`] yielding one item per audio
+  block with metadata-only blocks omitted; [`iter_decoded_blocks`]
+  fusing on first parse error AND on first decode error (both
+  routes); empty input and all-metadata-only input yielding zero
+  items; [`StreamDecodeIter::new`] and [`iter_decoded_blocks`]
+  returning identical sequences; [`StreamDecodeIter::remaining`]
+  tracking the underlying [`BlockIter`] across a `next()` call (full
+  buffer → empty after draining); the `Clone + FusedIterator` trait
+  bounds (a compile-time check via a generic helper); a mixed
+  mono+stereo input yielding `[0, 0, 0]` confirming the per-block
+  dispatch contract; and the eager / lazy equivalence over a
+  three-audio-block input (`decode_stream` is observationally
+  identical to draining [`iter_decoded_blocks`] and concatenating
+  each `Vec<i32>` via `flat_map`).
+
 - Round 219 — multi-block stream iteration on top of the round-13
   [`parse_block`] composer, lifting the wiki "WavPack file consists of
   blocks each beginning with 'wvpk'" file-format sentence into typed
