@@ -5,6 +5,51 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 219 — multi-block stream iteration on top of the round-13
+[`parse_block`] composer, lifting the wiki "WavPack file consists of
+blocks each beginning with 'wvpk'" file-format sentence into typed
+public API. New [`BlockIter<'a>`] is a `Clone`-able,
+`FusedIterator`-compliant lazy iterator yielding
+`Result<WavPackBlock<'a>>` over the chained-block byte buffer; it
+walks the chain by repeatedly calling [`parse_block`] on the previous
+call's returned tail, fusing on the first error so the caller can
+`?`-bubble without re-encountering the same failure on a follow-up
+`next()`. New free function [`iter_blocks`] is the `iter_blocks(bytes)`
+call-shape twin of [`BlockIter::new`]. New [`parse_blocks`] eagerly
+collects the iterator into `Vec<WavPackBlock<'_>>`. New [`block_count`]
+counts blocks without retaining them (one-block working set
+independent of input length). New [`total_block_samples`] sums the
+wiki "samples in this block" field across an already-parsed list,
+returning `u64` so a 4-GiB-plus stream's sample count does not
+overflow `u32`. Two introspection accessors on [`BlockIter`] —
+[`BlockIter::remaining`] (the bytes not yet consumed; on a fused
+iterator after an error, points at the malformed block's first byte
+for offset diagnostics) and [`BlockIter::is_exhausted`] — round out
+the surface. No new error variants and no docs-gap-blocked surface
+touched: every iterator yield is a direct [`parse_block`] result and
+the existing round-13 [`Error::CkSizeExceedsBuffer`] / [`Error::Truncated`]
+split surfaces verbatim across the iteration boundary, preserving the
+streaming caller's "need more bytes for this block's payload" vs
+"buffer ran out between blocks" distinction. 18 new tests (337 total)
+pin: empty-buffer iteration yielding zero items; single-block
+iteration with `is_exhausted` after; three back-to-back empty blocks;
+`remaining()` shrinking by exactly `8 + ck_size` per step; the
+fused-on-error contract with `remaining()` pointing at the malformed
+block's first byte; `CkSizeExceedsBuffer { ck_size: 200, available:
+32 }` surfacing on a partial second block; `Truncated` surfacing on a
+partial header between blocks (round-13 error split preserved across
+the iteration boundary); [`BlockIter::new`] and [`iter_blocks`]
+returning identical sequences; [`parse_blocks`] returning the same
+ordered list as iteration on a synthesised three-block stream with
+distinct `block_samples` (`100` / `200` / `300`), bubbling the first
+error rather than the partial Vec, and returning an empty Vec on
+empty input; [`block_count`] over five blocks; [`total_block_samples`]
+summing `100 + 200 + 300 = 600`, returning `0` on the empty slice,
+and the u64 return type preventing the `u32::MAX + u32::MAX` two-
+block sum from overflowing; and the equivalence check confirming
+[`parse_blocks`] is observationally identical to draining
+[`iter_blocks`].**
+
 **Round 214 — block-level discovery / accessor sweep on
 [`WavPackBlock`], pairing the round-13 `parse_block` aggregate with
 the typed views the existing free finders already build over
@@ -640,6 +685,31 @@ Public API:
   sub-block is present (the wiki "IDs" listing makes the MD5
   optional); returns `Err(Error::Md5ChecksumLength)` when the
   sub-block is present but the payload is the wrong length.
+- [`BlockIter`] (round 219) — `Clone`-able, `FusedIterator`-
+  compliant lazy iterator yielding `Result<WavPackBlock<'a>>` over a
+  chained-block byte buffer. Each `next()` calls [`parse_block`] on
+  the previous tail; the iterator fuses on the first error so a
+  `?`-bubble preserves the failure shape without re-trying it.
+  Accessors [`BlockIter::remaining`] (bytes not yet consumed; on a
+  fused-error iterator this points at the malformed block's first
+  byte for precise offset diagnostics) and [`BlockIter::is_exhausted`]
+  (`true` when no further items will be yielded). Construct via
+  [`BlockIter::new`] or the equivalent free function [`iter_blocks`].
+- [`iter_blocks`] (round 219) — free-function constructor for
+  [`BlockIter`] over a byte buffer; the `iter_blocks(bytes)` call
+  shape readers expect when scanning a `.wv` file's worth of blocks.
+- [`parse_blocks`] (round 219) — eager wrapper around [`iter_blocks`]
+  returning `Result<Vec<WavPackBlock<'_>>>` on a fully-clean input
+  or bubbling the first parse error verbatim.
+- [`block_count`] (round 219) — iterate via [`iter_blocks`] and
+  count without retaining the parsed blocks (working-set memory
+  stays at one block independent of input length). Returns the
+  count on a fully-clean input or the first parse error.
+- [`total_block_samples`] (round 219) — pure accessor summing the
+  wiki "samples in this block" field across an already-parsed
+  block list. Returns `u64` so a multi-block file whose individual
+  `block_samples` fit `u32` but whose sum exceeds it (a 4-GiB-plus
+  stream) does not overflow on the way out.
 
 ### Out of scope (later rounds)
 

@@ -1,5 +1,23 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 219 — multi-block stream iteration on top of the round-13
+//! [`parse_block`] composer, lifting the wiki "WavPack file consists of
+//! blocks each beginning with 'wvpk'" file-format sentence into typed
+//! public API. New [`BlockIter`] is a `Clone`-able, `FusedIterator`-
+//! compliant lazy iterator yielding `Result<WavPackBlock<'_>>` over the
+//! chained-block byte buffer. New free function [`iter_blocks`] is the
+//! call-shape twin of [`BlockIter::new`]. New [`parse_blocks`] eagerly
+//! collects the iterator into `Vec<WavPackBlock<'_>>`. New
+//! [`block_count`] counts blocks without retaining them.
+//! [`total_block_samples`] sums the wiki "samples in this block" field
+//! across an already-parsed block list, returning `u64` so a
+//! 4-GiB-plus stream's sample count does not overflow `u32`. The
+//! iterator fuses on the first error so the caller can `?`-bubble the
+//! failure without re-encountering it; [`BlockIter::remaining`]
+//! continues to point at the malformed block's first byte for offset
+//! diagnostics. No new error variants and no docs-gap-blocked surface
+//! touched. 18 new tests (337 total).**
+//!
 //! **Round 214 — block-level discovery / accessor sweep on
 //! [`WavPackBlock`] pairing the round-13 [`parse_block`] aggregate with
 //! the typed views the existing free finders already build. Adds four
@@ -362,7 +380,10 @@ mod metadata;
 mod packed_samples;
 mod samples;
 
-pub use crate::block::{parse_block, UnsupportedBlockFeature, WavPackBlock};
+pub use crate::block::{
+    block_count, iter_blocks, parse_block, parse_blocks, total_block_samples, BlockIter,
+    UnsupportedBlockFeature, WavPackBlock,
+};
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,

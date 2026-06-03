@@ -8,6 +8,69 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 219 — multi-block stream iteration on top of the round-13
+  [`parse_block`] composer, lifting the wiki "WavPack file consists of
+  blocks each beginning with 'wvpk'" file-format sentence into typed
+  public API. New [`BlockIter<'a>`] (a `Clone`-able, `FusedIterator`-
+  compliant lazy iterator yielding `Result<WavPackBlock<'a>>`) walks
+  the chain by repeatedly calling [`parse_block`] on the previous
+  call's returned tail; the iterator fuses on the first error so the
+  caller can `?`-bubble without re-encountering the same failure on
+  a follow-up `next()`. New free function [`iter_blocks`] is the
+  `iter_blocks(bytes)` call-shape twin of [`BlockIter::new`]. New
+  [`parse_blocks`] eagerly collects the iterator into a
+  `Vec<WavPackBlock<'_>>`, surfacing the first parse error verbatim.
+  New [`block_count`] iterates without retaining the parsed blocks
+  for callers that want only the count (working-set memory stays at
+  one block independent of input length). New [`total_block_samples`]
+  pure accessor sums the wiki "samples in this block" field across
+  an already-parsed block list, returning a `u64` so a 4-GiB-plus
+  stream's sample count does not overflow `u32` on the way out.
+  Two introspection accessors on [`BlockIter`] —
+  [`BlockIter::remaining`] (the bytes not yet consumed; on a fused
+  iterator after an error, points at the malformed block's first
+  byte for precise offset diagnostics) and [`BlockIter::is_exhausted`]
+  — round out the surface. No new error variants and no docs-gap-
+  blocked surface touched: every iterator yield is a direct
+  [`parse_block`] result and the existing round-13
+  [`Error::CkSizeExceedsBuffer`] / [`Error::Truncated`] split
+  surfaces verbatim across the iteration boundary.
+- 18 new unit tests (337 total, up from 319): empty-buffer
+  iteration yielding zero items and remaining empty on construction
+  (the wiki "WavPack file consists of blocks" sentence is plural but
+  the empty file is treated as zero blocks rather than an error);
+  single-block iteration yielding one Ok then terminating with
+  `is_exhausted() == true`; three back-to-back identical empty
+  blocks yielding three Ok items in order; `remaining()` shrinking
+  by exactly `8 + ck_size` per successful `next()` call (matching
+  the wiki "Block structure" on-disk extent definition); the
+  fused-on-error contract — first block Ok, second block with
+  corrupt magic → `Err(InvalidMagic)`, then `None` on every
+  subsequent call with the iterator's `remaining()` slice still
+  pointing at the malformed block's first byte for offset
+  recovery; `CkSizeExceedsBuffer { ck_size: 200, available: 32 }`
+  surfacing on a second block whose header advertises a
+  longer payload than the buffer carries; `Truncated` surfacing on
+  a partial header (sub-`HEADER_LEN` tail) between blocks — the
+  round-13 split between "buffer ran out mid-payload" and "buffer
+  ran out between blocks" preserved across the iterator boundary;
+  [`BlockIter::new`] and [`iter_blocks`] returning identical
+  sequences; [`parse_blocks`] returning a `Vec<WavPackBlock>` in
+  the same order as iteration on a synthesised three-block stream
+  with distinct `block_samples` (`100` / `200` / `300`),
+  bubbling the first error rather than the partial Vec on a
+  malformed second block, and returning an empty Vec on an empty
+  input; [`block_count`] returning the matching count across a
+  five-block stream and bubbling the first error verbatim;
+  [`total_block_samples`] summing the wiki "samples in this block"
+  field across a three-block list (`100 + 200 + 300 = 600`),
+  returning `0` on the empty slice, and the u64 return type
+  preventing the `u32::MAX + u32::MAX` two-block sum from
+  overflowing — i.e. confirming the file-scale sample count
+  withstands a 4-GiB-plus stream; and a final equivalence check
+  proving [`parse_blocks`] is observationally identical to
+  manually draining [`iter_blocks`] on the same input.
+
 - Round 214 — block-level discovery / accessor sweep on
   [`WavPackBlock`], surfacing the typed views the existing free
   finders already build over `self.sub_blocks` without making the

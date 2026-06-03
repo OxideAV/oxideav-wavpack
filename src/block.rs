@@ -559,6 +559,152 @@ pub fn parse_block(bytes: &[u8]) -> Result<(WavPackBlock<'_>, &[u8])> {
     Ok((WavPackBlock { header, sub_blocks }, tail))
 }
 
+/// Lazy iterator over the consecutive WavPack blocks in a byte buffer.
+///
+/// The wiki "File Format" section pins the file shape: a `.wv` file is a
+/// concatenation of WavPack blocks, each beginning with the `wvpk` magic
+/// and each declaring its own on-disk byte count via the `ck_size` field
+/// (the wiki "Block structure" listing). [`BlockIter`] walks that chain
+/// one block at a time, calling [`parse_block`] under the hood and using
+/// its returned tail as the next call's input.
+///
+/// The iterator yields `Result<WavPackBlock<'_>>`. The first error
+/// terminates iteration (subsequent `next()` calls return `None`) so the
+/// caller can `?`-bubble the first failure without losing the
+/// already-yielded blocks. An empty input is treated as zero blocks
+/// (the wiki "WavPack file consists of blocks" sentence is plural but
+/// nothing in the wiki forbids the empty file as a degenerate case).
+///
+/// Construction: [`iter_blocks`] for byte-slice input, or
+/// [`BlockIter::new`] for callers that already hold a `&[u8]`. Both
+/// return the same iterator type; choose by call site readability.
+#[derive(Debug, Clone)]
+pub struct BlockIter<'a> {
+    /// Remaining bytes to parse. Shrinks by one block's on-disk length on
+    /// every successful `next()` call (i.e. by `8 + ck_size` per the wiki
+    /// "Block structure" definition of `ck_size`).
+    remaining: &'a [u8],
+    /// Set to `true` once `next()` returns `Err(_)` so subsequent calls
+    /// short-circuit to `None` without re-attempting the failing parse.
+    /// Matches the standard `FusedIterator` contract.
+    done: bool,
+}
+
+impl<'a> BlockIter<'a> {
+    /// Build a [`BlockIter`] over the supplied byte buffer. Equivalent to
+    /// [`iter_blocks`] but spelled as a constructor for callers that
+    /// prefer the type-first form.
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            remaining: bytes,
+            done: false,
+        }
+    }
+
+    /// Bytes of the input buffer the iterator has not yet consumed.
+    ///
+    /// Equals the original input on a freshly-constructed iterator; on a
+    /// fully-iterated buffer it is the empty slice if every block parsed
+    /// cleanly, or the tail starting at the first malformed block's first
+    /// byte if iteration ended on an error.
+    pub fn remaining(&self) -> &'a [u8] {
+        self.remaining
+    }
+
+    /// `true` when this iterator will not yield any more items — either
+    /// because the buffer is empty or because a previous `next()` call
+    /// returned `Err(_)` (the iterator is fused on error).
+    pub fn is_exhausted(&self) -> bool {
+        self.done || self.remaining.is_empty()
+    }
+}
+
+impl<'a> Iterator for BlockIter<'a> {
+    type Item = Result<WavPackBlock<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.remaining.is_empty() {
+            return None;
+        }
+        match parse_block(self.remaining) {
+            Ok((block, tail)) => {
+                self.remaining = tail;
+                Some(Ok(block))
+            }
+            Err(e) => {
+                // Fuse on first error so the caller doesn't see the same
+                // failure repeatedly if they `next()` again.
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+impl core::iter::FusedIterator for BlockIter<'_> {}
+
+/// Construct a lazy [`BlockIter`] over the supplied byte buffer.
+///
+/// Equivalent to [`BlockIter::new`]; provided as a free function for the
+/// `iter_blocks(bytes)` call shape readers expect when scanning a `.wv`
+/// file's worth of blocks.
+///
+/// Yields one `Result<WavPackBlock<'_>>` per block. See [`BlockIter`] for
+/// the iteration contract (empty input → zero blocks; first error fuses
+/// the iterator).
+pub fn iter_blocks(bytes: &[u8]) -> BlockIter<'_> {
+    BlockIter::new(bytes)
+}
+
+/// Eagerly parse every WavPack block in the supplied byte buffer.
+///
+/// Convenience wrapper around [`iter_blocks`] for callers who want the
+/// full block list up front and the first parse error bubbled directly
+/// via `?`. Returns `Ok(vec)` only when **every** block parses cleanly
+/// and the buffer ends on a block boundary.
+///
+/// On the first malformed block the returned error is whichever variant
+/// [`parse_block`] produced — see [`parse_block`] for the full
+/// enumeration. Blocks parsed before the failure are discarded; callers
+/// who want to inspect them should drive [`iter_blocks`] manually.
+pub fn parse_blocks(bytes: &[u8]) -> Result<Vec<WavPackBlock<'_>>> {
+    iter_blocks(bytes).collect()
+}
+
+/// Count the WavPack blocks in `bytes` without retaining the parsed
+/// blocks.
+///
+/// Driven by [`iter_blocks`] for parse correctness (i.e. every block in
+/// the buffer must parse cleanly for the count to be returned); a single
+/// malformed block surfaces its [`parse_block`] error verbatim. The
+/// implementation pulls one block at a time and drops it before
+/// continuing, so the working-set memory stays at one block independent
+/// of input length.
+pub fn block_count(bytes: &[u8]) -> Result<usize> {
+    let mut iter = iter_blocks(bytes);
+    let mut count = 0;
+    for block in iter.by_ref() {
+        block?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Sum the `block_samples` field across every block in `blocks`.
+///
+/// The wiki "Block structure" listing defines `block_samples` as
+/// "samples in this block (may be 0 if no audio present)", so summing
+/// the field across a multi-block file yields the total number of
+/// sample frames carried by the file's audio blocks (metadata-only
+/// blocks contribute zero). The return type is `u64` so a 4-GiB-plus
+/// stream's sample count does not overflow `u32` on the way out.
+///
+/// Pure accessor over an already-parsed block list; performs no I/O and
+/// returns no error.
+pub fn total_block_samples(blocks: &[WavPackBlock<'_>]) -> u64 {
+    blocks.iter().map(|b| b.block_samples() as u64).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1582,5 +1728,300 @@ mod tests {
         // The round-206 composer still works end-to-end.
         let pcm = block.decode_samples().expect("decode samples");
         assert_eq!(pcm, vec![0]);
+    }
+
+    // ---------------------------------------------------------------
+    // Round 219 — multi-block stream iteration.
+    //
+    // Tests pin BlockIter / iter_blocks / parse_blocks / block_count /
+    // total_block_samples against the wiki "WavPack file consists of
+    // blocks each beginning with 'wvpk'" chained-block file shape.
+    // ---------------------------------------------------------------
+
+    /// Build a minimal valid block with the supplied `block_samples`
+    /// header field and an empty metadata region (`ck_size == 24`).
+    fn synthesise_block_with_samples(block_samples: u32) -> Vec<u8> {
+        let mut bytes = synthesise_header_bytes(MIN_CK_SIZE);
+        // The block_samples field lives at offset 20..24 of the 32-byte
+        // header per the wiki "Block structure" listing — after magic
+        // (4) + ck_size (4) + version (2) + track (2) + total_samples
+        // (4) + block_index (4) = 20.
+        bytes[20..24].copy_from_slice(&block_samples.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn iter_blocks_on_empty_buffer_yields_nothing() {
+        // Wiki File Format makes the "no blocks" file a degenerate case;
+        // the iterator returns zero items rather than erroring so the
+        // caller can treat an empty buffer as a no-op.
+        let mut iter = iter_blocks(&[]);
+        assert!(iter.is_exhausted());
+        assert!(iter.next().is_none());
+        assert!(iter.remaining().is_empty());
+        // FusedIterator: continued calls still return None.
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_blocks_yields_single_block_then_terminates() {
+        let bytes = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut iter = iter_blocks(&bytes);
+        let first = iter.next().expect("first item").expect("ok");
+        assert_eq!(first.header.ck_size, MIN_CK_SIZE);
+        assert!(iter.is_exhausted());
+        assert!(iter.next().is_none());
+        assert!(iter.remaining().is_empty());
+    }
+
+    #[test]
+    fn iter_blocks_walks_three_back_to_back_blocks() {
+        // Three identical empty blocks concatenated — the wiki "WavPack
+        // file consists of blocks" shape. The iterator should yield
+        // three Ok blocks in order, then terminate.
+        let block = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&block);
+
+        let mut count = 0;
+        for item in iter_blocks(&bytes) {
+            let b = item.expect("ok");
+            assert_eq!(b.header.ck_size, MIN_CK_SIZE);
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn iter_blocks_remaining_shrinks_by_on_disk_len_per_step() {
+        // After yielding block N, BlockIter::remaining() should equal
+        // the original buffer minus the sum of the on-disk lengths of
+        // every block already yielded.
+        let block = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+        let block_on_disk = block.len();
+        assert_eq!(block_on_disk, (8 + MIN_CK_SIZE) as usize);
+
+        let mut iter = iter_blocks(&bytes);
+        assert_eq!(iter.remaining().len(), 2 * block_on_disk);
+        iter.next().expect("first").expect("ok");
+        assert_eq!(iter.remaining().len(), block_on_disk);
+        iter.next().expect("second").expect("ok");
+        assert_eq!(iter.remaining().len(), 0);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_blocks_fuses_on_first_error() {
+        // First block parses; second carries a corrupt magic. After
+        // yielding the first Ok and the second Err, every subsequent
+        // next() must return None (FusedIterator contract).
+        let good = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&bad);
+
+        let mut iter = iter_blocks(&bytes);
+        iter.next().expect("first").expect("ok");
+        let err = iter.next().expect("second").expect_err("must reject");
+        assert_eq!(err, Error::InvalidMagic);
+        assert!(iter.is_exhausted());
+        assert!(iter.next().is_none());
+        // The remaining() slice still points at the malformed block's
+        // first byte so the caller can pinpoint the offset.
+        assert_eq!(iter.remaining(), bad.as_slice());
+        // Fused: another call still returns None.
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_blocks_surfaces_ck_size_exceeds_buffer_on_partial_tail() {
+        // First block parses cleanly. The "second" block has a valid
+        // header advertising a large ck_size but the buffer is cut
+        // short — the iterator should yield CkSizeExceedsBuffer (the
+        // round-13 error variant that distinguishes "buffer ran out
+        // inside a block" from "buffer ran out between blocks").
+        let first = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut second = synthesise_header_bytes(200);
+        // Truncate the second block to just its 32-byte header so the
+        // walker sees CkSizeExceedsBuffer.
+        second.truncate(HEADER_LEN);
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&second);
+
+        let mut iter = iter_blocks(&bytes);
+        iter.next().expect("first").expect("ok");
+        match iter
+            .next()
+            .expect("second")
+            .expect_err("partial second block")
+        {
+            Error::CkSizeExceedsBuffer { ck_size, available } => {
+                assert_eq!(ck_size, 200);
+                assert_eq!(available, HEADER_LEN);
+            }
+            other => panic!("expected CkSizeExceedsBuffer, got {other:?}"),
+        }
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_blocks_yields_truncated_on_partial_header_between_blocks() {
+        // First block parses cleanly; the trailing buffer carries only
+        // a partial header (no magic / ck_size) for the next block. The
+        // iterator should report Truncated (parse_block_header's "buffer
+        // ran out before HEADER_LEN" error) — distinct from
+        // CkSizeExceedsBuffer per the round-13 split.
+        let first = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&[0u8; HEADER_LEN - 1]);
+
+        let mut iter = iter_blocks(&bytes);
+        iter.next().expect("first").expect("ok");
+        let err = iter.next().expect("partial tail").expect_err("must reject");
+        assert_eq!(err, Error::Truncated);
+    }
+
+    #[test]
+    fn block_iter_new_matches_iter_blocks() {
+        // Constructor and free function are interchangeable surfaces
+        // over the same iterator type.
+        let bytes = synthesise_header_bytes(MIN_CK_SIZE);
+        let from_new: Vec<_> = BlockIter::new(&bytes)
+            .map(|r| r.expect("ok").header.ck_size)
+            .collect();
+        let from_fn: Vec<_> = iter_blocks(&bytes)
+            .map(|r| r.expect("ok").header.ck_size)
+            .collect();
+        assert_eq!(from_new, from_fn);
+        assert_eq!(from_new, vec![MIN_CK_SIZE]);
+    }
+
+    #[test]
+    fn parse_blocks_returns_all_blocks_in_order() {
+        let block_a = synthesise_block_with_samples(100);
+        let block_b = synthesise_block_with_samples(200);
+        let block_c = synthesise_block_with_samples(300);
+        let mut bytes = block_a.clone();
+        bytes.extend_from_slice(&block_b);
+        bytes.extend_from_slice(&block_c);
+
+        let blocks = parse_blocks(&bytes).expect("parse all three");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].block_samples(), 100);
+        assert_eq!(blocks[1].block_samples(), 200);
+        assert_eq!(blocks[2].block_samples(), 300);
+    }
+
+    #[test]
+    fn parse_blocks_bubbles_first_error() {
+        // First Ok block, second malformed → parse_blocks returns the
+        // first error rather than the partial Vec.
+        let good = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&bad);
+
+        let err = parse_blocks(&bytes).expect_err("must reject");
+        assert_eq!(err, Error::InvalidMagic);
+    }
+
+    #[test]
+    fn parse_blocks_returns_empty_vec_on_empty_input() {
+        let blocks = parse_blocks(&[]).expect("empty input is zero blocks");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn block_count_returns_count_without_retaining_blocks() {
+        let block = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&block);
+
+        let n = block_count(&bytes).expect("count five");
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn block_count_returns_zero_on_empty_input() {
+        assert_eq!(block_count(&[]).expect("zero blocks"), 0);
+    }
+
+    #[test]
+    fn block_count_bubbles_first_error() {
+        // Mid-stream malformed block → block_count surfaces the
+        // underlying parse_block error rather than silently undercounting.
+        let good = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&bad);
+
+        let err = block_count(&bytes).expect_err("malformed second block");
+        assert_eq!(err, Error::InvalidMagic);
+    }
+
+    #[test]
+    fn total_block_samples_sums_block_samples_field_across_list() {
+        let block_a = synthesise_block_with_samples(100);
+        let block_b = synthesise_block_with_samples(200);
+        let block_c = synthesise_block_with_samples(300);
+        let mut bytes = block_a.clone();
+        bytes.extend_from_slice(&block_b);
+        bytes.extend_from_slice(&block_c);
+
+        let blocks = parse_blocks(&bytes).expect("parse all");
+        assert_eq!(total_block_samples(&blocks), 600);
+    }
+
+    #[test]
+    fn total_block_samples_is_zero_on_empty_slice() {
+        let empty: Vec<WavPackBlock<'_>> = Vec::new();
+        assert_eq!(total_block_samples(&empty), 0);
+    }
+
+    #[test]
+    fn total_block_samples_uses_u64_to_avoid_overflow_on_large_files() {
+        // Two blocks whose 32-bit block_samples each individually fit
+        // u32 but whose sum overflows u32. The u64 return type carries
+        // the unrounded sum.
+        let block_a = synthesise_block_with_samples(u32::MAX);
+        let block_b = synthesise_block_with_samples(u32::MAX);
+        let mut bytes = block_a.clone();
+        bytes.extend_from_slice(&block_b);
+
+        let blocks = parse_blocks(&bytes).expect("parse two");
+        let total = total_block_samples(&blocks);
+        assert_eq!(total, 2 * u32::MAX as u64);
+        // Confirm we'd overflow u32 if we'd summed as u32.
+        assert!(total > u32::MAX as u64);
+    }
+
+    #[test]
+    fn iter_blocks_then_parse_blocks_yield_equivalent_sequences() {
+        // The eager parse_blocks wrapper should be observationally
+        // identical to manually draining iter_blocks.
+        let block_a = synthesise_block_with_samples(10);
+        let block_b = synthesise_block_with_samples(20);
+        let mut bytes = block_a.clone();
+        bytes.extend_from_slice(&block_b);
+
+        let lazy: Vec<u32> = iter_blocks(&bytes)
+            .map(|r| r.expect("ok").block_samples())
+            .collect();
+        let eager: Vec<u32> = parse_blocks(&bytes)
+            .expect("eager parse")
+            .iter()
+            .map(|b| b.block_samples())
+            .collect();
+        assert_eq!(lazy, eager);
+        assert_eq!(lazy, vec![10, 20]);
     }
 }
