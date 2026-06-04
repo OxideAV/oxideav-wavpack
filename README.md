@@ -5,6 +5,46 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 230 — stream-level introspection accessors composing the
+round-219 [`iter_blocks`] for aggregate "how many / what shape" /
+"where's the first audio block" questions without retaining the parsed
+block list. New free functions [`audio_block_count`] /
+[`metadata_block_count`] split the wiki "Block structure"
+`block_samples > 0` audio blocks from the `block_samples == 0`
+metadata-only blocks (RIFF wrappers, MD5 sums, encoding-details);
+together they sum to [`block_count`] across any input. New
+[`total_audio_samples`] sums the wiki "samples in this block" field
+across audio blocks only, returning `u64` so a 4-GiB-plus stream's
+sample count does not overflow `u32`. New [`decoded_sample_count`]
+free function sums the `i32` PCM slot count [`decode_stream`] would
+produce across the audio blocks (mono / false-stereo contribute
+`block_samples`, stereo contribute `block_samples * 2` per the round-206
+[`Flags::is_block_data_mono`] dispatch); the matching block-level
+[`WavPackBlock::decoded_sample_count`] reports the same shape per-block
+from the header alone — no entropy expansion, no per-sample-loop call.
+New [`first_audio_block`] peeks the first decode-eligible block past
+any leading metadata-only blocks (the wiki allowance for RIFF-header-only
+blocks); returns `Ok(None)` on empty / all-metadata-only input and
+surfaces the first [`parse_block`] error verbatim if a malformed block
+appears before the first audio block. New [`AudioBlockIter`] is the
+`Clone`-able, `FusedIterator`-compliant lazy iterator yielding only
+audio blocks; [`iter_audio_blocks`] is the call-shape twin. New
+[`BlockIter::next_audio`] adapter method skips metadata-only blocks on
+the existing block iterator (composes [`Iterator::next`] under the
+hood). No new error variants and no docs-gap-blocked surface touched:
+every error these accessors surface is one [`parse_block`] already
+raised. 34 new tests (392 total, up from 358) pin: each accessor on
+empty / all-metadata-only / mixed inputs; the
+audio + metadata == total identity across counts; the structural
+[`WavPackBlock::decoded_sample_count`] matching the actual PCM length
+[`WavPackBlock::decode_samples`] returns on mono and stereo;
+[`decoded_sample_count`] (stream) matching the [`decode_stream`] result
+length; [`AudioBlockIter`]'s `Clone + FusedIterator` trait bounds; the
+`audio_block_count == iter_audio_blocks().count()` equivalence; the
+`BlockIter::next_audio` skip-then-yield-then-error-then-fuse contract;
+[`AudioBlockIter::new`] and [`iter_audio_blocks`] returning identical
+sequences; and parse-error propagation through every accessor.**
+
 **Round 224 — multi-block stream → PCM composer fusing the round-219
 [`BlockIter`] with the round-206 [`WavPackBlock::decode_samples`] into a
 single byte-buffer → `Vec<i32>` surface. New eager [`decode_stream`]

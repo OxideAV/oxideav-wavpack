@@ -508,6 +508,39 @@ impl<'a> WavPackBlock<'a> {
             decode_packed_samples_stereo_from_entropy(&packed, &entropy, count)
         }
     }
+
+    /// Number of `i32` PCM slots [`Self::decode_samples`] would emit on
+    /// success, computed from the parsed header alone — no entropy
+    /// expansion, no per-sample-loop call.
+    ///
+    /// Returns `block_samples()` on a mono / false-stereo block (one
+    /// `i32` per sample) and `block_samples() * 2` on a stereo block
+    /// (two interleaved `i32`s per sample frame). Metadata-only blocks
+    /// (`block_samples == 0`) return `0` — they carry no PCM at all.
+    ///
+    /// The wiki bit 2 + bit 30 union (the [`Flags::is_block_data_mono`]
+    /// accessor) drives the per-block shape choice, mirroring the
+    /// dispatch the round-206 [`Self::decode_samples`] composer applies.
+    /// Callers sizing a buffer before calling [`Self::decode_samples`]
+    /// can use this to size in one constant-time step rather than
+    /// matching on the flags themselves; callers walking a multi-block
+    /// stream with [`StreamDecodeIter`] can sum this across the blocks
+    /// to pre-size a contiguous PCM `Vec`.
+    ///
+    /// The return type is `u64` so the pathological case
+    /// `u32::MAX * 2` (one stereo block claiming the full 32-bit sample
+    /// count — legal on the wire even if the wiki never produces it)
+    /// does not overflow `u32` on the multiplication.
+    ///
+    /// Round 230.
+    pub fn decoded_sample_count(&self) -> u64 {
+        let samples = self.header.block_samples as u64;
+        if self.header.flags.is_block_data_mono() {
+            samples
+        } else {
+            samples * 2
+        }
+    }
 }
 
 /// Parse one full WavPack block — the 32-byte fixed header plus the
@@ -617,6 +650,37 @@ impl<'a> BlockIter<'a> {
     pub fn is_exhausted(&self) -> bool {
         self.done || self.remaining.is_empty()
     }
+
+    /// Advance to and return the next **audio** block in the input,
+    /// silently skipping metadata-only blocks (`block_samples == 0`,
+    /// the wiki "Block structure" allowance for header-only / RIFF-only
+    /// blocks).
+    ///
+    /// Returns `Some(Ok(block))` for the next audio block, `Some(Err(e))`
+    /// on the first parse error (the iterator fuses on the underlying
+    /// [`BlockIter`] error contract, so a follow-up call returns `None`),
+    /// or `None` when the buffer is drained or only metadata-only blocks
+    /// remain. Useful for callers that pre-flight whether decoding has
+    /// any work to do before invoking the round-206
+    /// [`WavPackBlock::decode_samples`] composer.
+    ///
+    /// Pulled directly from the iterator surface; on a metadata-only
+    /// block the iterator advances past it (the metadata-only block is
+    /// consumed), so a subsequent [`Self::next`] call sees only blocks
+    /// further along the buffer. Round 230.
+    pub fn next_audio(&mut self) -> Option<Result<WavPackBlock<'a>>> {
+        loop {
+            match self.next()? {
+                Ok(block) => {
+                    if block.is_audio_block() {
+                        return Some(Ok(block));
+                    }
+                    // metadata-only block — skip and continue.
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
 }
 
 impl<'a> Iterator for BlockIter<'a> {
@@ -703,6 +767,206 @@ pub fn block_count(bytes: &[u8]) -> Result<usize> {
 /// returns no error.
 pub fn total_block_samples(blocks: &[WavPackBlock<'_>]) -> u64 {
     blocks.iter().map(|b| b.block_samples() as u64).sum()
+}
+
+/// Count the blocks in `bytes` whose `block_samples > 0` — i.e. those
+/// blocks carrying PCM rather than metadata only.
+///
+/// The wiki "Block structure" listing allows `block_samples == 0` for
+/// blocks carrying only RIFF wrappers / MD5 sums / other metadata; this
+/// counter splits the stream's blocks into "audio" and "metadata-only"
+/// by the same criterion [`WavPackBlock::is_audio_block`] uses.
+///
+/// Drives [`iter_blocks`] under the hood; every block in the buffer
+/// must parse cleanly for the count to be returned (any parse error
+/// surfaces verbatim). Working-set memory is one block at a time
+/// regardless of input length. Round 230.
+pub fn audio_block_count(bytes: &[u8]) -> Result<usize> {
+    let mut iter = iter_blocks(bytes);
+    let mut count = 0;
+    for block in iter.by_ref() {
+        let block = block?;
+        if block.is_audio_block() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Count the blocks in `bytes` whose `block_samples == 0` — i.e. the
+/// metadata-only blocks the wiki "Block structure" listing allows.
+///
+/// Inverse of [`audio_block_count`]; together they sum to
+/// [`block_count`]. The wiki examples of metadata-only blocks are
+/// leading RIFF-header blocks (block + sub-block `0x20`) and trailing
+/// RIFF-trailer / MD5 blocks (sub-block `0x21` / `0x26`); this counter
+/// reports the count without inspecting the sub-block list.
+///
+/// Drives [`iter_blocks`] under the hood; any parse error surfaces
+/// verbatim. Round 230.
+pub fn metadata_block_count(bytes: &[u8]) -> Result<usize> {
+    let mut iter = iter_blocks(bytes);
+    let mut count = 0;
+    for block in iter.by_ref() {
+        let block = block?;
+        if !block.is_audio_block() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Sum the `block_samples` field across the audio blocks in `bytes`.
+///
+/// Equivalent to filtering [`iter_blocks`] to audio blocks and summing
+/// `block_samples()` across them. Because metadata-only blocks
+/// contribute `0` by definition, this also equals
+/// `total_block_samples(&parse_blocks(bytes)?)` — but without
+/// retaining the parsed block list. Returns `u64` so a 4-GiB-plus
+/// stream's sample count does not overflow `u32`. Round 230.
+pub fn total_audio_samples(bytes: &[u8]) -> Result<u64> {
+    let mut iter = iter_blocks(bytes);
+    let mut sum: u64 = 0;
+    for block in iter.by_ref() {
+        let block = block?;
+        if block.is_audio_block() {
+            sum += block.block_samples() as u64;
+        }
+    }
+    Ok(sum)
+}
+
+/// Sum the `i32` PCM slot count [`decode_stream`] would emit across
+/// every audio block in `bytes`.
+///
+/// Mono / false-stereo blocks contribute `block_samples()` slots;
+/// stereo blocks contribute `block_samples() * 2` slots (the
+/// left-then-right interleave [`decode_stream`] produces). The sum is
+/// the exact `len()` [`decode_stream`] would return on success —
+/// callers sizing a destination buffer can use this to pre-allocate
+/// without paying the per-sample-loop cost.
+///
+/// Returns `u64` so the `u32::MAX * 2` worst case (one stereo block
+/// claiming the full 32-bit sample count) does not overflow. Drives
+/// [`iter_blocks`] under the hood; any parse error surfaces verbatim.
+/// Note this does **not** validate the per-block feature gates the
+/// round-206 [`WavPackBlock::decode_samples`] composer applies, so a
+/// stream whose every block decodes successfully and a stream whose
+/// blocks would be refused by the composer return the same count
+/// (the count is structural; the composer is semantic). Round 230.
+pub fn decoded_sample_count(bytes: &[u8]) -> Result<u64> {
+    let mut iter = iter_blocks(bytes);
+    let mut sum: u64 = 0;
+    for block in iter.by_ref() {
+        let block = block?;
+        sum += block.decoded_sample_count();
+    }
+    Ok(sum)
+}
+
+/// Peek the first audio block in `bytes` — the first block whose
+/// `block_samples > 0` — without retaining the rest of the stream.
+///
+/// The wiki "Block structure" allowance for `block_samples == 0`
+/// metadata-only blocks (RIFF headers, trailing MD5 sums, …) means a
+/// `.wv` file's first block on disk is not necessarily the first
+/// audio block; this accessor walks past the leading metadata-only
+/// blocks to surface the first one carrying PCM.
+///
+/// Returns `Ok(None)` when the stream has no audio blocks (empty
+/// input, all-metadata-only input). Returns `Err(_)` when a block
+/// before the first audio block fails to parse — the round-13
+/// [`parse_block`] errors surface verbatim. Round 230.
+pub fn first_audio_block(bytes: &[u8]) -> Result<Option<WavPackBlock<'_>>> {
+    let mut iter = iter_blocks(bytes);
+    match iter.next_audio() {
+        Some(Ok(block)) => Ok(Some(block)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// Lazy iterator over the audio blocks (`block_samples > 0`) in a
+/// WavPack byte buffer.
+///
+/// Wraps [`BlockIter`] so the iteration skips metadata-only blocks
+/// (`block_samples == 0`) silently. Yields `Result<WavPackBlock<'_>>`
+/// once per audio block; parse errors surface verbatim and fuse the
+/// iterator (the underlying [`BlockIter`] fuse mechanism). An empty
+/// or all-metadata-only input yields zero items.
+///
+/// The wiki "Block structure" listing allows `block_samples == 0` for
+/// metadata-only blocks (RIFF wrappers, MD5 sums, encoding-detail
+/// payloads); callers that only care about decode-eligible blocks
+/// (e.g. driving the round-206 [`WavPackBlock::decode_samples`]
+/// composer per-block) would otherwise have to filter `is_audio_block`
+/// on every yield. This iterator inlines the filter.
+///
+/// Construction: [`iter_audio_blocks`] for the call-shape twin, or
+/// [`AudioBlockIter::new`] for callers that prefer the type-first form.
+/// Round 230.
+#[derive(Debug, Clone)]
+pub struct AudioBlockIter<'a> {
+    /// Underlying block iterator. Drives parse + walks the byte buffer;
+    /// the audio-block filter is applied on each yield.
+    blocks: BlockIter<'a>,
+}
+
+impl<'a> AudioBlockIter<'a> {
+    /// Build an [`AudioBlockIter`] over the supplied byte buffer.
+    /// Equivalent to [`iter_audio_blocks`] but spelled as a
+    /// constructor for callers that prefer the type-first form.
+    /// Round 230.
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            blocks: BlockIter::new(bytes),
+        }
+    }
+
+    /// Bytes of the input buffer the underlying [`BlockIter`] has not
+    /// yet consumed. Pairs with [`BlockIter::remaining`]; on a
+    /// fused-error iterator this points at the malformed block's first
+    /// byte for precise offset diagnostics. Round 230.
+    pub fn remaining(&self) -> &'a [u8] {
+        self.blocks.remaining()
+    }
+
+    /// `true` when this iterator will not yield any more items —
+    /// either because the underlying [`BlockIter`] is exhausted or
+    /// because a previous `next()` call returned `Err(_)` (the
+    /// iterator is fused on error via the same mechanism
+    /// [`BlockIter`] uses). Note this returns `true` only when the
+    /// underlying iterator is exhausted — a buffer carrying only
+    /// metadata-only blocks reports `false` until the iterator drains
+    /// past every block. Round 230.
+    pub fn is_exhausted(&self) -> bool {
+        self.blocks.is_exhausted()
+    }
+}
+
+impl<'a> Iterator for AudioBlockIter<'a> {
+    type Item = Result<WavPackBlock<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Defer to BlockIter::next_audio which already implements the
+        // skip-metadata-only-blocks contract.
+        self.blocks.next_audio()
+    }
+}
+
+impl core::iter::FusedIterator for AudioBlockIter<'_> {}
+
+/// Construct a lazy [`AudioBlockIter`] over the supplied byte buffer.
+///
+/// Equivalent to [`AudioBlockIter::new`]; provided as a free function
+/// for the `iter_audio_blocks(bytes)` call shape readers expect when
+/// filtering a `.wv` file's blocks down to the decode-eligible ones.
+///
+/// Yields one `Result<WavPackBlock<'_>>` per audio block —
+/// metadata-only blocks are silently skipped. See [`AudioBlockIter`]
+/// for the iteration contract. Round 230.
+pub fn iter_audio_blocks(bytes: &[u8]) -> AudioBlockIter<'_> {
+    AudioBlockIter::new(bytes)
 }
 
 /// Lazy iterator over the PCM samples produced by every audio block in a
@@ -2532,5 +2796,411 @@ mod tests {
             .collect();
         assert_eq!(eager, lazy);
         assert_eq!(eager, vec![0, 0, 0]);
+    }
+
+    // ---- Round-230 stream-level introspection accessors ----
+
+    /// Synthesise a metadata-only block (`block_samples == 0`) carrying
+    /// no sub-blocks — the wiki "Block structure" header-only allowance.
+    fn synthesise_metadata_only_block() -> Vec<u8> {
+        // block_samples = 0; flags zero. The `synthesise_header_bytes`
+        // helper sets the header into a parseable shape with no
+        // metadata region (ck_size == MIN_CK_SIZE).
+        synthesise_header_bytes(MIN_CK_SIZE)
+    }
+
+    /// Synthesise a single decodable stereo block carrying one stereo
+    /// frame (two interleaved samples). Mirrors the stereo helper
+    /// `decode_samples_returns_two_interleaved_zeros_for_stereo_block_with_minimal_seed`
+    /// uses but as a reusable helper for the stream-level tests.
+    fn synthesise_decodable_stereo_block_one_frame() -> Vec<u8> {
+        let mut payload = Vec::new();
+        append_entropy_info_stereo_minimal(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        synthesise_block(1, flags_with(0), &payload)
+    }
+
+    #[test]
+    fn decoded_sample_count_on_mono_block_equals_block_samples() {
+        // Mono / false-stereo block: one i32 per sample.
+        let bytes = synthesise_decodable_mono_block_one_zero_sample();
+        let (block, _) = parse_block(&bytes).expect("parse mono");
+        assert!(block.header.flags.is_block_data_mono());
+        assert_eq!(block.block_samples(), 1);
+        assert_eq!(block.decoded_sample_count(), 1);
+    }
+
+    #[test]
+    fn decoded_sample_count_on_stereo_block_equals_block_samples_times_two() {
+        // Stereo block: two interleaved i32s per sample frame.
+        let bytes = synthesise_decodable_stereo_block_one_frame();
+        let (block, _) = parse_block(&bytes).expect("parse stereo");
+        assert!(!block.header.flags.is_block_data_mono());
+        assert_eq!(block.block_samples(), 1);
+        assert_eq!(block.decoded_sample_count(), 2);
+    }
+
+    #[test]
+    fn decoded_sample_count_on_metadata_only_block_is_zero() {
+        // block_samples == 0 → metadata-only block. Mono / stereo
+        // dispatch does not matter; 0 * anything = 0.
+        let bytes = synthesise_metadata_only_block();
+        let (block, _) = parse_block(&bytes).expect("parse metadata-only");
+        assert_eq!(block.block_samples(), 0);
+        assert!(!block.is_audio_block());
+        assert_eq!(block.decoded_sample_count(), 0);
+    }
+
+    #[test]
+    fn decoded_sample_count_matches_decode_samples_len_on_mono() {
+        // Sanity: the structural count must equal the actual PCM length
+        // decode_samples returns on success.
+        let bytes = synthesise_decodable_mono_block_one_zero_sample();
+        let (block, _) = parse_block(&bytes).expect("parse mono");
+        let pcm = block.decode_samples().expect("decode");
+        assert_eq!(block.decoded_sample_count() as usize, pcm.len());
+    }
+
+    #[test]
+    fn decoded_sample_count_matches_decode_samples_len_on_stereo() {
+        let bytes = synthesise_decodable_stereo_block_one_frame();
+        let (block, _) = parse_block(&bytes).expect("parse stereo");
+        let pcm = block.decode_samples().expect("decode");
+        assert_eq!(block.decoded_sample_count() as usize, pcm.len());
+    }
+
+    #[test]
+    fn block_iter_next_audio_skips_leading_metadata_only_block() {
+        // [metadata-only, audio] → next_audio() returns the audio block.
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&audio);
+
+        let mut iter = iter_blocks(&bytes);
+        let block = iter
+            .next_audio()
+            .expect("audio block")
+            .expect("parses cleanly");
+        assert!(block.is_audio_block());
+        assert_eq!(block.block_samples(), 1);
+        // The metadata-only block has been consumed by next_audio.
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn block_iter_next_audio_returns_none_on_all_metadata_only_input() {
+        // Pure metadata-only stream → no audio block ever appears.
+        let meta = synthesise_metadata_only_block();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&meta);
+
+        let mut iter = iter_blocks(&bytes);
+        assert!(iter.next_audio().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn block_iter_next_audio_returns_none_on_empty_input() {
+        let mut iter = iter_blocks(&[]);
+        assert!(iter.next_audio().is_none());
+    }
+
+    #[test]
+    fn block_iter_next_audio_propagates_parse_error() {
+        // Audio block followed by a corrupt block: next_audio yields
+        // the audio block, then the parse error on the next call.
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let mut bytes = audio.clone();
+        bytes.extend_from_slice(&bad);
+
+        let mut iter = iter_blocks(&bytes);
+        let block = iter
+            .next_audio()
+            .expect("audio block")
+            .expect("parses cleanly");
+        assert!(block.is_audio_block());
+        let err = iter
+            .next_audio()
+            .expect("second yield")
+            .expect_err("must reject");
+        assert_eq!(err, Error::InvalidMagic);
+        // Fused after error: next_audio returns None.
+        assert!(iter.next_audio().is_none());
+    }
+
+    #[test]
+    fn audio_block_count_on_empty_buffer_is_zero() {
+        assert_eq!(audio_block_count(&[]).expect("count empty"), 0);
+    }
+
+    #[test]
+    fn audio_block_count_counts_only_audio_blocks() {
+        // [metadata, audio, metadata, audio, audio] → 3 audio blocks.
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&audio);
+        assert_eq!(audio_block_count(&bytes).expect("count"), 3);
+    }
+
+    #[test]
+    fn audio_block_count_on_all_metadata_only_input_is_zero() {
+        let meta = synthesise_metadata_only_block();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&meta);
+        assert_eq!(audio_block_count(&bytes).expect("count"), 0);
+    }
+
+    #[test]
+    fn audio_block_count_propagates_parse_error() {
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let err = audio_block_count(&bad).expect_err("must reject");
+        assert_eq!(err, Error::InvalidMagic);
+    }
+
+    #[test]
+    fn metadata_block_count_inverse_of_audio_block_count() {
+        // The two counters together sum to block_count.
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&audio);
+
+        let total = block_count(&bytes).expect("count");
+        let audio_n = audio_block_count(&bytes).expect("audio count");
+        let meta_n = metadata_block_count(&bytes).expect("meta count");
+        assert_eq!(total, 4);
+        assert_eq!(audio_n, 2);
+        assert_eq!(meta_n, 2);
+        assert_eq!(audio_n + meta_n, total);
+    }
+
+    #[test]
+    fn metadata_block_count_on_empty_buffer_is_zero() {
+        assert_eq!(metadata_block_count(&[]).expect("count empty"), 0);
+    }
+
+    #[test]
+    fn total_audio_samples_sums_block_samples_across_audio_blocks() {
+        // One audio block carries block_samples = 1 (the helper sets it
+        // to 1). Three such blocks plus a leading metadata-only block
+        // → total = 3.
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&audio);
+        assert_eq!(total_audio_samples(&bytes).expect("sum"), 3u64);
+    }
+
+    #[test]
+    fn total_audio_samples_on_empty_buffer_is_zero() {
+        assert_eq!(total_audio_samples(&[]).expect("sum empty"), 0u64);
+    }
+
+    #[test]
+    fn total_audio_samples_on_all_metadata_only_input_is_zero() {
+        let meta = synthesise_metadata_only_block();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&meta);
+        assert_eq!(total_audio_samples(&bytes).expect("sum"), 0u64);
+    }
+
+    #[test]
+    fn total_audio_samples_propagates_parse_error() {
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let err = total_audio_samples(&bad).expect_err("must reject");
+        assert_eq!(err, Error::InvalidMagic);
+    }
+
+    #[test]
+    fn decoded_sample_count_stream_level_sums_per_block_counts() {
+        // [mono(1), stereo(1), metadata, mono(1)] → 1 + 2 + 0 + 1 = 4.
+        let mono = synthesise_decodable_mono_block_one_zero_sample();
+        let stereo = synthesise_decodable_stereo_block_one_frame();
+        let meta = synthesise_metadata_only_block();
+        let mut bytes = mono.clone();
+        bytes.extend_from_slice(&stereo);
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&mono);
+        assert_eq!(decoded_sample_count(&bytes).expect("count"), 4u64);
+    }
+
+    #[test]
+    fn decoded_sample_count_stream_level_matches_decode_stream_len() {
+        // Sanity: the structural count must equal the actual PCM length
+        // decode_stream returns on success.
+        let mono = synthesise_decodable_mono_block_one_zero_sample();
+        let stereo = synthesise_decodable_stereo_block_one_frame();
+        let mut bytes = mono.clone();
+        bytes.extend_from_slice(&stereo);
+        let count = decoded_sample_count(&bytes).expect("count");
+        let pcm = decode_stream(&bytes).expect("decode");
+        assert_eq!(count as usize, pcm.len());
+    }
+
+    #[test]
+    fn decoded_sample_count_stream_level_on_empty_buffer_is_zero() {
+        assert_eq!(decoded_sample_count(&[]).expect("count"), 0u64);
+    }
+
+    #[test]
+    fn first_audio_block_skips_leading_metadata_only_blocks() {
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&audio);
+
+        let block = first_audio_block(&bytes)
+            .expect("ok")
+            .expect("audio present");
+        assert!(block.is_audio_block());
+        assert_eq!(block.block_samples(), 1);
+    }
+
+    #[test]
+    fn first_audio_block_returns_none_on_empty_buffer() {
+        assert!(first_audio_block(&[]).expect("ok").is_none());
+    }
+
+    #[test]
+    fn first_audio_block_returns_none_on_all_metadata_only_input() {
+        let meta = synthesise_metadata_only_block();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&meta);
+        assert!(first_audio_block(&bytes).expect("ok").is_none());
+    }
+
+    #[test]
+    fn first_audio_block_propagates_parse_error_before_audio() {
+        // Bad block first; first_audio_block surfaces the error rather
+        // than skipping past it.
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = bad.clone();
+        bytes.extend_from_slice(&audio);
+        let err = first_audio_block(&bytes).expect_err("must reject");
+        assert_eq!(err, Error::InvalidMagic);
+    }
+
+    #[test]
+    fn iter_audio_blocks_skips_metadata_only_blocks_and_yields_audio() {
+        // [metadata, audio, metadata, audio] → 2 audio yields.
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&audio);
+
+        let mut iter = iter_audio_blocks(&bytes);
+        let a = iter.next().expect("first audio").expect("parses cleanly");
+        assert!(a.is_audio_block());
+        let b = iter.next().expect("second audio").expect("parses cleanly");
+        assert!(b.is_audio_block());
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_audio_blocks_on_empty_buffer_yields_zero_items() {
+        assert!(iter_audio_blocks(&[]).next().is_none());
+    }
+
+    #[test]
+    fn iter_audio_blocks_on_all_metadata_only_yields_zero_items() {
+        let meta = synthesise_metadata_only_block();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&meta);
+        let mut iter = iter_audio_blocks(&bytes);
+        assert!(iter.next().is_none());
+        // After draining, the underlying BlockIter is exhausted.
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_audio_blocks_fuses_on_parse_error() {
+        // audio, then a corrupt block. The audio yields; then the
+        // parse error; then None forever.
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
+        bad[0] = b'X';
+        let mut bytes = audio.clone();
+        bytes.extend_from_slice(&bad);
+
+        let mut iter = iter_audio_blocks(&bytes);
+        iter.next().expect("audio").expect("ok");
+        let err = iter.next().expect("second yield").expect_err("must reject");
+        assert_eq!(err, Error::InvalidMagic);
+        assert!(iter.is_exhausted());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_audio_blocks_constructor_and_new_return_identical_sequences() {
+        // Two construction paths must produce the same items.
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&audio);
+
+        let via_new: Vec<u32> = AudioBlockIter::new(&bytes)
+            .map(|r| r.expect("ok").block_samples())
+            .collect();
+        let via_fn: Vec<u32> = iter_audio_blocks(&bytes)
+            .map(|r| r.expect("ok").block_samples())
+            .collect();
+        assert_eq!(via_new, via_fn);
+        assert_eq!(via_new, vec![1, 1]);
+    }
+
+    #[test]
+    fn iter_audio_blocks_remaining_tracks_underlying_block_iter() {
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = audio.clone();
+        bytes.extend_from_slice(&audio);
+        let iter = iter_audio_blocks(&bytes);
+        assert_eq!(iter.remaining().len(), bytes.len());
+    }
+
+    #[test]
+    fn iter_audio_blocks_clone_and_fused_iterator_trait_bounds_hold() {
+        // Compile-time check: AudioBlockIter must be Clone + FusedIterator.
+        fn assert_clone_fused<I: Iterator + core::iter::FusedIterator + Clone>(_: &I) {}
+        let bytes: Vec<u8> = Vec::new();
+        let iter = iter_audio_blocks(&bytes);
+        assert_clone_fused(&iter);
+    }
+
+    #[test]
+    fn audio_block_count_equals_iter_audio_blocks_count() {
+        // The two surfaces (free function counter / iterator length)
+        // must agree on every input.
+        let meta = synthesise_metadata_only_block();
+        let audio = synthesise_decodable_mono_block_one_zero_sample();
+        let mut bytes = meta.clone();
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&audio);
+        bytes.extend_from_slice(&audio);
+
+        let via_fn = audio_block_count(&bytes).expect("count");
+        let via_iter = iter_audio_blocks(&bytes).count();
+        assert_eq!(via_fn, via_iter);
+        assert_eq!(via_fn, 3);
     }
 }

@@ -1,5 +1,31 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 230 — stream-level introspection accessors composing the
+//! round-219 [`iter_blocks`] for aggregate "how many / what shape" /
+//! "where's the first audio block" questions without retaining the
+//! parsed block list. New free functions [`audio_block_count`] /
+//! [`metadata_block_count`] split the wiki "Block structure"
+//! `block_samples > 0` audio blocks from the `block_samples == 0`
+//! metadata-only blocks (RIFF wrappers, MD5 sums, encoding-details);
+//! [`total_audio_samples`] sums the wiki "samples in this block" field
+//! across audio blocks only (returning `u64` to handle multi-GiB
+//! streams); [`decoded_sample_count`] sums the `i32` PCM slot count
+//! [`decode_stream`] would produce across all audio blocks (mono /
+//! false-stereo contribute `block_samples`, stereo contribute
+//! `block_samples * 2`); [`first_audio_block`] peeks the first
+//! decode-eligible block past any leading metadata-only blocks. New
+//! [`AudioBlockIter`] is the `Clone`-able, `FusedIterator`-compliant
+//! lazy iterator yielding only audio blocks; [`iter_audio_blocks`] is
+//! the call-shape twin. New [`BlockIter::next_audio`] adapter method
+//! skips metadata-only blocks on the existing block iterator. New
+//! block-level [`WavPackBlock::decoded_sample_count`] reports the `u64`
+//! slot count [`WavPackBlock::decode_samples`] would emit from the
+//! header alone (no entropy expansion, no per-sample-loop call) so
+//! callers can pre-size a destination buffer in one constant-time
+//! step. No new error variants and no docs-gap-blocked surface
+//! touched: every error these accessors surface is one [`parse_block`]
+//! already raised. 34 new tests (392 total, up from 358).**
+//!
 //! **Round 224 — multi-block stream → PCM composer fusing the round-219
 //! [`BlockIter`] with the round-206 [`WavPackBlock::decode_samples`]
 //! into a single byte-buffer → `Vec<i32>` surface. New eager
@@ -406,8 +432,10 @@ mod packed_samples;
 mod samples;
 
 pub use crate::block::{
-    block_count, decode_stream, iter_blocks, iter_decoded_blocks, parse_block, parse_blocks,
-    total_block_samples, BlockIter, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
+    audio_block_count, block_count, decode_stream, decoded_sample_count, first_audio_block,
+    iter_audio_blocks, iter_blocks, iter_decoded_blocks, metadata_block_count, parse_block,
+    parse_blocks, total_audio_samples, total_block_samples, AudioBlockIter, BlockIter,
+    StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
 };
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
