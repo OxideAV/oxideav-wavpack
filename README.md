@@ -5,6 +5,64 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 233 — `.wvc` correction-stream typed view + walker bridges +
+block-level and stream-level introspection accessors. The wiki "IDs"
+listing of `docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-blocks
+`0x07` (noise-shaping profile) and `0x0B` (packed correction data) as
+carried in the `.wvc` companion file alongside the lossy main `.wv`;
+this round elaborates the round-2 walker output for `0x0B` into a typed
+[`PackedCorrectionData<'a>`] view (analogous to the round-12
+[`PackedSamples<'a>`] view for `0x0A`) and threads the same finder /
+predicate / iterator pattern through the metadata-walker /
+block-level / stream-level surfaces. New
+[`PackedCorrectionData<'a>`] in `src/correction.rs` carries the
+borrowed `0x0B` sub-block payload verbatim and exposes the same
+`bytes()` / `len()` / `is_empty()` introspection + `bit_reader()`
+factory shape [`PackedSamples`] exposes for the main `0x0A` stream.
+New [`expand_packed_correction_data`] constructor + walker finders
+[`find_packed_correction_data`] (typed-view) /
+[`find_packed_correction_data_sub_block`] (raw-borrow) /
+[`find_noise_shaping_profile`] / [`find_hybrid_profile`] elaborate the
+walker output for the three hybrid-mode sub-block IDs without
+re-walking the metadata. New block-level accessors
+[`WavPackBlock::has_packed_correction_data`] /
+[`WavPackBlock::packed_correction_data`] /
+[`WavPackBlock::find_packed_correction_data_sub_block`] /
+[`WavPackBlock::has_noise_shaping_profile`] /
+[`WavPackBlock::find_noise_shaping_profile_sub_block`] /
+[`WavPackBlock::has_hybrid_profile`] /
+[`WavPackBlock::find_hybrid_profile_sub_block`] /
+[`WavPackBlock::has_correction_stream_data`] (the composite
+predicate matching the [`MetadataSubBlock::is_correction_payload`]
+grouping) expose the new sub-block IDs at the block level. New
+stream-level free functions [`correction_block_count`] /
+[`first_correction_block`] / [`iter_correction_blocks`] /
+[`total_correction_payload_bytes`] and the new
+[`CorrectionBlockIter<'a>`] (`Clone` + `FusedIterator`) lazy iterator
+mirror the round-230 [`AudioBlockIter`] pattern but filter to blocks
+whose `has_correction_stream_data` predicate fires. The hybrid-mode
+sample decode itself (spec §4.2 step 6 second paragraph,
+`error_limit != 0`) stays out of scope — the typed views give a
+callable handle into the bytes without committing to a decode
+semantics, and the existing
+[`Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)`]
+refusal on [`WavPackBlock::decode_samples`] is preserved verbatim. No
+new error variants and no docs-gap-blocked surface touched. 44 new
+tests (436 total, up from 392) pin: the typed view shape (empty /
+non-empty / round-trip / bit-reader factory / `Copy` + lifetime /
+distinct-from-[`PackedSamples`] type discrimination); each new
+block-level accessor / finder on present / absent / both-present
+inputs; the composite `has_correction_stream_data` predicate as the
+union of `0x07` and `0x0B`; the new stream-level free functions on
+empty / all-plain / mixed / error-trailing inputs;
+[`CorrectionBlockIter`]'s `Clone + FusedIterator` trait bounds and
+the `new` / free-function call-shape twin equivalence;
+[`total_correction_payload_bytes`] summing only `0x0B` payload bytes
+(excluding `0x07`); a metadata-only block carrying only a `0x0B`
+payload still surfaces as correction-bearing; and the hybrid-flag
+refusal contract is unchanged by the presence of a `0x0B` typed view
+(structural introspection vs. decode enablement).**
+
 **Round 230 — stream-level introspection accessors composing the
 round-219 [`iter_blocks`] for aggregate "how many / what shape" /
 "where's the first audio block" questions without retaining the parsed

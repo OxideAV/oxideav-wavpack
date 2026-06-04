@@ -349,6 +349,83 @@ impl<'a> WavPackBlock<'a> {
         find_packed_samples(&self.sub_blocks)
     }
 
+    /// `true` when a `0x0B` packed-correction-data sub-block is present.
+    /// The wiki "IDs" listing annotates this payload as carried in the
+    /// `.wvc` companion file alongside the lossy main `.wv`; presence
+    /// in a block indicates the block is part of a hybrid encode whose
+    /// correction stream has been merged back into the main file (a
+    /// valid wire shape — the wiki places no rule against carrying
+    /// `0x0B` alongside `0x0A` in the same block). Round 233.
+    pub fn has_packed_correction_data(&self) -> bool {
+        self.contains_sub_block(SubBlockId::PackedCorrectionData)
+    }
+
+    /// `true` when a `0x07` noise-shaping-profile sub-block is present.
+    /// The wiki "IDs" listing annotates this payload as carried in the
+    /// `.wvc` companion file; pairs with [`Self::has_packed_correction_data`]
+    /// to identify blocks fully equipped with a correction stream.
+    /// Round 233.
+    pub fn has_noise_shaping_profile(&self) -> bool {
+        self.contains_sub_block(SubBlockId::NoiseShapingProfile)
+    }
+
+    /// `true` when a `0x06` hybrid-profile sub-block is present. The
+    /// wiki "IDs" listing names this payload alongside the `0x07`
+    /// noise-shaping profile as the per-block hybrid configuration;
+    /// presence indicates the block was encoded with the hybrid
+    /// profile (independent of whether the `0x0B` correction data is
+    /// also carried — that gates whether the decode can be sample-exact).
+    /// Round 233.
+    pub fn has_hybrid_profile(&self) -> bool {
+        self.contains_sub_block(SubBlockId::HybridProfile)
+    }
+
+    /// `true` when the block carries **either** of the `.wvc`-side
+    /// payloads — `0x07` noise-shaping profile or `0x0B` packed
+    /// correction data. Composite predicate matching the existing
+    /// [`crate::MetadataSubBlock::is_correction_payload`] grouping; useful
+    /// for stream-level introspection that wants to count or filter
+    /// blocks the hybrid decoder would consume. Round 233.
+    pub fn has_correction_stream_data(&self) -> bool {
+        self.has_packed_correction_data() || self.has_noise_shaping_profile()
+    }
+
+    /// Borrow the first `0x0B` packed-correction-data sub-block, or
+    /// `None` when none is present. Block-level pairing with the free
+    /// [`crate::find_packed_correction_data_sub_block`] finder. Use
+    /// [`Self::packed_correction_data`] for the typed-view variant.
+    /// Round 233.
+    pub fn find_packed_correction_data_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        crate::metadata::find_packed_correction_data_sub_block(&self.sub_blocks)
+    }
+
+    /// Locate the `0x0B` packed-correction-data sub-block and wrap it
+    /// as a typed [`crate::PackedCorrectionData`] view, or return
+    /// `None` when no `0x0B` sub-block is present. Block-level pairing
+    /// with the free [`crate::find_packed_correction_data`] finder.
+    /// Round 233.
+    pub fn packed_correction_data(&self) -> Option<crate::PackedCorrectionData<'a>> {
+        crate::metadata::find_packed_correction_data(&self.sub_blocks)
+    }
+
+    /// Borrow the first `0x07` noise-shaping-profile sub-block, or
+    /// `None` when none is present. Block-level pairing with the free
+    /// [`crate::find_noise_shaping_profile`] finder. The wiki places
+    /// no internal structure on the payload, so this stops at
+    /// "borrow the bytes". Round 233.
+    pub fn find_noise_shaping_profile_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        crate::metadata::find_noise_shaping_profile(&self.sub_blocks)
+    }
+
+    /// Borrow the first `0x06` hybrid-profile sub-block, or `None`
+    /// when none is present. Block-level pairing with the free
+    /// [`crate::find_hybrid_profile`] finder. The wiki places no
+    /// internal structure on the payload, so this stops at "borrow
+    /// the bytes". Round 233.
+    pub fn find_hybrid_profile_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        crate::metadata::find_hybrid_profile(&self.sub_blocks)
+    }
+
     /// Locate the `0x05` entropy-info sub-block and expand its payload
     /// into a typed [`EntropyInfo`].
     ///
@@ -967,6 +1044,159 @@ impl core::iter::FusedIterator for AudioBlockIter<'_> {}
 /// for the iteration contract. Round 230.
 pub fn iter_audio_blocks(bytes: &[u8]) -> AudioBlockIter<'_> {
     AudioBlockIter::new(bytes)
+}
+
+/// Lazy iterator over the blocks in a WavPack byte buffer that carry
+/// `.wvc`-side correction-stream data — either the `0x0B` packed
+/// correction data, the `0x07` noise-shaping profile, or both.
+///
+/// Wraps [`BlockIter`] so the iteration filters to blocks whose
+/// [`WavPackBlock::has_correction_stream_data`] predicate fires. Yields
+/// `Result<WavPackBlock<'_>>` once per correction-bearing block; parse
+/// errors surface verbatim and fuse the iterator (the underlying
+/// [`BlockIter`] fuse mechanism). An empty input or an input whose every
+/// block carries only main-stream data yields zero items.
+///
+/// The wiki "IDs" listing groups the `.wvc`-side payloads (`0x07`
+/// noise-shaping profile, `0x0B` packed correction data) as the
+/// hybrid-mode companion content; this iterator surfaces every block
+/// that carries either, regardless of whether the block is otherwise an
+/// audio block (`block_samples > 0`) or a metadata-only block. The
+/// hybrid-mode decode itself is gated on
+/// [`UnsupportedBlockFeature::Hybrid`]; this iterator's role is
+/// structural introspection — counting / locating / sizing — without
+/// committing to a decode semantics. Round 233.
+#[derive(Debug, Clone)]
+pub struct CorrectionBlockIter<'a> {
+    /// Underlying block iterator. Drives parse + walks the byte buffer;
+    /// the correction-bearing filter is applied on each yield.
+    blocks: BlockIter<'a>,
+}
+
+impl<'a> CorrectionBlockIter<'a> {
+    /// Build a [`CorrectionBlockIter`] over the supplied byte buffer.
+    /// Equivalent to [`iter_correction_blocks`] but spelled as a
+    /// constructor for callers that prefer the type-first form.
+    /// Round 233.
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            blocks: BlockIter::new(bytes),
+        }
+    }
+
+    /// Bytes of the input buffer the underlying [`BlockIter`] has not
+    /// yet consumed. Pairs with [`BlockIter::remaining`]; on a
+    /// fused-error iterator this points at the malformed block's first
+    /// byte for precise offset diagnostics. Round 233.
+    pub fn remaining(&self) -> &'a [u8] {
+        self.blocks.remaining()
+    }
+
+    /// `true` when this iterator will not yield any more items —
+    /// either because the underlying [`BlockIter`] is exhausted or
+    /// because a previous `next()` call returned `Err(_)` (the
+    /// iterator fuses on error via the same mechanism [`BlockIter`]
+    /// uses). Round 233.
+    pub fn is_exhausted(&self) -> bool {
+        self.blocks.is_exhausted()
+    }
+}
+
+impl<'a> Iterator for CorrectionBlockIter<'a> {
+    type Item = Result<WavPackBlock<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.blocks.next()? {
+                Ok(block) => {
+                    if block.has_correction_stream_data() {
+                        return Some(Ok(block));
+                    }
+                    // No correction-stream payload — skip and continue.
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+impl core::iter::FusedIterator for CorrectionBlockIter<'_> {}
+
+/// Construct a lazy [`CorrectionBlockIter`] over the supplied byte
+/// buffer.
+///
+/// Equivalent to [`CorrectionBlockIter::new`]; provided as a free
+/// function for the `iter_correction_blocks(bytes)` call shape readers
+/// expect when scanning a `.wv` file for the hybrid-mode companion
+/// payloads. Round 233.
+pub fn iter_correction_blocks(bytes: &[u8]) -> CorrectionBlockIter<'_> {
+    CorrectionBlockIter::new(bytes)
+}
+
+/// Count the blocks in `bytes` whose sub-block list carries either of
+/// the wiki `.wvc`-side payloads — `0x07` noise-shaping profile or
+/// `0x0B` packed correction data.
+///
+/// Drives [`iter_blocks`] under the hood; every block in the buffer
+/// must parse cleanly for the count to be returned (any parse error
+/// surfaces verbatim). Working-set memory is one block at a time
+/// regardless of input length. Round 233.
+pub fn correction_block_count(bytes: &[u8]) -> Result<usize> {
+    let mut iter = iter_blocks(bytes);
+    let mut count = 0;
+    for block in iter.by_ref() {
+        let block = block?;
+        if block.has_correction_stream_data() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Peek the first correction-bearing block in `bytes` — the first
+/// block whose [`WavPackBlock::has_correction_stream_data`] predicate
+/// fires — without retaining the rest of the stream.
+///
+/// Returns `Ok(None)` when the stream has no correction-bearing blocks
+/// (empty input, or a pure lossless `.wv` file with no merged `.wvc`
+/// content). Returns `Err(_)` when a block before the first
+/// correction-bearing block fails to parse — the round-13
+/// [`parse_block`] errors surface verbatim. Round 233.
+pub fn first_correction_block(bytes: &[u8]) -> Result<Option<WavPackBlock<'_>>> {
+    let mut iter = iter_correction_blocks(bytes);
+    match iter.next() {
+        Some(Ok(block)) => Ok(Some(block)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// Sum the byte lengths of every `0x0B` packed-correction-data
+/// sub-block payload across every block in `bytes`.
+///
+/// Each `0x0B` sub-block contributes its post-walker payload byte count
+/// (the wiki "Metadata" preamble guarantees an even total — the
+/// odd-size flag means the round-2 walker already stripped a trailing
+/// padding byte before the payload reached this counter). Returns `u64`
+/// so a multi-GiB stream's aggregate correction-payload size does not
+/// overflow `u32`.
+///
+/// Drives [`iter_blocks`] under the hood; any parse error surfaces
+/// verbatim. Working-set memory is one block at a time regardless of
+/// input length. Notable: this counts only `0x0B` payload bytes —
+/// `0x07` noise-shaping profile bytes are excluded since they describe
+/// the decoder filter rather than the correction codewords themselves.
+/// Round 233.
+pub fn total_correction_payload_bytes(bytes: &[u8]) -> Result<u64> {
+    let mut iter = iter_blocks(bytes);
+    let mut sum: u64 = 0;
+    for block in iter.by_ref() {
+        let block = block?;
+        if let Some(view) = block.packed_correction_data() {
+            sum += view.len() as u64;
+        }
+    }
+    Ok(sum)
 }
 
 /// Lazy iterator over the PCM samples produced by every audio block in a
@@ -3202,5 +3432,496 @@ mod tests {
         let via_iter = iter_audio_blocks(&bytes).count();
         assert_eq!(via_fn, via_iter);
         assert_eq!(via_fn, 3);
+    }
+
+    // ---- Round-233 .wvc correction-stream typed view + introspection ----
+
+    /// Append a 0x0B packed-correction-data sub-block with the supplied
+    /// payload bytes. Must be even-length (sub-block size is in 16-bit
+    /// words and we don't set the odd-size flag here).
+    fn append_packed_correction_data(payload: &mut Vec<u8>, bytes: &[u8]) {
+        append_small_sub_block(payload, 0x0B, bytes);
+    }
+
+    /// Append a 0x07 noise-shaping-profile sub-block with the supplied
+    /// payload bytes.
+    fn append_noise_shaping_profile(payload: &mut Vec<u8>, bytes: &[u8]) {
+        append_small_sub_block(payload, 0x07, bytes);
+    }
+
+    /// Append a 0x06 hybrid-profile sub-block with the supplied payload
+    /// bytes.
+    fn append_hybrid_profile(payload: &mut Vec<u8>, bytes: &[u8]) {
+        append_small_sub_block(payload, 0x06, bytes);
+    }
+
+    #[test]
+    fn has_packed_correction_data_returns_false_on_no_0x0b_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_packed_correction_data());
+        assert!(block.packed_correction_data().is_none());
+        assert!(block.find_packed_correction_data_sub_block().is_none());
+    }
+
+    #[test]
+    fn has_packed_correction_data_returns_true_with_0x0b_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0xAA, 0xBB]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_packed_correction_data());
+
+        let view = block.packed_correction_data().expect("typed view");
+        assert_eq!(view.bytes(), &[0xAA, 0xBB]);
+        assert_eq!(view.len(), 2);
+
+        let sub = block
+            .find_packed_correction_data_sub_block()
+            .expect("borrow");
+        assert_eq!(sub.id, SubBlockId::PackedCorrectionData);
+        assert_eq!(sub.payload, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn has_noise_shaping_profile_returns_false_on_no_0x07_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_noise_shaping_profile());
+        assert!(block.find_noise_shaping_profile_sub_block().is_none());
+    }
+
+    #[test]
+    fn has_noise_shaping_profile_returns_true_with_0x07_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_noise_shaping_profile(&mut payload, &[0x55, 0x66]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_noise_shaping_profile());
+        let sub = block
+            .find_noise_shaping_profile_sub_block()
+            .expect("borrow");
+        assert_eq!(sub.id, SubBlockId::NoiseShapingProfile);
+        assert_eq!(sub.payload, &[0x55, 0x66]);
+    }
+
+    #[test]
+    fn has_hybrid_profile_returns_false_on_no_0x06_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_hybrid_profile());
+        assert!(block.find_hybrid_profile_sub_block().is_none());
+    }
+
+    #[test]
+    fn has_hybrid_profile_returns_true_with_0x06_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_hybrid_profile(&mut payload, &[0x10, 0x20]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_hybrid_profile());
+        let sub = block.find_hybrid_profile_sub_block().expect("borrow");
+        assert_eq!(sub.id, SubBlockId::HybridProfile);
+        assert_eq!(sub.payload, &[0x10, 0x20]);
+    }
+
+    #[test]
+    fn has_correction_stream_data_is_union_of_0x07_and_0x0b() {
+        // No 0x07 / 0x0B → false.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_correction_stream_data());
+
+        // 0x0B only → true.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0x01, 0x02]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_correction_stream_data());
+
+        // 0x07 only → true.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_noise_shaping_profile(&mut payload, &[0x03, 0x04]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_correction_stream_data());
+
+        // Both 0x07 + 0x0B → true.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_noise_shaping_profile(&mut payload, &[0x03, 0x04]);
+        append_packed_correction_data(&mut payload, &[0x05, 0x06]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_correction_stream_data());
+    }
+
+    #[test]
+    fn packed_correction_data_typed_view_round_trips_payload_bytes() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        let view = block.packed_correction_data().expect("typed view");
+        assert_eq!(view.bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(!view.is_empty());
+        assert_eq!(view.len(), 4);
+
+        // bit_reader starts at byte 0 / bit 0
+        let r = view.bit_reader();
+        assert_eq!(r.byte_position(), 0);
+        assert_eq!(r.bit_position(), 0);
+        assert_eq!(r.bits_remaining(), 32);
+    }
+
+    #[test]
+    fn correction_block_count_on_empty_buffer_is_zero() {
+        let bytes: &[u8] = &[];
+        assert_eq!(correction_block_count(bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn correction_block_count_zero_when_no_correction_payloads() {
+        // Single audio block, no 0x07 / 0x0B.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        assert_eq!(correction_block_count(&bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn correction_block_count_counts_blocks_with_either_payload() {
+        // Build a stream of: [plain audio][0x0B-only][0x07-only][both]
+        let mut plain_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut plain_payload);
+        append_packed_samples(&mut plain_payload, &[0x00, 0x00]);
+        let plain = synthesise_block(1, flags_with(1 << 2), &plain_payload);
+
+        let mut wvc_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut wvc_payload);
+        append_packed_samples(&mut wvc_payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut wvc_payload, &[0x01, 0x02]);
+        let wvc_only = synthesise_block(1, flags_with(1 << 2), &wvc_payload);
+
+        let mut shape_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut shape_payload);
+        append_packed_samples(&mut shape_payload, &[0x00, 0x00]);
+        append_noise_shaping_profile(&mut shape_payload, &[0x03, 0x04]);
+        let shape_only = synthesise_block(1, flags_with(1 << 2), &shape_payload);
+
+        let mut both_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut both_payload);
+        append_packed_samples(&mut both_payload, &[0x00, 0x00]);
+        append_noise_shaping_profile(&mut both_payload, &[0x05, 0x06]);
+        append_packed_correction_data(&mut both_payload, &[0x07, 0x08]);
+        let both = synthesise_block(1, flags_with(1 << 2), &both_payload);
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&plain);
+        stream.extend_from_slice(&wvc_only);
+        stream.extend_from_slice(&shape_only);
+        stream.extend_from_slice(&both);
+
+        // 3 of 4 blocks have correction-stream data.
+        assert_eq!(correction_block_count(&stream).unwrap(), 3);
+    }
+
+    #[test]
+    fn correction_block_count_propagates_parse_error() {
+        // Trailing 3 bytes too short for a header → Truncated.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0x09, 0x0A]);
+        let good = synthesise_block(1, flags_with(1 << 2), &payload);
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&[0u8; 3]);
+        let err = correction_block_count(&bytes).expect_err("must reject trailing");
+        assert_eq!(err, Error::Truncated);
+    }
+
+    #[test]
+    fn first_correction_block_returns_none_on_empty_buffer() {
+        let bytes: &[u8] = &[];
+        assert!(first_correction_block(bytes).unwrap().is_none());
+    }
+
+    #[test]
+    fn first_correction_block_skips_blocks_without_correction_data() {
+        // [plain][plain][correction][plain] — first_correction_block
+        // walks past the leading two and returns the third.
+        let mut plain_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut plain_payload);
+        append_packed_samples(&mut plain_payload, &[0x00, 0x00]);
+        let plain = synthesise_block(1, flags_with(1 << 2), &plain_payload);
+
+        let mut wvc_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut wvc_payload);
+        append_packed_samples(&mut wvc_payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut wvc_payload, &[0xAB, 0xCD]);
+        let wvc = synthesise_block(1, flags_with(1 << 2), &wvc_payload);
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&plain);
+        stream.extend_from_slice(&plain);
+        stream.extend_from_slice(&wvc);
+        stream.extend_from_slice(&plain);
+
+        let block = first_correction_block(&stream).expect("ok").expect("some");
+        let view = block.packed_correction_data().expect("typed view");
+        assert_eq!(view.bytes(), &[0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn first_correction_block_returns_none_when_no_correction_blocks_present() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        assert!(first_correction_block(&bytes).unwrap().is_none());
+    }
+
+    #[test]
+    fn iter_correction_blocks_on_empty_buffer_yields_zero_items() {
+        let bytes: &[u8] = &[];
+        let mut iter = iter_correction_blocks(bytes);
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_correction_blocks_skips_blocks_without_correction_payloads() {
+        // [plain][wvc][plain][wvc][wvc] → iterator yields 3 items.
+        let mut plain_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut plain_payload);
+        append_packed_samples(&mut plain_payload, &[0x00, 0x00]);
+        let plain = synthesise_block(1, flags_with(1 << 2), &plain_payload);
+
+        let mut wvc_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut wvc_payload);
+        append_packed_samples(&mut wvc_payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut wvc_payload, &[0xAB, 0xCD]);
+        let wvc = synthesise_block(1, flags_with(1 << 2), &wvc_payload);
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&plain);
+        stream.extend_from_slice(&wvc);
+        stream.extend_from_slice(&plain);
+        stream.extend_from_slice(&wvc);
+        stream.extend_from_slice(&wvc);
+
+        let yielded: Vec<_> = iter_correction_blocks(&stream)
+            .map(|b| b.expect("ok"))
+            .collect();
+        assert_eq!(yielded.len(), 3);
+        for block in &yielded {
+            assert!(block.has_correction_stream_data());
+        }
+    }
+
+    #[test]
+    fn iter_correction_blocks_fuses_on_parse_error() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0xAA, 0xBB]);
+        let good = synthesise_block(1, flags_with(1 << 2), &payload);
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&[0u8; 3]); // truncated trailing
+        let mut iter = iter_correction_blocks(&bytes);
+        // First item: the good correction block.
+        let first = iter.next().expect("first").expect("ok");
+        assert!(first.has_correction_stream_data());
+        // Second item: the parse error.
+        let err = iter.next().expect("err").expect_err("truncated");
+        assert_eq!(err, Error::Truncated);
+        // Third call: fused → None.
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn iter_correction_blocks_constructor_and_new_return_identical_sequences() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0x11, 0x22]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+
+        let via_fn: Vec<_> = iter_correction_blocks(&bytes).map(|b| b.is_ok()).collect();
+        let via_ctor: Vec<_> = CorrectionBlockIter::new(&bytes)
+            .map(|b| b.is_ok())
+            .collect();
+        assert_eq!(via_fn, via_ctor);
+    }
+
+    #[test]
+    fn iter_correction_blocks_remaining_tracks_underlying_block_iter() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0x33, 0x44]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+
+        let mut iter = iter_correction_blocks(&bytes);
+        assert_eq!(iter.remaining().len(), bytes.len());
+        let _ = iter.next();
+        assert!(iter.remaining().is_empty());
+    }
+
+    #[test]
+    fn correction_block_iter_clone_and_fused_iterator_trait_bounds_hold() {
+        // Compile-time trait assertions analogous to the AudioBlockIter
+        // test pattern: the iterator implements Clone and FusedIterator.
+        fn assert_clone<T: Clone>() {}
+        fn assert_fused<T: core::iter::FusedIterator>() {}
+        assert_clone::<CorrectionBlockIter<'_>>();
+        assert_fused::<CorrectionBlockIter<'_>>();
+    }
+
+    #[test]
+    fn correction_block_count_equals_iter_correction_blocks_count() {
+        let mut wvc_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut wvc_payload);
+        append_packed_samples(&mut wvc_payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut wvc_payload, &[0xCD, 0xEF]);
+        let wvc = synthesise_block(1, flags_with(1 << 2), &wvc_payload);
+
+        let mut plain_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut plain_payload);
+        append_packed_samples(&mut plain_payload, &[0x00, 0x00]);
+        let plain = synthesise_block(1, flags_with(1 << 2), &plain_payload);
+
+        let mut bytes = wvc.clone();
+        bytes.extend_from_slice(&plain);
+        bytes.extend_from_slice(&wvc);
+
+        let via_fn = correction_block_count(&bytes).expect("count");
+        let via_iter = iter_correction_blocks(&bytes).count();
+        assert_eq!(via_fn, via_iter);
+        assert_eq!(via_fn, 2);
+    }
+
+    #[test]
+    fn total_correction_payload_bytes_on_empty_buffer_is_zero() {
+        let bytes: &[u8] = &[];
+        assert_eq!(total_correction_payload_bytes(bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn total_correction_payload_bytes_zero_when_no_0x0b() {
+        // Plain audio block — no 0x0B → 0 correction bytes.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        assert_eq!(total_correction_payload_bytes(&bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn total_correction_payload_bytes_sums_only_0x0b_payload_bytes() {
+        // Block 1: 4 bytes of 0x0B
+        // Block 2: 0x07 only (excluded) + 6 bytes of 0x0B
+        // Block 3: nothing
+        // Expected: 4 + 6 = 10
+        let mut p1 = Vec::new();
+        append_entropy_info_mono_zero(&mut p1);
+        append_packed_samples(&mut p1, &[0x00, 0x00]);
+        append_packed_correction_data(&mut p1, &[1, 2, 3, 4]);
+        let b1 = synthesise_block(1, flags_with(1 << 2), &p1);
+
+        let mut p2 = Vec::new();
+        append_entropy_info_mono_zero(&mut p2);
+        append_packed_samples(&mut p2, &[0x00, 0x00]);
+        append_noise_shaping_profile(&mut p2, &[0xAA, 0xBB]);
+        append_packed_correction_data(&mut p2, &[5, 6, 7, 8, 9, 10]);
+        let b2 = synthesise_block(1, flags_with(1 << 2), &p2);
+
+        let mut p3 = Vec::new();
+        append_entropy_info_mono_zero(&mut p3);
+        append_packed_samples(&mut p3, &[0x00, 0x00]);
+        let b3 = synthesise_block(1, flags_with(1 << 2), &p3);
+
+        let mut bytes = b1;
+        bytes.extend_from_slice(&b2);
+        bytes.extend_from_slice(&b3);
+
+        assert_eq!(total_correction_payload_bytes(&bytes).unwrap(), 10);
+    }
+
+    #[test]
+    fn total_correction_payload_bytes_propagates_parse_error() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0x01, 0x02]);
+        let good = synthesise_block(1, flags_with(1 << 2), &payload);
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&[0u8; 3]); // truncated trailing header
+        let err = total_correction_payload_bytes(&bytes).expect_err("must reject");
+        assert_eq!(err, Error::Truncated);
+    }
+
+    #[test]
+    fn metadata_only_block_carrying_only_0x0b_is_correction_bearing() {
+        // A block with block_samples == 0 that carries only a 0x0B
+        // payload — a "correction-only metadata block" — must still be
+        // surfaced as correction-bearing. Wiki "Block structure" allows
+        // block_samples == 0 for metadata-only blocks; the wiki places
+        // no rule forbidding a wvc-side payload alongside zero audio
+        // samples in a merged file.
+        let mut payload = Vec::new();
+        append_packed_correction_data(&mut payload, &[0xFE, 0xED]);
+        let bytes = synthesise_block(0, flags_with(0), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.is_audio_block());
+        assert!(block.has_packed_correction_data());
+        assert!(block.has_correction_stream_data());
+    }
+
+    #[test]
+    fn block_with_correction_data_but_unsupported_hybrid_flag_still_refuses_decode() {
+        // The presence of a 0x0B payload does NOT make decode_samples
+        // succeed on a hybrid block — the per-sample loop still gates
+        // on the hybrid flag. This pins the contract: the typed view
+        // is structural introspection, not a decode-enablement.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_correction_data(&mut payload, &[0x01, 0x02]);
+        let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 3)), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_packed_correction_data());
+        let err = block.decode_samples().expect_err("must still refuse");
+        assert_eq!(
+            err,
+            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
+        );
     }
 }

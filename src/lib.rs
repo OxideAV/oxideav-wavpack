@@ -1,5 +1,42 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 233 — `.wvc` correction-stream typed view + walker bridges +
+//! block-level / stream-level introspection accessors. The wiki "IDs"
+//! listing annotates sub-blocks `0x07` (noise-shaping profile) and
+//! `0x0B` (packed correction data) as carried in the `.wvc` companion
+//! file alongside the lossy main `.wv`; this round elaborates the
+//! round-2 walker output for `0x0B` into a typed
+//! [`PackedCorrectionData`] view (analogous to the round-12
+//! [`PackedSamples`] view for `0x0A`) and threads the same finder /
+//! predicate / iterator pattern through the metadata-walker /
+//! block-level / stream-level surfaces. New [`PackedCorrectionData`] is
+//! the typed wrap (raw bytes + [`PackedCorrectionData::bit_reader`]
+//! factory analogous to [`PackedSamples::bit_reader`]); new
+//! [`expand_packed_correction_data`] constructs it from a raw payload.
+//! New walker finders [`find_packed_correction_data`] (typed-view
+//! variant) / [`find_packed_correction_data_sub_block`] (raw-borrow
+//! variant) / [`find_noise_shaping_profile`] / [`find_hybrid_profile`]
+//! pair the walker output with the three hybrid-mode sub-block IDs
+//! without re-walking the metadata. New block-level accessors
+//! [`WavPackBlock::has_packed_correction_data`] /
+//! [`WavPackBlock::packed_correction_data`] /
+//! [`WavPackBlock::find_packed_correction_data_sub_block`] /
+//! [`WavPackBlock::has_noise_shaping_profile`] /
+//! [`WavPackBlock::find_noise_shaping_profile_sub_block`] /
+//! [`WavPackBlock::has_hybrid_profile`] /
+//! [`WavPackBlock::find_hybrid_profile_sub_block`] /
+//! [`WavPackBlock::has_correction_stream_data`] expose the new
+//! sub-block IDs at the block level. New stream-level free functions
+//! [`correction_block_count`] / [`first_correction_block`] /
+//! [`iter_correction_blocks`] / [`total_correction_payload_bytes`] and
+//! the new [`CorrectionBlockIter`] mirror the round-230 audio-block
+//! introspection pattern for correction-stream-bearing blocks. The
+//! hybrid-mode sample decode itself (spec §4.2 step 6 second paragraph,
+//! `error_limit != 0`) stays out of scope — the typed views give a
+//! callable handle into the bytes without committing to a decode
+//! semantics. No new error variants and no docs-gap-blocked surface
+//! touched. 44 new tests (436 total, up from 392).**
+//!
 //! **Round 230 — stream-level introspection accessors composing the
 //! round-219 [`iter_blocks`] for aggregate "how many / what shape" /
 //! "where's the first audio block" questions without retaining the
@@ -424,6 +461,7 @@
 
 mod block;
 mod block_header;
+mod correction;
 mod decorrelation;
 mod entropy;
 mod error;
@@ -432,15 +470,17 @@ mod packed_samples;
 mod samples;
 
 pub use crate::block::{
-    audio_block_count, block_count, decode_stream, decoded_sample_count, first_audio_block,
-    iter_audio_blocks, iter_blocks, iter_decoded_blocks, metadata_block_count, parse_block,
-    parse_blocks, total_audio_samples, total_block_samples, AudioBlockIter, BlockIter,
-    StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
+    audio_block_count, block_count, correction_block_count, decode_stream, decoded_sample_count,
+    first_audio_block, first_correction_block, iter_audio_blocks, iter_blocks,
+    iter_correction_blocks, iter_decoded_blocks, metadata_block_count, parse_block, parse_blocks,
+    total_audio_samples, total_block_samples, total_correction_payload_bytes, AudioBlockIter,
+    BlockIter, CorrectionBlockIter, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
 };
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,
 };
+pub use crate::correction::{expand_packed_correction_data, PackedCorrectionData};
 pub use crate::decorrelation::{
     decorrelation_sample_count, expand_samples, expand_terms, expand_weights,
     partition_decorrelation_samples, weights_per_term, DecorrelationSamples, DecorrelationTerms,
@@ -455,9 +495,11 @@ pub use crate::entropy::{
 pub use crate::error::{Error, Result};
 pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
-    find_md5_checksum_block, find_multichannel_info, find_packed_samples, parse_md5_checksum,
-    parse_metadata_sub_block, walk_metadata, Md5Checksum, MetadataSubBlock, SubBlockFlags,
-    SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
+    find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
+    find_noise_shaping_profile, find_packed_correction_data, find_packed_correction_data_sub_block,
+    find_packed_samples, parse_md5_checksum, parse_metadata_sub_block, walk_metadata, Md5Checksum,
+    MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE,
+    ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
 };
 pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
 pub use crate::samples::{

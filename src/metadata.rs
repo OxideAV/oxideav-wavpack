@@ -577,6 +577,58 @@ pub fn find_packed_samples<'a>(subs: &[MetadataSubBlock<'a>]) -> Option<crate::P
     find_first(subs, SubBlockId::PackedSamples).map(|s| crate::PackedSamples::new(s.payload))
 }
 
+/// Convenience wrapper for [`find_first`] specialised to the `0x0B`
+/// packed-correction-data payload — the entropy-coded correction stream
+/// the wiki "IDs" listing annotates as carried in the `.wvc` companion
+/// file. Returns the borrowed metadata sub-block; pair with
+/// [`crate::expand_packed_correction_data`] (or the
+/// [`find_packed_correction_data`] typed wrapper just below) to obtain
+/// the typed [`crate::PackedCorrectionData`] view.
+pub fn find_packed_correction_data_sub_block<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::PackedCorrectionData)
+}
+
+/// Walk a metadata list and return the first `0x0B` packed-correction-data
+/// sub-block already wrapped as a typed [`crate::PackedCorrectionData`]
+/// view — the typed counterpart to [`find_packed_correction_data_sub_block`].
+/// `None` when no `0x0B` sub-block is present in the walk.
+///
+/// Equivalent to `find_packed_correction_data_sub_block(subs).map(|s|
+/// PackedCorrectionData::new(s.payload()))` but spelled directly so
+/// callers staging the deferred hybrid-mode decode have a one-call
+/// bridge from the walker output to the [`crate::BitReader`] factory.
+pub fn find_packed_correction_data<'a>(
+    subs: &[MetadataSubBlock<'a>],
+) -> Option<crate::PackedCorrectionData<'a>> {
+    find_first(subs, SubBlockId::PackedCorrectionData)
+        .map(|s| crate::PackedCorrectionData::new(s.payload))
+}
+
+/// Convenience wrapper for [`find_first`] specialised to the `0x07`
+/// noise-shaping-profile payload — the wiki "IDs" listing annotates this
+/// as carried in the `.wvc` companion file. Returns the borrowed
+/// metadata sub-block; the wiki places no internal structure on the
+/// payload, so the typed surface stops at the raw bytes.
+pub fn find_noise_shaping_profile<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::NoiseShapingProfile)
+}
+
+/// Convenience wrapper for [`find_first`] specialised to the `0x06`
+/// hybrid-profile payload — the wiki "IDs" listing names this payload
+/// alongside the `0x07` noise-shaping profile as the hybrid decoder's
+/// per-block configuration. Returns the borrowed metadata sub-block;
+/// the wiki places no internal structure on the payload, so the typed
+/// surface stops at the raw bytes.
+pub fn find_hybrid_profile<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::HybridProfile)
+}
+
 /// Locate the **decorrelation triple** in a metadata walk and return
 /// the three sub-blocks in wiki order — `0x02` terms, `0x03` weights,
 /// `0x04` samples. Returns `None` when any one of the three is missing
@@ -1300,5 +1352,77 @@ mod tests {
         stream.extend(synth_small(0x05, &[0u8; 6]));
         let subs = walk_metadata(&stream).unwrap();
         assert!(find_packed_samples(&subs).is_none());
+    }
+
+    // ---- Round-233 .wvc-side finders ----
+
+    #[test]
+    fn find_packed_correction_data_typed_view_returns_view_when_0x0b_present() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x0A, &[0x00, 0x00]));
+        stream.extend(synth_small(0x0B, &[0xAA, 0xBB, 0xCC, 0xDD]));
+        let subs = walk_metadata(&stream).unwrap();
+        let view = find_packed_correction_data(&subs).expect("0x0B present");
+        assert_eq!(view.bytes(), &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(view.len(), 4);
+    }
+
+    #[test]
+    fn find_packed_correction_data_typed_view_returns_none_when_0x0b_absent() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x0A, &[0x00, 0x00]));
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_packed_correction_data(&subs).is_none());
+    }
+
+    #[test]
+    fn find_packed_correction_data_sub_block_returns_metadata_borrow() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x0B, &[0x11, 0x22]));
+        let subs = walk_metadata(&stream).unwrap();
+        let sub = find_packed_correction_data_sub_block(&subs).expect("0x0B");
+        assert_eq!(sub.id, SubBlockId::PackedCorrectionData);
+        assert_eq!(sub.payload, &[0x11, 0x22]);
+    }
+
+    #[test]
+    fn find_noise_shaping_profile_returns_metadata_borrow_when_0x07_present() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x07, &[0x33, 0x44]));
+        let subs = walk_metadata(&stream).unwrap();
+        let sub = find_noise_shaping_profile(&subs).expect("0x07");
+        assert_eq!(sub.id, SubBlockId::NoiseShapingProfile);
+        assert_eq!(sub.payload, &[0x33, 0x44]);
+    }
+
+    #[test]
+    fn find_noise_shaping_profile_returns_none_when_0x07_absent() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_noise_shaping_profile(&subs).is_none());
+    }
+
+    #[test]
+    fn find_hybrid_profile_returns_metadata_borrow_when_0x06_present() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x06, &[0x55, 0x66]));
+        let subs = walk_metadata(&stream).unwrap();
+        let sub = find_hybrid_profile(&subs).expect("0x06");
+        assert_eq!(sub.id, SubBlockId::HybridProfile);
+        assert_eq!(sub.payload, &[0x55, 0x66]);
+    }
+
+    #[test]
+    fn find_hybrid_profile_returns_none_when_0x06_absent() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_hybrid_profile(&subs).is_none());
     }
 }
