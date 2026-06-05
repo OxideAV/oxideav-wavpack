@@ -5,6 +5,53 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 239 — typed file-total / end-cursor accessors on
+[`WavPackBlockHeader`] / [`WavPackBlock`] + a stream-level
+[`stream_total_samples`] free function. The wiki "Block structure"
+listing of `docs/audio/wavpack/wiki/WavPack.wiki` carries three
+explicitly file-global / per-block sample-cursor fields — `total
+samples in file` (32-bit, with `0xFFFFFFFF` reserved as the "unknown"
+sentinel), `offset in samples for current block`, and `samples in this
+block` — that the round-1 header parser preserved verbatim but had not
+yet lifted into typed accessors with `Option`-typed sentinel semantics
+or derived end-cursor arithmetic. This round adds the three header
+accessors and four block-level pass-throughs:
+[`WavPackBlockHeader::total_samples_in_file`] returns
+`Option<u32>` — `Some(n)` for a known total, `None` for the
+[`TOTAL_SAMPLES_UNKNOWN`] sentinel — so callers branching on the
+sentinel don't compare against the raw constant;
+[`WavPackBlockHeader::end_sample_index`] returns `u64` =
+`block_index + block_samples`, the half-open upper bound the next
+block's `block_index` should match in a well-formed stream
+(metadata-only blocks contribute zero, so the cursor doesn't advance);
+[`WavPackBlockHeader::samples_remaining_after`] returns
+`Option<u64>` — `Some(total - end)` when the total is known and the
+end cursor lies within it, `None` for the sentinel or for end-past-total
+malformed combinations. New block-level convenience accessors
+[`WavPackBlock::total_samples_in_file`] /
+[`WavPackBlock::end_sample_index`] /
+[`WavPackBlock::samples_remaining_after`] /
+[`WavPackBlock::is_final_audio_block_in_file`] pass through to the
+header and add the boolean discriminant for the "is this the last
+block of a fully-described file" case (`samples_remaining_after()
+== Some(0)`). New stream-level free function [`stream_total_samples`]
+returns `Result<Option<Option<u32>>>` — outer `None` for empty input,
+outer `Some` carrying the typed file-total from the first block's
+header (the wiki documents `total_samples` as file-global, so the
+first block's copy is the stream-level source of truth). All four new
+surfaces are derived directly from the three explicitly documented
+wiki fields — no spec gap, no docs-gap-blocked surface touched, no new
+error variants. 23 new tests (459 total, up from 436) pin: the
+sentinel / known / zero-as-distinct-from-sentinel discrimination on
+the typed `Option`; the u32-extreme-summands non-overflow on
+`end_sample_index`; the metadata-only-block end-cursor non-advancement;
+the exact-end / non-zero-remainder / unknown-total / end-past-total
+branches on `samples_remaining_after`; the boolean `is_final_audio_block_in_file`
+discriminant on each of those branches; the stream-level free function
+on empty / single-block / multi-block / sentinel / malformed-header
+inputs; the cross-block consistency of `end_sample_index` and
+`samples_remaining_after` across a synthesised three-block stream.**
+
 **Round 233 — `.wvc` correction-stream typed view + walker bridges +
 block-level and stream-level introspection accessors. The wiki "IDs"
 listing of `docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-blocks

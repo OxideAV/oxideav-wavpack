@@ -378,6 +378,78 @@ impl WavPackBlockHeader {
     pub fn payload_bytes(&self) -> u32 {
         self.ck_size - 24
     }
+
+    /// Stream-level "total samples in file" as a typed `Option<u32>` —
+    /// `Some(n)` for a known total, `None` for the wiki-defined
+    /// [`TOTAL_SAMPLES_UNKNOWN`] sentinel ("may be 0xFFFFFFFF if unknown"
+    /// per the wiki "Block structure" listing).
+    ///
+    /// This lifts the on-disk `total_samples` field into the same
+    /// `Option`-typed surface every other "unknown / known" pair uses,
+    /// so callers branching on the sentinel don't have to compare
+    /// against the raw constant. Pair with [`Self::is_total_samples_known`]
+    /// when only the boolean discriminant is needed.
+    ///
+    /// The wiki documents `total_samples` as a file-global quantity
+    /// (not block-local) — every block carries the same value, so any
+    /// block's accessor surfaces the stream-level total. The stream-
+    /// level free function `crate::stream_total_samples` (round 239) is
+    /// the byte-buffer call-shape twin that reaches through
+    /// [`parse_block_header`] for the caller.
+    pub fn total_samples_in_file(&self) -> Option<u32> {
+        if self.total_samples == TOTAL_SAMPLES_UNKNOWN {
+            None
+        } else {
+            Some(self.total_samples)
+        }
+    }
+
+    /// Sample index of the first sample **after** this block — the
+    /// half-open upper bound of the wiki "offset in samples for current
+    /// block" / "samples in this block" pair, computed as `block_index
+    /// + block_samples`.
+    ///
+    /// Returns `u64` so the sum never overflows when both fields hold
+    /// their `u32::MAX` extremes; a real file packs `block_index` along
+    /// a monotonically increasing 32-bit cursor over the on-the-wire
+    /// total, but the typed accessor stays defensive on the arithmetic.
+    ///
+    /// For a metadata-only block (`block_samples == 0`) the end index
+    /// equals `block_index` (no PCM is emitted, so the cursor doesn't
+    /// advance) — consistent with the wiki "may be 0 if no audio
+    /// present" note on `block_samples`.
+    pub fn end_sample_index(&self) -> u64 {
+        self.block_index as u64 + self.block_samples as u64
+    }
+
+    /// Number of samples remaining in the file after this block — the
+    /// difference between the wiki "total samples in file" field and
+    /// this block's [`Self::end_sample_index`].
+    ///
+    /// Returns `None` when the file-total is the wiki
+    /// [`TOTAL_SAMPLES_UNKNOWN`] sentinel — the wiki explicitly allows
+    /// the encoder to emit `0xFFFFFFFF` when the total can't be
+    /// predicted at write time, so "how many remain" can't be answered
+    /// without the total.
+    ///
+    /// Returns `Some(0)` when this block ends exactly at the file
+    /// total — the final block of a complete `.wv` file.
+    ///
+    /// Returns `None` when [`Self::end_sample_index`] exceeds the
+    /// file-total — a malformed combination the wiki does not
+    /// explicitly forbid but which the accessor refuses to surface as
+    /// a negative count. Callers wanting to distinguish the
+    /// "underflow" case from the "unknown total" case can pair this
+    /// with [`Self::is_total_samples_known`].
+    pub fn samples_remaining_after(&self) -> Option<u64> {
+        let total = self.total_samples_in_file()? as u64;
+        let end = self.end_sample_index();
+        if end > total {
+            None
+        } else {
+            Some(total - end)
+        }
+    }
 }
 
 /// Parse the 32-byte WavPack block header at the start of `bytes`.
@@ -857,5 +929,105 @@ mod tests {
         assert!(f.false_stereo);
         assert!(f.is_block_data_mono());
         assert!(!f.is_block_data_stereo());
+    }
+
+    // ---- Round-239 total_samples_in_file / end_sample_index /
+    // samples_remaining_after accessors ----
+
+    /// Synthesise a header that lets us pin per-field values for the
+    /// round-239 derived accessors without going through the
+    /// fully-typed `parse_block_header` path.
+    fn header_with(total_samples: u32, block_index: u32, block_samples: u32) -> WavPackBlockHeader {
+        let mut buf = synthesise_minimal_header(0);
+        buf[12..16].copy_from_slice(&total_samples.to_le_bytes());
+        buf[16..20].copy_from_slice(&block_index.to_le_bytes());
+        buf[20..24].copy_from_slice(&block_samples.to_le_bytes());
+        let (h, _) = parse_block_header(&buf).unwrap();
+        h
+    }
+
+    #[test]
+    fn total_samples_in_file_returns_some_for_known_total() {
+        let h = header_with(123_456, 0, 1024);
+        assert_eq!(h.total_samples_in_file(), Some(123_456));
+        assert!(h.is_total_samples_known());
+    }
+
+    #[test]
+    fn total_samples_in_file_returns_none_for_sentinel() {
+        // Wiki "may be 0xFFFFFFFF if unknown" sentinel.
+        let h = header_with(TOTAL_SAMPLES_UNKNOWN, 0, 0);
+        assert_eq!(h.total_samples_in_file(), None);
+        assert!(!h.is_total_samples_known());
+    }
+
+    #[test]
+    fn total_samples_in_file_distinguishes_zero_from_sentinel() {
+        // Wiki: `0` is a legitimate "no audio at all" total — distinct
+        // from the `0xFFFFFFFF` "unknown" sentinel. The Option-typed
+        // accessor preserves that distinction.
+        let h_zero = header_with(0, 0, 0);
+        assert_eq!(h_zero.total_samples_in_file(), Some(0));
+        let h_unknown = header_with(TOTAL_SAMPLES_UNKNOWN, 0, 0);
+        assert_eq!(h_unknown.total_samples_in_file(), None);
+    }
+
+    #[test]
+    fn end_sample_index_is_block_index_plus_block_samples() {
+        let h = header_with(10_000, 1_000, 1_024);
+        assert_eq!(h.end_sample_index(), 2_024);
+    }
+
+    #[test]
+    fn end_sample_index_metadata_only_block_does_not_advance_cursor() {
+        // Wiki: block_samples may be 0 for a metadata-only block.
+        // The cursor stays at block_index.
+        let h = header_with(10_000, 4_096, 0);
+        assert_eq!(h.end_sample_index(), 4_096);
+        assert_eq!(h.block_index, 4_096);
+        assert!(!h.is_audio_block());
+    }
+
+    #[test]
+    fn end_sample_index_does_not_overflow_u32_max_summands() {
+        // Both fields at their u32 extremes — sum is 2 * (u32::MAX) = 2^33 - 2,
+        // representable in u64.
+        let h = header_with(0, u32::MAX, u32::MAX);
+        assert_eq!(h.end_sample_index(), 2 * (u32::MAX as u64));
+    }
+
+    #[test]
+    fn samples_remaining_after_returns_some_difference_for_known_total() {
+        // 10_000 total, block ends at 2_024 → 7_976 remaining.
+        let h = header_with(10_000, 1_000, 1_024);
+        assert_eq!(h.samples_remaining_after(), Some(7_976));
+    }
+
+    #[test]
+    fn samples_remaining_after_returns_zero_at_exact_end_of_file() {
+        // Final block ending exactly at the file total.
+        let h = header_with(2_048, 1_024, 1_024);
+        assert_eq!(h.end_sample_index(), 2_048);
+        assert_eq!(h.samples_remaining_after(), Some(0));
+    }
+
+    #[test]
+    fn samples_remaining_after_returns_none_for_unknown_total() {
+        // Wiki sentinel: total unknown → cannot answer "how many
+        // remain".
+        let h = header_with(TOTAL_SAMPLES_UNKNOWN, 1_000, 1_024);
+        assert_eq!(h.samples_remaining_after(), None);
+    }
+
+    #[test]
+    fn samples_remaining_after_returns_none_when_end_exceeds_total() {
+        // Malformed combination: end past the declared total. Accessor
+        // refuses to surface a negative count.
+        let h = header_with(1_000, 800, 500); // ends at 1_300, > 1_000 total
+        assert_eq!(h.end_sample_index(), 1_300);
+        assert_eq!(h.samples_remaining_after(), None);
+        // But the total IS still known — the gap is structural, not
+        // sentinel-driven.
+        assert!(h.is_total_samples_known());
     }
 }

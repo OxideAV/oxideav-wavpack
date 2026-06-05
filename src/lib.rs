@@ -1,5 +1,38 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 239 — typed file-total / end-cursor accessors on
+//! [`WavPackBlockHeader`] / [`WavPackBlock`] + the stream-level
+//! [`stream_total_samples`] free function. The wiki "Block structure"
+//! listing names three sample-cursor fields — `total samples in file`
+//! (with `0xFFFFFFFF` documented as the "unknown" sentinel), `offset
+//! in samples for current block`, and `samples in this block` — that
+//! the round-1 header parser preserved verbatim but had not yet
+//! surfaced as typed `Option`-sentinel accessors or derived end-cursor
+//! arithmetic. New [`WavPackBlockHeader::total_samples_in_file`] →
+//! `Option<u32>` lifts the file-global total into the same `Option`
+//! sentinel-aware shape every other "known / unknown" accessor uses;
+//! new [`WavPackBlockHeader::end_sample_index`] returns the `u64`
+//! half-open upper bound `block_index + block_samples` (cursor stays
+//! put for a metadata-only block per the wiki "may be 0 if no audio
+//! present" note); new [`WavPackBlockHeader::samples_remaining_after`]
+//! returns `Option<u64>` — `Some(total - end)` for known totals with
+//! the end cursor within the file, `None` for the sentinel or for the
+//! malformed end-past-total case. New block-level pass-throughs
+//! [`WavPackBlock::total_samples_in_file`] /
+//! [`WavPackBlock::end_sample_index`] /
+//! [`WavPackBlock::samples_remaining_after`] /
+//! [`WavPackBlock::is_final_audio_block_in_file`] expose the same
+//! header-derived quantities at the block level (the boolean
+//! discriminant lights up only when the remainder is exactly zero).
+//! New stream-level free function [`stream_total_samples`] returns
+//! `Result<Option<Option<u32>>>` — outer `None` for an empty input,
+//! outer `Some` carrying the typed file-total from the first block's
+//! header (the wiki documents `total_samples` as file-global, so the
+//! first block's copy is the stream-level source of truth). All four
+//! new surfaces derive directly from the three explicitly-documented
+//! wiki fields — no spec gap, no docs-gap-blocked surface touched, no
+//! new error variants. 23 new tests (459 total, up from 436).**
+//!
 //! **Round 233 — `.wvc` correction-stream typed view + walker bridges +
 //! block-level / stream-level introspection accessors. The wiki "IDs"
 //! listing annotates sub-blocks `0x07` (noise-shaping profile) and
@@ -473,8 +506,9 @@ pub use crate::block::{
     audio_block_count, block_count, correction_block_count, decode_stream, decoded_sample_count,
     first_audio_block, first_correction_block, iter_audio_blocks, iter_blocks,
     iter_correction_blocks, iter_decoded_blocks, metadata_block_count, parse_block, parse_blocks,
-    total_audio_samples, total_block_samples, total_correction_payload_bytes, AudioBlockIter,
-    BlockIter, CorrectionBlockIter, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
+    stream_total_samples, total_audio_samples, total_block_samples, total_correction_payload_bytes,
+    AudioBlockIter, BlockIter, CorrectionBlockIter, StreamDecodeIter, UnsupportedBlockFeature,
+    WavPackBlock,
 };
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,

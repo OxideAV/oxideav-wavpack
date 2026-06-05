@@ -8,6 +8,74 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 239 — typed file-total / end-cursor accessors on
+  `WavPackBlockHeader` / `WavPackBlock` and the stream-level
+  `stream_total_samples` free function. The wiki "Block structure"
+  listing of `docs/audio/wavpack/wiki/WavPack.wiki` names three
+  sample-cursor fields the round-1 header parser preserved verbatim
+  (`total samples in file` with `0xFFFFFFFF` reserved as the wiki
+  "unknown" sentinel; `offset in samples for current block`; `samples
+  in this block`), but only the boolean `is_total_samples_known`
+  discriminant was surfaced through the typed API. This round adds:
+
+  - `WavPackBlockHeader::total_samples_in_file` — returns
+    `Option<u32>`, the typed sentinel-aware view of the file-global
+    total. `Some(n)` for a known total, `None` for the
+    `TOTAL_SAMPLES_UNKNOWN` constant. `Some(0)` and `None` remain
+    distinguishable — the wiki allows a literal zero total as a
+    legitimate "no audio at all" value, distinct from the sentinel.
+  - `WavPackBlockHeader::end_sample_index` — returns `u64` =
+    `block_index + block_samples`, the half-open upper bound of this
+    block's sample contribution. A metadata-only block
+    (`block_samples == 0`) reports the same cursor as `block_index`,
+    consistent with the wiki "may be 0 if no audio present" note. The
+    `u64` return type covers the pathological `u32::MAX + u32::MAX`
+    summands without overflow.
+  - `WavPackBlockHeader::samples_remaining_after` — returns
+    `Option<u64>` = `total - end` when both the total is known and the
+    end cursor lies within it. `None` for the wiki sentinel
+    (cannot answer without the total) and for the malformed end-past-
+    total combination (refuses to surface as a negative count).
+  - `WavPackBlock::total_samples_in_file` /
+    `WavPackBlock::end_sample_index` /
+    `WavPackBlock::samples_remaining_after` — block-level pass-throughs
+    so callers iterating parsed blocks reach the typed values without
+    going through `.header`.
+  - `WavPackBlock::is_final_audio_block_in_file` — boolean
+    `samples_remaining_after() == Some(0)` discriminant for the
+    "last block of a fully-described `.wv` file" case.
+  - `stream_total_samples(&[u8]) -> Result<Option<Option<u32>>>` —
+    stream-level free function reading the typed file-total from the
+    first block's header. Outer `None` for empty input (no first
+    block); outer `Some` carrying the inner `Option<u32>` from
+    `WavPackBlockHeader::total_samples_in_file`. The wiki documents
+    `total_samples` as file-global, so reading only the first block's
+    32-byte fixed header (constant-time, no metadata walk) is the
+    minimal call that surfaces the stream-level total.
+
+  All four surfaces derive directly from the three explicitly
+  documented wiki fields — no spec gap, no docs-gap-blocked surface
+  touched. No new error variants. The `WavPackBlock` exports are
+  re-exported through the existing `crate::block` block; the new
+  `stream_total_samples` free function joins the existing stream-level
+  free-function surface in `lib.rs`.
+
+- 23 new unit tests (459 total, up from 436) pin: the sentinel /
+  known / zero-as-distinct-from-sentinel discrimination on the typed
+  `Option`; the u32-extreme-summands non-overflow on
+  `end_sample_index`; the metadata-only-block end-cursor
+  non-advancement (cursor stays at `block_index`); the
+  exact-end / non-zero-remainder / unknown-total / end-past-total
+  branches of `samples_remaining_after`; the boolean
+  `is_final_audio_block_in_file` discriminant on each of those
+  branches; the stream-level free function on empty / single-block /
+  multi-block / sentinel / malformed-header inputs; the first-block-
+  only contract (a second block's hypothetically-different total
+  is not consulted); and the cross-block consistency of
+  `end_sample_index` / `samples_remaining_after` /
+  `is_final_audio_block_in_file` across a synthesised three-block
+  stream.
+
 - Round 233 — `.wvc` correction-stream typed view + walker bridges +
   block-level and stream-level introspection accessors. The wiki "IDs"
   listing of `docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-blocks

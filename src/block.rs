@@ -618,6 +618,42 @@ impl<'a> WavPackBlock<'a> {
             samples * 2
         }
     }
+
+    /// Block-level pairing with
+    /// [`WavPackBlockHeader::total_samples_in_file`] — the wiki
+    /// "total samples in file" field as a typed `Option<u32>`
+    /// (`Some(n)` for a known total, `None` for the wiki
+    /// [`crate::TOTAL_SAMPLES_UNKNOWN`] sentinel). Round 239.
+    pub fn total_samples_in_file(&self) -> Option<u32> {
+        self.header.total_samples_in_file()
+    }
+
+    /// Block-level pairing with
+    /// [`WavPackBlockHeader::end_sample_index`] — the wiki
+    /// "offset in samples for current block" + "samples in this block"
+    /// sum as a `u64`. The first-sample-after-this-block cursor the
+    /// next block's `block_index` should match in a well-formed stream.
+    /// Round 239.
+    pub fn end_sample_index(&self) -> u64 {
+        self.header.end_sample_index()
+    }
+
+    /// Block-level pairing with
+    /// [`WavPackBlockHeader::samples_remaining_after`] — the count of
+    /// samples remaining in the file after this block, when both the
+    /// total and the end cursor are well-defined. `None` for unknown
+    /// total or for end-past-total malformed combinations. Round 239.
+    pub fn samples_remaining_after(&self) -> Option<u64> {
+        self.header.samples_remaining_after()
+    }
+
+    /// `true` when this block is the final block of a fully-described
+    /// `.wv` file — `samples_remaining_after()` is `Some(0)`. Returns
+    /// `false` for `None` (unknown total) and for any non-zero remainder
+    /// (more audio follows). Round 239.
+    pub fn is_final_audio_block_in_file(&self) -> bool {
+        matches!(self.samples_remaining_after(), Some(0))
+    }
 }
 
 /// Parse one full WavPack block — the 32-byte fixed header plus the
@@ -939,6 +975,36 @@ pub fn decoded_sample_count(bytes: &[u8]) -> Result<u64> {
         sum += block.decoded_sample_count();
     }
     Ok(sum)
+}
+
+/// Read the wiki "total samples in file" field from the **first**
+/// block's header in `bytes`, lifted into a typed `Option<u32>`.
+///
+/// The wiki "Block structure" listing names `total_samples` as a
+/// file-global quantity — every block of a well-formed `.wv` file
+/// carries the same value, so the first block's copy is the
+/// stream-level total. Returns:
+///
+/// * `Ok(Some(Some(n)))` — the first block declares a known total of
+///   `n` samples;
+/// * `Ok(Some(None))` — the first block carries the wiki
+///   [`crate::TOTAL_SAMPLES_UNKNOWN`] sentinel (`0xFFFFFFFF`,
+///   documented as "may be 0xFFFFFFFF if unknown") — a streaming
+///   encoder that couldn't predict the total at write time emits this;
+/// * `Ok(None)` — the input is empty, so there is no first block to
+///   read;
+/// * `Err(_)` — the first block's header could not be parsed (the
+///   round-1 [`parse_block_header`] errors surface verbatim).
+///
+/// Only the 32-byte fixed header is read — no metadata walk, no
+/// per-block on-disk length validation, so this is constant-time
+/// regardless of stream size. Round 239.
+pub fn stream_total_samples(bytes: &[u8]) -> Result<Option<Option<u32>>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let (header, _) = parse_block_header(bytes)?;
+    Ok(Some(header.total_samples_in_file()))
 }
 
 /// Peek the first audio block in `bytes` — the first block whose
@@ -1365,7 +1431,7 @@ pub fn decode_stream(bytes: &[u8]) -> Result<Vec<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_header::{HEADER_LEN, MAGIC, MIN_CK_SIZE};
+    use crate::block_header::{HEADER_LEN, MAGIC, MIN_CK_SIZE, TOTAL_SAMPLES_UNKNOWN};
 
     /// Synthesise a minimal valid WavPack block header with the supplied
     /// `ck_size` (must be `>= 24`). The flag word is left at zero (mono,
@@ -3923,5 +3989,164 @@ mod tests {
             err,
             Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
         );
+    }
+
+    // ---- Round-239 total_samples_in_file / end_sample_index /
+    // samples_remaining_after / is_final_audio_block_in_file +
+    // stream_total_samples ----
+
+    /// Synthesise a block that pins the three round-239 header fields
+    /// (`total_samples`, `block_index`, `block_samples`) to caller
+    /// values. Standalone multichannel marker is set so the block
+    /// would also pass the round-206 composer's structural gates if a
+    /// decode test ever runs against this layout.
+    fn synthesise_block_with_indices(
+        total_samples: u32,
+        block_index: u32,
+        block_samples: u32,
+    ) -> Vec<u8> {
+        let ck_size = 24u32; // no metadata sub-blocks
+        let mut buf = vec![0u8; HEADER_LEN];
+        buf[0..4].copy_from_slice(MAGIC);
+        buf[4..8].copy_from_slice(&ck_size.to_le_bytes());
+        buf[8..10].copy_from_slice(&0x0410u16.to_le_bytes());
+        buf[12..16].copy_from_slice(&total_samples.to_le_bytes());
+        buf[16..20].copy_from_slice(&block_index.to_le_bytes());
+        buf[20..24].copy_from_slice(&block_samples.to_le_bytes());
+        // Flags = standalone multichannel marker so the block is well-formed
+        // even if downstream tests round-trip it through the composer.
+        let flags = 0b11u32 << 11;
+        buf[24..28].copy_from_slice(&flags.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn block_total_samples_in_file_passes_through_header_accessor() {
+        let bytes = synthesise_block_with_indices(123_456, 0, 1024);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.total_samples_in_file(), Some(123_456));
+    }
+
+    #[test]
+    fn block_total_samples_in_file_is_none_for_sentinel() {
+        let bytes = synthesise_block_with_indices(TOTAL_SAMPLES_UNKNOWN, 0, 1024);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.total_samples_in_file(), None);
+    }
+
+    #[test]
+    fn block_end_sample_index_sums_block_index_and_block_samples() {
+        let bytes = synthesise_block_with_indices(10_000, 1_000, 1_024);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.end_sample_index(), 2_024);
+        assert_eq!(
+            block.block_index() as u64 + block.block_samples() as u64,
+            2_024
+        );
+    }
+
+    #[test]
+    fn block_samples_remaining_after_returns_some_for_known_total() {
+        let bytes = synthesise_block_with_indices(10_000, 1_000, 1_024);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.samples_remaining_after(), Some(7_976));
+    }
+
+    #[test]
+    fn block_samples_remaining_after_returns_zero_at_exact_end_of_file() {
+        // A final block ending at the file total.
+        let bytes = synthesise_block_with_indices(2_048, 1_024, 1_024);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.samples_remaining_after(), Some(0));
+        assert!(block.is_final_audio_block_in_file());
+    }
+
+    #[test]
+    fn block_is_final_audio_block_in_file_is_false_when_total_is_unknown() {
+        // Wiki sentinel: cannot answer "is this final" without the
+        // declared total.
+        let bytes = synthesise_block_with_indices(TOTAL_SAMPLES_UNKNOWN, 1_000, 1_024);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.is_final_audio_block_in_file());
+        assert_eq!(block.samples_remaining_after(), None);
+    }
+
+    #[test]
+    fn block_is_final_audio_block_in_file_is_false_when_more_samples_remain() {
+        let bytes = synthesise_block_with_indices(10_000, 0, 1_024);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.is_final_audio_block_in_file());
+        assert_eq!(block.samples_remaining_after(), Some(8_976));
+    }
+
+    #[test]
+    fn stream_total_samples_returns_first_blocks_total() {
+        // Single-block stream: stream total == that block's header field.
+        let bytes = synthesise_block_with_indices(98_765, 0, 1_024);
+        assert_eq!(stream_total_samples(&bytes).unwrap(), Some(Some(98_765)));
+    }
+
+    #[test]
+    fn stream_total_samples_returns_none_for_sentinel_on_first_block() {
+        let bytes = synthesise_block_with_indices(TOTAL_SAMPLES_UNKNOWN, 0, 0);
+        assert_eq!(stream_total_samples(&bytes).unwrap(), Some(None));
+    }
+
+    #[test]
+    fn stream_total_samples_returns_outer_none_for_empty_input() {
+        // Empty input → no first block to read.
+        assert_eq!(stream_total_samples(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn stream_total_samples_reads_first_block_only_even_on_multi_block_input() {
+        // Multi-block stream where the first block's total differs
+        // from a (hypothetically-malformed) second block's total. The
+        // accessor reads only the first block — the wiki "total
+        // samples in file" is file-global, so it's the source of
+        // truth.
+        let a = synthesise_block_with_indices(50_000, 0, 1_024);
+        let b = synthesise_block_with_indices(99_999, 1_024, 1_024);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&a);
+        bytes.extend_from_slice(&b);
+        assert_eq!(stream_total_samples(&bytes).unwrap(), Some(Some(50_000)));
+    }
+
+    #[test]
+    fn stream_total_samples_surfaces_parse_error_on_malformed_header() {
+        // Truncated input (only 8 bytes) → Error::Truncated, not Ok.
+        let bytes = vec![b'w', b'v', b'p', b'k', 0, 0, 0, 0];
+        let err = stream_total_samples(&bytes).expect_err("must reject");
+        assert_eq!(err, Error::Truncated);
+    }
+
+    #[test]
+    fn block_round_239_accessors_are_consistent_across_a_three_block_stream() {
+        // A three-block stream with a known total — walk it and pin
+        // end_sample_index for each block, summing block_samples should
+        // equal the total at the last block.
+        let blocks = [
+            synthesise_block_with_indices(3_072, 0, 1_024),
+            synthesise_block_with_indices(3_072, 1_024, 1_024),
+            synthesise_block_with_indices(3_072, 2_048, 1_024),
+        ];
+        let mut stream = Vec::new();
+        for b in &blocks {
+            stream.extend_from_slice(b);
+        }
+        let parsed = parse_blocks(&stream).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].end_sample_index(), 1_024);
+        assert_eq!(parsed[1].end_sample_index(), 2_048);
+        assert_eq!(parsed[2].end_sample_index(), 3_072);
+        // Only the last block reports zero remaining.
+        assert_eq!(parsed[0].samples_remaining_after(), Some(2_048));
+        assert_eq!(parsed[1].samples_remaining_after(), Some(1_024));
+        assert_eq!(parsed[2].samples_remaining_after(), Some(0));
+        // And only the last block claims "final".
+        assert!(!parsed[0].is_final_audio_block_in_file());
+        assert!(!parsed[1].is_final_audio_block_in_file());
+        assert!(parsed[2].is_final_audio_block_in_file());
     }
 }
