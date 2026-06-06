@@ -5,6 +5,50 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 242 — `0x0C` packed-overflow-bits typed view + walker bridges
++ block-level introspection. The wiki "IDs" listing of
+`docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-block `0x0C` as
+"packed overflow bits from floating-point or large integers", and the
+staged clean-room entropy doc
+`docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 names the same
+ID as the **extension bitstream**. The round-2 metadata walker
+already routed `0x0C` payloads through the typed
+[`SubBlockId::PackedOverflowBits`] discriminant, but the bytes had
+not yet been elaborated into the same typed view + finder +
+block-level accessor shape the round-12 [`PackedSamples`] (`0x0A`)
+and round-233 [`PackedCorrectionData`] (`0x0B`) views expose. This
+round closes that gap. New [`PackedOverflowBits<'a>`] in
+`src/overflow_bits.rs` carries the borrowed `0x0C` payload verbatim
+and exposes the same `bytes()` / `len()` / `is_empty()` introspection
++ `bit_reader()` factory shape (LSB-first within each byte, the same
+convention every payload-carrying view in the crate uses). New
+[`expand_packed_overflow_bits`] constructor + walker finders
+[`find_packed_overflow_bits`] (typed-view) /
+[`find_packed_overflow_bits_sub_block`] (raw-borrow) elaborate the
+walker output for the `0x0C` ID without re-walking the metadata. New
+block-level accessors [`WavPackBlock::has_packed_overflow_bits`] /
+[`WavPackBlock::find_packed_overflow_bits_sub_block`] /
+[`WavPackBlock::packed_overflow_bits`] pair the block surface with
+the new walker bridges. The float (wiki flag bit 7) / large-integer
+(wiki flag bit 8) container fix-ups that would actually consume the
+wrapped bytes remain gated on the
+[`UnsupportedBlockFeature::FloatData`] /
+[`UnsupportedBlockFeature::Int32Mode`] feature refusals in
+[`WavPackBlock::decode_samples`] — the typed view is a deferred
+handoff into the bit reader, not a decode pass. 17 new tests (476
+total, up from 459) pin: bytes-verbatim / empty-acceptance / `len` /
+`is_empty` round-trip on the typed view; the `BitReader` factory's
+initial cursor and `bits_remaining == 8 * len`; the LSB-first bit
+order; factory independence (two readers from the same view advance
+separately); the empty-payload bit-reader's immediate `Truncated` (no
+zero-fill contract); the `Copy` semantics of the view; the
+type-distinct check that `PackedOverflowBits` / `PackedCorrectionData`
+/ `PackedSamples` are three different types even though all three
+wrap the same byte-slice shape; the walker bridges'
+present / absent / sub-block-borrow branches; and the block-level
+accessors' false / true / view-round-trip / 3-way independence with
+the existing `0x07` + `0x0B` accessors.**
+
 **Round 239 — typed file-total / end-cursor accessors on
 [`WavPackBlockHeader`] / [`WavPackBlock`] + a stream-level
 [`stream_total_samples`] free function. The wiki "Block structure"

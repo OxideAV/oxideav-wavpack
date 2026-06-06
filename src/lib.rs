@@ -1,5 +1,37 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 242 — `0x0C` packed-overflow-bits typed view + walker
+//! bridges + block-level introspection. The wiki "IDs" listing of
+//! `docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-block `0x0C`
+//! as "packed overflow bits from floating-point or large integers",
+//! and the staged clean-room entropy doc
+//! `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 names the
+//! same ID as the **extension bitstream**. The round-2 metadata
+//! walker already routes `0x0C` payloads through the typed
+//! [`SubBlockId::PackedOverflowBits`] discriminant, but the bytes had
+//! not yet been elaborated into the same typed view + finder + block-
+//! level accessor shape the round-12 [`PackedSamples`] (`0x0A`) and
+//! round-233 [`PackedCorrectionData`] (`0x0B`) views expose. This
+//! round closes that gap. New [`PackedOverflowBits`] in
+//! `src/overflow_bits.rs` carries the borrowed `0x0C` payload verbatim
+//! and exposes the same `bytes()` / `len()` / `is_empty()`
+//! introspection + `bit_reader()` factory shape; new
+//! [`expand_packed_overflow_bits`] constructor + walker finders
+//! [`find_packed_overflow_bits`] (typed-view variant) /
+//! [`find_packed_overflow_bits_sub_block`] (raw-borrow variant)
+//! elaborate the walker output without re-walking the metadata. New
+//! block-level accessors
+//! [`WavPackBlock::has_packed_overflow_bits`] /
+//! [`WavPackBlock::packed_overflow_bits`] /
+//! [`WavPackBlock::find_packed_overflow_bits_sub_block`] pair the
+//! block surface with the new walker bridges. The float / large-
+//! integer container fix-ups that would consume the wrapped bytes
+//! themselves remain gated on the
+//! [`UnsupportedBlockFeature::FloatData`] /
+//! [`UnsupportedBlockFeature::Int32Mode`] feature refusals — the typed
+//! view is a deferred handoff into the bit reader, not a decode pass.
+//! 17 new tests (476 total, up from 459).**
+//!
 //! **Round 239 — typed file-total / end-cursor accessors on
 //! [`WavPackBlockHeader`] / [`WavPackBlock`] + the stream-level
 //! [`stream_total_samples`] free function. The wiki "Block structure"
@@ -499,6 +531,7 @@ mod decorrelation;
 mod entropy;
 mod error;
 mod metadata;
+mod overflow_bits;
 mod packed_samples;
 mod samples;
 
@@ -531,10 +564,12 @@ pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
     find_noise_shaping_profile, find_packed_correction_data, find_packed_correction_data_sub_block,
-    find_packed_samples, parse_md5_checksum, parse_metadata_sub_block, walk_metadata, Md5Checksum,
-    MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE,
-    ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
+    find_packed_overflow_bits, find_packed_overflow_bits_sub_block, find_packed_samples,
+    parse_md5_checksum, parse_metadata_sub_block, walk_metadata, Md5Checksum, MetadataSubBlock,
+    SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK,
+    MD5_DIGEST_BYTES,
 };
+pub use crate::overflow_bits::{expand_packed_overflow_bits, PackedOverflowBits};
 pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
 pub use crate::samples::{
     decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,

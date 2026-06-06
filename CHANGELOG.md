@@ -8,6 +8,72 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 242 — `0x0C` packed-overflow-bits typed view + walker
+  bridges + block-level introspection. The wiki "IDs" listing of
+  `docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-block `0x0C` as
+  "packed overflow bits from floating-point or large integers", and
+  the staged clean-room entropy doc
+  `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 names the
+  same ID as the **extension bitstream**. The round-2 metadata walker
+  already routes `0x0C` payloads through the typed
+  `SubBlockId::PackedOverflowBits` discriminant, but the bytes had
+  not yet been elaborated into the same typed view + finder +
+  block-level accessor shape the round-12 `PackedSamples` (`0x0A`)
+  and round-233 `PackedCorrectionData` (`0x0B`) views expose. This
+  round closes that gap.
+
+  - `PackedOverflowBits<'a>` in `src/overflow_bits.rs` carries the
+    borrowed `0x0C` payload verbatim. Mirrors the `PackedSamples` /
+    `PackedCorrectionData` shape: `bytes()` / `len()` / `is_empty()`
+    introspection + `bit_reader()` factory producing a fresh
+    `BitReader` positioned at bit 0 (LSB-first within each byte, the
+    same convention every payload-carrying view in the crate uses).
+    Any byte slice — including the empty one — is accepted: the wiki
+    places no length constraint on the payload.
+  - `expand_packed_overflow_bits(payload: &[u8]) -> PackedOverflowBits<'_>`
+    — typed constructor analogous to `expand_packed_samples` and
+    `expand_packed_correction_data`.
+  - `find_packed_overflow_bits_sub_block(subs)` — walker finder
+    returning the borrowed `MetadataSubBlock<'a>`, for callers that
+    want the raw sub-block handle.
+  - `find_packed_overflow_bits(subs)` — typed walker finder returning
+    `Option<PackedOverflowBits<'a>>` directly, the one-call bridge
+    from the round-2 metadata walker output to the
+    `BitReader`-construction handoff.
+  - `WavPackBlock::has_packed_overflow_bits()` — boolean
+    discriminant for the presence of a `0x0C` sub-block.
+  - `WavPackBlock::find_packed_overflow_bits_sub_block()` /
+    `WavPackBlock::packed_overflow_bits()` — block-level accessors
+    pairing with the free walker finders.
+
+  The float (wiki flag bit 7) / large-integer (wiki flag bit 8)
+  container fix-ups that would actually consume the wrapped bytes
+  remain gated on the `UnsupportedBlockFeature::FloatData` /
+  `UnsupportedBlockFeature::Int32Mode` feature refusals in
+  `WavPackBlock::decode_samples`. The typed view is a deferred
+  handoff into the bit reader, not a decode pass.
+
+  17 new tests (476 total, up from 459): the new module's view +
+  walker + bit-reader contract (`new_preserves_bytes_verbatim` /
+  `empty_payload_is_accepted_and_reported_empty` /
+  `expand_packed_overflow_bits_round_trips_the_byte_slice` /
+  `bit_reader_starts_at_byte_zero_bit_zero` /
+  `bit_reader_yields_first_bit_lsb_first` /
+  `bit_reader_factory_returns_independent_readers` /
+  `empty_payload_bit_reader_reports_immediate_truncation` /
+  `view_is_copy_and_independent_of_caller_lifetime` /
+  `view_is_distinct_type_from_packed_samples_and_correction`) plus
+  the metadata walker bridges
+  (`find_packed_overflow_bits_typed_view_returns_view_when_0x0c_present`
+  / `find_packed_overflow_bits_typed_view_returns_none_when_0x0c_absent`
+  / `find_packed_overflow_bits_sub_block_returns_metadata_borrow` /
+  `find_packed_overflow_bits_sub_block_returns_none_when_0x0c_absent`)
+  plus the block-level accessor surface
+  (`has_packed_overflow_bits_returns_false_on_no_0x0c_subblock` /
+  `has_packed_overflow_bits_returns_true_with_0x0c_subblock` /
+  `packed_overflow_bits_view_round_trips_with_bit_reader` /
+  `has_packed_overflow_bits_is_independent_of_0x0b_and_0x07`).
+
 - Round 239 — typed file-total / end-cursor accessors on
   `WavPackBlockHeader` / `WavPackBlock` and the stream-level
   `stream_total_samples` free function. The wiki "Block structure"

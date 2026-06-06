@@ -426,6 +426,37 @@ impl<'a> WavPackBlock<'a> {
         crate::metadata::find_hybrid_profile(&self.sub_blocks)
     }
 
+    /// `true` when a `0x0C` packed-overflow-bits sub-block is
+    /// present. The wiki "IDs" listing annotates this ID as "packed
+    /// overflow bits from floating-point or large integers" and the
+    /// clean-room entropy doc names the same ID as the extension
+    /// bitstream. Presence indicates the block was encoded with the
+    /// float (wiki bit 7) or int32 (wiki bit 8) container fix-up, so
+    /// the main `0x0A` decode alone does not reconstruct the
+    /// per-sample value — the overflow bits supply the high-order
+    /// bits the consumer fix-up needs. Round 242.
+    pub fn has_packed_overflow_bits(&self) -> bool {
+        self.contains_sub_block(SubBlockId::PackedOverflowBits)
+    }
+
+    /// Borrow the first `0x0C` packed-overflow-bits sub-block, or
+    /// `None` when none is present. Block-level pairing with the
+    /// free [`crate::find_packed_overflow_bits_sub_block`] finder.
+    /// Use [`Self::packed_overflow_bits`] for the typed-view variant.
+    /// Round 242.
+    pub fn find_packed_overflow_bits_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
+        crate::metadata::find_packed_overflow_bits_sub_block(&self.sub_blocks)
+    }
+
+    /// Locate the `0x0C` packed-overflow-bits sub-block and wrap it
+    /// as a typed [`crate::PackedOverflowBits`] view, or return
+    /// `None` when no `0x0C` sub-block is present. Block-level
+    /// pairing with the free [`crate::find_packed_overflow_bits`]
+    /// finder. Round 242.
+    pub fn packed_overflow_bits(&self) -> Option<crate::PackedOverflowBits<'a>> {
+        crate::metadata::find_packed_overflow_bits(&self.sub_blocks)
+    }
+
     /// Locate the `0x05` entropy-info sub-block and expand its payload
     /// into a typed [`EntropyInfo`].
     ///
@@ -3521,6 +3552,13 @@ mod tests {
         append_small_sub_block(payload, 0x06, bytes);
     }
 
+    /// Append a 0x0C packed-overflow-bits sub-block with the supplied
+    /// payload bytes. Must be even-length (sub-block size is in 16-bit
+    /// words and we don't set the odd-size flag here).
+    fn append_packed_overflow_bits(payload: &mut Vec<u8>, bytes: &[u8]) {
+        append_small_sub_block(payload, 0x0C, bytes);
+    }
+
     #[test]
     fn has_packed_correction_data_returns_false_on_no_0x0b_subblock() {
         let mut payload = Vec::new();
@@ -3604,6 +3642,85 @@ mod tests {
         let sub = block.find_hybrid_profile_sub_block().expect("borrow");
         assert_eq!(sub.id, SubBlockId::HybridProfile);
         assert_eq!(sub.payload, &[0x10, 0x20]);
+    }
+
+    // ---- Round-242 0x0C packed-overflow-bits typed view + introspection ----
+
+    #[test]
+    fn has_packed_overflow_bits_returns_false_on_no_0x0c_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_packed_overflow_bits());
+        assert!(block.packed_overflow_bits().is_none());
+        assert!(block.find_packed_overflow_bits_sub_block().is_none());
+    }
+
+    #[test]
+    fn has_packed_overflow_bits_returns_true_with_0x0c_subblock() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_packed_overflow_bits(&mut payload, &[0xCA, 0xFE]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_packed_overflow_bits());
+
+        let view = block.packed_overflow_bits().expect("typed view");
+        assert_eq!(view.bytes(), &[0xCA, 0xFE]);
+        assert_eq!(view.len(), 2);
+
+        let sub = block.find_packed_overflow_bits_sub_block().expect("borrow");
+        assert_eq!(sub.id, SubBlockId::PackedOverflowBits);
+        assert_eq!(sub.payload, &[0xCA, 0xFE]);
+    }
+
+    #[test]
+    fn packed_overflow_bits_view_round_trips_with_bit_reader() {
+        // A non-empty 0x0C payload should yield a typed view whose
+        // bit_reader factory honours the LSB-first convention.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        // 0x03 = 0b0000_0011 -> LSB first: 1, 1, 0, 0, ...
+        append_packed_overflow_bits(&mut payload, &[0x03, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        let view = block.packed_overflow_bits().expect("typed view");
+        let mut r = view.bit_reader();
+        assert_eq!(r.bits_remaining(), 16);
+        assert_eq!(r.get_bit().unwrap(), 1);
+        assert_eq!(r.get_bit().unwrap(), 1);
+        assert_eq!(r.get_bit().unwrap(), 0);
+        assert_eq!(r.get_bit().unwrap(), 0);
+    }
+
+    #[test]
+    fn has_packed_overflow_bits_is_independent_of_0x0b_and_0x07() {
+        // 0x0C alongside 0x0B + 0x07 should all show up positively
+        // and independently — the three IDs are distinct sub-block
+        // discriminants and the accessors don't collide.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        append_noise_shaping_profile(&mut payload, &[0x11, 0x22]);
+        append_packed_correction_data(&mut payload, &[0x33, 0x44]);
+        append_packed_overflow_bits(&mut payload, &[0x55, 0x66]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+
+        assert!(block.has_noise_shaping_profile());
+        assert!(block.has_packed_correction_data());
+        assert!(block.has_packed_overflow_bits());
+
+        // Each typed view borrows its own distinct payload bytes.
+        let overflow = block.packed_overflow_bits().expect("0x0C view");
+        let correction = block.packed_correction_data().expect("0x0B view");
+        assert_eq!(overflow.bytes(), &[0x55, 0x66]);
+        assert_eq!(correction.bytes(), &[0x33, 0x44]);
     }
 
     #[test]

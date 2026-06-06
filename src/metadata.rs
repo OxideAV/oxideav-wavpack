@@ -617,6 +617,37 @@ pub fn find_noise_shaping_profile<'walk, 'a>(
     find_first(subs, SubBlockId::NoiseShapingProfile)
 }
 
+/// Convenience wrapper for [`find_first`] specialised to the `0x0C`
+/// packed-overflow-bits payload — the wiki "IDs" listing annotates
+/// this ID as "packed overflow bits from floating-point or large
+/// integers" and the clean-room entropy doc names the same ID as the
+/// extension bitstream. Returns the borrowed metadata sub-block; pair
+/// with [`crate::expand_packed_overflow_bits`] (or the
+/// [`find_packed_overflow_bits`] typed wrapper just below) to obtain
+/// the typed [`crate::PackedOverflowBits`] view.
+pub fn find_packed_overflow_bits_sub_block<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::PackedOverflowBits)
+}
+
+/// Walk a metadata list and return the first `0x0C` packed-overflow-bits
+/// sub-block already wrapped as a typed [`crate::PackedOverflowBits`]
+/// view — the typed counterpart to [`find_packed_overflow_bits_sub_block`].
+/// `None` when no `0x0C` sub-block is present in the walk.
+///
+/// Equivalent to `find_packed_overflow_bits_sub_block(subs).map(|s|
+/// PackedOverflowBits::new(s.payload()))` but spelled directly so
+/// callers staging the deferred float / large-integer container fix-up
+/// have a one-call bridge from the walker output to the
+/// [`crate::BitReader`] factory.
+pub fn find_packed_overflow_bits<'a>(
+    subs: &[MetadataSubBlock<'a>],
+) -> Option<crate::PackedOverflowBits<'a>> {
+    find_first(subs, SubBlockId::PackedOverflowBits)
+        .map(|s| crate::PackedOverflowBits::new(s.payload))
+}
+
 /// Convenience wrapper for [`find_first`] specialised to the `0x06`
 /// hybrid-profile payload — the wiki "IDs" listing names this payload
 /// alongside the `0x07` noise-shaping profile as the hybrid decoder's
@@ -1424,5 +1455,45 @@ mod tests {
         stream.extend(synth_small(0x05, &[0u8; 6]));
         let subs = walk_metadata(&stream).unwrap();
         assert!(find_hybrid_profile(&subs).is_none());
+    }
+
+    #[test]
+    fn find_packed_overflow_bits_typed_view_returns_view_when_0x0c_present() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x0A, &[0x00, 0x00]));
+        stream.extend(synth_small(0x0C, &[0x77, 0x88, 0x99, 0xAA]));
+        let subs = walk_metadata(&stream).unwrap();
+        let view = find_packed_overflow_bits(&subs).expect("0x0C present");
+        assert_eq!(view.bytes(), &[0x77, 0x88, 0x99, 0xAA]);
+        assert_eq!(view.len(), 4);
+    }
+
+    #[test]
+    fn find_packed_overflow_bits_typed_view_returns_none_when_0x0c_absent() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x0A, &[0x00, 0x00]));
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_packed_overflow_bits(&subs).is_none());
+    }
+
+    #[test]
+    fn find_packed_overflow_bits_sub_block_returns_metadata_borrow() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        stream.extend(synth_small(0x0C, &[0x33, 0x44]));
+        let subs = walk_metadata(&stream).unwrap();
+        let sub = find_packed_overflow_bits_sub_block(&subs).expect("0x0C");
+        assert_eq!(sub.id, SubBlockId::PackedOverflowBits);
+        assert_eq!(sub.payload, &[0x33, 0x44]);
+    }
+
+    #[test]
+    fn find_packed_overflow_bits_sub_block_returns_none_when_0x0c_absent() {
+        let mut stream = Vec::new();
+        stream.extend(synth_small(0x05, &[0u8; 6]));
+        let subs = walk_metadata(&stream).unwrap();
+        assert!(find_packed_overflow_bits_sub_block(&subs).is_none());
     }
 }
