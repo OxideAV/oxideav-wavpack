@@ -8,6 +8,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 245 — block-CRC accessor on `WavPackBlockHeader` /
+  `WavPackBlock`. The wiki "Block structure" listing of
+  `docs/audio/wavpack/wiki/WavPack.wiki` places a `32 bits - CRC`
+  word at the trailing 4 bytes of the fixed 32-byte block header.
+  The round-1 parser decoded the word little-endian into the
+  `WavPackBlockHeader::crc` field but no typed accessor surfaced
+  it on either the header or the block-level view — every other
+  documented header field had been lifted to a typed accessor
+  through rounds 214 and 239, so this was the last on-disk header
+  field without a method surface. This round closes the gap.
+
+  - `WavPackBlockHeader::crc(&self) -> u32` — typed accessor
+    returning the stored 32-bit word verbatim. The wiki names the
+    field but does not specify the polynomial, the byte span, the
+    initial value, or the byte / bit order of the computation, and
+    the staged docs do not either; the accessor surfaces the
+    stored bytes only and leaves recomputation / verification to a
+    later round once the algorithm spec lands.
+  - `WavPackBlock::crc(&self) -> u32` — block-level pass-through
+    pairing the block surface with the header accessor, for
+    callers iterating a multi-block stream that want to pick the
+    per-block CRC off a borrowed `WavPackBlock` alongside the
+    other round-214 / round-239 introspection accessors.
+  - 8 new tests (484 total, up from 476): header accessor verbatim
+    return; full-`u32`-range round-trip across documented extremes
+    (`0`, `1`, `u32::MAX`, alternating-bit patterns); little-endian
+    decode of bytes 28..32 through `parse_block_header`;
+    independence from other header fields; block-level
+    pass-through parity (`block.crc() == block.header().crc()`);
+    full-range extremes round-trip through `parse_block`;
+    per-block independence across a two-block stream; block-level
+    independence from the round-239 accessors.
+
 - Round 242 — `0x0C` packed-overflow-bits typed view + walker
   bridges + block-level introspection. The wiki "IDs" listing of
   `docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-block `0x0C` as

@@ -685,6 +685,22 @@ impl<'a> WavPackBlock<'a> {
     pub fn is_final_audio_block_in_file(&self) -> bool {
         matches!(self.samples_remaining_after(), Some(0))
     }
+
+    /// Block-level pairing with [`WavPackBlockHeader::crc`] — the
+    /// 32-bit CRC word the wiki "Block structure" listing places at
+    /// bytes 28..32 of the fixed block header.
+    ///
+    /// The wiki names the field but does not specify the polynomial,
+    /// the byte span the encoder computed it over, the initial value,
+    /// or the byte / bit order of the computation; the staged docs do
+    /// not specify those parameters either. This accessor surfaces the
+    /// **stored** word verbatim (no recomputation, no verification)
+    /// so callers iterating a multi-block stream can pick the
+    /// per-block CRC off a borrowed `WavPackBlock` alongside the other
+    /// round-214 / round-239 introspection accessors. Round 245.
+    pub fn crc(&self) -> u32 {
+        self.header.crc()
+    }
 }
 
 /// Parse one full WavPack block — the 32-byte fixed header plus the
@@ -4236,6 +4252,94 @@ mod tests {
         let bytes = vec![b'w', b'v', b'p', b'k', 0, 0, 0, 0];
         let err = stream_total_samples(&bytes).expect_err("must reject");
         assert_eq!(err, Error::Truncated);
+    }
+
+    /// Synthesise a minimal valid block with a chosen `crc` trailing
+    /// word, extending the round-239 `synthesise_block_with_indices`
+    /// helper to the round-245 `crc()` accessor's coverage. The wiki
+    /// places the CRC word at bytes 28..32 of the fixed header (the
+    /// last 4 bytes before the metadata sub-block region).
+    fn synthesise_block_with_crc(crc: u32) -> Vec<u8> {
+        let ck_size = 24u32;
+        let mut buf = vec![0u8; HEADER_LEN];
+        buf[0..4].copy_from_slice(MAGIC);
+        buf[4..8].copy_from_slice(&ck_size.to_le_bytes());
+        buf[8..10].copy_from_slice(&0x0410u16.to_le_bytes());
+        // Standalone marker so structural composer gates pass too.
+        let flags = 0b11u32 << 11;
+        buf[24..28].copy_from_slice(&flags.to_le_bytes());
+        buf[28..32].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn block_crc_passes_through_header_crc_verbatim() {
+        // Block-level crc() returns the stored word — no recomputation,
+        // matches the header accessor exactly.
+        let bytes = synthesise_block_with_crc(0xDEAD_BEEF);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.crc(), 0xDEAD_BEEF);
+        assert_eq!(block.crc(), block.header().crc());
+        assert_eq!(block.crc(), block.header().crc);
+    }
+
+    #[test]
+    fn block_crc_round_trips_full_u32_range_extremes() {
+        // The CRC field has no sentinel — every u32 is a valid stored
+        // value. Pin both extremes and a handful of representative
+        // patterns through the full parse path.
+        for w in [
+            0u32,
+            1,
+            u32::MAX,
+            0xFFFF_FFFE,
+            0x0000_0001,
+            0x8000_0000,
+            0x7FFF_FFFF,
+            0x1234_5678,
+            0xCAFE_BABE,
+        ] {
+            let bytes = synthesise_block_with_crc(w);
+            let (block, _) = parse_block(&bytes).expect("parse block");
+            assert_eq!(
+                block.crc(),
+                w,
+                "block CRC 0x{w:08x} should round-trip verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn block_crc_differs_per_block_across_a_two_block_stream() {
+        // Two back-to-back blocks with distinct CRC words. Walking the
+        // stream should yield each block's CRC verbatim — the field is
+        // per-block, not file-global like `total_samples`.
+        let a = synthesise_block_with_crc(0x1111_1111);
+        let b = synthesise_block_with_crc(0x2222_2222);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&a);
+        bytes.extend_from_slice(&b);
+        let parsed = parse_blocks(&bytes).expect("parse two blocks");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].crc(), 0x1111_1111);
+        assert_eq!(parsed[1].crc(), 0x2222_2222);
+        // Distinct values — confirms the per-block independence.
+        assert_ne!(parsed[0].crc(), parsed[1].crc());
+    }
+
+    #[test]
+    fn block_crc_independent_of_other_header_accessors() {
+        // The CRC accessor reads bytes 28..32 only — varying other
+        // header fields should not change the reported CRC.
+        let mut bytes = synthesise_block_with_indices(50_000, 1_024, 2_048);
+        // Stamp a CRC into the synthesised buffer's bytes 28..32.
+        bytes[28..32].copy_from_slice(&0xABCD_EF01u32.to_le_bytes());
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.crc(), 0xABCD_EF01);
+        // The other accessors still report the round-239 values.
+        assert_eq!(block.total_samples_in_file(), Some(50_000));
+        assert_eq!(block.block_index(), 1_024);
+        assert_eq!(block.block_samples(), 2_048);
     }
 
     #[test]

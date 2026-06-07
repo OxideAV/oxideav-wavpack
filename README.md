@@ -5,6 +5,43 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 245 — block-CRC accessor on `WavPackBlockHeader` /
+`WavPackBlock`. The wiki "Block structure" listing of
+`docs/audio/wavpack/wiki/WavPack.wiki` places a `32 bits - CRC` word
+at the trailing 4 bytes of the fixed 32-byte block header (the
+last field after `flags`). The round-1 parser already decoded the
+word little-endian into the [`WavPackBlockHeader::crc`] field, but
+no typed accessor surfaced it on either the header or the
+block-level view — every other documented header field
+(`block_samples`, `block_index`, `total_samples_in_file`,
+`end_sample_index`, …) had been lifted to a typed accessor through
+rounds 214 and 239, so the CRC was the last on-disk header field
+without a matching method surface. This round closes that gap.
+New [`WavPackBlockHeader::crc`] returns the stored 32-bit word
+verbatim — no recomputation, no validation. The wiki names the
+field but the staged docs (the wiki listing and the clean-room
+entropy doc `docs/audio/wavpack/spec/wavpack-entropy-decode.md`)
+do not specify the polynomial, the byte span the encoder computed
+it over, the initial value, or the byte / bit order of the
+computation, so any computational pass would be guessing; the
+typed accessor surfaces the stored bytes only and leaves
+recomputation to a later round once the algorithm spec lands.
+New block-level pass-through [`WavPackBlock::crc`] pairs the
+block surface with the header accessor for callers iterating a
+multi-block stream off a borrowed `WavPackBlock`. 8 new tests
+(484 total, up from 476) pin: the header accessor's verbatim
+return (`h.crc() == h.crc`); full-`u32`-range round-trip across
+the documented extremes (`0`, `1`, `u32::MAX`, alternating-bit
+patterns); little-endian decode of bytes 28..32 through the full
+`parse_block_header` path; independence from the other header
+fields (varying `total_samples` / `block_index` / `block_samples`
+leaves `crc()` unchanged); the block-level pass-through's parity
+with the header accessor (`block.crc() == block.header().crc()`);
+the full-range extremes round-trip through `parse_block`;
+per-block independence across a two-block stream (each block's
+CRC reported verbatim, distinct words distinguished); and
+block-level independence from the round-239 accessors.**
+
 **Round 242 — `0x0C` packed-overflow-bits typed view + walker bridges
 + block-level introspection. The wiki "IDs" listing of
 `docs/audio/wavpack/wiki/WavPack.wiki` annotates sub-block `0x0C` as

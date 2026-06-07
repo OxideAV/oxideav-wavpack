@@ -450,6 +450,31 @@ impl WavPackBlockHeader {
             Some(total - end)
         }
     }
+
+    /// The 32-bit CRC word the wiki "Block structure" listing places at
+    /// bytes 28..32 of the fixed block header — the trailing field of
+    /// the four 32-bit words (`total samples in file`, `offset in
+    /// samples for current block`, `samples in this block`, `flags`,
+    /// `CRC`) the wiki enumerates verbatim.
+    ///
+    /// The wiki names the field `CRC` but does **not** specify the
+    /// polynomial, the byte span it is computed over, the initial
+    /// value, or the byte / bit order of the computation. The staged
+    /// docs (`docs/audio/wavpack/wiki/WavPack.wiki` + the staged
+    /// clean-room entropy doc `docs/audio/wavpack/spec/wavpack-entropy-decode.md`)
+    /// do not specify those parameters either. This accessor therefore
+    /// surfaces the **stored** word verbatim — the byte-for-byte value
+    /// the encoder wrote into the header — and leaves recomputation /
+    /// verification to a later round once the algorithm spec lands.
+    ///
+    /// Equivalent to reading `self.crc` directly; provided as a typed
+    /// accessor so callers picking the CRC off a borrowed header can
+    /// stay on the method surface alongside the other documented
+    /// header fields (`block_samples`, `block_index`,
+    /// `total_samples_in_file`, etc.).
+    pub fn crc(&self) -> u32 {
+        self.crc
+    }
 }
 
 /// Parse the 32-byte WavPack block header at the start of `bytes`.
@@ -1029,5 +1054,85 @@ mod tests {
         // But the total IS still known — the gap is structural, not
         // sentinel-driven.
         assert!(h.is_total_samples_known());
+    }
+
+    /// Build a parsed [`WavPackBlockHeader`] with a chosen `crc`
+    /// trailing word — extends the round-239 `header_with` helper to
+    /// the round-245 `crc()` accessor's coverage. The wiki places the
+    /// CRC word at bytes 28..32 of the fixed header, so it's the four
+    /// bytes immediately preceding the metadata sub-block region.
+    fn header_with_crc(crc: u32) -> WavPackBlockHeader {
+        let mut buf = synthesise_minimal_header(0);
+        buf[28..32].copy_from_slice(&crc.to_le_bytes());
+        let (h, _) = parse_block_header(&buf).unwrap();
+        h
+    }
+
+    #[test]
+    fn crc_accessor_returns_stored_word_verbatim() {
+        // The wiki names the field but does not specify the algorithm.
+        // The accessor surfaces the byte-for-byte stored u32 — no
+        // recomputation, no validation.
+        let h = header_with_crc(0xDEAD_BEEF);
+        assert_eq!(h.crc(), 0xDEAD_BEEF);
+        assert_eq!(h.crc(), h.crc);
+    }
+
+    #[test]
+    fn crc_accessor_round_trips_full_u32_range_extremes() {
+        // The CRC field is a verbatim 32-bit word — every value in the
+        // u32 range is a valid stored CRC (no reserved sentinel).
+        for w in [
+            0u32,
+            1,
+            u32::MAX,
+            0xFFFF_FFFE,
+            0x0000_0001,
+            0x8000_0000,
+            0x7FFF_FFFF,
+            0x1234_5678,
+        ] {
+            let h = header_with_crc(w);
+            assert_eq!(h.crc(), w, "stored CRC 0x{w:08x} round-trips verbatim");
+        }
+    }
+
+    #[test]
+    fn crc_accessor_decodes_little_endian_bytes_28_to_32() {
+        // The wiki "Block structure" listing places the CRC at the
+        // trailing 32 bits of the fixed 32-byte header. The parser
+        // decodes it little-endian per the rest of the header layout;
+        // this test pins that decoding by feeding a known byte sequence
+        // through the full `parse_block_header` path.
+        let mut buf = synthesise_minimal_header(0);
+        // Bytes 28..32 = 0x12 0x34 0x56 0x78 → little-endian
+        // 0x78563412.
+        buf[28] = 0x12;
+        buf[29] = 0x34;
+        buf[30] = 0x56;
+        buf[31] = 0x78;
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(h.crc(), 0x7856_3412);
+        // And the raw field path agrees.
+        assert_eq!(h.crc, 0x7856_3412);
+    }
+
+    #[test]
+    fn crc_accessor_independent_of_other_header_fields() {
+        // The CRC is a payload-derived value the encoder writes after
+        // computing it — it doesn't depend on, and isn't constrained by,
+        // any other header field. Vary block_index / block_samples /
+        // total_samples and confirm the CRC accessor still reports the
+        // stored word.
+        let mut buf = synthesise_minimal_header(0);
+        buf[12..16].copy_from_slice(&12_345u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&6_000u32.to_le_bytes());
+        buf[20..24].copy_from_slice(&1_024u32.to_le_bytes());
+        buf[28..32].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(h.crc(), 0xCAFE_BABE);
+        assert_eq!(h.total_samples_in_file(), Some(12_345));
+        assert_eq!(h.block_index, 6_000);
+        assert_eq!(h.block_samples, 1_024);
     }
 }
