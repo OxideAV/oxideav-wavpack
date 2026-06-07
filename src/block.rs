@@ -701,6 +701,49 @@ impl<'a> WavPackBlock<'a> {
     pub fn crc(&self) -> u32 {
         self.header.crc()
     }
+
+    /// Block-level pairing with [`WavPackBlockHeader::version`] — the
+    /// 16-bit stream-format version the wiki "Block structure" listing
+    /// places at bytes 8..10 of the fixed block header. Always in the
+    /// [`crate::MIN_VERSION`]`..=`[`crate::MAX_VERSION`] inclusive
+    /// window (the parser refuses out-of-window values as
+    /// [`Error::UnsupportedVersion`]). Round 252.
+    pub fn version(&self) -> u16 {
+        self.header.version()
+    }
+
+    /// Block-level pairing with [`WavPackBlockHeader::track_number`] —
+    /// the 8-bit "track number" byte the wiki "Block structure" listing
+    /// places at byte 10 of the fixed block header. Wiki marks the
+    /// field "not currently implemented"; preserved verbatim. Round 252.
+    pub fn track_number(&self) -> u8 {
+        self.header.track_number()
+    }
+
+    /// Block-level pairing with
+    /// [`WavPackBlockHeader::track_sub_index`] — the 8-bit "track sub
+    /// index" byte the wiki "Block structure" listing places at byte
+    /// 11 of the fixed block header. Wiki marks the field "not
+    /// currently implemented"; preserved verbatim. Round 252.
+    pub fn track_sub_index(&self) -> u8 {
+        self.header.track_sub_index()
+    }
+
+    /// Block-level pairing with [`WavPackBlockHeader::has_track_id`] —
+    /// `true` when either of the two wiki "track number" / "track sub
+    /// index" bytes is non-zero. Round 252.
+    pub fn has_track_id(&self) -> bool {
+        self.header.has_track_id()
+    }
+
+    /// Block-level pairing with
+    /// [`WavPackBlockHeader::supports_false_stereo`] — `true` when
+    /// the stream version is at least `0x0410`, i.e. the version gate
+    /// the wiki "Flags meaning" listing places on bit 30 "false
+    /// stereo … version >= 0x410". Round 252.
+    pub fn supports_false_stereo(&self) -> bool {
+        self.header.supports_false_stereo()
+    }
 }
 
 /// Parse one full WavPack block — the 32-byte fixed header plus the
@@ -4340,6 +4383,132 @@ mod tests {
         assert_eq!(block.total_samples_in_file(), Some(50_000));
         assert_eq!(block.block_index(), 1_024);
         assert_eq!(block.block_samples(), 2_048);
+    }
+
+    // ---------------- Round 252: version + track-id passthroughs ----------------
+
+    /// Synthesise a minimal valid block with a chosen `version` /
+    /// `track_number` / `track_sub_index` triple, extending the
+    /// round-245 `synthesise_block_with_crc` helper to the round-252
+    /// accessors' coverage.
+    fn synthesise_block_with_version_track(
+        version: u16,
+        track_number: u8,
+        track_sub_index: u8,
+    ) -> Vec<u8> {
+        let ck_size = 24u32;
+        let mut buf = vec![0u8; HEADER_LEN];
+        buf[0..4].copy_from_slice(MAGIC);
+        buf[4..8].copy_from_slice(&ck_size.to_le_bytes());
+        buf[8..10].copy_from_slice(&version.to_le_bytes());
+        buf[10] = track_number;
+        buf[11] = track_sub_index;
+        // Standalone marker so structural composer gates pass too.
+        let flags = 0b11u32 << 11;
+        buf[24..28].copy_from_slice(&flags.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn block_version_passes_through_header_version() {
+        let bytes = synthesise_block_with_version_track(0x0410, 0, 0);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.version(), 0x0410);
+        assert_eq!(block.version(), block.header().version());
+    }
+
+    #[test]
+    fn block_version_round_trips_documented_window() {
+        for v in [
+            crate::MIN_VERSION,
+            0x0405,
+            0x040A,
+            0x040F,
+            crate::MAX_VERSION,
+        ] {
+            let bytes = synthesise_block_with_version_track(v, 0, 0);
+            let (block, _) = parse_block(&bytes).expect("parse block");
+            assert_eq!(block.version(), v, "block version 0x{v:04x} round-trips");
+        }
+    }
+
+    #[test]
+    fn block_track_number_passes_through_header_track_number() {
+        let bytes = synthesise_block_with_version_track(0x0410, 0x55, 0);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.track_number(), 0x55);
+        assert_eq!(block.track_number(), block.header().track_number());
+        assert_eq!(block.track_sub_index(), 0);
+    }
+
+    #[test]
+    fn block_track_sub_index_passes_through_header_track_sub_index() {
+        let bytes = synthesise_block_with_version_track(0x0410, 0, 0xAA);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.track_sub_index(), 0xAA);
+        assert_eq!(block.track_sub_index(), block.header().track_sub_index());
+        assert_eq!(block.track_number(), 0);
+    }
+
+    #[test]
+    fn block_has_track_id_false_when_both_bytes_zero() {
+        let bytes = synthesise_block_with_version_track(0x0410, 0, 0);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.has_track_id());
+    }
+
+    #[test]
+    fn block_has_track_id_true_when_either_or_both_bytes_set() {
+        for (n, s) in [(1u8, 0u8), (0, 1), (0x42, 0x99)] {
+            let bytes = synthesise_block_with_version_track(0x0410, n, s);
+            let (block, _) = parse_block(&bytes).expect("parse block");
+            assert!(
+                block.has_track_id(),
+                "track_number=0x{n:02x} track_sub_index=0x{s:02x} should report has_track_id"
+            );
+        }
+    }
+
+    #[test]
+    fn block_supports_false_stereo_true_at_0x0410() {
+        let bytes = synthesise_block_with_version_track(0x0410, 0, 0);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.supports_false_stereo());
+    }
+
+    #[test]
+    fn block_supports_false_stereo_false_below_0x0410() {
+        for v in [crate::MIN_VERSION, 0x0405, 0x040F] {
+            let bytes = synthesise_block_with_version_track(v, 0, 0);
+            let (block, _) = parse_block(&bytes).expect("parse block");
+            assert!(
+                !block.supports_false_stereo(),
+                "block version 0x{v:04x} should not support false_stereo"
+            );
+        }
+    }
+
+    #[test]
+    fn block_round_252_accessors_independent_across_two_block_stream() {
+        // Two back-to-back blocks with distinct version + track triples.
+        // Walking the stream should yield each block's stamping verbatim.
+        let a = synthesise_block_with_version_track(crate::MIN_VERSION, 0x01, 0x02);
+        let b = synthesise_block_with_version_track(crate::MAX_VERSION, 0x10, 0x20);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&a);
+        bytes.extend_from_slice(&b);
+        let parsed = parse_blocks(&bytes).expect("parse two blocks");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].version(), crate::MIN_VERSION);
+        assert_eq!(parsed[0].track_number(), 0x01);
+        assert_eq!(parsed[0].track_sub_index(), 0x02);
+        assert!(parsed[0].has_track_id());
+        assert!(!parsed[0].supports_false_stereo());
+        assert_eq!(parsed[1].version(), crate::MAX_VERSION);
+        assert_eq!(parsed[1].track_number(), 0x10);
+        assert_eq!(parsed[1].track_sub_index(), 0x20);
+        assert!(parsed[1].has_track_id());
+        assert!(parsed[1].supports_false_stereo());
     }
 
     #[test]

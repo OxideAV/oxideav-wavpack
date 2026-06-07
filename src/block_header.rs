@@ -475,6 +475,97 @@ impl WavPackBlockHeader {
     pub fn crc(&self) -> u32 {
         self.crc
     }
+
+    /// The 16-bit stream format version the wiki "Block structure"
+    /// listing places at bytes 8..10 of the fixed block header
+    /// ("16 bits - version (current valid versions are 0x402 - 0x410)").
+    ///
+    /// The parser already constrains this to the
+    /// [`MIN_VERSION`]`..=`[`MAX_VERSION`] inclusive window — any
+    /// out-of-window value is refused as
+    /// [`Error::UnsupportedVersion`] before a header reaches the
+    /// caller — so the returned `u16` is always in the documented
+    /// range. Pair with [`Self::supports_false_stereo`] for the
+    /// version-gated wiki bit 30 "version >= 0x410" predicate; pair
+    /// with the [`MIN_VERSION`] / [`MAX_VERSION`] constants for
+    /// boundary checks.
+    ///
+    /// Equivalent to reading `self.version` directly; provided as a
+    /// typed accessor so callers picking the version off a borrowed
+    /// header stay on the method surface alongside the other documented
+    /// header fields. Round 252.
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// The 8-bit `track number` field the wiki "Block structure"
+    /// listing places at byte 10 of the fixed block header
+    /// ("8 bits - track number (not currently implemented)").
+    ///
+    /// The wiki marks the field "not currently implemented" but the
+    /// parser preserves the raw byte verbatim — every block carries an
+    /// 8-bit value that an encoder may have stamped for its own
+    /// purposes, and the accessor surfaces that stored byte for
+    /// diagnostic round-trip / future-implementation use.
+    ///
+    /// Equivalent to reading `self.track_number` directly. Pair with
+    /// [`Self::track_sub_index`] for the byte-11 companion field and
+    /// with [`Self::has_track_id`] for the boolean discriminant of
+    /// the "any non-zero stamping" case. Round 252.
+    pub fn track_number(&self) -> u8 {
+        self.track_number
+    }
+
+    /// The 8-bit `track sub index` field the wiki "Block structure"
+    /// listing places at byte 11 of the fixed block header
+    /// ("8 bits - track sub index (not currently implemented)").
+    ///
+    /// The wiki marks the field "not currently implemented" but the
+    /// parser preserves the raw byte verbatim — same rationale as
+    /// [`Self::track_number`]. The accessor surfaces the stored byte
+    /// for diagnostic round-trip. Round 252.
+    pub fn track_sub_index(&self) -> u8 {
+        self.track_sub_index
+    }
+
+    /// `true` when either [`Self::track_number`] or
+    /// [`Self::track_sub_index`] is non-zero — the boolean
+    /// discriminant for "this block carries an encoder-stamped track
+    /// id". The wiki marks both fields "not currently implemented",
+    /// so most real-world encoders write zeroes; this predicate lights
+    /// up only for blocks whose encoder explicitly used the bytes for
+    /// the documented (but unimplemented) track-id slot.
+    ///
+    /// Returns `false` for the common case (both bytes zero) and
+    /// `true` for any non-zero stamping — including the
+    /// `track_number-only`, `track_sub_index-only`, and both-set
+    /// combinations. Round 252.
+    pub fn has_track_id(&self) -> bool {
+        self.track_number != 0 || self.track_sub_index != 0
+    }
+
+    /// `true` when the stream version is at least `0x0410` — the
+    /// version gate the wiki "Flags meaning" listing places on bit 30
+    /// "false stereo (stream is stereo but this block's data is mono,
+    /// **version >= 0x410**)".
+    ///
+    /// The wiki is explicit that the false-stereo flag is only valid
+    /// starting from version `0x0410`; a block whose
+    /// [`Self::version`] is below that threshold should not interpret
+    /// bit 30 as the false-stereo signal. This predicate lifts the
+    /// wiki's version gate into a typed boolean so callers branching
+    /// on bit 30 don't have to repeat the `version >= 0x0410`
+    /// comparison.
+    ///
+    /// The parser already constrains the version to
+    /// [`MIN_VERSION`]`..=`[`MAX_VERSION`] (the wiki's "current valid
+    /// versions are 0x402 - 0x410" window), so this accessor returns
+    /// `true` exactly when `version == 0x0410` — the only in-window
+    /// value at or above the gate — and `false` for every other
+    /// in-window value. Round 252.
+    pub fn supports_false_stereo(&self) -> bool {
+        self.version >= 0x0410
+    }
 }
 
 /// Parse the 32-byte WavPack block header at the start of `bytes`.
@@ -1134,5 +1225,190 @@ mod tests {
         assert_eq!(h.total_samples_in_file(), Some(12_345));
         assert_eq!(h.block_index, 6_000);
         assert_eq!(h.block_samples, 1_024);
+    }
+
+    // ---------------- Round 252: version + track-id accessors ----------------
+
+    /// Synthesise a header with chosen `version` / `track_number` /
+    /// `track_sub_index` triple — extends the round-1 minimal-header
+    /// helper to the round-252 accessors' coverage. The wiki places
+    /// the three fields at bytes 8..10, 10, 11 respectively.
+    fn header_with_version_track(
+        version: u16,
+        track_number: u8,
+        track_sub_index: u8,
+    ) -> WavPackBlockHeader {
+        let mut buf = synthesise_minimal_header(0);
+        buf[8..10].copy_from_slice(&version.to_le_bytes());
+        buf[10] = track_number;
+        buf[11] = track_sub_index;
+        let (h, _) = parse_block_header(&buf).unwrap();
+        h
+    }
+
+    #[test]
+    fn version_accessor_returns_stored_word_verbatim() {
+        // The wiki "current valid versions are 0x402 - 0x410" window
+        // is what the parser enforces; every value in the window must
+        // round-trip through the accessor.
+        for v in [MIN_VERSION, 0x0405, 0x040A, 0x040F, MAX_VERSION] {
+            let h = header_with_version_track(v, 0, 0);
+            assert_eq!(h.version(), v, "version 0x{v:04x} round-trips");
+            assert_eq!(h.version(), h.version);
+        }
+    }
+
+    #[test]
+    fn version_accessor_decodes_little_endian_bytes_8_to_10() {
+        // The wiki "Block structure" listing places the 16-bit version
+        // at bytes 8..10 of the fixed header. Bytes 0x10 0x04 should
+        // decode little-endian to 0x0410.
+        let mut buf = synthesise_minimal_header(0);
+        buf[8] = 0x10;
+        buf[9] = 0x04;
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(h.version(), 0x0410);
+        // Reverse byte order → 0x1004, which is out-of-window and
+        // would be rejected. Confirm the parser refuses it.
+        let mut buf2 = synthesise_minimal_header(0);
+        buf2[8] = 0x04;
+        buf2[9] = 0x10;
+        assert_eq!(
+            parse_block_header(&buf2),
+            Err(Error::UnsupportedVersion(0x1004))
+        );
+    }
+
+    #[test]
+    fn version_accessor_within_documented_window_after_parse() {
+        // Whatever value the accessor returns must satisfy the wiki
+        // "current valid versions are 0x402 - 0x410" constraint —
+        // because the parser refuses everything outside that window.
+        // Pin this with a spot-check on the bounds.
+        let lo = header_with_version_track(MIN_VERSION, 0, 0);
+        let hi = header_with_version_track(MAX_VERSION, 0, 0);
+        assert!(lo.version() >= MIN_VERSION && lo.version() <= MAX_VERSION);
+        assert!(hi.version() >= MIN_VERSION && hi.version() <= MAX_VERSION);
+    }
+
+    #[test]
+    fn track_number_accessor_returns_stored_byte_verbatim() {
+        // Byte 10 of the fixed header. Wiki marks the field "not
+        // currently implemented" so any byte value is valid on the wire.
+        for n in [0u8, 1, 0x55, 0xAA, 0x7F, 0x80, 0xFE, 0xFF] {
+            let h = header_with_version_track(MAX_VERSION, n, 0);
+            assert_eq!(h.track_number(), n, "track_number 0x{n:02x} round-trips");
+            assert_eq!(h.track_number(), h.track_number);
+        }
+    }
+
+    #[test]
+    fn track_sub_index_accessor_returns_stored_byte_verbatim() {
+        // Byte 11 of the fixed header. Same "not currently implemented"
+        // verbatim-preservation rationale as track_number.
+        for n in [0u8, 1, 0x55, 0xAA, 0x7F, 0x80, 0xFE, 0xFF] {
+            let h = header_with_version_track(MAX_VERSION, 0, n);
+            assert_eq!(
+                h.track_sub_index(),
+                n,
+                "track_sub_index 0x{n:02x} round-trips"
+            );
+            assert_eq!(h.track_sub_index(), h.track_sub_index);
+        }
+    }
+
+    #[test]
+    fn track_accessors_independent_decode_bytes_10_and_11() {
+        // Pin the byte assignment: byte 10 → track_number, byte 11 →
+        // track_sub_index. Stamp distinct values into each and verify
+        // they don't cross.
+        let mut buf = synthesise_minimal_header(0);
+        buf[10] = 0x12;
+        buf[11] = 0x34;
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(h.track_number(), 0x12);
+        assert_eq!(h.track_sub_index(), 0x34);
+    }
+
+    #[test]
+    fn has_track_id_is_false_when_both_bytes_zero() {
+        // The common "encoder didn't stamp the documented-but-
+        // unimplemented track-id slot" case.
+        let h = header_with_version_track(MAX_VERSION, 0, 0);
+        assert!(!h.has_track_id());
+    }
+
+    #[test]
+    fn has_track_id_is_true_when_only_track_number_set() {
+        let h = header_with_version_track(MAX_VERSION, 0x07, 0);
+        assert!(h.has_track_id());
+        assert_eq!(h.track_number(), 0x07);
+        assert_eq!(h.track_sub_index(), 0);
+    }
+
+    #[test]
+    fn has_track_id_is_true_when_only_track_sub_index_set() {
+        let h = header_with_version_track(MAX_VERSION, 0, 0x03);
+        assert!(h.has_track_id());
+        assert_eq!(h.track_number(), 0);
+        assert_eq!(h.track_sub_index(), 0x03);
+    }
+
+    #[test]
+    fn has_track_id_is_true_when_both_bytes_set() {
+        let h = header_with_version_track(MAX_VERSION, 0x42, 0x99);
+        assert!(h.has_track_id());
+        assert_eq!(h.track_number(), 0x42);
+        assert_eq!(h.track_sub_index(), 0x99);
+    }
+
+    #[test]
+    fn supports_false_stereo_true_at_0x0410() {
+        // The wiki bit-30 "false stereo … version >= 0x410" gate
+        // fires at the documented maximum (the only in-window
+        // value at or above the gate).
+        let h = header_with_version_track(MAX_VERSION, 0, 0);
+        assert!(h.supports_false_stereo());
+        assert_eq!(h.version(), 0x0410);
+    }
+
+    #[test]
+    fn supports_false_stereo_false_below_0x0410() {
+        // Every in-window value below 0x0410 must report `false`
+        // — the wiki gate is strict-less-than.
+        for v in [MIN_VERSION, 0x0405, 0x040A, 0x040F] {
+            let h = header_with_version_track(v, 0, 0);
+            assert!(
+                !h.supports_false_stereo(),
+                "version 0x{v:04x} should not support false_stereo"
+            );
+        }
+    }
+
+    #[test]
+    fn version_and_track_accessors_independent_of_other_fields() {
+        // Stamp version + track triple alongside other distinct field
+        // values; confirm the round-252 accessors return the stamped
+        // values and the round-239 / round-245 accessors still report
+        // the other stamped values (no cross-contamination).
+        let mut buf = synthesise_minimal_header(0);
+        buf[8..10].copy_from_slice(&MAX_VERSION.to_le_bytes());
+        buf[10] = 0xA1;
+        buf[11] = 0xB2;
+        buf[12..16].copy_from_slice(&77_777u32.to_le_bytes()); // total
+        buf[16..20].copy_from_slice(&4_096u32.to_le_bytes()); // block_index
+        buf[20..24].copy_from_slice(&512u32.to_le_bytes()); // block_samples
+        buf[28..32].copy_from_slice(&0xFEED_FACEu32.to_le_bytes()); // crc
+        let (h, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(h.version(), MAX_VERSION);
+        assert_eq!(h.track_number(), 0xA1);
+        assert_eq!(h.track_sub_index(), 0xB2);
+        assert!(h.has_track_id());
+        assert!(h.supports_false_stereo());
+        // Round-239 + round-245 unchanged:
+        assert_eq!(h.total_samples_in_file(), Some(77_777));
+        assert_eq!(h.block_index, 4_096);
+        assert_eq!(h.block_samples, 512);
+        assert_eq!(h.crc(), 0xFEED_FACE);
     }
 }

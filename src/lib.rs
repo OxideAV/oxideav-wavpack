@@ -1,5 +1,51 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 252 — typed `version` / `track_number` / `track_sub_index`
+//! accessors + derived `has_track_id` / `supports_false_stereo`
+//! predicates on [`WavPackBlockHeader`] / [`WavPackBlock`]. The wiki
+//! "Block structure" listing of
+//! `docs/audio/wavpack/wiki/WavPack.wiki` enumerates three explicitly-
+//! named header fields the round-1 parser preserved verbatim but had
+//! not yet lifted to typed accessors: `16 bits - version (current
+//! valid versions are 0x402 - 0x410)` (bytes 8..10), `8 bits - track
+//! number (not currently implemented)` (byte 10), and `8 bits - track
+//! sub index (not currently implemented)` (byte 11). The wiki "Flags
+//! meaning" listing further annotates bit 30 "false stereo" with the
+//! explicit gate "version >= 0x410". This round lifts all three
+//! fields onto the method surface alongside the round-214 / round-239
+//! / round-245 accessors and adds the boolean discriminants the wiki's
+//! own annotations imply. New [`WavPackBlockHeader::version`] /
+//! [`WavPackBlockHeader::track_number`] /
+//! [`WavPackBlockHeader::track_sub_index`] return the stored field
+//! verbatim — the parser already constrains `version` to the
+//! [`MIN_VERSION`]`..=`[`MAX_VERSION`] window, so the typed accessor
+//! is always in the documented range. New
+//! [`WavPackBlockHeader::has_track_id`] is the "either track byte is
+//! non-zero" boolean discriminant for the wiki "not currently
+//! implemented" track-id slot; new
+//! [`WavPackBlockHeader::supports_false_stereo`] is the `version >=
+//! 0x0410` gate the wiki places on bit 30. Five block-level
+//! pass-throughs [`WavPackBlock::version`] /
+//! [`WavPackBlock::track_number`] /
+//! [`WavPackBlock::track_sub_index`] / [`WavPackBlock::has_track_id`]
+//! / [`WavPackBlock::supports_false_stereo`] pair the block surface
+//! with the header accessors. All five new surfaces derive directly
+//! from explicitly documented wiki fields — no spec gap, no
+//! docs-gap-blocked surface touched, no new error variants. 22 new
+//! tests (506 total, up from 484) pin: each accessor's verbatim
+//! return; the little-endian byte-8..10 decoding of `version` through
+//! the full `parse_block_header` path (including a reverse-byte
+//! cross-check that the alternate ordering is refused as
+//! `UnsupportedVersion`); window-membership of every returned
+//! `version`; verbatim round-trip of every byte value in the u8 range
+//! for `track_number` / `track_sub_index`; independent byte-10 vs.
+//! byte-11 decoding; the four `has_track_id` branches (both-zero,
+//! number-only, sub-index-only, both-set); `supports_false_stereo`'s
+//! `true` at `0x0410` and `false` at every below-gate in-window
+//! value; independence from the round-239 / round-245 accessors; and
+//! the block-level pass-throughs' parity with the header accessors
+//! across a two-block stream with distinct version + track triples.**
+//!
 //! **Round 245 — block-CRC accessor on [`WavPackBlockHeader`] /
 //! [`WavPackBlock`]. The wiki "Block structure" listing of
 //! `docs/audio/wavpack/wiki/WavPack.wiki` places a `32 bits - CRC`

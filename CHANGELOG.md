@@ -8,6 +8,65 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 252 — typed `version` / `track_number` / `track_sub_index`
+  accessors + derived `has_track_id` / `supports_false_stereo`
+  predicates on `WavPackBlockHeader` / `WavPackBlock`. The wiki
+  "Block structure" listing of
+  `docs/audio/wavpack/wiki/WavPack.wiki` enumerates three
+  explicitly-named header fields the round-1 parser preserved
+  verbatim but had not yet lifted to typed accessors: `16 bits -
+  version (current valid versions are 0x402 - 0x410)` (bytes 8..10),
+  `8 bits - track number (not currently implemented)` (byte 10), and
+  `8 bits - track sub index (not currently implemented)` (byte 11).
+  The wiki "Flags meaning" listing further annotates bit 30 "false
+  stereo" with the explicit gate "version >= 0x410". This round
+  lifts all three fields onto the method surface alongside the
+  round-214 / round-239 / round-245 accessors and adds the boolean
+  discriminants the wiki's own annotations imply.
+
+  - `WavPackBlockHeader::version(&self) -> u16` — typed accessor
+    returning the stored 16-bit version verbatim. The parser already
+    constrains the field to `MIN_VERSION..=MAX_VERSION` (the wiki's
+    `0x0402..=0x0410` window) so every value the accessor returns
+    is in the documented range.
+  - `WavPackBlockHeader::track_number(&self) -> u8` /
+    `WavPackBlockHeader::track_sub_index(&self) -> u8` — typed
+    accessors returning the two single-byte fields verbatim. The
+    wiki marks both "not currently implemented" but the parser
+    preserves the raw byte for diagnostic round-trip / future-
+    implementation use.
+  - `WavPackBlockHeader::has_track_id(&self) -> bool` — boolean
+    discriminant for "this block carries a non-zero stamping in
+    either of the two track-id bytes". Common case (both bytes
+    zero) → `false`; any non-zero combination → `true`.
+  - `WavPackBlockHeader::supports_false_stereo(&self) -> bool` —
+    the `version >= 0x0410` gate the wiki places on bit 30 "false
+    stereo (stream is stereo but this block's data is mono, version
+    >= 0x410)". Lifts the wiki's version gate into a typed boolean
+    so callers branching on bit 30 don't repeat the comparison.
+  - `WavPackBlock::version` / `WavPackBlock::track_number` /
+    `WavPackBlock::track_sub_index` / `WavPackBlock::has_track_id`
+    / `WavPackBlock::supports_false_stereo` — five block-level
+    pass-throughs pairing the block surface with the header
+    accessors.
+  - 22 new tests (506 total, up from 484): each accessor's verbatim
+    return; little-endian byte-8..10 decoding of `version` through
+    the full `parse_block_header` path (with a reverse-byte
+    cross-check confirming the alternate byte ordering is refused
+    as `UnsupportedVersion`); window-membership of every returned
+    `version`; verbatim round-trip across the byte-value extremes
+    for `track_number` / `track_sub_index`; independent byte-10 vs.
+    byte-11 decoding (distinct values stamped into each don't
+    cross); the four `has_track_id` branches (both-zero /
+    number-only / sub-index-only / both-set);
+    `supports_false_stereo` `true` at the documented maximum
+    `0x0410` and `false` at every below-gate in-window value;
+    independence from the round-239 / round-245 accessors (varying
+    `total_samples` / `block_index` / `block_samples` / `crc`
+    leaves the new accessors unchanged); and the block-level
+    pass-throughs' parity with the header accessors across a
+    two-block stream carrying distinct `version` + track triples.
+
 - Round 245 — block-CRC accessor on `WavPackBlockHeader` /
   `WavPackBlock`. The wiki "Block structure" listing of
   `docs/audio/wavpack/wiki/WavPack.wiki` places a `32 bits - CRC`
