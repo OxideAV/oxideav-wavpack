@@ -1,5 +1,62 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 255 — typed [`SampleInterval`] view + new
+//! [`AdaptiveMedians::sample_interval`] /
+//! [`AdaptiveMedians::sample_interval_for_ones_count`] accessors lifting
+//! the spec §4.2 step 5 `(low, high)` interval-formation primitive onto
+//! the public method surface. The clean-room entropy doc
+//! `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §4.2 step 5
+//! specifies the four-arm interval ladder a decoder forms from the
+//! three running medians and the (folded) `ones_count` zone selector:
+//! zone 0 → `[0, get_med(0) - 1]`; zone 1 → `[get_med(0), low +
+//! get_med(1) - 1]`; zone 2 → `[get_med(0) + get_med(1), low +
+//! get_med(2) - 1]`; zone-2-overflow `N` → `[m0 + m1 + (N - 2) * m2,
+//! low + m2 - 1]`, with both ends masked to 31 bits
+//! ([`INTERVAL_MASK_31`]) and `high` clamped up to `low` on underflow.
+//! Round 15 wired this in the private `form_interval` helper inside
+//! [`decode_sample_stateful`], but the primitive had not yet been
+//! lifted to the public method surface — so callers walking the spec
+//! ladder by hand (or building diagnostic traces against a known median
+//! set) could not name the interval as a typed value. The new
+//! [`SampleInterval`] is a `{ low: u32, high: u32 }` value with the
+//! `high >= low` invariant; derived accessors expose
+//! [`SampleInterval::maxcode`] (`high - low`, the literal `maxcode`
+//! the truncated-binary mantissa decoder consumes), [`SampleInterval::width`]
+//! (`high - low + 1`, inclusive codeword count),
+//! [`SampleInterval::is_degenerate`] (`low == high` single-codeword
+//! interval), and [`SampleInterval::contains`] (the `low <= value <=
+//! high` membership test). The new
+//! [`AdaptiveMedians::sample_interval`] takes a typed [`Zone`] and
+//! returns the §4.2-step-5 interval with the 31-bit mask + underflow
+//! clamp applied per spec; the [`AdaptiveMedians::sample_interval_for_ones_count`]
+//! convenience wrapper composes [`Zone::from_ones_count`] with
+//! [`AdaptiveMedians::sample_interval`] for callers holding a raw
+//! `ones_count`. The private `form_interval` helper the round-15 decode
+//! loop calls is now a thin tuple-shaped delegator over the new typed
+//! surface, so the exact `(low, high)` the decoder consumes ARE the
+//! values the new typed accessor returns. The spec §3.2 median
+//! adaptation step (the mutation that happens at this point in the
+//! decode loop) stays on [`AdaptiveMedians::adapt`] — the typed
+//! interval formation is PURE (does NOT mutate the medians). 16 new
+//! tests (522 total, up from 506) pin: zone 0 / 1 / 2 / overflow
+//! formula correctness against hand-traced expected values for the
+//! seeds `[256, 256, 256]` worked example (get_med = 17 → intervals
+//! `[0,16] / [17,33] / [34,50] / [51,67] / [68,84] / [85,101]`);
+//! `sample_interval_for_ones_count` parity with the typed path through
+//! [`Zone::from_ones_count`]; `sample_interval` parity with the private
+//! `form_interval` across a sweep of median sets (uniform, mixed, zero,
+//! max) and zones (`0..=33`); 31-bit masking invariant for `low` and
+//! `high` across saturated median configurations; `high >= low`
+//! invariant across the same saturated sweep; `maxcode` / `width`
+//! arithmetic (`maxcode == high - low`, `width == maxcode + 1`);
+//! degenerate-interval predicate (zone 0 with `median[0] == 0` yields
+//! `(0, 0)`); zone-2-overflow stepping (`ones_count = 3` is exactly one
+//! m2 step past zone 2's `low`, both intervals share the same
+//! `maxcode`); `contains` boundary inclusivity (`low` and `high` both
+//! inside, `low - 1` and `high + 1` both outside); raw `new`
+//! constructor + accessor parity; and field-access parity with the
+//! accessors (`i.low == i.low()`, `i.high == i.high()`).**
+//!
 //! **Round 252 — typed `version` / `track_number` / `track_sub_index`
 //! accessors + derived `has_track_id` / `supports_false_stereo`
 //! predicates on [`WavPackBlockHeader`] / [`WavPackBlock`]. The wiki
@@ -644,6 +701,7 @@ pub use crate::samples::{
     decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy, decode_run_length,
     decode_sample, decode_sample_stateful, decode_sample_stateful_stereo, decode_sample_value,
     golomb_interval, AdaptiveMedians, BitReader, DecodeState, GolombInterval, Medians, RunState,
-    StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT,
-    INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
+    SampleInterval, StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR,
+    GET_MED_SHIFT, INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP,
+    UNARY_ESCAPE,
 };

@@ -8,6 +8,75 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 255 — typed `SampleInterval` view + `AdaptiveMedians::sample_interval`
+  / `sample_interval_for_ones_count` accessors lifting the spec §4.2 step 5
+  `(low, high)` interval-formation primitive onto the public method surface.
+
+  The clean-room entropy doc `docs/audio/wavpack/spec/wavpack-entropy-decode.md`
+  §4.2 step 5 specifies the four-arm interval ladder a decoder forms from the
+  three running medians and the (folded) `ones_count` zone selector:
+
+      Zone 0:          low = 0,                       high = get_med(0) - 1
+      Zone 1:          low = get_med(0),              high = low + get_med(1) - 1
+      Zone 2:          low = get_med(0) + get_med(1), high = low + get_med(2) - 1
+      Zone2Overflow N: low = m0 + m1 + (N-2)*m2,      high = low + get_med(2) - 1
+
+  with both ends masked to 31 bits (`INTERVAL_MASK_31 = 0x7fff_ffff`) and
+  `high` clamped up to `low` on underflow. Round 15 wired this in the
+  private `form_interval` helper inside `decode_sample_stateful`, but the
+  primitive had not yet been lifted to the public method surface — so
+  callers walking the spec ladder by hand (or building diagnostic traces
+  against a known median set) could not name the interval as a typed
+  value.
+
+  - `SampleInterval { low: u32, high: u32 }` — typed value carrying the
+    spec §4.2 step 5 `(low, high)` pair with `high >= low` invariant.
+    Both fields are public for direct destructuring and the same values
+    are reachable via `low()` / `high()` accessors. Derived predicates:
+    `maxcode()` returns `high - low` (the literal `maxcode` value the
+    truncated-binary mantissa decoder consumes); `width()` returns
+    `high - low + 1` (the inclusive codeword count); `is_degenerate()`
+    is `true` when `low == high` (single-codeword interval, mantissa
+    decode reads zero bits); `contains(value)` is the
+    `low <= value <= high` membership test.
+  - `AdaptiveMedians::sample_interval(&self, zone: Zone) -> SampleInterval`
+    — typed accessor forming the §4.2 step 5 interval from the channel's
+    three working medians and the typed `Zone` selector. Masks both
+    `low` and `high` to 31 bits and clamps `high` up to `low` on
+    underflow per spec.
+  - `AdaptiveMedians::sample_interval_for_ones_count(&self, ones_count:
+    u32) -> SampleInterval` — convenience wrapper composing
+    `Zone::from_ones_count` with `sample_interval` for callers that
+    hold a raw `ones_count` value rather than a typed `Zone`.
+
+  The private `form_interval` helper the round-15 decode loop calls is
+  now a thin tuple-shaped delegator over the new typed surface, so the
+  exact (low, high) bytes the decoder consumes ARE the bytes the new
+  typed accessor returns — no parallel implementation. The spec §3.2
+  median adaptation step (the mutation that happens at this point in
+  the decode loop) stays on `AdaptiveMedians::adapt` and is not exposed
+  by the new accessor; the typed interval formation is pure (does NOT
+  mutate the medians).
+
+  16 new tests (522 total, up from 506) pin: zone 0 / 1 / 2 / overflow
+  formula correctness against hand-traced expected values for the
+  seeds `[256, 256, 256]` worked example (get_med = 17 → intervals
+  `[0,16] / [17,33] / [34,50] / [51,67] / [68,84] / [85,101]`);
+  `sample_interval_for_ones_count` parity with the typed path through
+  `Zone::from_ones_count`; `sample_interval` parity with the private
+  `form_interval` across a sweep of median sets (uniform, mixed,
+  zero, max) and zones (`0..=33`); 31-bit masking invariant for `low`
+  and `high` across saturated median configurations; `high >= low`
+  invariant across the same saturated sweep; `maxcode` /
+  `width` arithmetic (`maxcode == high - low`, `width == maxcode + 1`);
+  degenerate-interval predicate (zone 0 with `median[0] == 0` yields
+  `(0, 0)`); zone-2-overflow stepping (`ones_count = 3` is exactly one
+  m2 step past zone 2's `low`, both intervals share the same
+  `maxcode`); `contains` boundary inclusivity (`low` and `high` both
+  inside, `low - 1` and `high + 1` both outside); raw `new`
+  constructor + accessor parity; and field-access parity with the
+  accessors (`i.low == i.low()`, `i.high == i.high()`).
+
 - Round 252 — typed `version` / `track_number` / `track_sub_index`
   accessors + derived `has_track_id` / `supports_false_stereo`
   predicates on `WavPackBlockHeader` / `WavPackBlock`. The wiki
