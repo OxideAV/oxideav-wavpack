@@ -8,6 +8,68 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 260 — spec §4.2 step 6 truncated-binary mantissa primitive lifted
+  onto the `SampleInterval` surface + spec §3.2 zone-predicate accessors
+  on `Zone`.
+
+  The clean-room entropy doc `docs/audio/wavpack/spec/wavpack-entropy-decode.md`
+  §4.2 step 6 first paragraph specifies the truncated-binary mantissa
+  decode the stateful loop reads inside a `(low, high)` interval —
+  `maxcode = 0` consumes no bits and returns `0`; `maxcode = 1` consumes
+  one bit; `maxcode >= 2` consumes `bitcount - 1` bits LSB-first into
+  `code` with `bitcount = floor(log2(maxcode)) + 1` and
+  `extras = (1 << bitcount) - maxcode - 1`, and reads one MORE bit when
+  `code >= extras` to form the full `bitcount`-bit phase-in codeword.
+  Round 15 wired this in the private `read_truncated_binary` helper
+  inside `decode_sample_stateful`, but the primitive had not yet been
+  lifted to the public method surface.
+
+  New on `SampleInterval`:
+
+  * `SampleInterval::mantissa_bitcount() -> u32` — the pure-arithmetic
+    spec `bitcount`, special-cased to `0` for `maxcode == 0`.
+  * `SampleInterval::mantissa_extras() -> u32` — the pure-arithmetic
+    spec `extras`, also `0` for the `maxcode < 2` arms.
+  * `SampleInterval::decode_mantissa(reader) -> Result<u32>` — consumes
+    a `BitReader` and returns the integer `code` in `[0, maxcode]`
+    per the spec ladder.
+  * `SampleInterval::decode_value(reader) -> Result<u32>` — adds
+    `low` to the decoded mantissa, returning the full §4.2 step 6
+    magnitude. Sign-bit reconstruction is §4.2 step 7 and stays at
+    the caller.
+
+  Round 15's private `read_truncated_binary` is now a thin delegator
+  over the new typed surface, so the exact bytes the decode loop
+  consumes ARE the bytes the typed accessor consumes.
+
+  New on `Zone`:
+
+  * `Zone::index() -> u8` — the zero-based zone arm selector
+    (`0/1/2/3`, independent of the carried `ones_count` in the
+    overflow arm).
+  * `Zone::is_overflow() -> bool` — the `matches!(self,
+    Zone::Zone2Overflow { .. })` predicate.
+  * `Zone::increments_median(idx) -> bool` — `true` when spec §3.2
+    increments `median[idx]` in this zone.
+  * `Zone::decrements_median(idx) -> bool` — `true` when spec §3.2
+    decrements `median[idx]` in this zone.
+  * `Zone::touches_median(idx) -> bool` — union of `increments_median`
+    and `decrements_median`.
+
+  Per the spec §3.2 table the predicates lift:
+
+      | Zone           | inc[0] | inc[1] | inc[2] | dec[0] | dec[1] | dec[2] |
+      | -------------- | ------ | ------ | ------ | ------ | ------ | ------ |
+      | Zone0          | no     | no     | no     | yes    | no     | no     |
+      | Zone1          | yes    | no     | no     | no     | yes    | no     |
+      | Zone2          | yes    | yes    | no     | no     | no     | yes    |
+      | Zone2Overflow  | yes    | yes    | yes    | no     | no     | no     |
+
+  The §3.2 mutation itself stays on `AdaptiveMedians::adapt` — the new
+  predicates are pure (do NOT touch the median values).
+
+  22 new tests (544 total, up from 522).
+
 - Round 255 — typed `SampleInterval` view + `AdaptiveMedians::sample_interval`
   / `sample_interval_for_ones_count` accessors lifting the spec §4.2 step 5
   `(low, high)` interval-formation primitive onto the public method surface.

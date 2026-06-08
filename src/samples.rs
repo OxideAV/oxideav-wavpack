@@ -584,6 +584,97 @@ impl Zone {
             Zone::Zone2Overflow { ones_count } => ones_count,
         }
     }
+
+    /// Zero-based zone selector index — `0` for [`Zone::Zone0`], `1` for
+    /// [`Zone::Zone1`], `2` for [`Zone::Zone2`], `3` for any
+    /// [`Zone::Zone2Overflow`] regardless of the carried `ones_count`.
+    ///
+    /// Lifts the spec §3.2 / §4.2 step 5 four-arm ladder as a numeric
+    /// arm selector for callers that want to drive a fixed-size table
+    /// (per-zone divisor, per-zone adaptation pattern) off the zone
+    /// without re-matching the enum. Distinct from
+    /// [`Zone::ones_count`], which preserves the raw `ones_count` value
+    /// the holding-bit fold produced (so an overflow zone with
+    /// `ones_count = 5` returns `5` from `ones_count` but `3` from
+    /// `index`).
+    pub const fn index(self) -> u8 {
+        match self {
+            Zone::Zone0 => 0,
+            Zone::Zone1 => 1,
+            Zone::Zone2 => 2,
+            Zone::Zone2Overflow { .. } => 3,
+        }
+    }
+
+    /// `true` when this zone is the spec §4.2 step 5 zone-2-overflow
+    /// arm (`ones_count >= 3`). Convenience predicate over the enum
+    /// discriminant — equivalent to `matches!(self, Zone::Zone2Overflow
+    /// { .. })`.
+    pub const fn is_overflow(self) -> bool {
+        matches!(self, Zone::Zone2Overflow { .. })
+    }
+
+    /// `true` when spec §3.2 INCREMENTS `median[idx]` in this zone.
+    ///
+    /// Per the §3.2 table:
+    ///
+    /// | Zone                  | inc `median[0]` | inc `median[1]` | inc `median[2]` |
+    /// | --------------------- | --------------- | --------------- | --------------- |
+    /// | [`Zone::Zone0`]         | no              | no              | no              |
+    /// | [`Zone::Zone1`]         | yes             | no              | no              |
+    /// | [`Zone::Zone2`]         | yes             | yes             | no              |
+    /// | [`Zone::Zone2Overflow`] | yes             | yes             | yes             |
+    ///
+    /// `idx` must be `0`, `1` or `2`; out-of-range indices return
+    /// `false` (no median is touched).
+    pub const fn increments_median(self, idx: usize) -> bool {
+        if idx >= 3 {
+            return false;
+        }
+        let zone_idx = self.index() as usize;
+        // median[i] is incremented when its index is strictly less than
+        // the zone selector — zone 0 increments none, zone 1 increments
+        // median[0], zone 2 increments median[0..=1], zone 3 (overflow)
+        // increments all three.
+        idx < zone_idx
+    }
+
+    /// `true` when spec §3.2 DECREMENTS `median[idx]` in this zone.
+    ///
+    /// Per the §3.2 table:
+    ///
+    /// | Zone                  | dec `median[0]` | dec `median[1]` | dec `median[2]` |
+    /// | --------------------- | --------------- | --------------- | --------------- |
+    /// | [`Zone::Zone0`]         | yes             | no              | no              |
+    /// | [`Zone::Zone1`]         | no              | yes             | no              |
+    /// | [`Zone::Zone2`]         | no              | no              | yes             |
+    /// | [`Zone::Zone2Overflow`] | no              | no              | no              |
+    ///
+    /// `idx` must be `0`, `1` or `2`; out-of-range indices return
+    /// `false`.
+    pub const fn decrements_median(self, idx: usize) -> bool {
+        if idx >= 3 {
+            return false;
+        }
+        match self {
+            Zone::Zone0 => idx == 0,
+            Zone::Zone1 => idx == 1,
+            Zone::Zone2 => idx == 2,
+            Zone::Zone2Overflow { .. } => false,
+        }
+    }
+
+    /// `true` when spec §3.2 touches `median[idx]` in this zone at all
+    /// — the union of [`Zone::increments_median`] and
+    /// [`Zone::decrements_median`]. `false` only for medians whose
+    /// running value is left unchanged by the adaptation step in this
+    /// zone.
+    ///
+    /// `idx` must be `0`, `1` or `2`; out-of-range indices return
+    /// `false`.
+    pub const fn touches_median(self, idx: usize) -> bool {
+        self.increments_median(idx) || self.decrements_median(idx)
+    }
 }
 
 /// Adaptive median state for one channel — three `u32` running
@@ -955,6 +1046,92 @@ impl SampleInterval {
     /// magnitude is in-bounds before sign reconstruction.
     pub const fn contains(&self, value: u32) -> bool {
         value >= self.low && value <= self.high
+    }
+
+    /// Spec §4.2 step 6 first paragraph `bitcount = floor(log2(maxcode))
+    /// + 1` — the bit-length of `maxcode`, i.e. the number of bits the
+    ///   FULL truncated-binary codeword would consume if every code were
+    ///   promoted to the long form.
+    ///
+    /// Special-cased per the spec:
+    ///
+    /// * `maxcode == 0` → `bitcount == 0` (no bits consumed; the
+    ///   mantissa is always `0`).
+    /// * `maxcode == 1` → `bitcount == 1` (exactly one bit consumed;
+    ///   the bit IS the mantissa).
+    /// * `maxcode >= 2` → `bitcount = 32 - maxcode.leading_zeros()`,
+    ///   the floor-log-2 plus one.
+    ///
+    /// Paired with [`Self::mantissa_extras`] to drive the phase-in
+    /// short / long branch of [`Self::decode_mantissa`].
+    pub const fn mantissa_bitcount(&self) -> u32 {
+        let maxcode = self.maxcode();
+        if maxcode == 0 {
+            0
+        } else {
+            32 - maxcode.leading_zeros()
+        }
+    }
+
+    /// Spec §4.2 step 6 first paragraph `extras = (1 << bitcount) -
+    /// maxcode - 1` — the number of SHORT codewords (the `(bitcount -
+    /// 1)`-bit values that map to magnitudes `[0, extras)`).
+    ///
+    /// * `maxcode == 0` → `extras == 0` (no codewords, no slack).
+    /// * `maxcode == 1` → `extras == 0` (both codewords are full
+    ///   1-bit values; no slack to absorb).
+    /// * `maxcode >= 2` → `extras = (1 << bitcount) - maxcode - 1`.
+    ///   With `2^(bitcount-1) <= maxcode < 2^bitcount`, this is in
+    ///   `[0, 2^(bitcount-1) - 1]`, so the short region is at most half
+    ///   the long region's width.
+    ///
+    /// Pure arithmetic — does not touch a bit-reader.
+    pub const fn mantissa_extras(&self) -> u32 {
+        let maxcode = self.maxcode();
+        if maxcode < 2 {
+            0
+        } else {
+            let bitcount = 32 - maxcode.leading_zeros();
+            (1u32 << bitcount) - maxcode - 1
+        }
+    }
+
+    /// Spec §4.2 step 6 first paragraph truncated-binary mantissa
+    /// decode — consumes the LSB-first bit-pattern from `reader` and
+    /// returns the integer `code` in `[0, maxcode]`.
+    ///
+    /// Steps (lifted verbatim from spec §4.2 step 6 first paragraph):
+    ///
+    /// * `maxcode == 0` → consume no bits, return `0`.
+    /// * `maxcode == 1` → consume one bit, return that bit (`0` or `1`).
+    /// * `maxcode >= 2` → consume `bitcount - 1` bits LSB-first into
+    ///   `short`. If `short < extras` return `short` (the short-form
+    ///   `(bitcount - 1)`-bit codeword); otherwise consume ONE more bit
+    ///   `extra_bit` and return `(short << 1) - extras + extra_bit` (the
+    ///   long-form `bitcount`-bit codeword).
+    ///
+    /// On `Error::Truncated` the reader's cursor is at the buffer end
+    /// per the [`BitReader::get_bit`] / [`BitReader::get_bits`] partial-
+    /// consume semantics. Pair with [`Self::low`] (or the
+    /// [`Self::decode_value`] convenience wrapper) to recover the
+    /// `low + code` magnitude.
+    pub fn decode_mantissa(&self, reader: &mut BitReader<'_>) -> Result<u32> {
+        read_truncated_binary(reader, self.maxcode())
+    }
+
+    /// Spec §4.2 step 6 first paragraph full magnitude decode — runs
+    /// [`Self::decode_mantissa`] and adds [`Self::low`] back, returning
+    /// the magnitude `low + code` (`u32`, masked to 31 bits by the
+    /// `low`/`high` 31-bit mask invariant).
+    ///
+    /// Convenience wrapper for callers walking the spec ladder by hand:
+    /// the magnitude is exactly what [`decode_sample_stateful`] feeds
+    /// the sign-bit reconstruction step (§4.2 step 7) before deciding
+    /// between `mid` and `!mid`. The sign bit itself is OUT of scope
+    /// here — this is the unsigned magnitude, no sign read.
+    pub fn decode_value(&self, reader: &mut BitReader<'_>) -> Result<u32> {
+        let code = self.decode_mantissa(reader)?;
+        Ok(self.low.wrapping_add(code))
     }
 }
 
@@ -4457,5 +4634,388 @@ mod tests {
         assert!(i.contains(0));
         assert!(i.contains(16));
         assert!(!i.contains(17));
+    }
+
+    // ----- Round 260: Zone predicate accessors ---------------------------
+
+    #[test]
+    fn zone_index_matches_spec_table() {
+        assert_eq!(Zone::Zone0.index(), 0);
+        assert_eq!(Zone::Zone1.index(), 1);
+        assert_eq!(Zone::Zone2.index(), 2);
+        assert_eq!(Zone::Zone2Overflow { ones_count: 3 }.index(), 3);
+        assert_eq!(Zone::Zone2Overflow { ones_count: 4 }.index(), 3);
+        assert_eq!(Zone::Zone2Overflow { ones_count: 33 }.index(), 3);
+    }
+
+    #[test]
+    fn zone_index_is_independent_of_overflow_ones_count() {
+        // Every overflow Zone maps to index 3 regardless of the carried
+        // `ones_count` value — the index discriminates the four arms
+        // ONLY, while `ones_count` preserves the raw value.
+        for n in 3..=64u32 {
+            let z = Zone::Zone2Overflow { ones_count: n };
+            assert_eq!(z.index(), 3);
+            assert_eq!(z.ones_count(), n);
+        }
+    }
+
+    #[test]
+    fn zone_is_overflow_only_true_for_overflow_arm() {
+        assert!(!Zone::Zone0.is_overflow());
+        assert!(!Zone::Zone1.is_overflow());
+        assert!(!Zone::Zone2.is_overflow());
+        assert!(Zone::Zone2Overflow { ones_count: 3 }.is_overflow());
+        assert!(Zone::Zone2Overflow { ones_count: 99 }.is_overflow());
+    }
+
+    #[test]
+    fn zone_increments_median_matches_spec_table() {
+        // Zone 0: nothing incremented.
+        assert!(!Zone::Zone0.increments_median(0));
+        assert!(!Zone::Zone0.increments_median(1));
+        assert!(!Zone::Zone0.increments_median(2));
+        // Zone 1: median[0] incremented.
+        assert!(Zone::Zone1.increments_median(0));
+        assert!(!Zone::Zone1.increments_median(1));
+        assert!(!Zone::Zone1.increments_median(2));
+        // Zone 2: median[0] + median[1] incremented.
+        assert!(Zone::Zone2.increments_median(0));
+        assert!(Zone::Zone2.increments_median(1));
+        assert!(!Zone::Zone2.increments_median(2));
+        // Zone overflow: all three.
+        let overflow = Zone::Zone2Overflow { ones_count: 5 };
+        assert!(overflow.increments_median(0));
+        assert!(overflow.increments_median(1));
+        assert!(overflow.increments_median(2));
+    }
+
+    #[test]
+    fn zone_decrements_median_matches_spec_table() {
+        // Zone 0: median[0] decremented; others untouched.
+        assert!(Zone::Zone0.decrements_median(0));
+        assert!(!Zone::Zone0.decrements_median(1));
+        assert!(!Zone::Zone0.decrements_median(2));
+        // Zone 1: median[1] decremented.
+        assert!(!Zone::Zone1.decrements_median(0));
+        assert!(Zone::Zone1.decrements_median(1));
+        assert!(!Zone::Zone1.decrements_median(2));
+        // Zone 2: median[2] decremented.
+        assert!(!Zone::Zone2.decrements_median(0));
+        assert!(!Zone::Zone2.decrements_median(1));
+        assert!(Zone::Zone2.decrements_median(2));
+        // Zone overflow: nothing decremented.
+        let overflow = Zone::Zone2Overflow { ones_count: 9 };
+        assert!(!overflow.decrements_median(0));
+        assert!(!overflow.decrements_median(1));
+        assert!(!overflow.decrements_median(2));
+    }
+
+    #[test]
+    fn zone_touches_median_union_of_inc_and_dec() {
+        for &zone in &[
+            Zone::Zone0,
+            Zone::Zone1,
+            Zone::Zone2,
+            Zone::Zone2Overflow { ones_count: 4 },
+        ] {
+            for idx in 0..3 {
+                let inc = zone.increments_median(idx);
+                let dec = zone.decrements_median(idx);
+                assert_eq!(
+                    zone.touches_median(idx),
+                    inc || dec,
+                    "zone {zone:?} median {idx}",
+                );
+                // No median is simultaneously incremented and
+                // decremented — the spec §3.2 table is mutually
+                // exclusive at each cell.
+                assert!(!(inc && dec), "zone {zone:?} median {idx} both inc + dec");
+            }
+        }
+    }
+
+    #[test]
+    fn zone_inc_dec_predicates_reject_out_of_range_idx() {
+        // idx >= 3 returns `false` for all three predicates on every
+        // zone — there is no median[3..] in the spec.
+        for &zone in &[
+            Zone::Zone0,
+            Zone::Zone1,
+            Zone::Zone2,
+            Zone::Zone2Overflow { ones_count: 3 },
+        ] {
+            assert!(!zone.increments_median(3));
+            assert!(!zone.decrements_median(3));
+            assert!(!zone.touches_median(3));
+            assert!(!zone.increments_median(99));
+            assert!(!zone.decrements_median(99));
+            assert!(!zone.touches_median(99));
+        }
+    }
+
+    #[test]
+    fn zone_predicates_drive_observed_adapt_mutations() {
+        // For each zone, the predicates must agree with the actual
+        // mutation `AdaptiveMedians::adapt` performs on a synthesised
+        // median set: a median is incremented when increments_median
+        // says so, decremented when decrements_median says so, and
+        // unchanged otherwise.
+        for &zone in &[
+            Zone::Zone0,
+            Zone::Zone1,
+            Zone::Zone2,
+            Zone::Zone2Overflow { ones_count: 4 },
+        ] {
+            let before = AdaptiveMedians::new([256, 256, 256]);
+            let mut after = before;
+            after.adapt(zone);
+            for idx in 0..3 {
+                let b = before.values[idx];
+                let a = after.values[idx];
+                if zone.increments_median(idx) {
+                    assert!(a > b, "zone {zone:?} median {idx}: expected inc");
+                } else if zone.decrements_median(idx) {
+                    assert!(a < b, "zone {zone:?} median {idx}: expected dec");
+                } else {
+                    assert_eq!(a, b, "zone {zone:?} median {idx}: expected no change");
+                }
+            }
+        }
+    }
+
+    // ----- Round 260: SampleInterval mantissa primitives ------------------
+
+    #[test]
+    fn mantissa_bitcount_special_cases() {
+        assert_eq!(SampleInterval::new(0, 0).mantissa_bitcount(), 0);
+        assert_eq!(SampleInterval::new(5, 5).mantissa_bitcount(), 0);
+        // maxcode = 1 → bitcount = 1.
+        assert_eq!(SampleInterval::new(0, 1).mantissa_bitcount(), 1);
+        assert_eq!(SampleInterval::new(10, 11).mantissa_bitcount(), 1);
+        // maxcode = 2 → bitcount = 2.
+        assert_eq!(SampleInterval::new(0, 2).mantissa_bitcount(), 2);
+        // maxcode = 16 → bitcount = 5 (floor(log2(16)) + 1 = 5).
+        assert_eq!(SampleInterval::new(0, 16).mantissa_bitcount(), 5);
+        // maxcode = 31 → bitcount = 5 (highest 5-bit value).
+        assert_eq!(SampleInterval::new(0, 31).mantissa_bitcount(), 5);
+        // maxcode = 32 → bitcount = 6.
+        assert_eq!(SampleInterval::new(0, 32).mantissa_bitcount(), 6);
+    }
+
+    #[test]
+    fn mantissa_bitcount_high_maxcode() {
+        // maxcode = INTERVAL_MASK_31 = 2^31 - 1 → bitcount = 31.
+        let i = SampleInterval::new(0, INTERVAL_MASK_31);
+        assert_eq!(i.mantissa_bitcount(), 31);
+    }
+
+    #[test]
+    fn mantissa_extras_special_cases() {
+        // maxcode == 0 → extras == 0 (no codewords).
+        assert_eq!(SampleInterval::new(0, 0).mantissa_extras(), 0);
+        // maxcode == 1 → extras == 0 (both codewords are full 1-bit).
+        assert_eq!(SampleInterval::new(0, 1).mantissa_extras(), 0);
+        // maxcode == 2 → bitcount=2, (1<<2) - 2 - 1 = 1.
+        assert_eq!(SampleInterval::new(0, 2).mantissa_extras(), 1);
+        // maxcode == 3 → bitcount=2, (1<<2) - 3 - 1 = 0 (perfect power-of-2 - 1).
+        assert_eq!(SampleInterval::new(0, 3).mantissa_extras(), 0);
+        // maxcode == 16 → bitcount=5, (1<<5) - 16 - 1 = 15.
+        assert_eq!(SampleInterval::new(0, 16).mantissa_extras(), 15);
+        // maxcode == 31 → bitcount=5, (1<<5) - 31 - 1 = 0.
+        assert_eq!(SampleInterval::new(0, 31).mantissa_extras(), 0);
+    }
+
+    #[test]
+    fn mantissa_extras_invariant_in_power_of_two_minus_one() {
+        // For any maxcode == 2^k - 1 (k >= 1), extras must be 0 — the
+        // codeword count is exactly 2^k, no slack to absorb.
+        for k in 1u32..=20 {
+            let maxcode = (1u32 << k) - 1;
+            let i = SampleInterval::new(0, maxcode);
+            assert_eq!(i.mantissa_extras(), 0, "k={k} maxcode={maxcode}");
+            assert_eq!(i.mantissa_bitcount(), k, "k={k} maxcode={maxcode}");
+        }
+    }
+
+    #[test]
+    fn mantissa_extras_bounded_by_half_long_region() {
+        // For maxcode >= 2, extras must lie in [0, 2^(bitcount-1) - 1]
+        // — the short region is at most half the long region's width.
+        for maxcode in 2u32..=1023 {
+            let i = SampleInterval::new(0, maxcode);
+            let bitcount = i.mantissa_bitcount();
+            let upper = (1u32 << (bitcount - 1)).saturating_sub(1);
+            let extras = i.mantissa_extras();
+            assert!(
+                extras <= upper,
+                "maxcode={maxcode}: extras={extras} upper={upper}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_mantissa_maxcode_zero_consumes_no_bits() {
+        let bytes = [0u8; 0];
+        let mut r = BitReader::new(&bytes);
+        let i = SampleInterval::new(0, 0);
+        assert_eq!(i.decode_mantissa(&mut r).unwrap(), 0);
+        assert_eq!(r.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn decode_mantissa_degenerate_interval_returns_low() {
+        // A degenerate (5, 5) interval has maxcode = 0, so decode_value
+        // returns `low` directly — no bits consumed.
+        let bytes = [0u8; 0];
+        let mut r = BitReader::new(&bytes);
+        let i = SampleInterval::new(5, 5);
+        assert_eq!(i.decode_value(&mut r).unwrap(), 5);
+        assert_eq!(r.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn decode_mantissa_maxcode_one_reads_one_bit() {
+        // Bit 0 set / clear → mantissa is the bit value (low-bit-first
+        // reader).
+        let bytes = [0b0000_0001];
+        let mut r = BitReader::new(&bytes);
+        let i = SampleInterval::new(0, 1);
+        assert_eq!(i.decode_mantissa(&mut r).unwrap(), 1);
+        // decode_value pairs with low=0 → magnitude == mantissa.
+        let bytes = [0b0000_0000];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(i.decode_mantissa(&mut r).unwrap(), 0);
+    }
+
+    #[test]
+    fn decode_mantissa_round_trips_via_emit_for_maxcode_sweep() {
+        // For a sweep of maxcode values covering both perfect-power
+        // (extras == 0) and slack (extras > 0) intervals, every
+        // codeword in [0, maxcode] must encode + decode bit-exactly.
+        for maxcode in 0u32..=32 {
+            let i = SampleInterval::new(0, maxcode);
+            for code in 0..=maxcode {
+                let mut w = BitWriter::new();
+                emit_truncated_binary(&mut w, maxcode, code);
+                // Append a sentinel byte so the reader has buffer slack
+                // for the rare bit-aligned read that lands on a byte
+                // boundary.
+                let bytes = w.finish();
+                let mut padded = bytes.clone();
+                padded.push(0);
+                let mut r = BitReader::new(&padded);
+                let decoded = i.decode_mantissa(&mut r).unwrap();
+                assert_eq!(
+                    decoded, code,
+                    "maxcode={maxcode} code={code} bytes={bytes:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_value_adds_low_to_decoded_mantissa() {
+        // For interval (low=17, high=33) → maxcode=16, code in [0,16],
+        // decode_value returns low + code.
+        let i = SampleInterval::new(17, 33);
+        for code in 0u32..=16 {
+            let mut w = BitWriter::new();
+            emit_truncated_binary(&mut w, 16, code);
+            let mut padded = w.finish();
+            padded.push(0);
+            let mut r = BitReader::new(&padded);
+            assert_eq!(i.decode_value(&mut r).unwrap(), 17 + code);
+        }
+    }
+
+    #[test]
+    fn decode_value_via_typed_interval_matches_private_truncated_binary() {
+        // The typed `decode_mantissa` MUST produce the same value as
+        // the private `read_truncated_binary` for every maxcode in the
+        // sweep — they are the SAME primitive lifted to the typed
+        // surface.
+        for maxcode in 0u32..=40 {
+            for code in 0..=maxcode {
+                let mut w = BitWriter::new();
+                emit_truncated_binary(&mut w, maxcode, code);
+                let mut padded = w.finish();
+                padded.push(0);
+                let i = SampleInterval::new(0, maxcode);
+                let mut r_typed = BitReader::new(&padded);
+                let mut r_priv = BitReader::new(&padded);
+                let typed = i.decode_mantissa(&mut r_typed).unwrap();
+                let priv_val = read_truncated_binary(&mut r_priv, maxcode).unwrap();
+                assert_eq!(typed, priv_val, "maxcode={maxcode} code={code}");
+                assert_eq!(
+                    r_typed.bits_consumed(),
+                    r_priv.bits_consumed(),
+                    "cursors diverge at maxcode={maxcode} code={code}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_mantissa_truncated_buffer_surfaces_error() {
+        // Empty buffer + maxcode=1 → reader needs one bit; truncation.
+        let bytes = [0u8; 0];
+        let mut r = BitReader::new(&bytes);
+        let i = SampleInterval::new(0, 1);
+        assert!(matches!(i.decode_mantissa(&mut r), Err(Error::Truncated),));
+        // decode_value surfaces the same error.
+        let mut r = BitReader::new(&bytes);
+        assert!(matches!(i.decode_value(&mut r), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn decode_mantissa_consumes_expected_bit_count() {
+        // For maxcode=16 (bitcount=5, extras=15), the short-form code
+        // < 15 consumes 4 bits; the long-form code >= 15 consumes 5.
+        let i = SampleInterval::new(0, 16);
+        // Short-form code 0 → 4 bits consumed.
+        let mut w = BitWriter::new();
+        emit_truncated_binary(&mut w, 16, 0);
+        let mut padded = w.finish();
+        padded.push(0);
+        let mut r = BitReader::new(&padded);
+        i.decode_mantissa(&mut r).unwrap();
+        assert_eq!(r.bits_consumed(), 4);
+        // Long-form code 15 → 5 bits consumed.
+        let mut w = BitWriter::new();
+        emit_truncated_binary(&mut w, 16, 15);
+        let mut padded = w.finish();
+        padded.push(0);
+        let mut r = BitReader::new(&padded);
+        i.decode_mantissa(&mut r).unwrap();
+        assert_eq!(r.bits_consumed(), 5);
+        // Long-form code 16 → 5 bits consumed.
+        let mut w = BitWriter::new();
+        emit_truncated_binary(&mut w, 16, 16);
+        let mut padded = w.finish();
+        padded.push(0);
+        let mut r = BitReader::new(&padded);
+        i.decode_mantissa(&mut r).unwrap();
+        assert_eq!(r.bits_consumed(), 5);
+    }
+
+    #[test]
+    fn decode_value_via_typed_interval_matches_decode_sample_stateful_inner() {
+        // For seeds [256,256,256] → get_med = 17 → Zone 0 interval =
+        // [0, 16]. The typed decode_value reads the mantissa + adds
+        // low; with a code emitted through emit_truncated_binary the
+        // result is exactly code (because low = 0). The decoder loop
+        // consumes the same interval and adds low (also 0), so the two
+        // surface points agree.
+        let m = AdaptiveMedians::new([256, 256, 256]);
+        let i = m.sample_interval(Zone::Zone0);
+        assert_eq!(i.low(), 0);
+        assert_eq!(i.high(), 16);
+        let mut w = BitWriter::new();
+        emit_truncated_binary(&mut w, i.maxcode(), 9);
+        let mut padded = w.finish();
+        padded.push(0);
+        let mut r = BitReader::new(&padded);
+        assert_eq!(i.decode_value(&mut r).unwrap(), 9);
     }
 }

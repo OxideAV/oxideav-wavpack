@@ -1,5 +1,68 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 260 — spec §4.2 step 6 truncated-binary mantissa primitive
+//! lifted onto the [`SampleInterval`] surface + spec §3.2 zone-
+//! predicate accessors on [`Zone`]. The clean-room entropy doc
+//! `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §4.2 step 6
+//! first paragraph specifies the truncated-binary mantissa decode the
+//! stateful loop reads inside a `(low, high)` interval — `maxcode = 0`
+//! consumes no bits and returns `0`; `maxcode = 1` consumes one bit and
+//! returns it; `maxcode >= 2` consumes `bitcount - 1` bits LSB-first
+//! into `code` with `bitcount = floor(log2(maxcode)) + 1` and
+//! `extras = (1 << bitcount) - maxcode - 1`, and reads one MORE bit
+//! when `code >= extras` to form the full `bitcount`-bit phase-in
+//! codeword. Round 15 wired this in the private `read_truncated_binary`
+//! helper inside [`decode_sample_stateful`], but the primitive had not
+//! yet been lifted to the public method surface — so callers walking
+//! the spec ladder by hand could not name the mantissa decode as a
+//! typed operation on the [`SampleInterval`] they already held. New
+//! [`SampleInterval::mantissa_bitcount`] is the pure-arithmetic spec
+//! `bitcount` (special-cased to `0` for `maxcode == 0`); new
+//! [`SampleInterval::mantissa_extras`] is the pure-arithmetic spec
+//! `extras` (also `0` for the `maxcode < 2` arms); new
+//! [`SampleInterval::decode_mantissa`] consumes a [`BitReader`] and
+//! returns the integer `code` in `[0, maxcode]` per the spec ladder;
+//! new [`SampleInterval::decode_value`] adds `low` to the decoded
+//! mantissa, returning the full §4.2 step 6 magnitude (sign-bit
+//! reconstruction still happens at the caller — that is §4.2 step 7).
+//! Round 15's private `read_truncated_binary` is now a thin delegator
+//! over the new typed surface, so the exact bytes the decode loop
+//! consumes ARE the bytes the typed accessor consumes. New on [`Zone`]:
+//! [`Zone::index`] returns the zero-based `0/1/2/3` zone arm selector
+//! (independent of the carried `ones_count` in the overflow arm);
+//! [`Zone::is_overflow`] is the `matches!(self, Zone::Zone2Overflow {
+//! .. })` predicate; [`Zone::increments_median`] /
+//! [`Zone::decrements_median`] / [`Zone::touches_median`] lift the spec
+//! §3.2 per-zone adaptation table onto typed predicates so callers
+//! branching on "which median mutates in this zone" do not need to
+//! re-walk the inc/dec pattern. The §3.2 mutation itself stays on
+//! [`AdaptiveMedians::adapt`] — the new predicates are PURE
+//! (do NOT touch the median values). 22 new tests (544 total, up from
+//! 522) pin: zone-index numeric mapping + independence from overflow
+//! `ones_count`; `is_overflow` only-true for the overflow arm;
+//! `increments_median` / `decrements_median` agreement with the spec
+//! §3.2 table at every (zone, idx) cell; mutual exclusion (no median
+//! is simultaneously incremented and decremented); `touches_median`
+//! as the union of inc + dec; out-of-range `idx` rejection
+//! (`idx >= 3 → false`); end-to-end predicate parity with the
+//! observed [`AdaptiveMedians::adapt`] mutation on synthetic median
+//! sets; `mantissa_bitcount` special cases (`0` / `1` / `2` / `16` /
+//! `31` / `32` / `INTERVAL_MASK_31`); `mantissa_extras` special
+//! cases (`0` for `maxcode < 2`, `1` for `maxcode == 2`, `0` for
+//! `maxcode == 2^k - 1`); extras-bounded-by-half-long-region invariant
+//! across `maxcode ∈ [2, 1023]`; `decode_mantissa` consumes-no-bits
+//! for `maxcode == 0`; degenerate-interval `decode_value` returns
+//! `low` directly; `maxcode == 1` reads exactly one bit LSB-first;
+//! end-to-end round-trip via `emit_truncated_binary` for every code in
+//! `[0, maxcode]` across `maxcode ∈ [0, 32]`; `decode_value` adds
+//! `low` correctly for the worked `[17, 33]` example; bit-exact parity
+//! with the private `read_truncated_binary` across `maxcode ∈ [0, 40]`
+//! (same value AND same cursor position); `Error::Truncated` surfacing
+//! on an empty buffer; expected bit-count consumption for the
+//! `maxcode == 16` short-form (4 bits) and long-form (5 bits) cases;
+//! and end-to-end pairing through [`AdaptiveMedians::sample_interval`]
+//! against the worked Zone 0 / `[256, 256, 256]` seed.**
+//!
 //! **Round 255 — typed [`SampleInterval`] view + new
 //! [`AdaptiveMedians::sample_interval`] /
 //! [`AdaptiveMedians::sample_interval_for_ones_count`] accessors lifting
