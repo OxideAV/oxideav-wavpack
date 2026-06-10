@@ -396,6 +396,36 @@ impl RunState {
             last_one: false,
         }
     }
+
+    /// Spec §4.2 step 4 holding-bit fold: collapse a raw modified-Rice
+    /// prefix `raw_value` (the value [`read_raw_prefix`] returns) onto
+    /// the `ones_count` zone selector the step-5 interval ladder takes,
+    /// updating the held `last_one` / `last_zero` carry in place.
+    ///
+    /// Per the spec: if a one is being held, the folded `ones_count` is
+    /// `(raw_value >> 1) + 1`, else it is `raw_value >> 1`; the new
+    /// held-one is the old low bit and the held-zero is its complement:
+    ///
+    /// * the new `last_one` is the low bit of `raw_value`;
+    /// * the folded `ones_count` is `(raw_value >> 1) + 1` when that low
+    ///   bit is set, else `raw_value >> 1`;
+    /// * the new `last_zero` is the complement of the new `last_one`.
+    ///
+    /// Reads no bits — pure state arithmetic over `raw_value`. This is
+    /// the typed lift of the §4.2 step-4 fold the private decode loop
+    /// previously inlined; pairing it with [`read_raw_prefix`]
+    /// reconstructs the full §4.2 step 2 + 3 + 4 prefix decode.
+    pub const fn fold_prefix(&mut self, raw_value: u32) -> u32 {
+        let last_one_bit = (raw_value & 1) != 0;
+        let ones_count = if last_one_bit {
+            (raw_value >> 1) + 1
+        } else {
+            raw_value >> 1
+        };
+        self.last_one = last_one_bit;
+        self.last_zero = !last_one_bit;
+        ones_count
+    }
 }
 
 /// Decode the run-length index `n` for one sample, advancing both the
@@ -1410,6 +1440,53 @@ impl DecodeState {
     }
 }
 
+/// Spec §4.2 steps 2 + 3: read the **raw** modified-Rice unary prefix
+/// for one sample word — the value the spec calls the prefix *before*
+/// the step-4 holding-bit fold collapses it onto a zone selector.
+///
+/// Sequence:
+///
+/// * **Step 2** — read the count of consecutive `1` bits terminated by
+///   a `0` bit (the plain unary prefix).
+/// * **Step 3** — if that count reaches [`UNARY_ESCAPE`] (`LIMIT_ONES =
+///   16`), an escape follows: a second unary `cbits` of up to
+///   [`ESCAPE_EOF_CBITS`] (`33`). `cbits == 33` signals end-of-data and
+///   surfaces as [`Error::EndOfStream`]; `cbits < 2` is the extra
+///   magnitude added straight onto [`UNARY_ESCAPE`]; otherwise read
+///   `cbits - 1` more bits LSB-first with the top bit implied set, then
+///   add [`UNARY_ESCAPE`] back in.
+///
+/// Reads no holding state and folds nothing — the returned value is the
+/// pre-fold `raw_value` the step-4 fold ([`RunState::fold_prefix`])
+/// consumes. This is the typed lift of the §4.2 step 2 + 3 portion the
+/// private decode loop previously inlined; it is the value-side twin of
+/// the §4.2 step 5/6/7 surface lifted in rounds 255 / 260 / 261.
+///
+/// `Error::Truncated` may surface from any of the unary / multi-bit
+/// reads if the buffer runs out; `Error::EndOfStream` is the explicit
+/// `cbits == 33` EOF marker, distinct from a buffer that merely ran dry.
+pub fn read_raw_prefix(reader: &mut BitReader<'_>) -> Result<u32> {
+    let raw = reader.get_unary()?;
+    if raw < UNARY_ESCAPE {
+        return Ok(raw);
+    }
+    // Spec §4.2 step 3: escape arm. cbits up to 33; cbits == 33 is EOF.
+    let cbits = reader.get_unary()?;
+    if cbits == ESCAPE_EOF_CBITS {
+        return Err(Error::EndOfStream);
+    }
+    if cbits < 2 {
+        Ok(UNARY_ESCAPE + cbits)
+    } else {
+        // cbits >= 2: read cbits - 1 mantissa bits LSB-first, top bit
+        // implied set, then add LIMIT_ONES back in (spec §4.2 step 3,
+        // "then add `LIMIT_ONES` back in").
+        let mantissa = reader.get_bits(cbits - 1)?;
+        let escape_value = (1u32 << (cbits - 1)) | mantissa;
+        Ok(UNARY_ESCAPE + escape_value)
+    }
+}
+
 /// Read and fold the `ones_count` for one sample — combines the spec
 /// §4.2 step 2 unary, the §4.2 step 3 `LIMIT_ONES = 16` escape (with
 /// `cbits == 33` surfaced as [`Error::EndOfStream`]) and the §4.2 step
@@ -1421,7 +1498,12 @@ impl DecodeState {
 /// per-block decode loop, rather than reading mantissa bits past EOF.
 /// On `Ok` the returned value is the post-fold `ones_count` zone
 /// selector the spec §4.2 step 5 interval ladder takes.
-fn read_folded_ones_count(reader: &mut BitReader<'_>, state: &mut RunState) -> Result<u32> {
+///
+/// Composes the round-274 typed surface: the wiki `last_zero`
+/// short-circuit, then [`read_raw_prefix`] (steps 2 + 3) feeding
+/// [`RunState::fold_prefix`] (step 4) — so the exact bits this routine
+/// consumes ARE the bits the public primitives consume.
+pub fn read_folded_ones_count(reader: &mut BitReader<'_>, state: &mut RunState) -> Result<u32> {
     // Wiki short-circuit: when last_zero is set, this sample's
     // ones_count is 0 with no bits read; last_zero clears and
     // last_one is untouched. Matches decode_run_length's first branch.
@@ -1430,37 +1512,8 @@ fn read_folded_ones_count(reader: &mut BitReader<'_>, state: &mut RunState) -> R
         return Ok(0);
     }
 
-    let raw = reader.get_unary()?;
-    let raw_value = if raw < UNARY_ESCAPE {
-        raw
-    } else {
-        // Spec §4.2 step 3: escape arm. cbits up to 33; cbits == 33 is EOF.
-        let cbits = reader.get_unary()?;
-        if cbits == ESCAPE_EOF_CBITS {
-            return Err(Error::EndOfStream);
-        }
-        if cbits < 2 {
-            UNARY_ESCAPE + cbits
-        } else {
-            // cbits >= 2: read cbits - 1 mantissa bits LSB-first, top
-            // bit implied set, then add LIMIT_ONES back in (spec §4.2
-            // step 3, "then add `LIMIT_ONES` back in").
-            let mantissa = reader.get_bits(cbits - 1)?;
-            let escape_value = (1u32 << (cbits - 1)) | mantissa;
-            UNARY_ESCAPE + escape_value
-        }
-    };
-
-    // Spec §4.2 step 4 fold.
-    let last_one_bit = (raw_value & 1) != 0;
-    let ones_count = if last_one_bit {
-        (raw_value >> 1) + 1
-    } else {
-        raw_value >> 1
-    };
-    state.last_one = last_one_bit;
-    state.last_zero = !last_one_bit;
-    Ok(ones_count)
+    let raw_value = read_raw_prefix(reader)?;
+    Ok(state.fold_prefix(raw_value))
 }
 
 /// Spec §4.2 step 5: form the `(low, high)` value interval from a
@@ -5334,5 +5387,202 @@ mod tests {
         assert_eq!(loop_sample, apply_sign(9, true)); // !(0 + 9) = -10
         assert_eq!(r_loop.bits_consumed(), r_hand.bits_consumed());
         assert_eq!(medians_loop, medians_hand);
+    }
+
+    // ---- Round 274: §4.2 step 2 + 3 raw prefix + step 4 fold on the
+    // public typed surface -------------------------------------------
+
+    /// Emit a raw prefix value through the spec §4.2 step 2 + 3 encode,
+    /// the inverse of [`read_raw_prefix`].
+    fn emit_raw_prefix(w: &mut BitWriter, raw_value: u32) {
+        if raw_value < UNARY_ESCAPE {
+            // Step 2: plain unary.
+            w.write_unary(raw_value);
+            return;
+        }
+        // Step 3 escape: leading unary == LIMIT_ONES, then the cbits
+        // unary, then (for cbits >= 2) the implied-top-bit mantissa.
+        w.write_unary(UNARY_ESCAPE);
+        let escape_value = raw_value - UNARY_ESCAPE;
+        if escape_value < 2 {
+            // cbits == escape_value (< 2): cbits unary only.
+            w.write_unary(escape_value);
+        } else {
+            // escape_value carries an implied top bit; cbits is its
+            // bit-length, mantissa is the low (cbits - 1) bits.
+            let cbits = 32 - escape_value.leading_zeros();
+            w.write_unary(cbits);
+            w.write_bits(escape_value, cbits - 1);
+        }
+    }
+
+    #[test]
+    fn read_raw_prefix_plain_unary_below_escape() {
+        // Every raw value 0..16 is a plain unary prefix consuming
+        // raw_value `1`-bits + one `0` terminator.
+        for raw in 0..UNARY_ESCAPE {
+            let mut w = BitWriter::new();
+            emit_raw_prefix(&mut w, raw);
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(read_raw_prefix(&mut r).unwrap(), raw);
+            assert_eq!(r.bits_consumed(), (raw + 1) as usize);
+        }
+    }
+
+    #[test]
+    fn read_raw_prefix_escape_cbits_lt_2() {
+        // Escape arm with cbits 0 and 1: raw_value = 16 + cbits.
+        for cbits in 0..2u32 {
+            let mut w = BitWriter::new();
+            w.write_unary(UNARY_ESCAPE); // leading 16 ones + 0
+            w.write_unary(cbits); // cbits unary
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(read_raw_prefix(&mut r).unwrap(), UNARY_ESCAPE + cbits);
+        }
+    }
+
+    #[test]
+    fn read_raw_prefix_escape_cbits_ge_2_implied_top_bit() {
+        // escape_value >= 2 carries an implied top bit; round-trip every
+        // value in [2, 256] through the emitter.
+        for escape_value in 2..=256u32 {
+            let raw = UNARY_ESCAPE + escape_value;
+            let mut w = BitWriter::new();
+            emit_raw_prefix(&mut w, raw);
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(read_raw_prefix(&mut r).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn read_raw_prefix_eof_marker() {
+        // cbits == 33 inside the escape arm is the EOF marker.
+        let mut w = BitWriter::new();
+        w.write_unary(UNARY_ESCAPE);
+        w.write_unary(ESCAPE_EOF_CBITS);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_raw_prefix(&mut r), Err(Error::EndOfStream));
+    }
+
+    #[test]
+    fn read_raw_prefix_truncated_empty() {
+        let bytes: [u8; 0] = [];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_raw_prefix(&mut r), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn fold_prefix_low_bit_zero_halves() {
+        // raw even → last_one false, ones_count = raw >> 1.
+        let mut state = RunState::new();
+        assert_eq!(state.fold_prefix(0), 0);
+        assert!(!state.last_one);
+        assert!(state.last_zero);
+
+        let mut state = RunState::new();
+        assert_eq!(state.fold_prefix(8), 4);
+        assert!(!state.last_one);
+        assert!(state.last_zero);
+    }
+
+    #[test]
+    fn fold_prefix_low_bit_one_halves_plus_one() {
+        // raw odd → last_one true, ones_count = (raw >> 1) + 1.
+        let mut state = RunState::new();
+        assert_eq!(state.fold_prefix(1), 1);
+        assert!(state.last_one);
+        assert!(!state.last_zero);
+
+        let mut state = RunState::new();
+        assert_eq!(state.fold_prefix(9), 5);
+        assert!(state.last_one);
+        assert!(!state.last_zero);
+    }
+
+    #[test]
+    fn fold_prefix_held_one_zero_complement() {
+        // last_one and last_zero are always complements after a fold.
+        for raw in 0..64u32 {
+            let mut state = RunState::new();
+            let folded = state.fold_prefix(raw);
+            assert_eq!(state.last_one, (raw & 1) != 0);
+            assert_eq!(state.last_zero, !state.last_one);
+            let expected = if (raw & 1) != 0 {
+                (raw >> 1) + 1
+            } else {
+                raw >> 1
+            };
+            assert_eq!(folded, expected);
+        }
+    }
+
+    #[test]
+    fn fold_prefix_is_const() {
+        const FOLDED: u32 = {
+            let mut s = RunState::new();
+            s.fold_prefix(17)
+        };
+        assert_eq!(FOLDED, 9);
+    }
+
+    #[test]
+    fn read_folded_ones_count_equals_raw_then_fold() {
+        // read_folded_ones_count == read_raw_prefix + fold_prefix,
+        // bit-for-bit, for every raw across the plain + escape range.
+        for raw in 0..40u32 {
+            let mut w = BitWriter::new();
+            emit_raw_prefix(&mut w, raw);
+            let bytes = w.finish();
+
+            // Fused path.
+            let mut r_fused = BitReader::new(&bytes);
+            let mut s_fused = RunState::new();
+            let fused = read_folded_ones_count(&mut r_fused, &mut s_fused).unwrap();
+
+            // Two-step path.
+            let mut r_step = BitReader::new(&bytes);
+            let mut s_step = RunState::new();
+            let raw_val = read_raw_prefix(&mut r_step).unwrap();
+            let folded = s_step.fold_prefix(raw_val);
+
+            assert_eq!(fused, folded);
+            assert_eq!(raw_val, raw);
+            assert_eq!(r_fused.bits_consumed(), r_step.bits_consumed());
+            assert_eq!(s_fused, s_step);
+        }
+    }
+
+    #[test]
+    fn read_folded_ones_count_last_zero_short_circuit() {
+        // When last_zero is set, read_folded_ones_count returns 0 with
+        // no bits read and clears last_zero, leaving last_one untouched.
+        let mut state = RunState {
+            last_zero: true,
+            last_one: true,
+        };
+        let bytes = [0xFFu8]; // would decode to a non-zero prefix if read
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_folded_ones_count(&mut r, &mut state).unwrap(), 0);
+        assert_eq!(r.bits_consumed(), 0);
+        assert!(!state.last_zero);
+        assert!(state.last_one); // untouched on the short-circuit arm
+    }
+
+    #[test]
+    fn read_folded_ones_count_propagates_eof() {
+        let mut w = BitWriter::new();
+        w.write_unary(UNARY_ESCAPE);
+        w.write_unary(ESCAPE_EOF_CBITS);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState::new();
+        assert_eq!(
+            read_folded_ones_count(&mut r, &mut state),
+            Err(Error::EndOfStream)
+        );
     }
 }

@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 274 — spec §4.2 step 2 + 3 raw modified-Rice prefix decode and
+  spec §4.2 step 4 holding-bit fold lifted onto the public typed
+  surface.
+
+  The clean-room entropy doc `docs/audio/wavpack/spec/wavpack-entropy-decode.md`
+  §4.2 step 2 reads the count of consecutive `1` bits terminated by a
+  `0` bit (the modified-Rice prefix), step 3 escapes that prefix when it
+  reaches `LIMIT_ONES = 16` (a second unary `cbits` up to `33`, with
+  `cbits == 33` the EOF marker and `cbits >= 2` carrying an implied
+  top-bit mantissa), and step 4 folds the raw prefix onto the
+  `ones_count` zone selector via the held `last_one` / `last_zero`
+  carry. Rounds 255 / 260 / 261 lifted §4.2 steps 5 / 6 / 7 onto the
+  typed `SampleInterval` / `apply_sign` surface, but steps 2-4 still
+  lived only in the private `read_folded_ones_count` helper inside the
+  decode loop — so callers walking the spec ladder by hand could not
+  name the prefix decode or the fold as typed operations.
+
+  New `read_raw_prefix(reader)` reads the §4.2 step 2 unary plus the
+  §4.2 step 3 escape, returning the pre-fold `raw_value` and surfacing
+  the `cbits == 33` EOF as `Error::EndOfStream` (distinct from a buffer
+  that merely ran dry, which is `Error::Truncated`). New
+  `RunState::fold_prefix(raw_value)` is the pure §4.2 step 4 fold — it
+  mutates the held `last_one` / `last_zero` registers in place and
+  returns the folded `ones_count` zone selector; it reads no bits and is
+  `const`-evaluable. `read_folded_ones_count` is now public and
+  delegates to these two primitives (after the wiki `last_zero`
+  short-circuit), so the exact bits the decode loop consumes ARE the
+  bits the public primitives consume. 12 new tests (571 total, up from
+  559) pin: `read_raw_prefix` plain-unary returns for every raw in
+  `[0, 16)` with exact bit-consumption; the escape arm for `cbits < 2`;
+  the `cbits >= 2` implied-top-bit round-trip across escape values
+  `[2, 256]`; the `cbits == 33` EOF marker; `Error::Truncated` on an
+  empty buffer; `fold_prefix` low-bit-zero halving / low-bit-one
+  half-plus-one / held-one-zero-complement invariant across raw values;
+  `const` evaluability; the fused-equals-two-step bit-exact identity
+  (value, cursor AND post-fold state) across the plain + escape range;
+  the `last_zero` short-circuit consuming no bits and leaving `last_one`
+  untouched; and EOF propagation through the fused path.
+
 - Round 261 — spec §4.2 step 7 sign-bit reconstruction lifted onto the
   typed surface.
 
