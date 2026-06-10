@@ -5,6 +5,50 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 261 — spec §4.2 step 7 sign-bit reconstruction lifted onto the
+typed surface. The clean-room entropy doc
+`docs/audio/wavpack/spec/wavpack-entropy-decode.md` §4.2 step 7
+specifies the last on-wire field of every sample word: "Sign bit, last.
+After the magnitude is fixed, read exactly one sign bit. If the sign
+bit is set the returned sample is the bitwise complement of the
+magnitude (`~mid`), otherwise the magnitude itself." Round 15 wired
+this inline at the tail of `decode_sample_stateful` (round 199 in
+`decode_sample_stateful_stereo`), and round 260's
+`SampleInterval::decode_value` explicitly stopped at the unsigned
+magnitude — so callers walking the spec ladder by hand could not name
+step 7 as a typed operation. New `apply_sign(magnitude, sign_bit_set)`
+is the pure `const` step 7 arithmetic (`magnitude as i32` when the
+sign bit is clear; `!(magnitude as i32)` = `-(magnitude + 1)` when
+set); new `read_sign_and_apply(reader, magnitude)` reads exactly ONE
+bit and folds it through `apply_sign`; new
+`SampleInterval::decode_signed_value` fuses §4.2 steps 6 + 7 —
+`decode_value` for the magnitude, then the sign bit — returning the
+signed `i32` sample, the complete value tail of one sample word after
+the zone selector is fixed. Both decode loops now delegate their steps
+5-8 tail to `AdaptiveMedians::sample_interval_for_ones_count` +
+`SampleInterval::decode_signed_value`, so the exact bits the loops
+consume ARE the bits the typed surface consumes (the round-255 private
+`form_interval` tuple shim is now test-only). 15 new tests (559 total,
+up from 544) pin: `apply_sign` clear-arm verbatim return across
+magnitudes up to `INTERVAL_MASK_31`; set-arm ones-complement (`0 →
+-1`, `17 → -18`, `INTERVAL_MASK_31 → i32::MIN`); the
+set-arm-equals-complement-of-clear-arm identity and the
+two's-complement `-(m + 1)` identity across `m ∈ [0, 100]`; const
+evaluability; `read_sign_and_apply` consuming exactly one bit for both
+sign values; magnitude-verbatim / complement returns;
+`Error::Truncated` on an empty buffer with the cursor unchanged;
+degenerate-interval `decode_signed_value` consuming ONLY the sign bit
+(`[5, 5]` → `5` / `-6` at one bit each); the worked `[17, 33]` example
+with code 3 yielding `20` (sign clear, 5 bits) and `-21` (sign set);
+end-to-end round-trip across `maxcode ∈ [0, 20]` × every code × both
+signs against `apply_sign(low + code, sign)`; bit-exact parity (value
+AND cursor) between the fused `decode_signed_value` and the manual
+`decode_value` + `read_sign_and_apply` two-step; `Truncated` at a
+missing sign bit after a fully-consumed 8-bit mantissa; and
+hand-walked spec-ladder parity with `decode_sample_stateful` (same
+sample, same cursor, same post-adapt medians) on a prefix + mantissa +
+sign stream.**
+
 **Round 260 — spec §4.2 step 6 truncated-binary mantissa primitive
 lifted onto the `SampleInterval` surface + spec §3.2 zone-predicate
 accessors on `Zone`. The clean-room entropy doc

@@ -1133,6 +1133,34 @@ impl SampleInterval {
         let code = self.decode_mantissa(reader)?;
         Ok(self.low.wrapping_add(code))
     }
+
+    /// Spec §4.2 steps 6 + 7 fused decode — runs [`Self::decode_value`]
+    /// for the unsigned magnitude, then reads exactly ONE sign bit per
+    /// spec §4.2 step 7 ("Sign bit, last. After the magnitude is fixed,
+    /// read exactly one sign bit") and returns the signed sample: the
+    /// bitwise complement of the magnitude when the sign bit is set,
+    /// the magnitude itself otherwise.
+    ///
+    /// This is the complete value tail of one sample word — everything
+    /// after the zone selector is fixed:
+    ///
+    /// ```text
+    /// mantissa bits  →  sign bit
+    /// ```
+    ///
+    /// (the spec §4.2 closing on-wire-order line, with the prefix
+    /// already consumed by the caller). [`decode_sample_stateful`] /
+    /// [`decode_sample_stateful_stereo`] delegate their steps 6 + 7 to
+    /// this method, so the exact bits the decode loop consumes ARE the
+    /// bits this typed accessor consumes.
+    ///
+    /// On `Error::Truncated` (mid-mantissa or at the missing sign bit)
+    /// the reader's cursor follows the [`BitReader::get_bit`] /
+    /// [`BitReader::get_bits`] partial-consume semantics.
+    pub fn decode_signed_value(&self, reader: &mut BitReader<'_>) -> Result<i32> {
+        let magnitude = self.decode_value(reader)?;
+        read_sign_and_apply(reader, magnitude)
+    }
 }
 
 /// Return the spec §3 divisor `D` for the given median index. Panics
@@ -1440,8 +1468,10 @@ fn read_folded_ones_count(reader: &mut BitReader<'_>, state: &mut RunState) -> R
 ///
 /// Thin wrapper over the public typed
 /// [`AdaptiveMedians::sample_interval_for_ones_count`] surface (round
-/// 255), preserved as the private tuple-returning shape the existing
-/// decode loop / tests are written against.
+/// 255), preserved as the private tuple-returning shape the round-255
+/// parity tests are written against. The decode loops consume the
+/// typed surface directly since round 261, so this shim is test-only.
+#[cfg(test)]
 fn form_interval(medians: &AdaptiveMedians, ones_count: u32) -> (u32, u32) {
     let interval = medians.sample_interval_for_ones_count(ones_count);
     (interval.low, interval.high)
@@ -1475,6 +1505,46 @@ fn read_truncated_binary(reader: &mut BitReader<'_>, maxcode: u32) -> Result<u32
         let extra_bit = reader.get_bit()?;
         Ok((short << 1).wrapping_sub(extras).wrapping_add(extra_bit))
     }
+}
+
+/// Spec §4.2 step 7 pure sign arithmetic: map an unsigned magnitude and
+/// a sign-bit flag onto the signed sample value.
+///
+/// Per the spec ("If the sign bit is set the returned sample is the
+/// bitwise complement of the magnitude (`~mid`), otherwise the
+/// magnitude itself"):
+///
+/// * `sign_bit_set == false` → `magnitude as i32` (the magnitude
+///   verbatim).
+/// * `sign_bit_set == true` → `!(magnitude as i32)`, i.e.
+///   `-(magnitude + 1)` in two's complement — magnitude `0` maps to
+///   `-1`, magnitude `17` maps to `-18`, and the 31-bit-mask maximum
+///   [`INTERVAL_MASK_31`] maps to `i32::MIN`.
+///
+/// Pure arithmetic — reads no bits. The spec §4.2 step 5 31-bit mask
+/// (`low`/`high` both `<=` [`INTERVAL_MASK_31`]) keeps every magnitude
+/// the decode ladder produces non-negative after the `as i32` cast.
+pub const fn apply_sign(magnitude: u32, sign_bit_set: bool) -> i32 {
+    let mid = magnitude as i32;
+    if sign_bit_set {
+        !mid
+    } else {
+        mid
+    }
+}
+
+/// Spec §4.2 step 7 on-wire sign decode: read exactly ONE bit from the
+/// reader ("Sign bit, last. After the magnitude is fixed, read exactly
+/// one sign bit") and fold it into the magnitude via [`apply_sign`].
+///
+/// Returns the signed sample value — the bitwise complement of the
+/// magnitude when the sign bit is set, the magnitude itself otherwise.
+/// On `Error::Truncated` no bit was consumed (the cursor is unchanged
+/// per [`BitReader::get_bit`] empty-buffer semantics) and the caller's
+/// magnitude is unaffected (taken by value).
+pub fn read_sign_and_apply(reader: &mut BitReader<'_>, magnitude: u32) -> Result<i32> {
+    let sign = reader.get_bit()?;
+    Ok(apply_sign(magnitude, sign != 0))
 }
 
 /// Spec §4.2 step 1 attempt: when the channel's `median[0]` is `<= 1`
@@ -1599,24 +1669,20 @@ pub fn decode_sample_stateful(
     // pre-encoded this sample's zone selector as 0).
     let ones_count = read_folded_ones_count(reader, &mut state.run)?;
 
-    // 5. Form the interval (spec §4.2 step 5).
-    let (low, high) = form_interval(medians, ones_count);
+    // 5. Form the interval (spec §4.2 step 5) — from the PRE-adaptation
+    // medians, via the round-255 typed surface.
+    let interval = medians.sample_interval_for_ones_count(ones_count);
 
     // 6. Adapt the medians (spec §3.2) — BEFORE the mantissa read, per
     // the spec note "The medians are adapted at this point".
     medians.adapt(Zone::from_ones_count(ones_count));
 
-    // 7. Mantissa (spec §4.2 step 6 first paragraph).
-    let maxcode = high.wrapping_sub(low);
-    let code = read_truncated_binary(reader, maxcode)?;
-    let magnitude = low.wrapping_add(code);
-
-    // 8. Sign (spec §4.2 step 7). The result is built in i32 space:
-    // magnitude can be up to INTERVAL_MASK_31 (2^31 - 1), which fits.
-    let sign = reader.get_bit()?;
-    let mid = magnitude as i32;
-    let result = if sign == 0 { mid } else { !mid };
-    Ok(result)
+    // 7-8. Mantissa (spec §4.2 step 6 first paragraph) + sign (spec
+    // §4.2 step 7) via the typed surface — the exact bits this loop
+    // consumes ARE the bits SampleInterval::decode_signed_value
+    // consumes. The result is built in i32 space: the magnitude can be
+    // up to INTERVAL_MASK_31 (2^31 - 1), which fits.
+    interval.decode_signed_value(reader)
 }
 
 /// Decode `count` mono samples from a `0x0A` packed-samples payload,
@@ -1824,22 +1890,19 @@ pub fn decode_sample_stateful_stereo(
     };
     let ones_count = read_folded_ones_count(reader, ch_state)?;
 
-    // 5. Form the interval from the per-channel medians.
-    let (low, high) = form_interval(&medians[ch], ones_count);
+    // 5. Form the interval from the per-channel PRE-adaptation medians,
+    // via the round-255 typed surface.
+    let interval = medians[ch].sample_interval_for_ones_count(ones_count);
 
     // 6. Adapt the per-channel medians (spec §3.2) — BEFORE the mantissa
     // read, per the spec note "The medians are adapted at this point".
     medians[ch].adapt(Zone::from_ones_count(ones_count));
 
-    // 7. Mantissa (spec §4.2 step 6 first paragraph).
-    let maxcode = high.wrapping_sub(low);
-    let code = read_truncated_binary(reader, maxcode)?;
-    let magnitude = low.wrapping_add(code);
-
-    // 8. Sign (spec §4.2 step 7).
-    let sign = reader.get_bit()?;
-    let mid = magnitude as i32;
-    let result = if sign == 0 { mid } else { !mid };
+    // 7-8. Mantissa (spec §4.2 step 6 first paragraph) + sign (spec
+    // §4.2 step 7) via the typed surface — the exact bits this loop
+    // consumes ARE the bits SampleInterval::decode_signed_value
+    // consumes.
+    let result = interval.decode_signed_value(reader)?;
 
     // Toggle channel parity for the next call. Toggle ONLY on a
     // successful emit so a `?`-bubbled error leaves the cursor
@@ -5017,5 +5080,259 @@ mod tests {
         padded.push(0);
         let mut r = BitReader::new(&padded);
         assert_eq!(i.decode_value(&mut r).unwrap(), 9);
+    }
+
+    // ----- round 261: spec §4.2 step 7 sign-bit reconstruction on the
+    // ----- typed surface (apply_sign / read_sign_and_apply /
+    // ----- SampleInterval::decode_signed_value)
+
+    #[test]
+    fn apply_sign_clear_returns_magnitude_verbatim() {
+        // Spec §4.2 step 7: sign bit clear → "the magnitude itself".
+        for magnitude in [0u32, 1, 17, 33, 1024, INTERVAL_MASK_31] {
+            assert_eq!(apply_sign(magnitude, false), magnitude as i32);
+        }
+    }
+
+    #[test]
+    fn apply_sign_set_returns_ones_complement() {
+        // Spec §4.2 step 7: sign bit set → "the bitwise complement of
+        // the magnitude (~mid)". In two's complement that is
+        // -(magnitude + 1).
+        assert_eq!(apply_sign(0, true), -1);
+        assert_eq!(apply_sign(17, true), -18);
+        assert_eq!(apply_sign(33, true), -34);
+        // The 31-bit-mask maximum maps to i32::MIN — the most negative
+        // sample the masked interval ladder can ever produce.
+        assert_eq!(apply_sign(INTERVAL_MASK_31, true), i32::MIN);
+    }
+
+    #[test]
+    fn apply_sign_set_is_complement_of_clear() {
+        // The two arms are bitwise complements of each other for every
+        // magnitude: apply_sign(m, true) == !apply_sign(m, false).
+        for magnitude in 0u32..=100 {
+            assert_eq!(
+                apply_sign(magnitude, true),
+                !apply_sign(magnitude, false),
+                "magnitude={magnitude}",
+            );
+            // And the two's-complement identity -(m + 1).
+            assert_eq!(apply_sign(magnitude, true), -(magnitude as i32) - 1);
+        }
+    }
+
+    #[test]
+    fn apply_sign_is_const_evaluable() {
+        // Pure spec §4.2 step 7 arithmetic — usable in const context.
+        const NEGATIVE: i32 = apply_sign(5, true);
+        const POSITIVE: i32 = apply_sign(5, false);
+        assert_eq!(NEGATIVE, -6);
+        assert_eq!(POSITIVE, 5);
+    }
+
+    #[test]
+    fn read_sign_and_apply_reads_exactly_one_bit() {
+        // Spec §4.2 step 7: "read exactly one sign bit".
+        let bytes = [0b0000_0000u8];
+        let mut r = BitReader::new(&bytes);
+        read_sign_and_apply(&mut r, 7).unwrap();
+        assert_eq!(r.bits_consumed(), 1);
+
+        let bytes = [0b0000_0001u8];
+        let mut r = BitReader::new(&bytes);
+        read_sign_and_apply(&mut r, 7).unwrap();
+        assert_eq!(r.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn read_sign_and_apply_zero_bit_returns_magnitude() {
+        let bytes = [0b0000_0000u8];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_sign_and_apply(&mut r, 42).unwrap(), 42);
+    }
+
+    #[test]
+    fn read_sign_and_apply_one_bit_returns_complement() {
+        let bytes = [0b0000_0001u8];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_sign_and_apply(&mut r, 42).unwrap(), -43);
+    }
+
+    #[test]
+    fn read_sign_and_apply_truncated_on_empty_buffer() {
+        // Empty buffer: the single sign-bit read reports Truncated and
+        // the cursor stays at zero (BitReader partial-consume
+        // semantics).
+        let bytes = [0u8; 0];
+        let mut r = BitReader::new(&bytes);
+        assert!(matches!(
+            read_sign_and_apply(&mut r, 5),
+            Err(Error::Truncated)
+        ));
+        assert_eq!(r.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn decode_signed_value_degenerate_interval_reads_only_sign_bit() {
+        // A degenerate interval (low == high) has maxcode == 0 → the
+        // mantissa consumes no bits per spec §4.2 step 6, so
+        // decode_signed_value consumes exactly the ONE sign bit.
+        let i = SampleInterval::new(5, 5);
+
+        let bytes = [0b0000_0000u8];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(i.decode_signed_value(&mut r).unwrap(), 5);
+        assert_eq!(r.bits_consumed(), 1);
+
+        let bytes = [0b0000_0001u8];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(i.decode_signed_value(&mut r).unwrap(), -6);
+        assert_eq!(r.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn decode_signed_value_worked_example_positive() {
+        // Round-255 worked interval [17, 33] (maxcode 16, bitcount 5,
+        // extras 15). Short-form code 3 consumes 4 mantissa bits; the
+        // sign bit (clear) makes 5 total. Magnitude = 17 + 3 = 20.
+        let i = SampleInterval::new(17, 33);
+        let mut w = BitWriter::new();
+        emit_truncated_binary(&mut w, 16, 3);
+        w.write_bit(0); // sign clear
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(i.decode_signed_value(&mut r).unwrap(), 20);
+        assert_eq!(r.bits_consumed(), 5);
+    }
+
+    #[test]
+    fn decode_signed_value_worked_example_negative() {
+        // Same interval / code as the positive worked example with the
+        // sign bit SET: the result is the bitwise complement of the
+        // magnitude, !(20) = -21.
+        let i = SampleInterval::new(17, 33);
+        let mut w = BitWriter::new();
+        emit_truncated_binary(&mut w, 16, 3);
+        w.write_bit(1); // sign set
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(i.decode_signed_value(&mut r).unwrap(), -21);
+        assert_eq!(r.bits_consumed(), 5);
+    }
+
+    #[test]
+    fn decode_signed_value_round_trips_all_codes_both_signs() {
+        // End-to-end through the emit helper: for every maxcode in
+        // [0, 20], every code in [0, maxcode] and both sign values, the
+        // decoded sample is apply_sign(low + code, sign).
+        let low = 7u32;
+        for maxcode in 0u32..=20 {
+            let i = SampleInterval::new(low, low + maxcode);
+            for code in 0..=maxcode {
+                for sign in [0u32, 1] {
+                    let mut w = BitWriter::new();
+                    emit_truncated_binary(&mut w, maxcode, code);
+                    w.write_bit(sign);
+                    let bytes = w.finish();
+                    let mut r = BitReader::new(&bytes);
+                    assert_eq!(
+                        i.decode_signed_value(&mut r).unwrap(),
+                        apply_sign(low + code, sign != 0),
+                        "maxcode={maxcode} code={code} sign={sign}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_signed_value_matches_manual_value_plus_sign() {
+        // Bit-exact parity (same value AND same cursor) between the
+        // fused decode_signed_value and the manual decode_value +
+        // read_sign_and_apply two-step across a maxcode/code/sign sweep.
+        for maxcode in 0u32..=24 {
+            let i = SampleInterval::new(3, 3 + maxcode);
+            for code in 0..=maxcode {
+                for sign in [0u32, 1] {
+                    let mut w = BitWriter::new();
+                    emit_truncated_binary(&mut w, maxcode, code);
+                    w.write_bit(sign);
+                    let bytes = w.finish();
+                    let mut r_fused = BitReader::new(&bytes);
+                    let mut r_manual = BitReader::new(&bytes);
+                    let fused = i.decode_signed_value(&mut r_fused).unwrap();
+                    let magnitude = i.decode_value(&mut r_manual).unwrap();
+                    let manual = read_sign_and_apply(&mut r_manual, magnitude).unwrap();
+                    assert_eq!(fused, manual, "maxcode={maxcode} code={code} sign={sign}");
+                    assert_eq!(
+                        r_fused.bits_consumed(),
+                        r_manual.bits_consumed(),
+                        "cursors diverge at maxcode={maxcode} code={code} sign={sign}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_signed_value_truncated_at_missing_sign_bit() {
+        // Mantissa bits present, sign bit missing: the §4.2 step 7
+        // read surfaces Truncated. Buffers are byte-granular, so pick
+        // an interval whose mantissa consumes EXACTLY 8 bits: maxcode
+        // = 255 → bitcount = 8, extras = 0 → every code is the long
+        // form (7 short bits + 1 extra bit), filling one byte and
+        // leaving NO ninth bit for the sign.
+        let i = SampleInterval::new(0, 255);
+        let mut w = BitWriter::new();
+        emit_truncated_binary(&mut w, 255, 9);
+        let bytes = w.finish();
+        assert_eq!(bytes.len(), 1, "8 mantissa bits fill exactly one byte");
+        let mut r = BitReader::new(&bytes);
+        assert!(matches!(
+            i.decode_signed_value(&mut r),
+            Err(Error::Truncated)
+        ));
+        // The mantissa itself was fully consumed before the sign read
+        // failed.
+        assert_eq!(r.bits_consumed(), 8);
+    }
+
+    #[test]
+    fn decode_signed_value_parity_with_stateful_loop() {
+        // The decode loop delegates its steps 6 + 7 to
+        // decode_signed_value. Prove parity by hand-walking the spec
+        // ladder (prefix → fold → interval → adapt → signed value) next
+        // to decode_sample_stateful on the same bit-stream.
+        //
+        // Seeds [256, 256, 256] → get_med(0) = 17 → no zero-run
+        // eligibility. Stream: unary "0" (raw 0 → fold → ones_count 0,
+        // Zone 0 interval [0, 16]) + mantissa code 9 + sign 1.
+        let mut w = BitWriter::new();
+        w.write_bit(0); // unary prefix: raw ones_count = 0
+        emit_truncated_binary(&mut w, 16, 9);
+        w.write_bit(1); // sign set
+        let bytes = w.finish();
+
+        // Loop path.
+        let mut medians_loop = AdaptiveMedians::new([256, 256, 256]);
+        let mut state = DecodeState::new();
+        let mut r_loop = BitReader::new(&bytes);
+        let loop_sample =
+            decode_sample_stateful(&mut r_loop, &mut medians_loop, &mut state).unwrap();
+
+        // Hand-walked typed path.
+        let mut medians_hand = AdaptiveMedians::new([256, 256, 256]);
+        let mut run = RunState::new();
+        let mut r_hand = BitReader::new(&bytes);
+        let ones_count = read_folded_ones_count(&mut r_hand, &mut run).unwrap();
+        let interval = medians_hand.sample_interval_for_ones_count(ones_count);
+        medians_hand.adapt(Zone::from_ones_count(ones_count));
+        let hand_sample = interval.decode_signed_value(&mut r_hand).unwrap();
+
+        assert_eq!(loop_sample, hand_sample);
+        assert_eq!(loop_sample, apply_sign(9, true)); // !(0 + 9) = -10
+        assert_eq!(r_loop.bits_consumed(), r_hand.bits_consumed());
+        assert_eq!(medians_loop, medians_hand);
     }
 }

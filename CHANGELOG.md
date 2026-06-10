@@ -8,6 +8,48 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 261 — spec §4.2 step 7 sign-bit reconstruction lifted onto the
+  typed surface.
+
+  The clean-room entropy doc `docs/audio/wavpack/spec/wavpack-entropy-decode.md`
+  §4.2 step 7 specifies the last on-wire field of every sample word:
+  "Sign bit, last. After the magnitude is fixed, read exactly one sign
+  bit. If the sign bit is set the returned sample is the bitwise
+  complement of the magnitude (`~mid`), otherwise the magnitude
+  itself." Round 15 wired this inline at the tail of
+  `decode_sample_stateful` (round 199 in
+  `decode_sample_stateful_stereo`), and round 260's
+  `SampleInterval::decode_value` explicitly stopped at the unsigned
+  magnitude — step 7 had no typed name on the public surface.
+
+  New free functions:
+
+  * `apply_sign(magnitude: u32, sign_bit_set: bool) -> i32` — the pure
+    `const` spec §4.2 step 7 arithmetic: `magnitude as i32` when the
+    sign bit is clear; `!(magnitude as i32)` (two's-complement
+    `-(magnitude + 1)`) when set. Reads no bits.
+  * `read_sign_and_apply(reader, magnitude) -> Result<i32>` — reads
+    exactly ONE bit per the spec sentence and folds it through
+    `apply_sign`.
+
+  New on `SampleInterval`:
+
+  * `SampleInterval::decode_signed_value(reader) -> Result<i32>` —
+    fuses spec §4.2 steps 6 + 7: `decode_value` for the unsigned
+    magnitude, then the sign bit. This is the complete value tail of
+    one sample word (`mantissa bits → sign bit` per the spec §4.2
+    closing on-wire-order line) once the zone selector is fixed.
+
+  Both decode loops (`decode_sample_stateful` /
+  `decode_sample_stateful_stereo`) now delegate their steps 5-8 tail
+  to `AdaptiveMedians::sample_interval_for_ones_count` +
+  `SampleInterval::decode_signed_value`, so the exact bits the loops
+  consume ARE the bits the typed surface consumes. The round-255
+  private `form_interval` tuple shim no longer has production callers
+  and is now `#[cfg(test)]` (kept for the round-255 parity tests).
+
+  15 new tests (559 total, up from 544).
+
 - Round 260 — spec §4.2 step 6 truncated-binary mantissa primitive lifted
   onto the `SampleInterval` surface + spec §3.2 zone-predicate accessors
   on `Zone`.
