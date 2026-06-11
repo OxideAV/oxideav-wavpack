@@ -8,6 +8,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 278 — spec §4.2 step 1 zero-run fast path lifted onto the
+  public typed surface + over-cap shift-overflow hardening.
+
+  The clean-room entropy doc `docs/audio/wavpack/spec/wavpack-entropy-decode.md`
+  §4.2 step 1 specifies the run-of-zeros fast path: when both channels'
+  `median[0]` are ≤ 1 and no holding state is pending, the stream may
+  carry an explicit zero-run — a leading unary count (capped at 33)
+  that is the run length directly when `< 2`, otherwise `count - 1`
+  bits read LSB-first with the top bit implied set; a non-zero run
+  resets both channels' medians to zero and emits a `0` sample. Rounds
+  255 / 260 / 261 / 274 lifted §4.2 steps 5 / 6 / 7 / 2-4 onto the
+  typed surface, leaving step 1 as the only rung still living solely
+  inside the private `try_zero_run_path` helpers.
+
+  New `read_zero_run_length(reader)` is the pure on-wire step 1 decode
+  (no eligibility gate, no median mutation); new
+  `DecodeState::zero_run_eligible(&medians)` and
+  `StereoDecodeState::zero_run_eligible(&[medians; 2])` are the pure
+  eligibility predicates (working `median[0] <= 1` on every channel AND
+  no `last_one` / `last_zero` pending on any `RunState`). Both private
+  zero-run paths now delegate to the predicate + primitive, so the
+  exact bits the decode loops consume ARE the bits the public
+  primitives consume.
+
+  Hardening (same commit): a unary count of exactly 33 in the zero-run
+  context previously hit a `1u32 << 32` shift-overflow debug panic (the
+  spec assigns 33 EOF semantics only in the §4.2 step 3 escape, and a
+  33-count run length needs an implied bit 32 that exceeds the `u32`
+  accumulator) — it now reports `Error::Truncated`, as does a §4.2
+  step 3 second unary beyond the 33 cap in `read_raw_prefix` (formerly
+  a `get_bits(33)` / `1u32 << 33` debug panic on adversarial input).
+  Both edges are spec-silent; failing loudly replaces undefined
+  arithmetic. 12 new tests (583 total, up from 571) pin: direct counts
+  0 / 1 with exact bit consumption; the implied-top-bit round-trip
+  across run lengths `[2, 600]` at exactly `2 * count` bits; the
+  widest in-range form (`count == 32` → `u32::MAX`); the 33-cap and
+  over-cap typed errors (no panic); `Truncated` on an empty buffer;
+  every mono + stereo eligibility gate (median threshold at the
+  `get_med` 15/16 raw boundary, each of the holding bits); bit-exact
+  loop-vs-primitive parity on a length-5 zero-run including the
+  no-bits drain of the pending debt; the mono + stereo loop-level cap
+  errors (stereo also pinning the untouched `next_channel` error
+  contract); and the `read_raw_prefix` second-unary over-cap error.
+
 - Round 274 — spec §4.2 step 2 + 3 raw modified-Rice prefix decode and
   spec §4.2 step 4 holding-bit fold lifted onto the public typed
   surface.

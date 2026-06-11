@@ -1438,6 +1438,21 @@ impl DecodeState {
             ever_took_zero_run: false,
         }
     }
+
+    /// Spec §4.2 step 1 eligibility gate for the mono loop: the
+    /// zero-run fast path may only be probed when the channel's working
+    /// `median[0]` is `<= 1` (spec: "If both channels' `median[0]` are
+    /// ≤ 1" — for mono, the one channel) AND no holding state is
+    /// pending ("and no 'holding' state is pending") — neither the
+    /// `last_one` carry nor the `last_zero` short-circuit may be set.
+    ///
+    /// Pure predicate — reads no bits, mutates nothing. Pair with
+    /// [`read_zero_run_length`] to walk the spec §4.2 step 1 fast path
+    /// by hand; the private decode loop's gate IS this predicate.
+    /// Round 278.
+    pub fn zero_run_eligible(&self, medians: &AdaptiveMedians) -> bool {
+        medians.get_med(0) <= 1 && !self.run.last_one && !self.run.last_zero
+    }
 }
 
 /// Spec §4.2 steps 2 + 3: read the **raw** modified-Rice unary prefix
@@ -1464,7 +1479,12 @@ impl DecodeState {
 ///
 /// `Error::Truncated` may surface from any of the unary / multi-bit
 /// reads if the buffer runs out; `Error::EndOfStream` is the explicit
-/// `cbits == 33` EOF marker, distinct from a buffer that merely ran dry.
+/// `cbits == 33` EOF marker, distinct from a buffer that merely ran
+/// dry. A second unary run **beyond** the cap (`cbits > 33`) is
+/// spec-silent ("read a further unary count of up to 33 1-bits") and
+/// reports `Error::Truncated` — failing loudly instead of overflowing
+/// the `cbits - 1`-bit mantissa assembly (round 278; previously a
+/// shift-overflow debug panic).
 pub fn read_raw_prefix(reader: &mut BitReader<'_>) -> Result<u32> {
     let raw = reader.get_unary()?;
     if raw < UNARY_ESCAPE {
@@ -1474,6 +1494,14 @@ pub fn read_raw_prefix(reader: &mut BitReader<'_>) -> Result<u32> {
     let cbits = reader.get_unary()?;
     if cbits == ESCAPE_EOF_CBITS {
         return Err(Error::EndOfStream);
+    }
+    if cbits > ESCAPE_EOF_CBITS {
+        // Spec-silent edge: the §4.2 step 3 second unary is "up to 33"
+        // — a longer run contradicts the cap, and `cbits - 1 >= 33`
+        // mantissa bits would overflow the u32 assembly below. Treat as
+        // truncated to fail loudly rather than wrapping. (Before round
+        // 278 this input hit a shift-overflow debug panic.)
+        return Err(Error::Truncated);
     }
     if cbits < 2 {
         Ok(UNARY_ESCAPE + cbits)
@@ -1600,6 +1628,54 @@ pub fn read_sign_and_apply(reader: &mut BitReader<'_>, magnitude: u32) -> Result
     Ok(apply_sign(magnitude, sign != 0))
 }
 
+/// Spec §4.2 step 1 on-wire run-length decode: read an explicit
+/// zero-run length from the main bitstream.
+///
+/// Per the spec §4.2 step 1 prose: "A leading unary count of 1-bits
+/// (capped at 33) is read; if `< 2` it is the run length directly,
+/// otherwise the remaining `count-1` bits are read low-bit-first to
+/// form the run length with the top bit implied set." Concretely:
+///
+/// * `count == 0` → run length `0` (the encoder's "no zero run here"
+///   signal — one bit consumed, no zero samples owed beyond the call's
+///   own emit).
+/// * `count == 1` → run length `1`.
+/// * `2 <= count <= 32` → read `count - 1` mantissa bits LSB-first;
+///   run length is `(1 << (count - 1)) | mantissa`.
+/// * `count >= 33` → [`Error::Truncated`]. The spec caps the unary at
+///   [`RUN_ESCAPE_CAP`] (`33`) and assigns no meaning to the cap value
+///   in the zero-run context (unlike the §4.2 step 3 escape, where `33`
+///   is the EOF marker); a 33-count run length would also need an
+///   implied bit 32, exceeding the 32-bit accumulator. Failing loudly
+///   beats a silent wrap. (Before round 278 the private path hit a
+///   shift-overflow debug panic on exactly this input.)
+///
+/// This is the pure on-wire half of the §4.2 step 1 fast path: it does
+/// NOT gate on eligibility and does NOT mutate medians or decode state
+/// — pair it with [`DecodeState::zero_run_eligible`] (or
+/// [`StereoDecodeState::zero_run_eligible`]) for the gate, and apply
+/// the spec's "a non-zero run resets both channels' medians to zero and
+/// emits a `0` sample" consequence at the caller. The private decode
+/// loops delegate here, so the exact bits they consume ARE the bits
+/// this primitive consumes.
+pub fn read_zero_run_length(reader: &mut BitReader<'_>) -> Result<u32> {
+    let count = reader.get_unary()?;
+    if count >= RUN_ESCAPE_CAP {
+        // Spec-silent edge: >= 33 contradicts the cap (and 33 itself
+        // would overflow the u32 run length via the implied top bit).
+        // Treat as truncated to fail loudly rather than wrapping.
+        return Err(Error::Truncated);
+    }
+    if count < 2 {
+        Ok(count)
+    } else {
+        // Read count-1 LSB-first mantissa bits with the top bit implied
+        // set, exactly as the spec §4.2 step 1 prose specifies.
+        let mantissa = reader.get_bits(count - 1)?;
+        Ok((1u32 << (count - 1)) | mantissa)
+    }
+}
+
 /// Spec §4.2 step 1 attempt: when the channel's `median[0]` is `<= 1`
 /// AND no holding state is pending (no `last_one` carry, no
 /// `last_zero` short-circuit waiting), the stream may carry an explicit
@@ -1625,31 +1701,17 @@ fn try_zero_run_path(
     medians: &mut AdaptiveMedians,
     state: &mut DecodeState,
 ) -> Result<Option<i32>> {
-    // Spec §4.2 step 1 eligibility: median[0] <= 1 AND no holding-bit
-    // pending. For mono "both channels" reduces to the one channel.
-    if medians.get_med(0) > 1 {
-        return Ok(None);
-    }
-    if state.run.last_one || state.run.last_zero {
+    // Spec §4.2 step 1 eligibility gate, via the round-278 public
+    // predicate: median[0] <= 1 AND no holding-bit pending. For mono
+    // "both channels" reduces to the one channel.
+    if !state.zero_run_eligible(medians) {
         return Ok(None);
     }
 
-    // Read the zero-run unary, capped at RUN_ESCAPE_CAP per spec.
-    let count = reader.get_unary()?;
-    if count > RUN_ESCAPE_CAP {
-        // Defensive: a >33 run from a well-formed stream contradicts
-        // the spec cap. Treat as truncated to fail loudly rather than
-        // silently truncating.
-        return Err(Error::Truncated);
-    }
-    let run_length = if count < 2 {
-        count
-    } else {
-        // Read count-1 LSB-first mantissa bits with the top bit implied
-        // set, exactly as the spec §4.2 step 1 prose specifies.
-        let mantissa = reader.get_bits(count - 1)?;
-        (1u32 << (count - 1)) | mantissa
-    };
+    // On-wire run length via the round-278 public primitive — the
+    // exact bits this path consumes ARE the bits the primitive
+    // consumes.
+    let run_length = read_zero_run_length(reader)?;
 
     if run_length > 0 {
         // Non-zero run: spec §4.2 step 1 — "resets both channels'
@@ -1837,6 +1899,25 @@ impl StereoDecodeState {
             next_channel: 0,
         }
     }
+
+    /// Spec §4.2 step 1 eligibility gate for the stereo loop: the
+    /// zero-run fast path may only be probed when **both** channels'
+    /// working `median[0]` are `<= 1` (spec: "If both channels'
+    /// `median[0]` are ≤ 1") AND **neither** channel's holding state
+    /// is pending — no `last_one` carry and no `last_zero`
+    /// short-circuit on either [`RunState`].
+    ///
+    /// Pure predicate — reads no bits, mutates nothing. Stereo
+    /// counterpart of [`DecodeState::zero_run_eligible`]; the private
+    /// stereo decode loop's gate IS this predicate. Round 278.
+    pub fn zero_run_eligible(&self, medians: &[AdaptiveMedians; 2]) -> bool {
+        medians[0].get_med(0) <= 1
+            && medians[1].get_med(0) <= 1
+            && !self.left_run.last_one
+            && !self.left_run.last_zero
+            && !self.right_run.last_one
+            && !self.right_run.last_zero
+    }
 }
 
 /// Spec §4.2 step 1 attempt for the stereo path: gate on **both**
@@ -1852,31 +1933,16 @@ fn try_zero_run_path_stereo(
     medians: &mut [AdaptiveMedians; 2],
     state: &mut StereoDecodeState,
 ) -> Result<Option<i32>> {
-    // Spec §4.2 step 1 eligibility for stereo: BOTH channels' median[0]
-    // must satisfy <= 1, AND neither channel's holding state may be
-    // pending.
-    if medians[0].get_med(0) > 1 || medians[1].get_med(0) > 1 {
-        return Ok(None);
-    }
-    if state.left_run.last_one
-        || state.left_run.last_zero
-        || state.right_run.last_one
-        || state.right_run.last_zero
-    {
+    // Spec §4.2 step 1 eligibility gate for stereo, via the round-278
+    // public predicate: BOTH channels' median[0] must satisfy <= 1, AND
+    // neither channel's holding state may be pending.
+    if !state.zero_run_eligible(medians) {
         return Ok(None);
     }
 
-    // Read the zero-run unary, capped at RUN_ESCAPE_CAP per spec.
-    let count = reader.get_unary()?;
-    if count > RUN_ESCAPE_CAP {
-        return Err(Error::Truncated);
-    }
-    let run_length = if count < 2 {
-        count
-    } else {
-        let mantissa = reader.get_bits(count - 1)?;
-        (1u32 << (count - 1)) | mantissa
-    };
+    // On-wire run length via the round-278 public primitive — the exact
+    // bits this path consumes ARE the bits the primitive consumes.
+    let run_length = read_zero_run_length(reader)?;
 
     if run_length > 0 {
         // Non-zero run: spec §4.2 step 1 "resets both channels' medians
@@ -5584,5 +5650,232 @@ mod tests {
             read_folded_ones_count(&mut r, &mut state),
             Err(Error::EndOfStream)
         );
+    }
+
+    // ---- Round 278: §4.2 step 1 zero-run fast path on the public
+    // typed surface + over-cap hardening ------------------------------
+
+    /// Emit a zero-run length through the spec §4.2 step 1 encode — the
+    /// inverse of [`read_zero_run_length`]. Run lengths `< 2` are the
+    /// unary count directly; larger values emit their bit-length as the
+    /// unary count and the low `count - 1` bits LSB-first (the top bit
+    /// is implied set).
+    fn emit_zero_run_length(w: &mut BitWriter, run_length: u32) {
+        if run_length < 2 {
+            w.write_unary(run_length);
+        } else {
+            let count = 32 - run_length.leading_zeros(); // bit-length
+            w.write_unary(count);
+            w.write_bits(run_length, count - 1); // top bit implied
+        }
+    }
+
+    #[test]
+    fn read_zero_run_length_direct_counts() {
+        // count < 2 is the run length directly: count 0 consumes one
+        // bit (the terminator alone), count 1 consumes two.
+        let mut w = BitWriter::new();
+        w.write_unary(0);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_zero_run_length(&mut r).unwrap(), 0);
+        assert_eq!(r.bits_consumed(), 1);
+
+        let mut w = BitWriter::new();
+        w.write_unary(1);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_zero_run_length(&mut r).unwrap(), 1);
+        assert_eq!(r.bits_consumed(), 2);
+    }
+
+    #[test]
+    fn read_zero_run_length_implied_top_bit_round_trip() {
+        // Every run length in [2, 600] round-trips through the
+        // implied-top-bit form with exact bit accounting: (count + 1)
+        // unary bits + (count - 1) mantissa bits = 2 * count.
+        for run_length in 2..=600u32 {
+            let mut w = BitWriter::new();
+            emit_zero_run_length(&mut w, run_length);
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(read_zero_run_length(&mut r).unwrap(), run_length);
+            let count = 32 - run_length.leading_zeros();
+            assert_eq!(r.bits_consumed(), (2 * count) as usize);
+        }
+    }
+
+    #[test]
+    fn read_zero_run_length_count_32_reaches_u32_max() {
+        // count == 32 (the widest in-range form) with an all-ones
+        // mantissa decodes to u32::MAX without overflow.
+        let mut w = BitWriter::new();
+        w.write_unary(32);
+        w.write_bits(u32::MAX, 31);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_zero_run_length(&mut r).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn read_zero_run_length_cap_count_is_error_not_panic() {
+        // count == 33 (RUN_ESCAPE_CAP) has no assigned meaning in the
+        // zero-run context (the spec only gives 33 EOF semantics in the
+        // §4.2 step 3 escape) and its implied bit 32 exceeds the u32
+        // accumulator — typed error, not a shift-overflow panic.
+        let mut w = BitWriter::new();
+        w.write_unary(RUN_ESCAPE_CAP);
+        w.write_bits(0, 32); // padding the old panic path would have read
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_zero_run_length(&mut r), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn read_zero_run_length_over_cap_is_error() {
+        // A 40-one unary contradicts the spec's 33 cap outright.
+        let mut w = BitWriter::new();
+        w.write_unary(40);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_zero_run_length(&mut r), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn read_zero_run_length_truncated_empty() {
+        let bytes: [u8; 0] = [];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_zero_run_length(&mut r), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn decode_state_zero_run_eligible_gates() {
+        // Eligible: working median[0] == 1 (raw <= 15 → get_med == 1)
+        // and a clean run state.
+        let state = DecodeState::new();
+        assert!(state.zero_run_eligible(&AdaptiveMedians::new([15, 0, 0])));
+
+        // Gate 1: working median[0] > 1 (raw >= 16 → get_med >= 2).
+        assert!(!state.zero_run_eligible(&AdaptiveMedians::new([16, 0, 0])));
+
+        // Gate 2: last_one carry pending.
+        let mut held_one = DecodeState::new();
+        held_one.run.last_one = true;
+        assert!(!held_one.zero_run_eligible(&AdaptiveMedians::new([0, 0, 0])));
+
+        // Gate 3: last_zero short-circuit pending.
+        let mut held_zero = DecodeState::new();
+        held_zero.run.last_zero = true;
+        assert!(!held_zero.zero_run_eligible(&AdaptiveMedians::new([0, 0, 0])));
+    }
+
+    #[test]
+    fn stereo_decode_state_zero_run_eligible_gates() {
+        let low = AdaptiveMedians::new([0, 0, 0]);
+        let high = AdaptiveMedians::new([16, 0, 0]);
+        let state = StereoDecodeState::new();
+        assert!(state.zero_run_eligible(&[low, low]));
+        // Either channel's median[0] over the threshold blocks the path.
+        assert!(!state.zero_run_eligible(&[high, low]));
+        assert!(!state.zero_run_eligible(&[low, high]));
+        // Any of the four holding bits blocks the path.
+        for setter in 0..4 {
+            let mut s = StereoDecodeState::new();
+            match setter {
+                0 => s.left_run.last_one = true,
+                1 => s.left_run.last_zero = true,
+                2 => s.right_run.last_one = true,
+                _ => s.right_run.last_zero = true,
+            }
+            assert!(!s.zero_run_eligible(&[low, low]), "setter {setter}");
+        }
+    }
+
+    #[test]
+    fn zero_run_loop_matches_public_primitives() {
+        // The mono loop's zero-run arm consumes exactly the bits
+        // read_zero_run_length consumes, gated by zero_run_eligible.
+        let mut w = BitWriter::new();
+        emit_zero_run_length(&mut w, 5);
+        let bytes = w.finish();
+
+        let mut medians = AdaptiveMedians::new([4, 100, 100]); // get_med(0) == 1
+        let mut state = DecodeState::new();
+        assert!(state.zero_run_eligible(&medians));
+        let mut r_loop = BitReader::new(&bytes);
+        assert_eq!(
+            decode_sample_stateful(&mut r_loop, &mut medians, &mut state).unwrap(),
+            0
+        );
+        assert!(state.ever_took_zero_run);
+        assert_eq!(state.zero_run_pending, 4);
+        assert_eq!(medians.values, [0, 0, 0]); // spec §4.2 step 1 reset
+
+        // Hand-walked primitive: same bits, same run length.
+        let mut r_hand = BitReader::new(&bytes);
+        assert_eq!(read_zero_run_length(&mut r_hand).unwrap(), 5);
+        assert_eq!(r_loop.bits_consumed(), r_hand.bits_consumed());
+
+        // The remaining 4 zero samples drain without reading bits.
+        for _ in 0..4 {
+            let before = r_loop.bits_consumed();
+            assert_eq!(
+                decode_sample_stateful(&mut r_loop, &mut medians, &mut state).unwrap(),
+                0
+            );
+            assert_eq!(r_loop.bits_consumed(), before);
+        }
+        assert_eq!(state.zero_run_pending, 0);
+    }
+
+    #[test]
+    fn decode_sample_stateful_zero_run_cap_is_error_not_panic() {
+        // 33 leading ones on an eligible channel previously hit the
+        // `1u32 << 32` shift-overflow debug panic inside the private
+        // zero-run path; the loop now surfaces a typed error.
+        let mut w = BitWriter::new();
+        w.write_unary(RUN_ESCAPE_CAP);
+        w.write_bits(0, 32);
+        let bytes = w.finish();
+        let mut medians = AdaptiveMedians::new([0, 0, 0]);
+        let mut state = DecodeState::new();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            decode_sample_stateful(&mut r, &mut medians, &mut state),
+            Err(Error::Truncated)
+        );
+    }
+
+    #[test]
+    fn decode_sample_stateful_stereo_zero_run_cap_is_error_not_panic() {
+        // Stereo twin of the cap hardening: the stream-level zero-run
+        // arm surfaces the same typed error.
+        let mut w = BitWriter::new();
+        w.write_unary(RUN_ESCAPE_CAP);
+        w.write_bits(0, 32);
+        let bytes = w.finish();
+        let mut medians = [AdaptiveMedians::new([0, 0, 0]); 2];
+        let mut state = StereoDecodeState::new();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            decode_sample_stateful_stereo(&mut r, &mut medians, &mut state),
+            Err(Error::Truncated)
+        );
+        // On error the channel cursor is untouched (next sample still
+        // left), matching the loop's error contract.
+        assert_eq!(state.next_channel, 0);
+    }
+
+    #[test]
+    fn read_raw_prefix_second_unary_over_cap_is_error_not_panic() {
+        // 16 ones (escape) then a 34-one second unary: the spec caps
+        // the second unary at 33 ("up to 33 1-bits"); previously
+        // `get_bits(33)` / `1u32 << 33` panicked in debug builds.
+        let mut w = BitWriter::new();
+        w.write_unary(UNARY_ESCAPE);
+        w.write_unary(34);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_raw_prefix(&mut r), Err(Error::Truncated));
     }
 }

@@ -809,8 +809,9 @@ pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
     decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy, decode_run_length,
     decode_sample, decode_sample_stateful, decode_sample_stateful_stereo, decode_sample_value,
-    golomb_interval, read_folded_ones_count, read_raw_prefix, read_sign_and_apply, AdaptiveMedians,
-    BitReader, DecodeState, GolombInterval, Medians, RunState, SampleInterval, StereoDecodeState,
-    Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT, INTERVAL_MASK_31,
-    MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
+    golomb_interval, read_folded_ones_count, read_raw_prefix, read_sign_and_apply,
+    read_zero_run_length, AdaptiveMedians, BitReader, DecodeState, GolombInterval, Medians,
+    RunState, SampleInterval, StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS,
+    GET_MED_FLOOR, GET_MED_SHIFT, INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER,
+    RUN_ESCAPE_CAP, UNARY_ESCAPE,
 };
