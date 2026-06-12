@@ -368,14 +368,109 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// Adaptive run-state carried between successive [`decode_run_length`]
-/// calls, mirroring the wiki's `last_zero` / `last_one` locals.
+/// Least-significant-bit-first bit emitter — the exact write-side twin
+/// of [`BitReader`] (spec §4.1: bits leave the stream LSB-first within
+/// each byte, multi-bit fields assembled low-bit-first; the writer
+/// therefore places the **first** written bit in bit 0 of the current
+/// byte). Round 281, lifted from the long-standing test-side inverse
+/// helper onto the public surface for the spec §4.2 inverse encoder.
 ///
-/// The wiki keeps two booleans across samples: after a sample whose
-/// run-length index `n` was odd it sets `last_one`, and the next call
-/// is forced to `n = 0` (via `last_zero`). [`RunState`] packages that
-/// carry so a caller can decode a sequence of run-lengths from one
-/// [`BitReader`].
+/// Every bit written through this type is readable back, in order,
+/// through a [`BitReader`] over [`BitWriter::finish`]'s bytes — the
+/// reader/writer pairing is the bit-exactness contract every
+/// `emit_*` / `read_*` primitive pair in this module is tested
+/// against.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BitWriter {
+    bytes: Vec<u8>,
+    cur: u8,
+    nbits: u8,
+}
+
+impl BitWriter {
+    /// Fresh writer with no bits emitted.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a single bit (the low bit of `bit`; higher bits are
+    /// ignored, mirroring [`BitReader::get_bit`]'s 0/1 return domain).
+    pub fn write_bit(&mut self, bit: u32) {
+        self.cur |= ((bit & 1) as u8) << self.nbits;
+        self.nbits += 1;
+        if self.nbits == 8 {
+            self.bytes.push(self.cur);
+            self.cur = 0;
+            self.nbits = 0;
+        }
+    }
+
+    /// Append the low `count` bits of `value`, LSB-first — the exact
+    /// inverse of [`BitReader::get_bits`]. `count` must be `<= 32`;
+    /// bits of `value` at or above `count` are ignored.
+    pub fn write_bits(&mut self, value: u32, count: u32) {
+        debug_assert!(count <= 32, "write_bits count {count} exceeds 32");
+        for i in 0..count {
+            self.write_bit((value >> i) & 1);
+        }
+    }
+
+    /// Append `n` `1` bits followed by a single `0` terminator — the
+    /// exact inverse of [`BitReader::get_unary`].
+    pub fn write_unary(&mut self, n: u32) {
+        for _ in 0..n {
+            self.write_bit(1);
+        }
+        self.write_bit(0);
+    }
+
+    /// Total bits written so far (before any final-byte padding).
+    pub fn bits_written(&self) -> usize {
+        self.bytes.len() * 8 + self.nbits as usize
+    }
+
+    /// `true` when no bits have been written.
+    pub fn is_empty(&self) -> bool {
+        self.bits_written() == 0
+    }
+
+    /// Consume the writer, zero-padding the final partial byte (the
+    /// pad bits land in the high, later-read positions, so a reader
+    /// consuming exactly the written bits never sees them).
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            self.bytes.push(self.cur);
+        }
+        self.bytes
+    }
+}
+
+/// Adaptive run-state carried between successive [`decode_run_length`]
+/// calls — the spec §4.2 step 4 "holding one" / "holding zero"
+/// registers under the wiki's shorter `last_one` / `last_zero` names.
+///
+/// Two booleans carry across samples, and each transmitted raw prefix
+/// encodes the boundary between two adjacent words through them (spec
+/// §4.2 step 4):
+///
+/// * a raw prefix with its low bit **set** holds a one — the **next**
+///   word's folded `ones_count` gains `+1` (so its own raw prefix is
+///   two ones shorter on the wire);
+/// * a raw prefix with its low bit **clear** holds a zero — the
+///   **next** word's `ones_count` is `0` outright and that word reads
+///   **no prefix bits at all** (the `last_zero` short-circuit).
+///
+/// [`RunState`] packages that carry so a caller can decode a sequence
+/// of prefixes from one [`BitReader`]. Round 281 corrected the fold to
+/// the spec §4.2 step 4 prior-state form ("if a one **is being held**…
+/// the **new** held-one is the **old** low bit"): the `+1` comes from
+/// the held state the word *entered* with, not from the raw value's
+/// own low bit. The wiki pseudocode assigns `last_one = n & 1` before
+/// testing it — a transcription divergence the staged docs README
+/// explicitly flags as non-factual; the self-referencing form cannot
+/// represent a zone-0 word followed by a non-zero-zone word at all, so
+/// the prior-state form is also the only reading under which every
+/// sample sequence is encodable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunState {
     /// The wiki `last_zero` flag — when set, the next decode short-
@@ -402,85 +497,115 @@ impl RunState {
     /// the `ones_count` zone selector the step-5 interval ladder takes,
     /// updating the held `last_one` / `last_zero` carry in place.
     ///
-    /// Per the spec: if a one is being held, the folded `ones_count` is
-    /// `(raw_value >> 1) + 1`, else it is `raw_value >> 1`; the new
-    /// held-one is the old low bit and the held-zero is its complement:
+    /// Per the spec ("if a one is being held, `ones_count =
+    /// (ones_count >> 1) + 1`, else `ones_count >>= 1`; the new
+    /// held-one is the old low bit and the held-zero is its
+    /// complement"):
     ///
-    /// * the new `last_one` is the low bit of `raw_value`;
-    /// * the folded `ones_count` is `(raw_value >> 1) + 1` when that low
-    ///   bit is set, else `raw_value >> 1`;
+    /// * the folded `ones_count` is `(raw_value >> 1) + 1` when a one
+    ///   **was being held on entry** (`self.last_one`), else
+    ///   `raw_value >> 1`;
+    /// * the **new** `last_one` is the low bit of `raw_value` (the "old
+    ///   low bit" — the bit the shift discards);
     /// * the new `last_zero` is the complement of the new `last_one`.
     ///
-    /// Reads no bits — pure state arithmetic over `raw_value`. This is
-    /// the typed lift of the §4.2 step-4 fold the private decode loop
-    /// previously inlined; pairing it with [`read_raw_prefix`]
-    /// reconstructs the full §4.2 step 2 + 3 + 4 prefix decode.
+    /// So the raw prefix's low bit is a carry **into the next word**:
+    /// set, it adds one to the next word's folded count; clear, it
+    /// pre-encodes the next word's count as `0` (the `last_zero`
+    /// short-circuit in [`read_folded_ones_count`], which reads no
+    /// bits). Reads no bits itself — pure state arithmetic over
+    /// `raw_value`. Pairing it with [`read_raw_prefix`] reconstructs
+    /// the full §4.2 step 2 + 3 + 4 prefix decode; the exact inverse is
+    /// [`RunState::unfold_prefix`].
+    ///
+    /// Round 281 corrected the `+1` source from the raw value's own low
+    /// bit (the wiki pseudocode's assign-then-test order, flagged
+    /// non-factual by the staged docs) to the prior held state the spec
+    /// prose describes — see the type-level docs for why the
+    /// prior-state form is the only coherent reading.
     pub const fn fold_prefix(&mut self, raw_value: u32) -> u32 {
-        let last_one_bit = (raw_value & 1) != 0;
-        let ones_count = if last_one_bit {
+        let ones_count = if self.last_one {
             (raw_value >> 1) + 1
         } else {
             raw_value >> 1
         };
+        let last_one_bit = (raw_value & 1) != 0;
         self.last_one = last_one_bit;
         self.last_zero = !last_one_bit;
         ones_count
+    }
+
+    /// Exact inverse of [`RunState::fold_prefix`]: pick the raw
+    /// modified-Rice prefix that folds to `ones_count` under the
+    /// current held state, choosing the new low-bit carry.
+    ///
+    /// `hold_one` selects the raw value's low bit — the carry **into
+    /// the next word** (spec §4.2 step 4 "the new held-one is the old
+    /// low bit"):
+    ///
+    /// * `hold_one == true` → the next word's folded count gains `+1`
+    ///   (so it must be `>= 1`);
+    /// * `hold_one == false` → the next word's count is pre-encoded as
+    ///   `0` and that word reads no prefix bits (the `last_zero`
+    ///   short-circuit).
+    ///
+    /// Returns the raw prefix to hand to [`emit_raw_prefix`] and
+    /// updates the held state exactly as the decoder-side fold will,
+    /// or `None` when no raw value folds to `ones_count` from the
+    /// current state:
+    ///
+    /// * a held one on entry with `ones_count == 0` (the fold adds
+    ///   `+1`, so `0` is unreachable);
+    /// * `ones_count - carry > (u32::MAX - 1) / 2` (the doubled raw
+    ///   would not fit `u32` — unreachable for magnitudes that fit the
+    ///   spec §4.2 step 5 31-bit interval mask).
+    ///
+    /// On `None` the state is untouched. Like the fold, this performs
+    /// no I/O; callers in `last_zero` state must consume the
+    /// short-circuit (which emits nothing) instead of calling this.
+    pub const fn unfold_prefix(&mut self, ones_count: u32, hold_one: bool) -> Option<u32> {
+        let carry = if self.last_one { 1u32 } else { 0u32 };
+        if ones_count < carry {
+            return None;
+        }
+        let halved = ones_count - carry;
+        if halved > (u32::MAX - 1) / 2 {
+            return None;
+        }
+        let raw = (halved << 1) | if hold_one { 1 } else { 0 };
+        self.last_one = hold_one;
+        self.last_zero = !hold_one;
+        Some(raw)
     }
 }
 
 /// Decode the run-length index `n` for one sample, advancing both the
 /// bit reader and the adaptive [`RunState`].
 ///
-/// This is the first half of the wiki "Samples coding" pseudocode —
-/// the part that turns the unary prefix (with the `n == 16` escape)
-/// into the halved run-length index and updates `last_zero` /
-/// `last_one`:
+/// This is the round-5 name for the first half of the sample-word
+/// decode — the unary prefix (with the `LIMIT_ONES = 16` escape) and
+/// the `last_zero` / `last_one` carry. Since round 281 it delegates to
+/// [`read_folded_ones_count`], which composes [`read_raw_prefix`]
+/// (spec §4.2 steps 2 + 3, with the `cbits == 33` EOF surfaced as
+/// [`Error::EndOfStream`] and the over-cap second unary as
+/// [`Error::Truncated`] instead of the round-5 shift-overflow panic)
+/// with [`RunState::fold_prefix`] (the spec §4.2 step 4 prior-state
+/// fold).
 ///
-/// ```text
-/// if(last_zero){ n = 0; last_zero = 0; }
-/// else{
-///   n = get_unary();
-///   if(n == 16){
-///     n2 = get_unary();
-///     if(n2 < 2) n += n2;
-///     else       n += (1 << (n2-1)) | getbits(n2-1);
-///   }
-///   last_one = n & 1;
-///   if(last_one) n = (n>>1) + 1;
-///   else         n = n >> 1;
-///   last_zero = !last_one;
-/// }
-/// ```
+/// The wiki "Samples coding" pseudocode this function originally
+/// transcribed assigns `last_one = n & 1` **before** testing it in the
+/// halving — a divergence from the spec §4.2 step 4 prose ("if a one
+/// **is being held** … the **new** held-one is the **old** low bit")
+/// that the staged docs README explicitly flags: the wiki pseudocode
+/// mirrors a third-party transcription and is NOT a factual source.
+/// Round 281 aligned this function with the spec; under the wiki's
+/// self-referencing order a zone-0 word could never be followed by a
+/// non-zero-zone word, which no working sample stream could satisfy.
 ///
-/// The returned `n` is the run-length index the (deferred) second half
-/// of the pseudocode maps onto a Golomb `(base, add)` interval. The
-/// escape `getbits(n2 - 1)` is only reached when `n2 >= 2`, so the
-/// argument is always `>= 1`.
+/// The returned `n` is the run-length index the second half of the
+/// decode maps onto a Golomb `(base, add)` interval.
 pub fn decode_run_length(reader: &mut BitReader<'_>, state: &mut RunState) -> Result<u32> {
-    if state.last_zero {
-        state.last_zero = false;
-        // The wiki leaves last_one untouched on this branch; it is only
-        // (re)assigned inside the else arm. Mirror that exactly.
-        return Ok(0);
-    }
-
-    let mut n = reader.get_unary()?;
-    if n == UNARY_ESCAPE {
-        let n2 = reader.get_unary()?;
-        if n2 < 2 {
-            n += n2;
-        } else {
-            // getbits(n2 - 1): n2 >= 2 here so the argument is >= 1.
-            let mantissa = reader.get_bits(n2 - 1)?;
-            n += (1u32 << (n2 - 1)) | mantissa;
-        }
-    }
-
-    let last_one = (n & 1) != 0;
-    n = if last_one { (n >> 1) + 1 } else { n >> 1 };
-    state.last_one = last_one;
-    state.last_zero = !last_one;
-    Ok(n)
+    read_folded_ones_count(reader, state)
 }
 
 /// The three medians (`median[0]`, `median[1]`, `median[2]`) for one
@@ -998,6 +1123,41 @@ impl AdaptiveMedians {
     pub fn sample_interval_for_ones_count(&self, ones_count: u32) -> SampleInterval {
         self.sample_interval(Zone::from_ones_count(ones_count))
     }
+
+    /// Inverse of the spec §4.2 step 5 interval ladder: the `ones_count`
+    /// zone selector whose (pre-mask) interval contains `magnitude`.
+    ///
+    /// Walks the ladder's own breakpoints (`get_med` working values):
+    ///
+    /// * `magnitude < get_med(0)` → zone `0`;
+    /// * `magnitude < get_med(0) + get_med(1)` → zone `1`;
+    /// * otherwise → `2 + (magnitude - get_med(0) - get_med(1)) /
+    ///   get_med(2)` (each overflow step adds one `get_med(2)` stride to
+    ///   the zone-2 base, per the step 5 overflow arm).
+    ///
+    /// For every magnitude `<=` [`INTERVAL_MASK_31`] the returned zone's
+    /// **unmasked** interval contains the magnitude by construction; the
+    /// **masked** interval ([`AdaptiveMedians::sample_interval_for_ones_count`])
+    /// can collapse below it only in the 31-bit-boundary corner where
+    /// `low + get_med(2) - 1` crosses the mask — encoder callers verify
+    /// with [`SampleInterval::contains`] and surface
+    /// [`Error::ValueNotInInterval`] there (no decode of the same median
+    /// state could have produced such a magnitude). Round 281.
+    pub fn zone_for_magnitude(&self, magnitude: u32) -> u32 {
+        let m0 = self.get_med(0);
+        let m1 = self.get_med(1);
+        if magnitude < m0 {
+            return 0;
+        }
+        let zone1_width = m1;
+        let past_m0 = magnitude - m0;
+        if past_m0 < zone1_width {
+            return 1;
+        }
+        let m2 = self.get_med(2);
+        // get_med() >= 1 always (the +1 floor), so the division is safe.
+        2 + (past_m0 - zone1_width) / m2
+    }
 }
 
 /// Spec §4.2 step 5 typed `(low, high)` value interval — the bracket
@@ -1190,6 +1350,82 @@ impl SampleInterval {
     pub fn decode_signed_value(&self, reader: &mut BitReader<'_>) -> Result<i32> {
         let magnitude = self.decode_value(reader)?;
         read_sign_and_apply(reader, magnitude)
+    }
+
+    /// Exact inverse of [`Self::decode_mantissa`]: emit the truncated-
+    /// binary bit pattern for the mantissa `code` inside this interval
+    /// (spec §4.2 step 6 first paragraph, write side).
+    ///
+    /// * `maxcode == 0` → emits no bits (`code` must be `0`).
+    /// * `maxcode == 1` → emits one bit (the code itself).
+    /// * `maxcode >= 2` → codes `< extras` emit the short
+    ///   `(bitcount - 1)`-bit form; codes `>= extras` emit the full
+    ///   `bitcount`-bit long form `short = (code + extras) >> 1`
+    ///   followed by `extra_bit = (code + extras) & 1` (the decode's
+    ///   `code = (short << 1) - extras + extra_bit` solved for the
+    ///   written bits).
+    ///
+    /// Returns [`Error::ValueNotInInterval`] (with the code reported
+    /// against `[0, maxcode]`) when `code > maxcode`; nothing is
+    /// written in that case. Round 281.
+    pub fn encode_mantissa(&self, writer: &mut BitWriter, code: u32) -> Result<()> {
+        let maxcode = self.maxcode();
+        if code > maxcode {
+            return Err(Error::ValueNotInInterval {
+                value: code,
+                low: 0,
+                high: maxcode,
+            });
+        }
+        if maxcode == 0 {
+            return Ok(());
+        }
+        if maxcode == 1 {
+            writer.write_bit(code);
+            return Ok(());
+        }
+        let bitcount = self.mantissa_bitcount();
+        let extras = self.mantissa_extras();
+        if code < extras {
+            writer.write_bits(code, bitcount - 1);
+        } else {
+            let combined = code + extras;
+            writer.write_bits(combined >> 1, bitcount - 1);
+            writer.write_bit(combined & 1);
+        }
+        Ok(())
+    }
+
+    /// Exact inverse of [`Self::decode_value`]: emit the mantissa bits
+    /// for the unsigned `magnitude` (`low <= magnitude <= high`).
+    ///
+    /// Returns [`Error::ValueNotInInterval`] (with the interval's
+    /// `[low, high]`) when the magnitude lies outside the interval;
+    /// nothing is written in that case. Round 281.
+    pub fn encode_value(&self, writer: &mut BitWriter, magnitude: u32) -> Result<()> {
+        if !self.contains(magnitude) {
+            return Err(Error::ValueNotInInterval {
+                value: magnitude,
+                low: self.low,
+                high: self.high,
+            });
+        }
+        self.encode_mantissa(writer, magnitude - self.low)
+    }
+
+    /// Exact inverse of [`Self::decode_signed_value`]: split the signed
+    /// sample into magnitude + sign via [`split_sign`], emit the
+    /// mantissa bits, then emit exactly ONE sign bit last (spec §4.2
+    /// step 7 "Sign bit, last").
+    ///
+    /// Returns [`Error::ValueNotInInterval`] when the magnitude lies
+    /// outside the interval; nothing is written in that case. Round
+    /// 281.
+    pub fn encode_signed_value(&self, writer: &mut BitWriter, value: i32) -> Result<()> {
+        let (magnitude, sign_bit_set) = split_sign(value);
+        self.encode_value(writer, magnitude)?;
+        writer.write_bit(u32::from(sign_bit_set));
+        Ok(())
     }
 }
 
@@ -1440,18 +1676,27 @@ impl DecodeState {
     }
 
     /// Spec §4.2 step 1 eligibility gate for the mono loop: the
-    /// zero-run fast path may only be probed when the channel's working
-    /// `median[0]` is `<= 1` (spec: "If both channels' `median[0]` are
-    /// ≤ 1" — for mono, the one channel) AND no holding state is
-    /// pending ("and no 'holding' state is pending") — neither the
-    /// `last_one` carry nor the `last_zero` short-circuit may be set.
+    /// zero-run fast path may only be probed when the channel's **raw
+    /// stored** `median[0]` is `<= 1` (spec: "If both channels'
+    /// `median[0]` are ≤ 1" — for mono, the one channel) AND no holding
+    /// state is pending ("and no 'holding' state is pending") — neither
+    /// the `last_one` carry nor the `last_zero` short-circuit may be
+    /// set.
+    ///
+    /// The threshold reads the raw `median[0]` value, NOT the
+    /// [`AdaptiveMedians::get_med`] working value: spec §2.1 explicitly
+    /// distinguishes the stored `median[i]` from the derived
+    /// `get_med(i) = (median[i] >> 4) + 1`, and the §4.2 step 1 prose
+    /// names the bare `median[0]` — everywhere the spec means the
+    /// working value it says so ("Using `get_med(i)`…", step 5).
+    /// Round 281 corrected the gate from the round-278 `get_med(0) <=
+    /// 1` reading (raw `<= 15`) to the spec's raw `<= 1`.
     ///
     /// Pure predicate — reads no bits, mutates nothing. Pair with
     /// [`read_zero_run_length`] to walk the spec §4.2 step 1 fast path
     /// by hand; the private decode loop's gate IS this predicate.
-    /// Round 278.
     pub fn zero_run_eligible(&self, medians: &AdaptiveMedians) -> bool {
-        medians.get_med(0) <= 1 && !self.run.last_one && !self.run.last_zero
+        medians.values[0] <= 1 && !self.run.last_one && !self.run.last_zero
     }
 }
 
@@ -1513,6 +1758,46 @@ pub fn read_raw_prefix(reader: &mut BitReader<'_>) -> Result<u32> {
         let escape_value = (1u32 << (cbits - 1)) | mantissa;
         Ok(UNARY_ESCAPE + escape_value)
     }
+}
+
+/// Exact inverse of [`read_raw_prefix`]: emit the spec §4.2 step 2 + 3
+/// bit pattern for a raw modified-Rice prefix.
+///
+/// * `raw < `[`UNARY_ESCAPE`] → the plain step 2 unary (`raw` `1` bits
+///   and a `0` terminator).
+/// * `raw >= `[`UNARY_ESCAPE`] → the step 3 escape: a 16-one unary,
+///   then the escape value `raw - 16` as a second unary `cbits` (the
+///   value directly when `< 2`, otherwise its bit-length) followed by
+///   its low `cbits - 1` bits LSB-first with the top bit implied set.
+///
+/// Total over `u32` — every raw value the decoder can fold is
+/// emittable, and the produced `cbits` is at most `32`, never colliding
+/// with the [`ESCAPE_EOF_CBITS`] EOF marker (see
+/// [`emit_end_of_stream_marker`] for writing that explicitly). Round
+/// 281.
+pub fn emit_raw_prefix(writer: &mut BitWriter, raw_value: u32) {
+    if raw_value < UNARY_ESCAPE {
+        writer.write_unary(raw_value);
+        return;
+    }
+    writer.write_unary(UNARY_ESCAPE);
+    let escape_value = raw_value - UNARY_ESCAPE;
+    if escape_value < 2 {
+        writer.write_unary(escape_value);
+    } else {
+        let cbits = 32 - escape_value.leading_zeros();
+        writer.write_unary(cbits);
+        writer.write_bits(escape_value, cbits - 1);
+    }
+}
+
+/// Emit the spec §4.2 step 3 end-of-stream marker: the
+/// [`UNARY_ESCAPE`] (16-one) first unary followed by a second unary of
+/// exactly [`ESCAPE_EOF_CBITS`] (33) ones — the pattern
+/// [`read_raw_prefix`] surfaces as [`Error::EndOfStream`]. Round 281.
+pub fn emit_end_of_stream_marker(writer: &mut BitWriter) {
+    writer.write_unary(UNARY_ESCAPE);
+    writer.write_unary(ESCAPE_EOF_CBITS);
 }
 
 /// Read and fold the `ones_count` for one sample — combines the spec
@@ -1614,6 +1899,29 @@ pub const fn apply_sign(magnitude: u32, sign_bit_set: bool) -> i32 {
     }
 }
 
+/// Exact inverse of [`apply_sign`]: split a signed sample into the
+/// unsigned magnitude and the sign-bit flag the spec §4.2 step 7 wire
+/// carries.
+///
+/// * `value >= 0` → `(value as u32, false)` (the magnitude verbatim,
+///   sign clear).
+/// * `value < 0` → `(!value as u32, true)` — the decode returns `!mid`
+///   for a set sign bit, so the magnitude is the bitwise complement of
+///   the value (`-1` → magnitude `0`, `-18` → `17`, `i32::MIN` →
+///   [`INTERVAL_MASK_31`]).
+///
+/// Every `i32` maps to a magnitude `<=` [`INTERVAL_MASK_31`], so the
+/// pair always round-trips: `apply_sign(split_sign(v).0,
+/// split_sign(v).1) == v` for all `v`. Pure `const` arithmetic — no
+/// bits move. Round 281.
+pub const fn split_sign(value: i32) -> (u32, bool) {
+    if value >= 0 {
+        (value as u32, false)
+    } else {
+        ((!value) as u32, true)
+    }
+}
+
 /// Spec §4.2 step 7 on-wire sign decode: read exactly ONE bit from the
 /// reader ("Sign bit, last. After the magnitude is fixed, read exactly
 /// one sign bit") and fold it into the magnitude via [`apply_sign`].
@@ -1637,8 +1945,8 @@ pub fn read_sign_and_apply(reader: &mut BitReader<'_>, magnitude: u32) -> Result
 /// form the run length with the top bit implied set." Concretely:
 ///
 /// * `count == 0` → run length `0` (the encoder's "no zero run here"
-///   signal — one bit consumed, no zero samples owed beyond the call's
-///   own emit).
+///   marker — one bit consumed, no zero samples at all; the sample
+///   word follows immediately in the regular §4.2 step 2+ sequence).
 /// * `count == 1` → run length `1`.
 /// * `2 <= count <= 32` → read `count - 1` mantissa bits LSB-first;
 ///   run length is `(1 << (count - 1)) | mantissa`.
@@ -1676,6 +1984,29 @@ pub fn read_zero_run_length(reader: &mut BitReader<'_>) -> Result<u32> {
     }
 }
 
+/// Exact inverse of [`read_zero_run_length`]: emit the spec §4.2 step 1
+/// bit pattern for an explicit zero-run length.
+///
+/// * `run_length < 2` → the run length is the unary count directly
+///   (`run_length` `1` bits and a `0` terminator; a `0` run is the
+///   single-bit "no zero run here" marker).
+/// * `run_length >= 2` → the unary count is the run length's
+///   bit-length, followed by its low `count - 1` bits LSB-first (the
+///   top bit implied set).
+///
+/// Total over `u32` — every representable run length emits a count
+/// `<= 32`, inside the [`RUN_ESCAPE_CAP`] guard. Round 281 (public
+/// lift of the round-278 test-side inverse).
+pub fn emit_zero_run_length(writer: &mut BitWriter, run_length: u32) {
+    if run_length < 2 {
+        writer.write_unary(run_length);
+    } else {
+        let count = 32 - run_length.leading_zeros();
+        writer.write_unary(count);
+        writer.write_bits(run_length, count - 1);
+    }
+}
+
 /// Spec §4.2 step 1 attempt: when the channel's `median[0]` is `<= 1`
 /// AND no holding state is pending (no `last_one` carry, no
 /// `last_zero` short-circuit waiting), the stream may carry an explicit
@@ -1685,25 +2016,28 @@ pub fn read_zero_run_length(reader: &mut BitReader<'_>) -> Result<u32> {
 /// * `Ok(Some(0))` when a non-zero run was decoded — the call emits a
 ///   `0` sample, [`DecodeState::zero_run_pending`] is set to
 ///   `run_length - 1`, and the medians are zeroed per spec §4.2 step 1.
-/// * `Ok(None)` when the path was not entered (medians not <= 1, or
-///   holding state pending), so the caller proceeds to the normal
-///   prefix-decode path.
-/// * `Ok(Some(0))` is ALSO emitted on an explicit zero-length run (the
-///   unary prefix decodes to 0) — that is the spec's "no zero run here"
-///   signal, written into the stream when the encoder wanted to clear
-///   the zero-run fast path's eligibility without emitting any zero
-///   samples; the next call reads a normal sample value. In that case
-///   `zero_run_pending` is left at `0` so the caller returns the `0`
-///   sample (the explicit-zero-prefix's documented behaviour is to emit
-///   the single `0` sample).
+/// * `Ok(None)` when the path was not entered (raw `median[0]` not
+///   `<= 1`, or holding state pending) — **no bits consumed** — OR when
+///   an explicit zero-length run was decoded (the unary prefix decodes
+///   to `0`, consuming exactly one bit). Either way the caller proceeds
+///   to the normal prefix-decode path for this same sample.
+///
+/// The zero-length-run fall-through is the round-281 correction: spec
+/// §4.2 step 1 says "the stream **may** carry an explicit zero-run …
+/// A **non-zero** run resets both channels' medians to zero and emits
+/// a `0` sample" — a zero-length run is the encoder's "no zero run
+/// here" marker and the sample word follows in the same step sequence.
+/// (The pre-281 behaviour emitted a `0` sample on the marker too, which
+/// would have made every eligible word decode to `0` forever — no
+/// non-zero sample could ever follow once the gate opened.)
 fn try_zero_run_path(
     reader: &mut BitReader<'_>,
     medians: &mut AdaptiveMedians,
     state: &mut DecodeState,
 ) -> Result<Option<i32>> {
-    // Spec §4.2 step 1 eligibility gate, via the round-278 public
-    // predicate: median[0] <= 1 AND no holding-bit pending. For mono
-    // "both channels" reduces to the one channel.
+    // Spec §4.2 step 1 eligibility gate, via the public predicate: raw
+    // median[0] <= 1 AND no holding-bit pending. For mono "both
+    // channels" reduces to the one channel.
     if !state.zero_run_eligible(medians) {
         return Ok(None);
     }
@@ -1713,21 +2047,20 @@ fn try_zero_run_path(
     // consumes.
     let run_length = read_zero_run_length(reader)?;
 
-    if run_length > 0 {
-        // Non-zero run: spec §4.2 step 1 — "resets both channels'
-        // medians to zero and emits a `0` sample." Mono: the one
-        // channel.
-        medians.values = [0, 0, 0];
-        state.ever_took_zero_run = true;
-        // run_length samples total are zero; we are emitting the first
-        // here, so owe run_length - 1 more on subsequent calls.
-        state.zero_run_pending = run_length - 1;
+    if run_length == 0 {
+        // Explicit zero-length run: the encoder's "no zero run here"
+        // marker. The sample word follows immediately — fall through to
+        // the normal §4.2 step 2+ path with the marker bit consumed.
+        return Ok(None);
     }
-    // Whether the run was zero or non-zero, the call's emitted sample
-    // is `0`. (count == 0 case: the encoder said "no zero run", but the
-    // spec path STILL emits one zero sample per the §4.2 step 1 prose;
-    // the next call resumes the normal prefix path. This is the wiki
-    // mapping where `0` is the legal sentinel.)
+
+    // Non-zero run: spec §4.2 step 1 — "resets both channels' medians
+    // to zero and emits a `0` sample." Mono: the one channel.
+    medians.values = [0, 0, 0];
+    state.ever_took_zero_run = true;
+    // run_length samples total are zero; we are emitting the first
+    // here, so owe run_length - 1 more on subsequent calls.
+    state.zero_run_pending = run_length - 1;
     Ok(Some(0))
 }
 
@@ -1740,9 +2073,11 @@ fn try_zero_run_path(
 /// 1. **Zero-run debt**: if [`DecodeState::zero_run_pending`] is
 ///    non-zero, return a `0` sample and decrement the counter. No bits
 ///    are read on this call.
-/// 2. **Zero-run fast path** (spec §4.2 step 1) when eligible
-///    (`medians.get_med(0) <= 1` AND no holding bits): try to decode an
-///    explicit run length; emit a `0` sample on success.
+/// 2. **Zero-run fast path** (spec §4.2 step 1) when eligible (raw
+///    `median[0] <= 1` AND no holding bits): decode an explicit run
+///    length; a non-zero run emits a `0` sample (and owes the rest), a
+///    zero-length run is the "no run" marker and decoding falls
+///    through to step 3 for this same sample.
 /// 3. **Unary prefix** (spec §4.2 step 2 + §4.2 step 3 escape): read
 ///    the raw `ones_count`, with the `LIMIT_ONES = 16` escape and the
 ///    `cbits == 33` EOF signal surfaced as [`Error::EndOfStream`].
@@ -1902,17 +2237,22 @@ impl StereoDecodeState {
 
     /// Spec §4.2 step 1 eligibility gate for the stereo loop: the
     /// zero-run fast path may only be probed when **both** channels'
-    /// working `median[0]` are `<= 1` (spec: "If both channels'
+    /// **raw stored** `median[0]` are `<= 1` (spec: "If both channels'
     /// `median[0]` are ≤ 1") AND **neither** channel's holding state
     /// is pending — no `last_one` carry and no `last_zero`
     /// short-circuit on either [`RunState`].
     ///
+    /// As on the mono gate, the threshold reads the raw `median[0]`
+    /// values, NOT the [`AdaptiveMedians::get_med`] working values —
+    /// see [`DecodeState::zero_run_eligible`] for the spec §2.1
+    /// raw-vs-working grounding (round 281 correction).
+    ///
     /// Pure predicate — reads no bits, mutates nothing. Stereo
     /// counterpart of [`DecodeState::zero_run_eligible`]; the private
-    /// stereo decode loop's gate IS this predicate. Round 278.
+    /// stereo decode loop's gate IS this predicate.
     pub fn zero_run_eligible(&self, medians: &[AdaptiveMedians; 2]) -> bool {
-        medians[0].get_med(0) <= 1
-            && medians[1].get_med(0) <= 1
+        medians[0].values[0] <= 1
+            && medians[1].values[0] <= 1
             && !self.left_run.last_one
             && !self.left_run.last_zero
             && !self.right_run.last_one
@@ -1921,20 +2261,24 @@ impl StereoDecodeState {
 }
 
 /// Spec §4.2 step 1 attempt for the stereo path: gate on **both**
-/// channels' `median[0] <= 1` AND **both** channels' holding state
+/// channels' raw `median[0] <= 1` AND **both** channels' holding state
 /// empty; on a successful non-zero run reset **both** channels' medians
 /// to zero (per the spec §4.2 step 1 "resets both channels' medians to
 /// zero" sentence).
 ///
 /// Stream-level: the returned sample applies to the current
-/// `state.next_channel` (the caller toggles parity after the emit).
+/// `state.next_channel` (the caller toggles parity after the emit). A
+/// zero-length run is the "no zero run here" marker — `Ok(None)` with
+/// the marker bit consumed, and the current channel's sample word
+/// follows (the round-281 fall-through correction; see
+/// [`try_zero_run_path`]).
 fn try_zero_run_path_stereo(
     reader: &mut BitReader<'_>,
     medians: &mut [AdaptiveMedians; 2],
     state: &mut StereoDecodeState,
 ) -> Result<Option<i32>> {
-    // Spec §4.2 step 1 eligibility gate for stereo, via the round-278
-    // public predicate: BOTH channels' median[0] must satisfy <= 1, AND
+    // Spec §4.2 step 1 eligibility gate for stereo, via the public
+    // predicate: BOTH channels' raw median[0] must satisfy <= 1, AND
     // neither channel's holding state may be pending.
     if !state.zero_run_eligible(medians) {
         return Ok(None);
@@ -1944,20 +2288,20 @@ fn try_zero_run_path_stereo(
     // bits this path consumes ARE the bits the primitive consumes.
     let run_length = read_zero_run_length(reader)?;
 
-    if run_length > 0 {
-        // Non-zero run: spec §4.2 step 1 "resets both channels' medians
-        // to zero". This call emits the first zero sample on the
-        // current channel; run_length - 1 stream-level zero samples
-        // remain to drain across alternating channels.
-        medians[0].values = [0, 0, 0];
-        medians[1].values = [0, 0, 0];
-        state.ever_took_zero_run = true;
-        state.zero_run_pending = run_length - 1;
+    if run_length == 0 {
+        // Explicit zero-length run: "no zero run here" marker; the
+        // current channel's sample word follows. Marker bit consumed.
+        return Ok(None);
     }
-    // Whether the run was zero or non-zero, the call's emitted sample is
-    // `0` per the spec §4.2 step 1 prose (the `count == 0` case is the
-    // encoder's "no zero run" signal but the path still emits one zero
-    // sample at the stream cursor).
+
+    // Non-zero run: spec §4.2 step 1 "resets both channels' medians
+    // to zero". This call emits the first zero sample on the
+    // current channel; run_length - 1 stream-level zero samples
+    // remain to drain across alternating channels.
+    medians[0].values = [0, 0, 0];
+    medians[1].values = [0, 0, 0];
+    state.ever_took_zero_run = true;
+    state.zero_run_pending = run_length - 1;
     Ok(Some(0))
 }
 
@@ -2116,6 +2460,226 @@ pub fn decode_packed_samples_stereo_from_entropy(
     let mut medians = AdaptiveMedians::stereo_pair_from_entropy(info)
         .ok_or(Error::InvalidEntropyInfoForStereo)?;
     decode_packed_samples_stereo(payload, &mut medians, frames)
+}
+
+/// Pad the finished payload to an **even** byte count, per spec §1:
+/// the `0x0A` sub-block's "byte length must be even or the block is
+/// rejected". The pad byte is all zeros, past every written bit, so a
+/// decoder consuming exactly the encoded samples never reads it.
+fn finish_even(writer: BitWriter) -> Vec<u8> {
+    let mut bytes = writer.finish();
+    if bytes.len() % 2 != 0 {
+        bytes.push(0);
+    }
+    bytes
+}
+
+/// Encode one non-zero-run sample word — the exact inverse of the
+/// decoder's spec §4.2 steps 2-8 tail, shared by the mono and stereo
+/// packed encoders.
+///
+/// `next_value` is the **same channel's** next sample, used for the
+/// step-4 carry decision: the emitted raw prefix's low bit pre-encodes
+/// the next word's mode (clear → that word's `ones_count` is `0` and
+/// it reads no prefix bits; set → its folded count gains `+1`). The
+/// choice is forced — clear is only decodable when the next magnitude
+/// lands in zone 0 under the post-adapt medians, set only when it does
+/// not — except for the final word, where clear is chosen (one wire
+/// bit shorter). No zero-run word can interpose between this word and
+/// the same channel's next (the holding bit this word leaves pending
+/// blocks the §4.2 step 1 gate until that word consumes it), so the
+/// lookahead target is exact.
+fn encode_one_word(
+    writer: &mut BitWriter,
+    medians: &mut AdaptiveMedians,
+    run: &mut RunState,
+    value: i32,
+    next_value: Option<i32>,
+) -> Result<()> {
+    let (magnitude, _) = split_sign(value);
+    let ones_count = if run.last_zero {
+        // The previous word's clear low bit pre-encoded this word's
+        // zone selector as 0 — mirror the decoder's last_zero
+        // short-circuit: no prefix bits, clear the flag.
+        run.last_zero = false;
+        0
+    } else {
+        let zone = medians.zone_for_magnitude(magnitude);
+        let hold_one = match next_value {
+            None => false,
+            Some(next) => {
+                let mut after = *medians;
+                after.adapt(Zone::from_ones_count(zone));
+                let (next_mag, _) = split_sign(next);
+                next_mag >= after.get_med(0)
+            }
+        };
+        match run.unfold_prefix(zone, hold_one) {
+            Some(raw) => emit_raw_prefix(writer, raw),
+            None => {
+                // Unreachable by construction: the +1 carry is only
+                // pending when this word's zone is >= 1, and i32
+                // magnitudes keep the doubled raw inside u32. Surface
+                // the typed interval error defensively rather than
+                // panicking.
+                let interval = medians.sample_interval_for_ones_count(zone);
+                return Err(Error::ValueNotInInterval {
+                    value: magnitude,
+                    low: interval.low,
+                    high: interval.high,
+                });
+            }
+        }
+        zone
+    };
+    // Mirror the decode order exactly: interval from the PRE-adapt
+    // medians (§4.2 step 5), adapt (§3.2), then mantissa + sign (§4.2
+    // steps 6 + 7).
+    let interval = medians.sample_interval_for_ones_count(ones_count);
+    medians.adapt(Zone::from_ones_count(ones_count));
+    interval.encode_signed_value(writer, value)
+}
+
+/// Encode a mono sample sequence into a spec §4.2 `0x0A` packed-samples
+/// payload — the exact inverse of [`decode_packed_samples_mono`].
+///
+/// Walks the same per-word state machine the decode loop walks, in
+/// write direction:
+///
+/// 1. **Zero-run fast path** (spec §4.2 step 1) whenever the decoder
+///    will probe it (raw `median[0] <= 1`, no holding bits, via
+///    [`DecodeState::zero_run_eligible`]): the maximal run of `0`
+///    samples at the cursor is emitted as one explicit run length —
+///    `0` (the one-bit "no run" marker) when the current sample is
+///    non-zero. A non-zero run zeroes the medians exactly as the
+///    decoder will.
+/// 2. **Prefix** (steps 2-4): the zone selector from
+///    [`AdaptiveMedians::zone_for_magnitude`], unfolded through
+///    [`RunState::unfold_prefix`] (the holding-bit carry chosen by
+///    one-sample lookahead — see the spec §4.2 step 4 boundary
+///    pre-encoding) and emitted via [`emit_raw_prefix`].
+/// 3. **Interval + adaptation + mantissa + sign** (steps 5-8 and
+///    §3.2): [`SampleInterval::encode_signed_value`] against the
+///    pre-adapt interval, with [`AdaptiveMedians::adapt`] applied at
+///    the same point the decoder applies it.
+///
+/// The medians MUTATE in place across the loop (the caller's seed is
+/// the running state, exactly as on the decode side) and finish in the
+/// same state the decoder's will — the round-trip tests pin both the
+/// PCM and the final median state. The returned payload is padded to
+/// an **even** byte count per the spec §1 `0x0A` length rule.
+///
+/// [`Error::ValueNotInInterval`] surfaces only in the spec §4.2 step 5
+/// 31-bit-mask corner — a magnitude no decode of the same median state
+/// could produce. Round 281.
+pub fn encode_packed_samples_mono(
+    values: &[i32],
+    medians: &mut AdaptiveMedians,
+) -> Result<Vec<u8>> {
+    let mut writer = BitWriter::new();
+    let mut state = DecodeState::new();
+    let mut i = 0usize;
+    while i < values.len() {
+        if state.zero_run_eligible(medians) {
+            let zeros = values[i..].iter().take_while(|&&v| v == 0).count();
+            let run = u32::try_from(zeros).unwrap_or(u32::MAX);
+            emit_zero_run_length(&mut writer, run);
+            if run > 0 {
+                medians.values = [0, 0, 0];
+                state.ever_took_zero_run = true;
+                i += run as usize;
+                continue;
+            }
+            // run == 0: the marker is on the wire; the decoder falls
+            // through to the regular word for this same sample.
+        }
+        let next = values.get(i + 1).copied();
+        encode_one_word(&mut writer, medians, &mut state.run, values[i], next)?;
+        i += 1;
+    }
+    Ok(finish_even(writer))
+}
+
+/// Encode an interleaved (left, right, left, right, …) stereo sample
+/// sequence into a spec §4.2 `0x0A` packed-samples payload — the exact
+/// inverse of [`decode_packed_samples_stereo`].
+///
+/// Per spec §2 the channels alternate by sample-index parity, each
+/// with its own median set and holding state; the §4.2 step 1 zero-run
+/// is stream-level (gated on BOTH channels via
+/// [`StereoDecodeState::zero_run_eligible`], counting samples across
+/// both channels, zeroing both channels' medians). The step-4 carry
+/// lookahead therefore targets the **same channel's** next sample, two
+/// positions ahead.
+///
+/// `values.len()` need not be even — a trailing left-channel sample
+/// encodes fine and decodes back through the per-call
+/// [`decode_sample_stateful_stereo`] (the frame-based
+/// [`decode_packed_samples_stereo`] wrapper consumes whole frames).
+/// The returned payload is padded to an **even** byte count per the
+/// spec §1 `0x0A` length rule. Round 281.
+pub fn encode_packed_samples_stereo(
+    values: &[i32],
+    medians: &mut [AdaptiveMedians; 2],
+) -> Result<Vec<u8>> {
+    let mut writer = BitWriter::new();
+    let mut state = StereoDecodeState::new();
+    let mut i = 0usize;
+    while i < values.len() {
+        if state.zero_run_eligible(medians) {
+            let zeros = values[i..].iter().take_while(|&&v| v == 0).count();
+            let run = u32::try_from(zeros).unwrap_or(u32::MAX);
+            emit_zero_run_length(&mut writer, run);
+            if run > 0 {
+                medians[0].values = [0, 0, 0];
+                medians[1].values = [0, 0, 0];
+                state.ever_took_zero_run = true;
+                i += run as usize;
+                continue;
+            }
+        }
+        let ch = i & 1;
+        let next = values.get(i + 2).copied();
+        let run_state = if ch == 0 {
+            &mut state.left_run
+        } else {
+            &mut state.right_run
+        };
+        encode_one_word(&mut writer, &mut medians[ch], run_state, values[i], next)?;
+        i += 1;
+    }
+    Ok(finish_even(writer))
+}
+
+/// End-to-end mono encode driven by the `0x05` entropy-info expander
+/// output — the inverse of [`decode_packed_samples_mono_from_entropy`],
+/// with the same [`AdaptiveMedians::from_entropy`] bridge and the same
+/// [`Error::InvalidEntropyInfoForMono`] rejection of a negative
+/// channel-0 seed. The seeds are consumed by value; callers that need
+/// the final median state should call [`encode_packed_samples_mono`]
+/// directly with an [`AdaptiveMedians`] they own. Round 281.
+pub fn encode_packed_samples_mono_from_entropy(
+    values: &[i32],
+    info: &EntropyInfo,
+) -> Result<Vec<u8>> {
+    let mut medians =
+        AdaptiveMedians::from_entropy(info, 0).ok_or(Error::InvalidEntropyInfoForMono)?;
+    encode_packed_samples_mono(values, &mut medians)
+}
+
+/// End-to-end stereo encode driven by the `0x05` entropy-info expander
+/// output — the inverse of
+/// [`decode_packed_samples_stereo_from_entropy`], with the same
+/// [`AdaptiveMedians::stereo_pair_from_entropy`] bridge and the same
+/// [`Error::InvalidEntropyInfoForStereo`] rejection of a mono info or
+/// a negative per-channel seed. Round 281.
+pub fn encode_packed_samples_stereo_from_entropy(
+    values: &[i32],
+    info: &EntropyInfo,
+) -> Result<Vec<u8>> {
+    let mut medians = AdaptiveMedians::stereo_pair_from_entropy(info)
+        .ok_or(Error::InvalidEntropyInfoForStereo)?;
+    encode_packed_samples_stereo(values, &mut medians)
 }
 
 #[cfg(test)]
@@ -2432,15 +2996,34 @@ mod tests {
     }
 
     #[test]
-    fn run_length_odd_unary_rounds_up_and_sets_last_one() {
-        // unary = 3 (bits "1110"). n & 1 == 1 → last_one = true,
-        // n = (3 >> 1) + 1 = 1 + 1 = 2, last_zero = false.
+    fn run_length_odd_unary_halves_and_holds_a_one() {
+        // unary = 3 (bits "1110") from a neutral state: no one is being
+        // held on entry, so n = 3 >> 1 = 1 (spec §4.2 step 4 prior-state
+        // fold). The discarded low bit (1) becomes the NEW held-one —
+        // the +1 carry lands on the NEXT word, not this one.
         let bytes = bits_to_bytes("1110");
         let mut r = BitReader::new(&bytes);
         let mut state = RunState::new();
         let n = decode_run_length(&mut r, &mut state).unwrap();
-        assert_eq!(n, 2);
+        assert_eq!(n, 1);
         assert!(state.last_one);
+        assert!(!state.last_zero);
+    }
+
+    #[test]
+    fn run_length_held_one_adds_one_to_the_fold() {
+        // The same raw prefix decoded while a one is being held gains
+        // the +1: unary = 3 with last_one set on entry → n = (3 >> 1)
+        // + 1 = 2 (spec §4.2 step 4 "if a one is being held").
+        let bytes = bits_to_bytes("1110");
+        let mut r = BitReader::new(&bytes);
+        let mut state = RunState {
+            last_zero: false,
+            last_one: true,
+        };
+        let n = decode_run_length(&mut r, &mut state).unwrap();
+        assert_eq!(n, 2);
+        assert!(state.last_one, "new held-one is the raw low bit (1)");
         assert!(!state.last_zero);
     }
 
@@ -2449,7 +3032,8 @@ mod tests {
         // unary = 16 triggers the escape. Build sixteen ones + a zero
         // (the first get_unary = 16), then a second unary with n2 = 1
         // (bits "10"). n2 < 2 → n += n2 → n = 17.
-        // Then last_one = 17 & 1 = 1 → n = (17 >> 1) + 1 = 8 + 1 = 9.
+        // From a neutral state (no held one) n = 17 >> 1 = 8; the raw
+        // low bit (1) becomes the new held-one for the NEXT word.
         let mut bits = String::new();
         bits.push_str(&"1".repeat(16));
         bits.push('0'); // terminator for the first unary = 16
@@ -2458,7 +3042,7 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let mut state = RunState::new();
         let n = decode_run_length(&mut r, &mut state).unwrap();
-        assert_eq!(n, 9);
+        assert_eq!(n, 8);
         assert!(state.last_one);
         assert!(!state.last_zero);
     }
@@ -2469,7 +3053,8 @@ mod tests {
         // getbits(2). Mantissa bits "10" → first bit '1' lands in bit 0,
         // second bit '0' in bit 1 → value = 1<<0 | 0<<1 = 1.
         // n += (1 << (3-1)) | 1 = (1<<2) | 1 = 4 | 1 = 5 → n = 16 + 5 = 21.
-        // last_one = 21 & 1 = 1 → n = (21 >> 1) + 1 = 10 + 1 = 11.
+        // Neutral state on entry → n = 21 >> 1 = 10; the raw low bit
+        // (1) becomes the new held-one.
         let mut bits = String::new();
         bits.push_str(&"1".repeat(16));
         bits.push('0'); // first unary = 16
@@ -2479,7 +3064,7 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let mut state = RunState::new();
         let n = decode_run_length(&mut r, &mut state).unwrap();
-        assert_eq!(n, 11);
+        assert_eq!(n, 10);
         assert!(state.last_one);
         assert!(!state.last_zero);
     }
@@ -2525,10 +3110,12 @@ mod tests {
         // last_zero, the following decode short-circuits to 0 without
         // consuming bits. Walk a small sequence to prove the carry.
         //
-        // Sample 1: unary "110" = 2 → even → n=1, last_zero=true.
-        // Sample 2: last_zero → n=0, no bits consumed, last_zero=false.
-        // Sample 3: unary "1110" = 3 → odd → n=2, last_one=true,
-        //           last_zero=false.
+        // Sample 1: unary "110" = 2 → even → n=1, last_zero=true (the
+        //           clear low bit pre-encodes sample 2's count as 0).
+        // Sample 2: last_zero → n=0, no bits consumed, last_zero=false,
+        //           last_one untouched (false).
+        // Sample 3: unary "1110" = 3 from a neutral state → n = 3 >> 1
+        //           = 1, last_one=true (the held +1 lands on sample 4).
         let mut bits = String::new();
         bits.push_str("110"); // sample 1 unary = 2
         bits.push_str("1110"); // sample 3 unary = 3 (sample 2 reads nothing)
@@ -2545,7 +3132,7 @@ mod tests {
         assert!(!state.last_zero);
 
         let n3 = decode_run_length(&mut r, &mut state).unwrap();
-        assert_eq!(n3, 2);
+        assert_eq!(n3, 1);
         assert!(state.last_one);
         assert!(!state.last_zero);
     }
@@ -2742,11 +3329,13 @@ mod tests {
         // decode n via decode_run_length, then the value via
         // decode_sample_value, from one contiguous bitstream.
         //
-        // Stream: unary "1110" → run-length raw n=3 (odd) → n = (3>>1)+1
-        // = 2. Then interval for n=2 with medians [10,20,30]: base=30,
+        // Stream: unary "111110" → run-length raw n=5; from a neutral
+        // state the spec §4.2 step 4 fold halves it (no held +1) →
+        // n = 5 >> 1 = 2, and the odd low bit holds a one for the next
+        // word. Then interval for n=2 with medians [10,20,30]: base=30,
         // add=29, k=5, ex=2. getbits(4)="1000"=1 (< ex), sign "0" →
         // result = 31.
-        let bits = "1110" /* unary=3 → n=2 */ .to_string()
+        let bits = "111110" /* unary=5 → n=2 */ .to_string()
             + "1000" /* getbits(4)=1 */
             + "0"; /* sign=0 */
         let bytes = bits_to_bytes(&bits);
@@ -2794,10 +3383,10 @@ mod tests {
     fn decode_sample_chains_run_length_and_value() {
         // Same bitstream as `run_length_then_sample_value_compose`, but
         // driven through the single-call `decode_sample`.
-        // unary "1110" → raw n=3 (odd) → n=2; interval for n=2 with
-        // medians [10,20,30]: base=30, add=29, k=5, ex=2;
+        // unary "111110" → raw n=5, neutral fold → n=2; interval for
+        // n=2 with medians [10,20,30]: base=30, add=29, k=5, ex=2;
         // getbits(4)="1000"=1 (< ex), sign "0" → result = 31.
-        let bits = "1110".to_string() + "1000" + "0";
+        let bits = "111110".to_string() + "1000" + "0";
         let bytes = bits_to_bytes(&bits);
         let mut r = BitReader::new(&bytes);
         let mut state = RunState::new();
@@ -2865,7 +3454,7 @@ mod tests {
             medians_left: [10, 20, 30],
             medians_right: [40, 50, 60],
         };
-        let bits = "1110".to_string() + "1000" + "0";
+        let bits = "111110".to_string() + "1000" + "0";
         let bytes = bits_to_bytes(&bits);
         let mut r = BitReader::new(&bytes);
         let mut state = RunState::new();
@@ -3350,66 +3939,14 @@ mod tests {
 
     // ---- Round-194 stateful per-sample decode (spec §3 + §3.2 + §4.2) ----
     //
-    // The tests in this block use a spec-derived inverse encoder
-    // (`encode_one_sample`) to produce a `0x0A`-shape bitstream from a
-    // fixed PCM sequence, then decode it back through
-    // `decode_sample_stateful` / `decode_packed_samples_mono` and assert
-    // every sample reconstructs bit-for-bit. The encoder is the
-    // bit-for-bit INVERSE of the decoder spec (§4.2 read order: unary
-    // prefix → mantissa → sign; spec §3.2 zone adaptation interleaved
-    // BEFORE the mantissa), so a successful round-trip pins both halves
-    // to the spec text.
-    //
-    // The encoder is also `#[cfg(test)]`-only — production code only
-    // ships the decode side, since real WavPack `0x0A` bytes come from
-    // an external encoder. The round-trip is the closure proof.
-
-    /// Push a single bit (LSB-first into the running byte) onto an
-    /// encoder buffer. Mirrors `bits_to_bytes` but for incremental
-    /// emission instead of a one-shot bit string.
-    #[derive(Debug, Default)]
-    struct BitWriter {
-        bytes: Vec<u8>,
-        cur: u8,
-        nbits: u8,
-    }
-
-    impl BitWriter {
-        fn new() -> Self {
-            Self::default()
-        }
-
-        fn write_bit(&mut self, bit: u32) {
-            self.cur |= ((bit & 1) as u8) << self.nbits;
-            self.nbits += 1;
-            if self.nbits == 8 {
-                self.bytes.push(self.cur);
-                self.cur = 0;
-                self.nbits = 0;
-            }
-        }
-
-        fn write_bits(&mut self, value: u32, count: u32) {
-            for i in 0..count {
-                self.write_bit((value >> i) & 1);
-            }
-        }
-
-        /// Write `n` `1` bits followed by a single `0` terminator.
-        fn write_unary(&mut self, n: u32) {
-            for _ in 0..n {
-                self.write_bit(1);
-            }
-            self.write_bit(0);
-        }
-
-        fn finish(mut self) -> Vec<u8> {
-            if self.nbits > 0 {
-                self.bytes.push(self.cur);
-            }
-            self.bytes
-        }
-    }
+    // The tests in this block originally used a test-side spec-derived
+    // inverse encoder to produce a `0x0A`-shape bitstream from a fixed
+    // PCM sequence; round 281 lifted that inverse onto the public
+    // surface (`BitWriter`, `emit_*`, `encode_packed_samples_*`), so
+    // the round-trips here drive the public encoder against the
+    // per-call decode loop and assert every sample reconstructs
+    // bit-for-bit. A successful round-trip pins both halves to the
+    // spec text.
 
     /// Inverse of the spec §4.2 step 6 truncated-binary decoder: emit
     /// the bits for `code` inside an interval of `maxcode + 1`
@@ -3446,137 +3983,25 @@ mod tests {
         }
     }
 
-    /// Pick the post-fold `ones_count` for a non-negative magnitude
-    /// `mag` given the channel's current medians, mirroring spec §4.2
-    /// step 5 in reverse.
-    ///
-    /// Returns `(ones_count, low)` where `low` is the interval base
-    /// and `code = mag - low` is the mantissa to emit through
-    /// [`emit_truncated_binary`].
-    fn pick_zone_for_magnitude(medians: &AdaptiveMedians, mag: u32) -> (u32, u32) {
-        let m0 = medians.get_med(0);
-        let m1 = medians.get_med(1);
-        let m2 = medians.get_med(2);
-        if mag < m0 {
-            (0, 0)
-        } else if mag < m0 + m1 {
-            (1, m0)
-        } else {
-            // n >= 2: each subsequent zone adds m2 to the base.
-            let above = mag - (m0 + m1);
-            let extra = above / m2;
-            (2 + extra, m0 + m1 + extra * m2)
-        }
-    }
-
-    /// Pick a raw unary count whose fold yields the requested
-    /// `ones_count` AND whose carry (`last_one` / `last_zero`) is
-    /// compatible with the encoder's intent. Returns `raw` to write
-    /// (with `raw + 1` bits on the wire — `raw` `1` bits + a single `0`
-    /// terminator).
-    ///
-    /// `prefer_last_one` picks between the two raw choices for a given
-    /// `ones_count > 0`: odd raw (= 2k-1, sets last_one) vs even raw
-    /// (= 2k, sets last_zero and pre-encodes the NEXT sample as zone 0).
-    /// For tests where we want a long sequence of independent zone
-    /// reads, use `prefer_last_one = true` (odd raw) — every sample
-    /// reads its own prefix and adjacent samples don't tangle.
-    fn pick_raw_unary(ones_count: u32, prefer_last_one: bool) -> u32 {
-        if ones_count == 0 {
-            // Only legal raw is 0 (even, last_zero=true). Forces the
-            // NEXT sample to short-circuit to ones_count=0.
-            0
-        } else if prefer_last_one {
-            2 * ones_count - 1
-        } else {
-            2 * ones_count
-        }
-    }
-
-    /// Emit one sample value through the spec-derived inverse encoder.
-    /// MUTATES `medians` per spec §3.2 EXACTLY like the decoder does,
-    /// so encoder + decoder walk identical median trajectories.
-    ///
-    /// `value` is the signed sample to encode. `prefer_last_one`
-    /// controls the raw-unary parity tie-break (see `pick_raw_unary`).
-    fn encode_one_sample(
-        w: &mut BitWriter,
-        medians: &mut AdaptiveMedians,
-        state: &mut RunState,
-        value: i32,
-        prefer_last_one: bool,
-    ) {
-        // Decoder reconstruction: sign=0 → mid = magnitude; sign=1 →
-        // mid = !magnitude → signed value = -(magnitude+1). So:
-        let (sign_bit, magnitude) = if value >= 0 {
-            (0u32, value as u32)
-        } else {
-            // value < 0 → returned by decoder as !magnitude; so
-            // value = !magnitude → magnitude = !value as u32 (because
-            // !value as i32 == !(value)).
-            (1u32, (!value) as u32)
-        };
-
-        if state.last_zero {
-            // Encoder MUST emit ones_count = 0 on this sample — the
-            // previous even-raw pre-committed us. The magnitude must
-            // fit zone 0 (i.e. magnitude < m0). If the caller picked a
-            // value outside that interval the sequence is illegal; the
-            // test helper panics so contributors notice immediately.
-            let (ones_count, low) = pick_zone_for_magnitude(medians, magnitude);
-            assert_eq!(
-                ones_count, 0,
-                "encoder: last_zero pre-commits ones_count=0 but magnitude {magnitude} lands in zone {ones_count}",
-            );
-            state.last_zero = false;
-            // No unary written; the decoder short-circuits.
-            // Adapt + mantissa + sign exactly as the non-short-circuit
-            // path does (spec §3.2 + §4.2 step 6 + step 7).
-            let (low_chk, high) = form_interval(medians, ones_count);
-            assert_eq!(low_chk, low);
-            medians.adapt(Zone::from_ones_count(ones_count));
-            let maxcode = high.wrapping_sub(low);
-            let code = magnitude - low;
-            assert!(code <= maxcode, "encoder: code {code} > maxcode {maxcode}");
-            emit_truncated_binary(w, maxcode, code);
-            w.write_bit(sign_bit);
-            return;
-        }
-
-        // Normal path: pick the zone, the raw unary, emit prefix +
-        // mantissa + sign, then adapt.
-        let (ones_count, low) = pick_zone_for_magnitude(medians, magnitude);
-        let raw = pick_raw_unary(ones_count, prefer_last_one);
-        w.write_unary(raw);
-        // Update encoder state to match the decoder fold.
-        let last_one_bit = (raw & 1) != 0;
-        state.last_one = last_one_bit;
-        state.last_zero = !last_one_bit;
-        let (low_chk, high) = form_interval(medians, ones_count);
-        assert_eq!(low_chk, low);
-        medians.adapt(Zone::from_ones_count(ones_count));
-        let maxcode = high.wrapping_sub(low);
-        let code = magnitude - low;
-        assert!(code <= maxcode, "encoder: code {code} > maxcode {maxcode}");
-        emit_truncated_binary(w, maxcode, code);
-        w.write_bit(sign_bit);
-    }
-
-    /// Round-trip a sequence of sample values through encode + decode
-    /// against a fresh `AdaptiveMedians` seed and assert every
-    /// reconstructed sample matches the input.
+    /// Round-trip a sequence of sample values through the public
+    /// encoder ([`encode_packed_samples_mono`]) and the per-call decode
+    /// loop ([`decode_sample_stateful`]) against a fresh
+    /// `AdaptiveMedians` seed, asserting every reconstructed sample
+    /// matches the input AND the encoder and decoder finish in
+    /// identical median state (pinning spec §3.2 adaptation across the
+    /// whole sequence).
     ///
     /// Returns the number of samples (== `values.len()`) so callers
     /// can aggregate a sample-exact count across multiple round-trips.
     fn round_trip(seed: [u32; 3], values: &[i32]) -> usize {
-        // Encode.
+        // Encode through the public surface.
         let mut enc_medians = AdaptiveMedians::new(seed);
-        let mut enc_state = RunState::new();
-        let mut w = BitWriter::new();
-        for &v in values {
-            encode_one_sample(&mut w, &mut enc_medians, &mut enc_state, v, true);
-        }
-        let bytes = w.finish();
+        let bytes = encode_packed_samples_mono(values, &mut enc_medians).expect("encode");
+        assert_eq!(
+            bytes.len() % 2,
+            0,
+            "encoded payload must be even-length per spec §1"
+        );
 
         // Decode and compare.
         let mut dec_medians = AdaptiveMedians::new(seed);
@@ -3692,7 +4117,7 @@ mod tests {
             };
             // Simulate the per-sample adapt that decode/encode will do
             // so the next iteration picks against the post-adapt medians.
-            let (ones_count, _) = pick_zone_for_magnitude(&sim_medians, mag as u32);
+            let ones_count = sim_medians.zone_for_magnitude(mag as u32);
             sim_medians.adapt(Zone::from_ones_count(ones_count));
             values.push(mag);
         }
@@ -3709,14 +4134,9 @@ mod tests {
         let seed = [8192u32, 8192, 8192];
         let values: Vec<i32> = (1..=32).collect();
 
-        // Encode (matching the round_trip helper).
+        // Encode through the public surface.
         let mut enc_medians = AdaptiveMedians::new(seed);
-        let mut enc_state = RunState::new();
-        let mut w = BitWriter::new();
-        for &v in &values {
-            encode_one_sample(&mut w, &mut enc_medians, &mut enc_state, v, true);
-        }
-        let bytes = w.finish();
+        let bytes = encode_packed_samples_mono(&values, &mut enc_medians).expect("encode");
 
         // Decode via the public payload-loop API.
         let view = crate::PackedSamples::new(&bytes);
@@ -3730,16 +4150,34 @@ mod tests {
 
     #[test]
     fn round_trip_value_zero_with_zone0_seed() {
-        // Encoding `0` with last_zero==false picks ones_count=0,
-        // raw=0 (the only legal raw for ones_count=0), which sets
-        // last_zero=true. The encoder then expects the next sample to
-        // also be zone-0 — the assertion in encode_one_sample's
-        // last_zero branch catches a caller that violates this. So
-        // sequence two zeros to walk the short-circuit explicitly.
+        // Zero samples in zone 0: the encoder pre-encodes each
+        // following zero through the spec §4.2 step 4 boundary carry (a
+        // clear low bit on the raw prefix), so alternating words
+        // short-circuit with no prefix bits at all. The medians' raw
+        // median[0] (256) is far above the §4.2 step 1 zero-run gate,
+        // so this walks the prefix path, not the zero-run path.
         let seed = [256u32, 256, 256];
         let values: Vec<i32> = vec![0, 0, 0, 0];
         let n = round_trip(seed, &values);
         assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn round_trip_zone0_word_followed_by_non_zero_zone_word() {
+        // The spec §4.2 step 4 prior-state fold is the only reading
+        // under which a zone-0 word can be followed by a word in any
+        // other zone: the zone-0 word emits raw = 1 (odd — hold a one
+        // into the next word) and the next word's folded count gains
+        // +1. Under the wiki pseudocode's self-referencing fold this
+        // sequence is unrepresentable (raw 1 would fold to 1, not 0).
+        // Seed get_med = 17, so 5 is zone 0 and 1000 is deep overflow.
+        let seed = [256u32, 256, 256];
+        let n = round_trip(seed, &[5, 1000]);
+        assert_eq!(n, 2);
+
+        // And the mirrored shape: non-zero zone, zone 0, non-zero zone.
+        let n = round_trip(seed, &[1000, 5, 900]);
+        assert_eq!(n, 3);
     }
 
     #[test]
@@ -3933,44 +4371,33 @@ mod tests {
     // The spec §2 channel-alternation rule maps even sample indices to
     // the left channel and odd indices to the right channel; the
     // §4.2 step 1 zero-run fast path inspects + zeroes BOTH channels.
-    // These tests encode interleaved (L,R,L,R,…) frames with a
-    // simulator that walks the spec §3.2 adapt steps per channel and
-    // re-checks bit-for-bit against the new
-    // `decode_sample_stateful_stereo` / `decode_packed_samples_stereo`
-    // surface.
+    // These tests encode interleaved (L,R,L,R,…) frames through the
+    // public stereo encoder (round 281) and re-check bit-for-bit
+    // against the `decode_sample_stateful_stereo` /
+    // `decode_packed_samples_stereo` surface.
 
-    /// Encode `frames * 2` interleaved samples into a single bitstream
-    /// using the same `encode_one_sample` helper but with per-channel
-    /// median + run-state, the way a real stereo encoder writes the
-    /// `0x0A` payload. Returns the wire bytes plus the per-channel
-    /// post-encode adaptive medians so a test can assert encoder ==
-    /// decoder end state.
-    fn stereo_encode(
-        seeds: [[u32; 3]; 2],
-        interleaved: &[i32],
-    ) -> (Vec<u8>, [AdaptiveMedians; 2], [RunState; 2]) {
-        assert!(
-            interleaved.len() % 2 == 0,
-            "interleaved sample count must be even for stereo",
-        );
+    /// Encode interleaved samples through the public stereo encoder.
+    /// Returns the wire bytes plus the per-channel post-encode adaptive
+    /// medians so a test can assert encoder == decoder end state.
+    fn stereo_encode(seeds: [[u32; 3]; 2], interleaved: &[i32]) -> (Vec<u8>, [AdaptiveMedians; 2]) {
         let mut enc_medians = [
             AdaptiveMedians::new(seeds[0]),
             AdaptiveMedians::new(seeds[1]),
         ];
-        let mut enc_states = [RunState::new(), RunState::new()];
-        let mut w = BitWriter::new();
-        for (i, &v) in interleaved.iter().enumerate() {
-            let ch = i % 2;
-            encode_one_sample(&mut w, &mut enc_medians[ch], &mut enc_states[ch], v, true);
-        }
-        let bytes = w.finish();
-        (bytes, enc_medians, enc_states)
+        let bytes =
+            encode_packed_samples_stereo(interleaved, &mut enc_medians).expect("stereo encode");
+        assert_eq!(
+            bytes.len() % 2,
+            0,
+            "encoded payload must be even-length per spec §1"
+        );
+        (bytes, enc_medians)
     }
 
     /// Round-trip a stereo sample sequence through encode + decode and
     /// assert every reconstructed sample matches.
     fn stereo_round_trip(seeds: [[u32; 3]; 2], interleaved: &[i32]) -> usize {
-        let (bytes, enc_medians, _enc_states) = stereo_encode(seeds, interleaved);
+        let (bytes, enc_medians) = stereo_encode(seeds, interleaved);
         let mut dec_medians = [
             AdaptiveMedians::new(seeds[0]),
             AdaptiveMedians::new(seeds[1]),
@@ -4072,7 +4499,7 @@ mod tests {
                 1 => m0 + m1 + 1,      // zone 2
                 _ => m0 + m1 + m2 + 1, // zone 2 overflow
             };
-            let (ones_count, _) = pick_zone_for_magnitude(&sim[ch], mag as u32);
+            let ones_count = sim[ch].zone_for_magnitude(mag as u32);
             sim[ch].adapt(Zone::from_ones_count(ones_count));
             interleaved.push(mag);
         }
@@ -4135,7 +4562,7 @@ mod tests {
             sim[ch].adapt(Zone::from_ones_count(1));
             interleaved.push(mag);
         }
-        let (bytes, enc_medians, _) = stereo_encode(seeds, &interleaved);
+        let (bytes, enc_medians) = stereo_encode(seeds, &interleaved);
         let view = crate::PackedSamples::new(&bytes);
         let mut dec_medians = [
             AdaptiveMedians::new(seeds[0]),
@@ -4438,14 +4865,10 @@ mod tests {
         let info = EntropyInfo::mono([8192, 8192, 8192]);
         let values: Vec<i32> = (1..=8).collect();
 
-        // Encode (matching the round_trip helper).
+        // Encode through the public surface (matching the round_trip
+        // helper).
         let mut enc_medians = AdaptiveMedians::new(seed);
-        let mut enc_state = RunState::new();
-        let mut w = BitWriter::new();
-        for &v in &values {
-            encode_one_sample(&mut w, &mut enc_medians, &mut enc_state, v, true);
-        }
-        let bytes = w.finish();
+        let bytes = encode_packed_samples_mono(&values, &mut enc_medians).expect("encode");
         let view = crate::PackedSamples::new(&bytes);
 
         // Decode via the from_entropy wrapper.
@@ -4491,8 +4914,7 @@ mod tests {
 
     #[test]
     fn decode_packed_samples_stereo_from_entropy_matches_explicit_seeds() {
-        // Encode a stereo zone-1 sequence (well-formed under
-        // encode_one_sample's last_zero pre-commit) with both channels
+        // Encode a stereo zone-1 sequence with both channels
         // seeded [8192;3], then decode it through both the explicit-
         // seed and the from_entropy wrappers and assert identical
         // reconstructions.
@@ -4509,7 +4931,7 @@ mod tests {
             sim[ch].adapt(Zone::from_ones_count(1));
             interleaved.push(mag);
         }
-        let (bytes, _, _) = stereo_encode(seeds, &interleaved);
+        let (bytes, _) = stereo_encode(seeds, &interleaved);
         let view = crate::PackedSamples::new(&bytes);
 
         let got = decode_packed_samples_stereo_from_entropy(&view, &info, interleaved.len() / 2)
@@ -5456,31 +5878,8 @@ mod tests {
     }
 
     // ---- Round 274: §4.2 step 2 + 3 raw prefix + step 4 fold on the
-    // public typed surface -------------------------------------------
-
-    /// Emit a raw prefix value through the spec §4.2 step 2 + 3 encode,
-    /// the inverse of [`read_raw_prefix`].
-    fn emit_raw_prefix(w: &mut BitWriter, raw_value: u32) {
-        if raw_value < UNARY_ESCAPE {
-            // Step 2: plain unary.
-            w.write_unary(raw_value);
-            return;
-        }
-        // Step 3 escape: leading unary == LIMIT_ONES, then the cbits
-        // unary, then (for cbits >= 2) the implied-top-bit mantissa.
-        w.write_unary(UNARY_ESCAPE);
-        let escape_value = raw_value - UNARY_ESCAPE;
-        if escape_value < 2 {
-            // cbits == escape_value (< 2): cbits unary only.
-            w.write_unary(escape_value);
-        } else {
-            // escape_value carries an implied top bit; cbits is its
-            // bit-length, mantissa is the low (cbits - 1) bits.
-            let cbits = 32 - escape_value.leading_zeros();
-            w.write_unary(cbits);
-            w.write_bits(escape_value, cbits - 1);
-        }
-    }
+    // public typed surface (the emit side is the public
+    // `emit_raw_prefix` since round 281) -------------------------------
 
     #[test]
     fn read_raw_prefix_plain_unary_below_escape() {
@@ -5556,14 +5955,38 @@ mod tests {
     }
 
     #[test]
-    fn fold_prefix_low_bit_one_halves_plus_one() {
-        // raw odd → last_one true, ones_count = (raw >> 1) + 1.
+    fn fold_prefix_neutral_state_halves_regardless_of_low_bit() {
+        // From a neutral state (no held one) the fold is a plain halve
+        // — the raw value's own low bit does NOT add to THIS word's
+        // count (spec §4.2 step 4 prior-state fold); it becomes the new
+        // held-one for the next word.
         let mut state = RunState::new();
-        assert_eq!(state.fold_prefix(1), 1);
+        assert_eq!(state.fold_prefix(1), 0);
         assert!(state.last_one);
         assert!(!state.last_zero);
 
         let mut state = RunState::new();
+        assert_eq!(state.fold_prefix(9), 4);
+        assert!(state.last_one);
+        assert!(!state.last_zero);
+    }
+
+    #[test]
+    fn fold_prefix_held_one_adds_one() {
+        // With a one held on entry the fold gains +1 ("if a one is
+        // being held, ones_count = (ones_count >> 1) + 1").
+        let mut state = RunState {
+            last_zero: false,
+            last_one: true,
+        };
+        assert_eq!(state.fold_prefix(0), 1);
+        assert!(!state.last_one, "new held-one is raw low bit (0)");
+        assert!(state.last_zero);
+
+        let mut state = RunState {
+            last_zero: false,
+            last_one: true,
+        };
         assert_eq!(state.fold_prefix(9), 5);
         assert!(state.last_one);
         assert!(!state.last_zero);
@@ -5571,18 +5994,22 @@ mod tests {
 
     #[test]
     fn fold_prefix_held_one_zero_complement() {
-        // last_one and last_zero are always complements after a fold.
+        // last_one and last_zero are always complements after a fold,
+        // the new held-one is the raw low bit, and the folded count is
+        // the halved raw plus the ENTRY held-one — for both entry
+        // states.
         for raw in 0..64u32 {
-            let mut state = RunState::new();
-            let folded = state.fold_prefix(raw);
-            assert_eq!(state.last_one, (raw & 1) != 0);
-            assert_eq!(state.last_zero, !state.last_one);
-            let expected = if (raw & 1) != 0 {
-                (raw >> 1) + 1
-            } else {
-                raw >> 1
-            };
-            assert_eq!(folded, expected);
+            for entry_held in [false, true] {
+                let mut state = RunState {
+                    last_zero: false,
+                    last_one: entry_held,
+                };
+                let folded = state.fold_prefix(raw);
+                assert_eq!(state.last_one, (raw & 1) != 0);
+                assert_eq!(state.last_zero, !state.last_one);
+                let expected = (raw >> 1) + u32::from(entry_held);
+                assert_eq!(folded, expected, "raw {raw} held {entry_held}");
+            }
         }
     }
 
@@ -5592,7 +6019,70 @@ mod tests {
             let mut s = RunState::new();
             s.fold_prefix(17)
         };
-        assert_eq!(FOLDED, 9);
+        assert_eq!(FOLDED, 8);
+
+        const FOLDED_HELD: u32 = {
+            let mut s = RunState {
+                last_zero: false,
+                last_one: true,
+            };
+            s.fold_prefix(17)
+        };
+        assert_eq!(FOLDED_HELD, 9);
+    }
+
+    #[test]
+    fn unfold_prefix_inverts_fold_prefix_across_states_and_carries() {
+        // fold(unfold(n, b)) == n for every representable combination,
+        // with identical post-states on both sides.
+        for n in 0..=100u32 {
+            for entry_held in [false, true] {
+                for hold_one in [false, true] {
+                    let entry = RunState {
+                        last_zero: false,
+                        last_one: entry_held,
+                    };
+                    let mut enc = entry;
+                    let raw = match enc.unfold_prefix(n, hold_one) {
+                        Some(raw) => raw,
+                        None => {
+                            // Only the held-one + n == 0 combination is
+                            // unrepresentable in this sweep.
+                            assert!(entry_held && n == 0);
+                            assert_eq!(enc, entry, "state untouched on None");
+                            continue;
+                        }
+                    };
+                    assert_eq!(raw & 1, u32::from(hold_one));
+                    let mut dec = entry;
+                    assert_eq!(dec.fold_prefix(raw), n, "n {n} held {entry_held}");
+                    assert_eq!(dec, enc, "encoder and decoder post-states");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unfold_prefix_rejects_doubled_raw_overflow() {
+        // ones_count too large for the doubled raw to fit u32 → None,
+        // state untouched.
+        let mut state = RunState::new();
+        assert_eq!(state.unfold_prefix(u32::MAX / 2 + 1, false), None);
+        assert_eq!(state, RunState::new());
+        // The widest representable count from neutral folds back.
+        let mut enc = RunState::new();
+        let raw = enc.unfold_prefix(u32::MAX / 2, true).expect("in range");
+        let mut dec = RunState::new();
+        assert_eq!(dec.fold_prefix(raw), u32::MAX / 2);
+    }
+
+    #[test]
+    fn unfold_prefix_is_const() {
+        const RAW: Option<u32> = {
+            let mut s = RunState::new();
+            s.unfold_prefix(8, true)
+        };
+        assert_eq!(RAW, Some(17));
     }
 
     #[test]
@@ -5653,22 +6143,8 @@ mod tests {
     }
 
     // ---- Round 278: §4.2 step 1 zero-run fast path on the public
-    // typed surface + over-cap hardening ------------------------------
-
-    /// Emit a zero-run length through the spec §4.2 step 1 encode — the
-    /// inverse of [`read_zero_run_length`]. Run lengths `< 2` are the
-    /// unary count directly; larger values emit their bit-length as the
-    /// unary count and the low `count - 1` bits LSB-first (the top bit
-    /// is implied set).
-    fn emit_zero_run_length(w: &mut BitWriter, run_length: u32) {
-        if run_length < 2 {
-            w.write_unary(run_length);
-        } else {
-            let count = 32 - run_length.leading_zeros(); // bit-length
-            w.write_unary(count);
-            w.write_bits(run_length, count - 1); // top bit implied
-        }
-    }
+    // typed surface + over-cap hardening (the emit side is the public
+    // `emit_zero_run_length` since round 281) ---------------------------
 
     #[test]
     fn read_zero_run_length_direct_counts() {
@@ -5750,13 +6226,17 @@ mod tests {
 
     #[test]
     fn decode_state_zero_run_eligible_gates() {
-        // Eligible: working median[0] == 1 (raw <= 15 → get_med == 1)
-        // and a clean run state.
+        // Eligible: RAW median[0] <= 1 (spec §4.2 step 1 reads the
+        // stored value, not the get_med working value — round 281) and
+        // a clean run state.
         let state = DecodeState::new();
-        assert!(state.zero_run_eligible(&AdaptiveMedians::new([15, 0, 0])));
+        assert!(state.zero_run_eligible(&AdaptiveMedians::new([1, 0, 0])));
 
-        // Gate 1: working median[0] > 1 (raw >= 16 → get_med >= 2).
-        assert!(!state.zero_run_eligible(&AdaptiveMedians::new([16, 0, 0])));
+        // Gate 1: raw median[0] > 1. Raw 2 still has get_med == 1, so
+        // this boundary also pins that the gate is NOT the working
+        // value.
+        assert!(!state.zero_run_eligible(&AdaptiveMedians::new([2, 0, 0])));
+        assert!(!state.zero_run_eligible(&AdaptiveMedians::new([15, 0, 0])));
 
         // Gate 2: last_one carry pending.
         let mut held_one = DecodeState::new();
@@ -5772,7 +6252,9 @@ mod tests {
     #[test]
     fn stereo_decode_state_zero_run_eligible_gates() {
         let low = AdaptiveMedians::new([0, 0, 0]);
-        let high = AdaptiveMedians::new([16, 0, 0]);
+        // Raw median[0] == 2 still has get_med == 1 — over the raw
+        // spec §4.2 step 1 threshold (round 281).
+        let high = AdaptiveMedians::new([2, 0, 0]);
         let state = StereoDecodeState::new();
         assert!(state.zero_run_eligible(&[low, low]));
         // Either channel's median[0] over the threshold blocks the path.
@@ -5799,7 +6281,7 @@ mod tests {
         emit_zero_run_length(&mut w, 5);
         let bytes = w.finish();
 
-        let mut medians = AdaptiveMedians::new([4, 100, 100]); // get_med(0) == 1
+        let mut medians = AdaptiveMedians::new([1, 100, 100]); // raw median[0] <= 1
         let mut state = DecodeState::new();
         assert!(state.zero_run_eligible(&medians));
         let mut r_loop = BitReader::new(&bytes);
@@ -5877,5 +6359,678 @@ mod tests {
         let bytes = w.finish();
         let mut r = BitReader::new(&bytes);
         assert_eq!(read_raw_prefix(&mut r), Err(Error::Truncated));
+    }
+
+    // ---- Round 281: spec §4.2 inverse encoder on the public surface
+    // (BitWriter, split_sign, SampleInterval::encode_*, emit_*,
+    // RunState::unfold_prefix, zone_for_magnitude,
+    // encode_packed_samples_*) + the §4.2 step 1 / step 4 conformance
+    // corrections ------------------------------------------------------
+
+    #[test]
+    fn bit_writer_places_first_bit_in_bit_zero() {
+        // Spec §4.1 write side: the first written bit lands in bit 0 of
+        // byte 0 (LSB-first), exactly where BitReader reads it first.
+        let mut w = BitWriter::new();
+        w.write_bit(1);
+        w.write_bit(0);
+        w.write_bit(1);
+        assert_eq!(w.bits_written(), 3);
+        let bytes = w.finish();
+        assert_eq!(bytes, vec![0b0000_0101]);
+    }
+
+    #[test]
+    fn bit_writer_write_bits_assembles_low_bit_first() {
+        // write_bits is the exact inverse of get_bits: a 13-bit field
+        // crosses the byte boundary and reads back verbatim.
+        let mut w = BitWriter::new();
+        w.write_bits(0x15A3 & 0x1FFF, 13);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.get_bits(13).unwrap(), 0x15A3 & 0x1FFF);
+    }
+
+    #[test]
+    fn bit_writer_write_unary_matches_get_unary() {
+        for n in [0u32, 1, 5, 16, 33] {
+            let mut w = BitWriter::new();
+            w.write_unary(n);
+            assert_eq!(w.bits_written(), (n + 1) as usize);
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.get_unary().unwrap(), n, "unary {n}");
+        }
+    }
+
+    #[test]
+    fn bit_writer_finish_pads_final_byte_high_bits() {
+        // 9 bits written → 2 bytes out; the 7 pad bits are zeros in the
+        // later-read (high) positions of the final byte.
+        let mut w = BitWriter::new();
+        for _ in 0..9 {
+            w.write_bit(1);
+        }
+        let bytes = w.finish();
+        assert_eq!(bytes, vec![0xFF, 0x01]);
+    }
+
+    #[test]
+    fn bit_writer_empty_finish_is_empty() {
+        let w = BitWriter::new();
+        assert!(w.is_empty());
+        assert_eq!(w.bits_written(), 0);
+        assert!(w.finish().is_empty());
+        assert!(!{
+            let mut w = BitWriter::new();
+            w.write_bit(0);
+            w.is_empty()
+        });
+    }
+
+    #[test]
+    fn bit_writer_reader_round_trip_mixed_fields() {
+        // Deterministic LCG-driven field sweep: every (value, width)
+        // written reads back in order through BitReader.
+        let mut lcg = 0x2545F491u32;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            lcg
+        };
+        let fields: Vec<(u32, u32)> = (0..200)
+            .map(|_| {
+                let width = next() % 33; // 0..=32
+                let value = if width == 0 {
+                    0
+                } else {
+                    next() & (u32::MAX >> (32 - width))
+                };
+                (value, width)
+            })
+            .collect();
+        let mut w = BitWriter::new();
+        for &(value, width) in &fields {
+            w.write_bits(value, width);
+        }
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        for &(value, width) in &fields {
+            assert_eq!(r.get_bits(width).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn split_sign_inverts_apply_sign_across_the_full_shape() {
+        for v in (-1000..=1000).chain([i32::MIN, i32::MIN + 1, i32::MAX - 1, i32::MAX, -1, 0, 1]) {
+            let (magnitude, sign) = split_sign(v);
+            assert!(magnitude <= INTERVAL_MASK_31, "magnitude fits the mask");
+            assert_eq!(apply_sign(magnitude, sign), v, "round-trip {v}");
+            assert_eq!(sign, v < 0);
+        }
+        // The worked spec values: -1 is magnitude 0 signed; -18 is 17.
+        assert_eq!(split_sign(-1), (0, true));
+        assert_eq!(split_sign(-18), (17, true));
+        assert_eq!(split_sign(i32::MIN), (INTERVAL_MASK_31, true));
+    }
+
+    #[test]
+    fn split_sign_is_const() {
+        const PAIR: (u32, bool) = split_sign(-21);
+        assert_eq!(PAIR, (20, true));
+    }
+
+    #[test]
+    fn encode_mantissa_round_trips_every_code_per_maxcode() {
+        for maxcode in 0..=40u32 {
+            let interval = SampleInterval::new(0, maxcode);
+            for code in 0..=maxcode {
+                let mut w = BitWriter::new();
+                interval.encode_mantissa(&mut w, code).expect("in range");
+                let bytes = w.finish();
+                let mut r = BitReader::new(&bytes);
+                assert_eq!(
+                    interval.decode_mantissa(&mut r).unwrap(),
+                    code,
+                    "maxcode {maxcode} code {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_mantissa_rejects_code_above_maxcode() {
+        let interval = SampleInterval::new(0, 16);
+        let mut w = BitWriter::new();
+        assert_eq!(
+            interval.encode_mantissa(&mut w, 17),
+            Err(Error::ValueNotInInterval {
+                value: 17,
+                low: 0,
+                high: 16,
+            })
+        );
+        assert!(w.is_empty(), "nothing written on the error path");
+    }
+
+    #[test]
+    fn encode_value_round_trips_inside_the_worked_interval() {
+        // The spec worked example interval [17, 33] (seed [256;3] zone
+        // 1): value 20 is code 3.
+        let interval = SampleInterval::new(17, 33);
+        let mut w = BitWriter::new();
+        interval.encode_value(&mut w, 20).expect("contained");
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(interval.decode_value(&mut r).unwrap(), 20);
+    }
+
+    #[test]
+    fn encode_value_rejects_magnitudes_outside_the_interval() {
+        let interval = SampleInterval::new(17, 33);
+        for bad in [0u32, 16, 34, 1000] {
+            let mut w = BitWriter::new();
+            assert_eq!(
+                interval.encode_value(&mut w, bad),
+                Err(Error::ValueNotInInterval {
+                    value: bad,
+                    low: 17,
+                    high: 33,
+                })
+            );
+            assert!(w.is_empty());
+        }
+    }
+
+    #[test]
+    fn encode_signed_value_round_trips_decode_signed_value() {
+        // Every (magnitude, sign) over the worked [17, 33] interval —
+        // bit-exact against the decode twin, including the cursor.
+        let interval = SampleInterval::new(17, 33);
+        for magnitude in 17..=33u32 {
+            for sign in [false, true] {
+                let value = apply_sign(magnitude, sign);
+                let mut w = BitWriter::new();
+                interval.encode_signed_value(&mut w, value).expect("ok");
+                let bytes = w.finish();
+                let mut r = BitReader::new(&bytes);
+                assert_eq!(interval.decode_signed_value(&mut r).unwrap(), value);
+            }
+        }
+        // Degenerate interval: only the sign bit moves (1 bit each way).
+        let degenerate = SampleInterval::new(5, 5);
+        for (value, expect_bits) in [(5i32, 1usize), (-6, 1)] {
+            let mut w = BitWriter::new();
+            degenerate.encode_signed_value(&mut w, value).expect("ok");
+            assert_eq!(w.bits_written(), expect_bits);
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(degenerate.decode_signed_value(&mut r).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn emit_end_of_stream_marker_reads_back_as_end_of_stream() {
+        let mut w = BitWriter::new();
+        emit_end_of_stream_marker(&mut w);
+        // 16 ones + terminator + 33 ones + terminator = 51 bits.
+        assert_eq!(w.bits_written(), 51);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_raw_prefix(&mut r), Err(Error::EndOfStream));
+    }
+
+    #[test]
+    fn emit_raw_prefix_round_trips_large_escape_values() {
+        // The widest escape forms: cbits == 32 territory.
+        for raw in [u32::MAX, u32::MAX - 1, (1 << 31) + 16, 1 << 30] {
+            let mut w = BitWriter::new();
+            emit_raw_prefix(&mut w, raw);
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(read_raw_prefix(&mut r).unwrap(), raw, "raw {raw}");
+        }
+    }
+
+    #[test]
+    fn zone_for_magnitude_matches_the_worked_interval_ladder() {
+        // Seed [256;3] → get_med = 17 everywhere → intervals [0,16] /
+        // [17,33] / [34,50] / [51,67] / [68,84] (the round-255 worked
+        // example).
+        let m = AdaptiveMedians::new([256, 256, 256]);
+        for (mag, zone) in [
+            (0u32, 0u32),
+            (16, 0),
+            (17, 1),
+            (33, 1),
+            (34, 2),
+            (50, 2),
+            (51, 3),
+            (67, 3),
+            (68, 4),
+            (84, 4),
+            (85, 5),
+        ] {
+            assert_eq!(m.zone_for_magnitude(mag), zone, "magnitude {mag}");
+        }
+        // And the interval-membership identity across a sweep.
+        for mag in 0..=300u32 {
+            let zone = m.zone_for_magnitude(mag);
+            let interval = m.sample_interval_for_ones_count(zone);
+            assert!(
+                interval.contains(mag),
+                "interval for zone {zone} must contain {mag}"
+            );
+        }
+    }
+
+    #[test]
+    fn zone_for_magnitude_membership_holds_across_varied_medians() {
+        for seed in [
+            [0u32, 0, 0],
+            [16, 16, 16],
+            [256, 64, 16],
+            [16, 64, 256],
+            [8192, 8192, 8192],
+            [40000, 1, 70000],
+        ] {
+            let m = AdaptiveMedians::new(seed);
+            for mag in (0..200u32).chain([1000, 65535, 1 << 20]) {
+                let zone = m.zone_for_magnitude(mag);
+                let interval = m.sample_interval_for_ones_count(zone);
+                assert!(interval.contains(mag), "seed {seed:?} mag {mag}");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_mono_empty_input_yields_empty_payload() {
+        let mut medians = AdaptiveMedians::new([256, 256, 256]);
+        let bytes = encode_packed_samples_mono(&[], &mut medians).expect("encode");
+        assert!(bytes.is_empty());
+        assert_eq!(medians, AdaptiveMedians::new([256, 256, 256]));
+    }
+
+    #[test]
+    fn encode_mono_payload_is_even_length() {
+        // A single small word is well under 8 bits — the payload must
+        // still come out at 2 bytes per the spec §1 even-length rule.
+        let mut medians = AdaptiveMedians::new([256, 256, 256]);
+        let bytes = encode_packed_samples_mono(&[3], &mut medians).expect("encode");
+        assert_eq!(bytes.len(), 2);
+    }
+
+    #[test]
+    fn encode_mono_round_trips_extreme_values() {
+        // i32 extremes drive the deepest overflow zones and the escape
+        // prefix; -1 is the magnitude-0 negative. The seeds sit at the
+        // get_med floor (working medians all 1) so every 31-bit
+        // magnitude lands in a degenerate in-range interval — under
+        // wider medians the spec §4.2 step 5 31-bit mask makes the very
+        // top of the magnitude range unrepresentable (see
+        // `encode_mono_value_not_in_interval_on_mask_corner`).
+        let seed = [8u32, 8, 8];
+        let values = [i32::MAX, i32::MIN, -1, 0, 1, i32::MIN + 1, i32::MAX - 1];
+        let n = round_trip(seed, &values);
+        assert_eq!(n, values.len());
+
+        // Large-but-representable magnitudes under adapted medians.
+        let n = round_trip([8192, 8192, 8192], &[10_000_000, -10_000_000, 0, 1]);
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn encode_mono_round_trips_lcg_mixed_sequence() {
+        // 500 deterministic pseudo-random samples across small and
+        // large magnitudes, both signs, with zeros sprinkled in.
+        let mut lcg = 0xACE1u32;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            lcg
+        };
+        let values: Vec<i32> = (0..500)
+            .map(|_| {
+                let r = next();
+                match r % 5 {
+                    0 => 0,
+                    1 => (r >> 8) as i32 % 17,
+                    2 => -((r >> 8) as i32 % 1000),
+                    3 => (r >> 8) as i32 % 100_000,
+                    _ => -((r >> 8) as i32 % 10_000_000),
+                }
+            })
+            .collect();
+        let n = round_trip([8192, 8192, 8192], &values);
+        assert_eq!(n, 500);
+    }
+
+    #[test]
+    fn encode_mono_zero_run_engages_and_round_trips() {
+        // Low seed → the §4.2 step 1 gate is open at the first word; a
+        // run of zeros followed by non-zeros must round-trip, with the
+        // decoder actually taking the zero-run fast path.
+        let seed = [0u32, 0, 0];
+        let values = [0i32, 0, 0, 0, 5, -1, 0, 7];
+        let mut enc_medians = AdaptiveMedians::new(seed);
+        let bytes = encode_packed_samples_mono(&values, &mut enc_medians).expect("encode");
+
+        let mut dec_medians = AdaptiveMedians::new(seed);
+        let mut reader = BitReader::new(&bytes);
+        let mut state = DecodeState::new();
+        for (i, &expected) in values.iter().enumerate() {
+            let got = decode_sample_stateful(&mut reader, &mut dec_medians, &mut state)
+                .unwrap_or_else(|e| panic!("sample {i}: {e:?}"));
+            assert_eq!(got, expected, "sample {i}");
+        }
+        assert!(state.ever_took_zero_run, "fast path actually engaged");
+        assert_eq!(dec_medians, enc_medians);
+    }
+
+    #[test]
+    fn encode_mono_emits_no_run_marker_when_eligible_but_nonzero() {
+        // Seed raw median[0] == 0 → gate open, but the first sample is
+        // non-zero: the encoder must emit the one-bit zero-length
+        // marker and the decoder must fall through to the regular word
+        // (the round-281 §4.2 step 1 correction).
+        let seed = [0u32, 0, 0];
+        let values = [5i32];
+        let mut enc_medians = AdaptiveMedians::new(seed);
+        let bytes = encode_packed_samples_mono(&values, &mut enc_medians).expect("encode");
+
+        // First wire bit is the zero-length-run marker (a 0 bit).
+        let mut probe = BitReader::new(&bytes);
+        assert_eq!(probe.get_bit().unwrap(), 0, "marker bit first");
+
+        let mut dec_medians = AdaptiveMedians::new(seed);
+        let mut reader = BitReader::new(&bytes);
+        let mut state = DecodeState::new();
+        let got = decode_sample_stateful(&mut reader, &mut dec_medians, &mut state).unwrap();
+        assert_eq!(got, 5, "non-zero sample after the marker");
+        assert!(!state.ever_took_zero_run);
+        assert_eq!(dec_medians, enc_medians);
+    }
+
+    #[test]
+    fn zero_length_run_marker_falls_through_on_hand_built_wire() {
+        // Hand-built wire pinning the round-281 decoder correction
+        // without the encoder in the loop: marker "0", then the word
+        // for magnitude 0 / sign set (value -1) — raw prefix "0" (zone
+        // 0), no mantissa (get_med(0) == 1 → degenerate [0, 0]), sign
+        // "1".
+        let mut bits = String::new();
+        bits.push('0'); // zero-length run marker
+        bits.push('0'); // raw prefix unary 0 → zone 0
+        bits.push('1'); // sign bit set
+        let bytes = bits_to_bytes(&bits);
+        let mut medians = AdaptiveMedians::new([0, 0, 0]);
+        let mut state = DecodeState::new();
+        let mut reader = BitReader::new(&bytes);
+        let got = decode_sample_stateful(&mut reader, &mut medians, &mut state).unwrap();
+        assert_eq!(got, -1, "regular word decoded after the marker");
+        assert_eq!(reader.bits_consumed(), 3);
+        assert!(!state.ever_took_zero_run);
+        assert_eq!(state.zero_run_pending, 0);
+    }
+
+    #[test]
+    fn decoder_rereads_run_length_after_drain() {
+        // After a non-zero run drains, the medians are still zero and
+        // the holding state clean, so the NEXT word starts with another
+        // explicit run-length field — here the zero-length marker, then
+        // a regular word. Wire: run 2 ("10" → count 1? no: count=2 needs
+        // "110" + 1 mantissa bit) — use run length 2: unary count 2
+        // ("110") + mantissa bit 0 → (1 << 1) | 0 = 2. Then marker "0",
+        // then word for 5: zone_for_magnitude(5) with all-zero medians
+        // (get_med = 1) = 2 + (5 - 2) / 1 = 5 → raw 10 (last word, even)
+        // → unary "11111111110", then degenerate interval (no
+        // mantissa), then sign "0".
+        let mut bits = String::new();
+        bits.push_str("110"); // run-length count = 2
+        bits.push('0'); // mantissa bit → run length 2
+        bits.push('0'); // next word: zero-length-run marker
+        bits.push_str("11111111110"); // raw prefix unary 10 → zone 5
+        bits.push('0'); // sign clear
+        let bytes = bits_to_bytes(&bits);
+        let mut medians = AdaptiveMedians::new([1, 0, 0]);
+        let mut state = DecodeState::new();
+        let mut reader = BitReader::new(&bytes);
+        assert_eq!(
+            decode_sample_stateful(&mut reader, &mut medians, &mut state).unwrap(),
+            0
+        );
+        assert_eq!(state.zero_run_pending, 1);
+        assert_eq!(
+            decode_sample_stateful(&mut reader, &mut medians, &mut state).unwrap(),
+            0
+        );
+        assert_eq!(state.zero_run_pending, 0);
+        assert_eq!(
+            decode_sample_stateful(&mut reader, &mut medians, &mut state).unwrap(),
+            5
+        );
+        // And the same stream is exactly what the encoder produces.
+        let mut enc_medians = AdaptiveMedians::new([1, 0, 0]);
+        let encoded = encode_packed_samples_mono(&[0, 0, 5], &mut enc_medians).expect("encode");
+        let mut enc_reader = BitReader::new(&encoded);
+        let mut redec_medians = AdaptiveMedians::new([1, 0, 0]);
+        let mut redec_state = DecodeState::new();
+        for &expected in &[0i32, 0, 5] {
+            assert_eq!(
+                decode_sample_stateful(&mut enc_reader, &mut redec_medians, &mut redec_state)
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(enc_reader.bits_consumed(), reader.bits_consumed());
+    }
+
+    #[test]
+    fn encode_mono_value_not_in_interval_on_mask_corner() {
+        // The one reachable encode failure: median state whose overflow
+        // stride pushes the zone's pre-mask high past INTERVAL_MASK_31,
+        // collapsing the masked interval below the magnitude. Seeds
+        // [8, 8, 48] → get_med = (1, 1, 4); i32::MAX has magnitude
+        // 0x7FFFFFFF whose zone interval is [0x7FFFFFFE, 0x80000001]
+        // pre-mask → masked high wraps below low → clamped degenerate
+        // [0x7FFFFFFE, 0x7FFFFFFE] which cannot carry the magnitude.
+        let mut medians = AdaptiveMedians::new([8, 8, 48]);
+        let err = encode_packed_samples_mono(&[i32::MAX], &mut medians);
+        assert_eq!(
+            err,
+            Err(Error::ValueNotInInterval {
+                value: 0x7FFF_FFFF,
+                low: 0x7FFF_FFFE,
+                high: 0x7FFF_FFFE,
+            })
+        );
+    }
+
+    #[test]
+    fn encode_mono_from_entropy_matches_explicit_seeds() {
+        let info = EntropyInfo::mono([8192, 8192, 8192]);
+        let values: Vec<i32> = (1..=8).collect();
+        let via_info = encode_packed_samples_mono_from_entropy(&values, &info).expect("encode");
+        let mut medians = AdaptiveMedians::new([8192, 8192, 8192]);
+        let via_seeds = encode_packed_samples_mono(&values, &mut medians).expect("encode");
+        assert_eq!(via_info, via_seeds);
+    }
+
+    #[test]
+    fn encode_mono_from_entropy_rejects_negative_seed() {
+        let info = EntropyInfo {
+            medians_left: [-1, 0, 0],
+            medians_right: [0, 0, 0],
+        };
+        assert_eq!(
+            encode_packed_samples_mono_from_entropy(&[1, 2], &info),
+            Err(Error::InvalidEntropyInfoForMono)
+        );
+    }
+
+    #[test]
+    fn encode_stereo_zero_run_spans_both_channels() {
+        // Both channels' raw median[0] <= 1 → the stream-level run
+        // covers interleaved zeros on both channels; the non-zero
+        // samples after it land on the right parity.
+        let seeds = [[0u32, 0, 0], [1u32, 0, 0]];
+        let values = [0i32, 0, 0, 0, 0, 9, -3, 4];
+        let mut enc_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let bytes = encode_packed_samples_stereo(&values, &mut enc_medians).expect("encode");
+
+        let mut dec_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut state = StereoDecodeState::new();
+        let mut reader = BitReader::new(&bytes);
+        for (i, &expected) in values.iter().enumerate() {
+            let got = decode_sample_stateful_stereo(&mut reader, &mut dec_medians, &mut state)
+                .unwrap_or_else(|e| panic!("sample {i}: {e:?}"));
+            assert_eq!(got, expected, "sample {i}");
+        }
+        assert!(state.ever_took_zero_run);
+        assert_eq!(dec_medians, enc_medians);
+    }
+
+    #[test]
+    fn encode_stereo_gate_needs_both_channels_low() {
+        // Right channel's raw median[0] over the threshold → no
+        // zero-run field on the wire even for a leading zero; the
+        // round-trip must still hold via regular words.
+        let seeds = [[0u32, 0, 0], [256u32, 256, 256]];
+        let values = [0i32, 100, 0, -50];
+        let mut enc_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let bytes = encode_packed_samples_stereo(&values, &mut enc_medians).expect("encode");
+        let mut dec_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut state = StereoDecodeState::new();
+        let mut reader = BitReader::new(&bytes);
+        for (i, &expected) in values.iter().enumerate() {
+            let got = decode_sample_stateful_stereo(&mut reader, &mut dec_medians, &mut state)
+                .unwrap_or_else(|e| panic!("sample {i}: {e:?}"));
+            assert_eq!(got, expected, "sample {i}");
+        }
+        assert!(!state.ever_took_zero_run, "gate stayed shut");
+        assert_eq!(dec_medians, enc_medians);
+    }
+
+    #[test]
+    fn encode_stereo_round_trips_odd_length_slice() {
+        // A trailing left-only sample is encodable; decode per-call.
+        let seeds = [[8192u32, 8192, 8192], [4096u32, 4096, 4096]];
+        let values = [600i32, -300, 555];
+        let mut enc_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let bytes = encode_packed_samples_stereo(&values, &mut enc_medians).expect("encode");
+        let mut dec_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let mut state = StereoDecodeState::new();
+        let mut reader = BitReader::new(&bytes);
+        for &expected in &values {
+            assert_eq!(
+                decode_sample_stateful_stereo(&mut reader, &mut dec_medians, &mut state).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(dec_medians, enc_medians);
+    }
+
+    #[test]
+    fn encode_stereo_round_trips_lcg_mixed_sequence() {
+        // 400 interleaved deterministic pseudo-random samples through
+        // the frame-based decode wrapper.
+        let mut lcg = 0xBEEFu32;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            lcg
+        };
+        let values: Vec<i32> = (0..400)
+            .map(|_| {
+                let r = next();
+                match r % 4 {
+                    0 => 0,
+                    1 => (r >> 8) as i32 % 600,
+                    2 => -((r >> 8) as i32 % 60_000),
+                    _ => (r >> 8) as i32 % 5_000_000,
+                }
+            })
+            .collect();
+        let seeds = [[8192u32, 8192, 8192], [2048u32, 2048, 2048]];
+        let mut enc_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let bytes = encode_packed_samples_stereo(&values, &mut enc_medians).expect("encode");
+        assert_eq!(bytes.len() % 2, 0);
+
+        let view = crate::PackedSamples::new(&bytes);
+        let mut dec_medians = [
+            AdaptiveMedians::new(seeds[0]),
+            AdaptiveMedians::new(seeds[1]),
+        ];
+        let got =
+            decode_packed_samples_stereo(&view, &mut dec_medians, values.len() / 2).expect("ok");
+        assert_eq!(got, values);
+        assert_eq!(dec_medians, enc_medians);
+    }
+
+    #[test]
+    fn encode_stereo_from_entropy_matches_explicit_seeds() {
+        let info = EntropyInfo::stereo([8192, 8192, 8192], [4096, 4096, 4096]);
+        let values = [600i32, -300, 555, 222];
+        let via_info = encode_packed_samples_stereo_from_entropy(&values, &info).expect("encode");
+        let mut medians = [
+            AdaptiveMedians::new([8192, 8192, 8192]),
+            AdaptiveMedians::new([4096, 4096, 4096]),
+        ];
+        let via_seeds = encode_packed_samples_stereo(&values, &mut medians).expect("encode");
+        assert_eq!(via_info, via_seeds);
+    }
+
+    #[test]
+    fn encode_stereo_from_entropy_rejects_mono_info() {
+        let info = EntropyInfo::mono([100, 200, 300]);
+        assert_eq!(
+            encode_packed_samples_stereo_from_entropy(&[1, 2], &info),
+            Err(Error::InvalidEntropyInfoForStereo)
+        );
+    }
+
+    #[test]
+    fn encode_stereo_from_entropy_rejects_negative_seed() {
+        let info = EntropyInfo {
+            medians_left: [1, 2, 3],
+            medians_right: [0, -1, 0],
+        };
+        assert_eq!(
+            encode_packed_samples_stereo_from_entropy(&[1, 2], &info),
+            Err(Error::InvalidEntropyInfoForStereo)
+        );
+    }
+
+    #[test]
+    fn encode_decode_full_pipeline_through_packed_samples_view() {
+        // Encoder output consumed exactly the way a block decode does:
+        // through the PackedSamples view + decode_packed_samples_mono.
+        let seed = [8192u32, 8192, 8192];
+        let values: Vec<i32> = (-20..=20).map(|v| v * 37).collect();
+        let mut enc_medians = AdaptiveMedians::new(seed);
+        let bytes = encode_packed_samples_mono(&values, &mut enc_medians).expect("encode");
+        let view = crate::PackedSamples::new(&bytes);
+        let mut dec_medians = AdaptiveMedians::new(seed);
+        let got = decode_packed_samples_mono(&view, &mut dec_medians, values.len()).expect("ok");
+        assert_eq!(got, values);
+        assert_eq!(dec_medians, enc_medians);
     }
 }

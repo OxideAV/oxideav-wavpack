@@ -8,6 +8,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 281 — spec §4.2 exact-inverse entropy encoder on the public
+  surface.
+
+  New write-side twins for the entire decode ladder: `BitWriter`
+  (LSB-first emitter, inverse of `BitReader`); `split_sign` (const
+  inverse of `apply_sign`); `SampleInterval::encode_mantissa` /
+  `encode_value` / `encode_signed_value` (refusing out-of-interval
+  values via the new `Error::ValueNotInInterval`); `emit_raw_prefix` /
+  `emit_end_of_stream_marker` (inverse of `read_raw_prefix` including
+  the `LIMIT_ONES = 16` escape and the `cbits == 33` EOF marker);
+  `emit_zero_run_length` (public lift of the round-278 test-side
+  inverse); `RunState::unfold_prefix` (const inverse of `fold_prefix`,
+  choosing the spec §4.2 step 4 boundary carry);
+  `AdaptiveMedians::zone_for_magnitude` (inverse of the §4.2 step 5
+  interval ladder); and end-to-end `encode_packed_samples_mono` /
+  `encode_packed_samples_stereo` (+ `_from_entropy` twins) walking the
+  same per-word state machine the decode loops walk, padding the
+  payload to an even byte count per the spec §1 `0x0A` length rule.
+  42 net-new tests (625 total) pin every primitive against its decode
+  twin, mono + stereo round-trips across zones / signs / extremes /
+  zero-runs / LCG-mixed sequences with end-state median equality, and
+  the 31-bit-mask corner refusal.
+
+### Fixed
+
+- Round 281 — three spec §4.2 conformance corrections surfaced by the
+  inverse-encoder construction:
+
+  1. The §4.2 step 4 holding-bit fold (`RunState::fold_prefix`, the
+     decode loops, and `decode_run_length`) now adds the `+1` from the
+     PRIOR held-one state ("if a one **is being held**… the **new**
+     held-one is the **old** low bit"), not from the raw value's own
+     low bit. The previous behaviour transcribed the wiki pseudocode's
+     assign-then-test order — flagged non-factual by the staged docs —
+     under which a zone-0 word could never be followed by a
+     non-zero-zone word. `decode_run_length` now delegates to
+     `read_folded_ones_count`, gaining the typed `Error::EndOfStream`
+     / `Error::Truncated` escape handling in place of round-5's
+     shift-overflow debug panic on `n2 >= 33`.
+  2. A zero-length spec §4.2 step 1 run is the encoder's "no zero run
+     here" marker: decoding now falls through to the regular sample
+     word (previously it emitted a `0` sample, making every eligible
+     word decode to `0` forever).
+  3. The §4.2 step 1 eligibility gate (`DecodeState::zero_run_eligible`
+     / `StereoDecodeState::zero_run_eligible`) reads the RAW stored
+     `median[0] <= 1` per the spec §2.1 raw-vs-working distinction —
+     previously `get_med(0) <= 1`, i.e. raw `<= 15`.
+
 - Round 278 — spec §4.2 step 1 zero-run fast path lifted onto the
   public typed surface + over-cap shift-overflow hardening.
 

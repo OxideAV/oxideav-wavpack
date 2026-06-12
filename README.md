@@ -5,6 +5,55 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 281 — spec §4.2 exact-inverse entropy ENCODER on the public
+surface + three §4.2 conformance corrections the inverse construction
+surfaced. New write-side twins for the entire decode ladder:
+`BitWriter` (LSB-first emitter, inverse of `BitReader`); `split_sign`
+(const inverse of `apply_sign`); `SampleInterval::encode_mantissa` /
+`encode_value` / `encode_signed_value` (inverses of the round-260/261
+decode methods, refusing out-of-interval values via the new
+`Error::ValueNotInInterval`); `emit_raw_prefix` /
+`emit_end_of_stream_marker` (inverse of `read_raw_prefix` incl. the
+`LIMIT_ONES = 16` escape + `cbits == 33` EOF); `emit_zero_run_length`
+(public lift of the round-278 test-side inverse);
+`RunState::unfold_prefix` (const inverse of `fold_prefix`, choosing
+the §4.2 step 4 boundary carry); `AdaptiveMedians::zone_for_magnitude`
+(inverse of the §4.2 step 5 interval ladder); and end-to-end
+`encode_packed_samples_mono` / `encode_packed_samples_stereo` (+
+`_from_entropy` twins) walking the same per-word state machine the
+decode loops walk — zero-run fast path, prefix unfold with one-sample
+lookahead, pre-adapt interval, §3.2 adaptation, mantissa + sign — and
+padding the payload to an even byte count per the spec §1 `0x0A`
+length rule. Conformance corrections, each forced by the requirement
+that the encoder be a true inverse: (1) the §4.2 step 4 holding-bit
+fold now reads the PRIOR held-one ("if a one **is being held**… the
+**new** held-one is the **old** low bit") instead of the raw value's
+own low bit — the wiki pseudocode's assign-then-test order, which
+`docs/audio/wavpack/README.md` explicitly flags as non-factual, cannot
+represent a zone-0 word followed by any non-zero-zone word
+(`decode_run_length` now delegates to `read_folded_ones_count`,
+gaining the typed EOF / over-cap errors in place of round-5's
+shift-overflow panic); (2) a zero-length §4.2 step 1 run is the "no
+zero run here" marker and decoding falls through to the regular word
+for the same sample (previously it emitted a `0` sample, making every
+eligible word decode to `0` forever — no non-zero sample could follow
+once the gate opened); (3) the step 1 eligibility gate reads the RAW
+stored `median[0] <= 1` per the spec §2.1 raw-vs-working distinction,
+not `get_med(0) <= 1` (raw `<= 15`). 42 net-new tests (625 total, up
+from 583) pin: writer/reader bit-exactness (incl. an LCG-driven
+200-field sweep); every encode primitive against its decode twin
+(values, error shapes, exact bit counts, const evaluability,
+fold∘unfold identity across both entry states); the corrected fold +
+gate semantics at their boundaries (raw 1/2, both entry states ×
+carries); hand-built wires for the marker fall-through and the
+re-read-after-drain contract; mono + stereo round-trips across zones
+/ signs / i32 extremes / zero-runs / LCG-mixed sequences with
+end-state median equality between encoder and decoder; the
+even-length payload rule; the 31-bit-mask corner refusal (the one
+reachable encode error — a magnitude no decode of the same median
+state could produce); and the `_from_entropy` parity + rejection
+arms.**
+
 **Round 278 — spec §4.2 step 1 zero-run fast path lifted onto the
 public typed surface + over-cap shift-overflow hardening. The
 clean-room entropy doc
@@ -1289,7 +1338,14 @@ Public API:
 - Non-standard sample-rate `0x27` numeric decode.
 - Hybrid correction stream (`.wvc`) pairing.
 - CRC32 verification (depends on sample decode).
-- Encoder.
+- Block-level encoder (header + metadata sub-block writers). The spec
+  §4.2 entropy-stream encoder (`encode_packed_samples_mono` /
+  `encode_packed_samples_stereo` + the per-primitive `emit_*` /
+  `encode_*` write-side twins) landed in round 281; composing it with
+  a 32-byte header writer + `0x05` / `0x0A` sub-block framing into a
+  full `.wv` block writer is a later round (the `0x05` seed writer
+  also needs the log-pack *encode* direction, which the staged docs
+  describe only as a decode).
 
 ## Clean-room provenance
 

@@ -157,6 +157,25 @@ pub enum Error {
     /// callers that have validated the block's feature set themselves.
     /// Round 206.
     UnsupportedBlockFeature(crate::UnsupportedBlockFeature),
+    /// An encode-side primitive was asked to represent a value the
+    /// current spec §4.2 step 5 interval cannot carry.
+    /// [`crate::SampleInterval::encode_value`] /
+    /// [`crate::SampleInterval::encode_signed_value`] report the
+    /// magnitude against the `[low, high]` interval bounds;
+    /// [`crate::SampleInterval::encode_mantissa`] reports the mantissa
+    /// `code` against `[0, maxcode]`. Reachable through the packed
+    /// encoders only in the 31-bit-mask corner where the zone ladder's
+    /// masked interval collapses below the magnitude — exactly the
+    /// magnitudes no decode of the same median state could ever
+    /// produce. Round 281.
+    ValueNotInInterval {
+        /// The magnitude (or mantissa code) that does not fit.
+        value: u32,
+        /// Inclusive lower bound of the target interval.
+        low: u32,
+        /// Inclusive upper bound of the target interval.
+        high: u32,
+    },
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -232,6 +251,10 @@ impl core::fmt::Display for Error {
             Error::UnsupportedBlockFeature(feat) => write!(
                 f,
                 "oxideav-wavpack: WavPackBlock::decode_samples: block uses an unsupported feature ({feat})"
+            ),
+            Error::ValueNotInInterval { value, low, high } => write!(
+                f,
+                "oxideav-wavpack: encode: value {value} is outside the spec §4.2 step 5 interval [{low}, {high}]"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

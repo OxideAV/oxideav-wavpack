@@ -1,5 +1,55 @@
 //! Pure-Rust WavPack lossless audio codec.
 //!
+//! **Round 281 — spec §4.2 exact-inverse entropy ENCODER on the public
+//! surface + three §4.2 conformance corrections the inverse
+//! construction surfaced. New write-side twins for the whole decode
+//! ladder: [`BitWriter`] (the LSB-first emitter inverse of
+//! [`BitReader`]); [`split_sign`] (const inverse of [`apply_sign`]);
+//! [`SampleInterval::encode_mantissa`] /
+//! [`SampleInterval::encode_value`] /
+//! [`SampleInterval::encode_signed_value`] (inverses of the round-260/
+//! 261 decode methods, refusing out-of-interval values via the new
+//! [`Error::ValueNotInInterval`]); [`emit_raw_prefix`] /
+//! [`emit_end_of_stream_marker`] (inverse of [`read_raw_prefix`],
+//! including the `LIMIT_ONES = 16` escape and the `cbits == 33` EOF
+//! marker); [`emit_zero_run_length`] (public lift of the round-278
+//! test-side inverse of [`read_zero_run_length`]);
+//! [`RunState::unfold_prefix`] (const inverse of
+//! [`RunState::fold_prefix`], choosing the §4.2 step 4 boundary
+//! carry); [`AdaptiveMedians::zone_for_magnitude`] (inverse of the
+//! §4.2 step 5 interval ladder); and the end-to-end
+//! [`encode_packed_samples_mono`] / [`encode_packed_samples_stereo`]
+//! (with `_from_entropy` twins) walking the same per-word state
+//! machine the decode loops walk — zero-run fast path, prefix unfold
+//! with one-sample lookahead, pre-adapt interval, §3.2 adaptation,
+//! mantissa and sign — and padding the payload to an even byte count
+//! per the spec §1 `0x0A` length rule. Conformance corrections, each
+//! forced by the
+//! requirement that the encoder be a true inverse: (1) the §4.2 step 4
+//! holding-bit fold now reads the PRIOR held-one ("if a one **is being
+//! held**… the **new** held-one is the **old** low bit") instead of
+//! the raw value's own low bit — the wiki pseudocode's
+//! assign-then-test order, which the staged docs README flags as
+//! non-factual, cannot represent a zone-0 word followed by any
+//! non-zero-zone word ([`decode_run_length`] now delegates to
+//! [`read_folded_ones_count`], gaining the typed EOF/over-cap errors);
+//! (2) a zero-length §4.2 step 1 run is the "no zero run here" marker
+//! and decoding falls through to the regular word for the same sample
+//! (previously it emitted a `0` sample, making every eligible word
+//! decode to `0` forever); (3) the step 1 eligibility gate reads the
+//! RAW stored `median[0] <= 1` per the spec §2.1 raw-vs-working
+//! distinction, not `get_med(0) <= 1`. 42 net-new tests (625 total, up
+//! from 583) pin the writer/reader bit-exactness (including an
+//! LCG-driven 200-field sweep), every encode primitive against its
+//! decode twin (values, errors, exact bit counts, const evaluability,
+//! fold∘unfold identity across both entry states), the corrected fold
+//! and gate semantics at their boundaries, hand-built wires for the
+//! marker fall-through and the re-read-after-drain contract, mono +
+//! stereo round-trips across zones / signs / extremes / zero-runs /
+//! LCG-mixed sequences with end-state median equality, the
+//! even-length payload rule, the 31-bit-mask corner refusal, and the
+//! `_from_entropy` parity + rejection arms.**
+//!
 //! **Round 261 — spec §4.2 step 7 sign-bit reconstruction lifted onto
 //! the typed surface. The clean-room entropy doc
 //! `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §4.2 step 7
@@ -809,9 +859,11 @@ pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
     decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy, decode_run_length,
     decode_sample, decode_sample_stateful, decode_sample_stateful_stereo, decode_sample_value,
-    golomb_interval, read_folded_ones_count, read_raw_prefix, read_sign_and_apply,
-    read_zero_run_length, AdaptiveMedians, BitReader, DecodeState, GolombInterval, Medians,
-    RunState, SampleInterval, StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS,
-    GET_MED_FLOOR, GET_MED_SHIFT, INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER,
-    RUN_ESCAPE_CAP, UNARY_ESCAPE,
+    emit_end_of_stream_marker, emit_raw_prefix, emit_zero_run_length, encode_packed_samples_mono,
+    encode_packed_samples_mono_from_entropy, encode_packed_samples_stereo,
+    encode_packed_samples_stereo_from_entropy, golomb_interval, read_folded_ones_count,
+    read_raw_prefix, read_sign_and_apply, read_zero_run_length, split_sign, AdaptiveMedians,
+    BitReader, BitWriter, DecodeState, GolombInterval, Medians, RunState, SampleInterval,
+    StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT,
+    INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
 };
