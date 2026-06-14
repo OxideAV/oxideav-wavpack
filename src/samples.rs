@@ -1754,9 +1754,21 @@ pub fn read_raw_prefix(reader: &mut BitReader<'_>) -> Result<u32> {
         // cbits >= 2: read cbits - 1 mantissa bits LSB-first, top bit
         // implied set, then add LIMIT_ONES back in (spec §4.2 step 3,
         // "then add `LIMIT_ONES` back in").
+        //
+        // `cbits` may be as large as 32 (the `> ESCAPE_EOF_CBITS = 33`
+        // guard above only rejects 34+), so `escape_value` reaches
+        // `(1 << 31) | mantissa` ≈ `u32::MAX` and the `+ UNARY_ESCAPE`
+        // back-add overflows `u32`. A prefix value that close to `2^32`
+        // is structurally meaningless — it is only ever consumed as the
+        // §4.2 step 5 zone selector — so a `checked_add` overflow is
+        // treated as truncated to fail loudly rather than wrap, mirroring
+        // the round-278 `cbits > 33` handling above. (Before round 296
+        // this was a debug-build add-overflow panic.)
         let mantissa = reader.get_bits(cbits - 1)?;
         let escape_value = (1u32 << (cbits - 1)) | mantissa;
-        Ok(UNARY_ESCAPE + escape_value)
+        UNARY_ESCAPE
+            .checked_add(escape_value)
+            .ok_or(Error::Truncated)
     }
 }
 
@@ -2166,11 +2178,39 @@ pub fn decode_packed_samples_mono(
 ) -> Result<Vec<i32>> {
     let mut reader = payload.bit_reader();
     let mut state = DecodeState::new();
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(prealloc_floor(count, payload.len()));
     for _ in 0..count {
         out.push(decode_sample_stateful(&mut reader, medians, &mut state)?);
     }
     Ok(out)
+}
+
+/// Defensive pre-allocation floor for the per-block decode loops.
+///
+/// `count` is the caller-supplied sample target, ultimately the raw
+/// 32-bit `block_samples` header field, which is fully
+/// attacker-controlled and unbounded against the actual payload. Sizing
+/// the output `Vec` directly from it lets a 32-byte block claim
+/// `block_samples = 0xFFFF_FFFF` while carrying a near-empty `0x0A`
+/// payload, forcing a multi-gigabyte `Vec::with_capacity` before the
+/// decode loop reaches its first truncated read and errors — an
+/// allocation-amplification denial of service.
+///
+/// Spec §4.2 establishes the bound used to clamp the hint: every emitted
+/// sample word consumes **at least one bit** from the `0x0A` payload
+/// (the run-of-zeros unary count in step 1, or the modified-Rice unary
+/// prefix in step 2; both terminate on a wire bit, and the sign bit in
+/// step 7 costs a further bit for every non-zero-run word). A payload of
+/// `payload_len` bytes therefore carries at most `8 * payload_len`
+/// decodable sample words; any larger `count` is guaranteed to surface
+/// [`Error::Truncated`] mid-loop. Capping the *pre-allocation* at
+/// `min(count, 8 * payload_len)` removes the OOM while leaving decode
+/// behaviour identical: `with_capacity` is only a growth hint, the loop
+/// still runs to the real `count` and errors naturally when the bits run
+/// out, and every valid stream has `count` far below the bit budget so
+/// the cap never under-reserves a legitimate decode.
+fn prealloc_floor(count: usize, payload_len: usize) -> usize {
+    count.min(payload_len.saturating_mul(8))
 }
 
 /// Stereo (two-channel) decode state — one [`RunState`] per channel plus
@@ -2395,8 +2435,9 @@ pub fn decode_packed_samples_stereo(
 ) -> Result<Vec<i32>> {
     let mut reader = payload.bit_reader();
     let mut state = StereoDecodeState::new();
-    let mut out = Vec::with_capacity(frames * 2);
-    for _ in 0..(frames * 2) {
+    let slots = frames.saturating_mul(2);
+    let mut out = Vec::with_capacity(prealloc_floor(slots, payload.len()));
+    for _ in 0..slots {
         out.push(decode_sample_stateful_stereo(
             &mut reader,
             medians,
@@ -4913,6 +4954,59 @@ mod tests {
     }
 
     #[test]
+    fn prealloc_floor_clamps_oversized_count_to_payload_bit_budget() {
+        // A tiny payload (2 bytes = 16 bits) cannot encode more than 16
+        // sample words. An attacker-supplied count far larger than that
+        // must clamp the pre-allocation hint to the bit budget, never to
+        // the raw count.
+        assert_eq!(prealloc_floor(usize::MAX, 2), 16);
+        assert_eq!(prealloc_floor(553_648_129, 2), 16);
+        // An empty payload reserves nothing.
+        assert_eq!(prealloc_floor(1_000_000, 0), 0);
+        // A legitimate decode (count well under the bit budget) is
+        // unaffected — the floor returns the exact requested count.
+        assert_eq!(prealloc_floor(4, 1024), 4);
+        assert_eq!(prealloc_floor(0, 0), 0);
+    }
+
+    #[test]
+    fn decode_packed_samples_mono_rejects_oversized_count_without_oom() {
+        // Regression: a 2-byte 0x0A payload paired with a colossal
+        // `count` (the kind a malicious 32-bit `block_samples` header
+        // field carries) must surface a typed error from the truncated
+        // read, NOT attempt a multi-gigabyte `Vec::with_capacity`. The
+        // call returning at all (rather than aborting on OOM) is the
+        // contract; the cap keeps the reservation bounded by the
+        // payload's 16-bit budget.
+        let bytes = [0x00u8, 0x00];
+        let view = crate::PackedSamples::new(&bytes);
+        let mut medians = AdaptiveMedians::new([0, 0, 0]);
+        let err = decode_packed_samples_mono(&view, &mut medians, 553_648_129);
+        assert!(
+            matches!(err, Err(Error::Truncated) | Err(Error::EndOfStream)),
+            "expected a typed truncation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_packed_samples_stereo_rejects_oversized_frames_without_oom() {
+        // Stereo counterpart: an oversized `frames` (× 2 slots) against a
+        // small payload must clamp its pre-allocation and error on the
+        // truncated read rather than OOM.
+        let bytes = [0x00u8, 0x00, 0x00, 0x00];
+        let view = crate::PackedSamples::new(&bytes);
+        let mut medians = [
+            AdaptiveMedians::new([1, 0, 0]),
+            AdaptiveMedians::new([1, 0, 0]),
+        ];
+        let err = decode_packed_samples_stereo(&view, &mut medians, 553_648_129);
+        assert!(
+            matches!(err, Err(Error::Truncated) | Err(Error::EndOfStream)),
+            "expected a typed truncation error, got {err:?}"
+        );
+    }
+
+    #[test]
     fn decode_packed_samples_stereo_from_entropy_matches_explicit_seeds() {
         // Encode a stereo zone-1 sequence with both channels
         // seeded [8192;3], then decode it through both the explicit-
@@ -6356,6 +6450,24 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_unary(UNARY_ESCAPE);
         w.write_unary(34);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_raw_prefix(&mut r), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn read_raw_prefix_escape_value_near_u32_max_is_error_not_overflow_panic() {
+        // Regression (round 296): 16 ones (escape) then a `cbits = 32`
+        // second unary, then 31 all-one mantissa bits gives
+        // `escape_value = (1 << 31) | 0x7FFF_FFFF = 0xFFFF_FFFF`. The
+        // spec §4.2 step 3 "add `LIMIT_ONES` back in" then overflows the
+        // `u32` prefix (`16 + 0xFFFF_FFFF`). The decoder must surface a
+        // typed `Truncated` rather than the debug-build add-overflow
+        // panic the fuzzer found.
+        let mut w = BitWriter::new();
+        w.write_unary(UNARY_ESCAPE); // 16 ones + terminator (escape arm)
+        w.write_unary(32); // cbits = 32 (within the <= 33 cap)
+        w.write_bits(0x7FFF_FFFF, 31); // 31 mantissa bits, all set
         let bytes = w.finish();
         let mut r = BitReader::new(&bytes);
         assert_eq!(read_raw_prefix(&mut r), Err(Error::Truncated));

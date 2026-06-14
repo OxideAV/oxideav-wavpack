@@ -825,7 +825,7 @@ pub use crate::block::{
     iter_correction_blocks, iter_decoded_blocks, metadata_block_count, parse_block, parse_blocks,
     stream_total_samples, total_audio_samples, total_block_samples, total_correction_payload_bytes,
     AudioBlockIter, BlockIter, CorrectionBlockIter, StreamDecodeIter, UnsupportedBlockFeature,
-    WavPackBlock,
+    WavPackBlock, MAX_DECODE_SAMPLES_PER_BLOCK,
 };
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,

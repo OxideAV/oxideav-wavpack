@@ -5,6 +5,31 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 296 — `decode_stream` cargo-fuzz target + three decode-side
+hardening fixes it surfaced. New `fuzz/` libfuzzer sub-crate fuzzes the
+broadest public decode entry point (`decode_stream`): block-header
+validation, the metadata sub-block walker, the `0x05` entropy-info seed
+expander, and the `0x0A` modified-Rice sample-word decoder, asserting
+panic / overflow / OOM freedom. The campaign found three issues, all
+fixed: (1) pre-allocation amplification — `decode_packed_samples_*` sized
+their output `Vec::with_capacity` from the raw 32-bit `block_samples`
+header field, so a ~44-byte block could force a ~2.2 GB reservation; the
+new private `prealloc_floor` clamps the hint to
+`min(count, 8 * payload_len)`. (2) Eager-decode OOM — the spec §4.2
+step 1 zero-run path lets one ~63-bit run word expand to ~`2^31` zero
+samples, so the emitted count is unbounded by the payload byte length; a
+tiny block with `block_samples ≈ u32::MAX` still grows the output to
+billions of entries. `decode_samples` now rejects `block_samples` above
+the new `MAX_DECODE_SAMPLES_PER_BLOCK` ceiling (`1 << 26`) with the typed
+`Error::BlockSamplesTooLarge` (a defensive bound, not a spec limit). (3)
+Prefix add-overflow — `read_raw_prefix`'s §4.2 step 3 escape arm
+overflowed `UNARY_ESCAPE + escape_value` for `cbits = 32` with all-one
+mantissa bits (debug panic); the back-add is now `checked_add` surfacing
+`Error::Truncated`, matching the round-278 over-cap handling. Decode of
+every valid stream is unchanged. 6 net-new regression tests (631 total);
+a five-file seed corpus decodes cleanly; a sustained ~6M-exec
+`decode_stream` campaign is crash-free after the fixes.**
+
 **Round 281 — spec §4.2 exact-inverse entropy ENCODER on the public
 surface + three §4.2 conformance corrections the inverse construction
 surfaced. New write-side twins for the entire decode ladder:

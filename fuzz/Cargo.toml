@@ -1,0 +1,44 @@
+[package]
+name = "oxideav-wavpack-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The block-stream decoder is the surface worth fuzzing: a 32-byte
+# WavPack block header (magic + ck_size + version + index/sample
+# fields + the 32-bit flag word + crc), followed by a metadata region
+# of length-prefixed sub-blocks (0x05 entropy-info median seeds,
+# 0x0A packed sample words, decorrelation/correction/overflow IDs),
+# then the next block. Header field validation, the metadata walker's
+# size-word/odd-size/large-size bounds arithmetic, the 0x05 seed
+# expander, the LSB-first bit reader and the 0x0A modified-Rice
+# sample-word decoder (zone ladder, unary escape, phase-in mantissa,
+# adaptive medians) are all driven from attacker-controlled bytes.
+#
+# There is no cross-decode oracle here: the clean-room wall bars the
+# reference implementation as a source, so the contract under test is
+# purely panic / overflow / OOM freedom over the public decode entry
+# point.
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-wavpack]
+path = ".."
+
+# Keep this fuzz package out of the umbrella workspace's `crates/*`
+# glob at resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_stream"
+path = "fuzz_targets/decode_stream.rs"
+test = false
+doc = false

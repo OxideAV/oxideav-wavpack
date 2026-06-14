@@ -8,6 +8,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 296 — `decode_stream` cargo-fuzz target + seed corpus.
+
+  New `fuzz/` libfuzzer sub-crate with a `decode_stream` target driving
+  arbitrary bytes through the broadest public decode entry point — block
+  header validation, the metadata sub-block walker, the `0x05`
+  entropy-info seed expander, and the `0x0A` modified-Rice sample-word
+  decoder — asserting panic / overflow / OOM freedom. Ships a five-file
+  seed corpus (minimal mono / stereo audio blocks, a metadata-only
+  block, back-to-back blocks, a multi-sample mono block) that decodes
+  cleanly through `decode_stream`.
+
 - Round 281 — spec §4.2 exact-inverse entropy encoder on the public
   surface.
 
@@ -32,6 +43,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the 31-bit-mask corner refusal.
 
 ### Fixed
+
+- Round 296 — three decode-side hardening fixes against malformed input,
+  all found by the new `decode_stream` cargo-fuzz target.
+
+  1. **Pre-allocation amplification.** `decode_packed_samples_mono` /
+     `decode_packed_samples_stereo` sized their output
+     `Vec::with_capacity` directly from the caller's `count` / `frames`,
+     ultimately the raw 32-bit `block_samples` header field. A ~44-byte
+     block claiming `block_samples = 0x21000001` with a 2-byte `0x0A`
+     payload forced a ~2.2 GB reservation before the loop reached its
+     first truncated read. The new private `prealloc_floor` clamps the
+     reservation hint to `min(count, 8 * payload_len)` (spec §4.2: a
+     bit-reading sample word costs at least one wire bit).
+
+  2. **Eager-decode amplification (OOM).** The reservation cap alone is
+     insufficient because the spec §4.2 step 1 zero-run fast path lets a
+     single ~63-bit run word expand to ~`2^31` zero samples, so the
+     emitted count is not bounded by the `0x0A` payload byte length: a
+     tiny block with `block_samples ≈ u32::MAX` still grows the output
+     `Vec` to billions of entries via `push`. `WavPackBlock::decode_samples`
+     now rejects `block_samples` above the new
+     `MAX_DECODE_SAMPLES_PER_BLOCK` ceiling (`1 << 26`, well above any
+     real block) with the typed `Error::BlockSamplesTooLarge`. This is a
+     defensive engineering bound, not a spec limit.
+
+  3. **Prefix add-overflow panic.** `read_raw_prefix`'s spec §4.2 step 3
+     escape arm computed `UNARY_ESCAPE + escape_value`; with `cbits = 32`
+     (within the `<= 33` cap) and all-one mantissa bits `escape_value`
+     reaches `u32::MAX`, overflowing the `u32` add (a debug-build panic).
+     The back-add is now `checked_add`, surfacing `Error::Truncated` on
+     overflow — mirroring the existing round-278 `cbits > 33` handling.
+
+  Decode behaviour for every valid stream is unchanged. New
+  `Error::BlockSamplesTooLarge` variant + `MAX_DECODE_SAMPLES_PER_BLOCK`
+  public constant; 6 net-new regression tests (631 total). A sustained
+  ~6M-exec `decode_stream` campaign is crash-free after the fixes.
 
 - Round 281 — three spec §4.2 conformance corrections surfaced by the
   inverse-encoder construction:

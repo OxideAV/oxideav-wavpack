@@ -176,6 +176,25 @@ pub enum Error {
         /// Inclusive upper bound of the target interval.
         high: u32,
     },
+    /// `WavPackBlock::decode_samples` was called on a block whose
+    /// 32-bit `block_samples` header field
+    /// (`docs/audio/wavpack/wiki/WavPack.wiki` "Block structure",
+    /// "32 bits - samples in this block") exceeds the decoder's
+    /// per-block sample ceiling [`crate::MAX_DECODE_SAMPLES_PER_BLOCK`].
+    ///
+    /// The wiki documents `block_samples` as a bare 32-bit count with no
+    /// upper bound, and the spec §4.2 step 1 zero-run fast path lets a
+    /// single ~63-bit run word expand to ~`2^31` zero samples — so the
+    /// emitted sample count is **not** bounded by the `0x0A` payload
+    /// byte length. An attacker can therefore set `block_samples` to a
+    /// near-`u32::MAX` value in a tiny block and force the per-sample
+    /// loop to grow its output `Vec` to billions of entries (a
+    /// multi-gigabyte allocation) before the bitstream genuinely runs
+    /// dry. This typed rejection caps the eager decode at a generous
+    /// engineering ceiling well above any real WavPack block; it is an
+    /// anti-amplification guard, not a spec-mandated limit. The
+    /// contained value is the offending `block_samples` field verbatim.
+    BlockSamplesTooLarge(u32),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -255,6 +274,11 @@ impl core::fmt::Display for Error {
             Error::ValueNotInInterval { value, low, high } => write!(
                 f,
                 "oxideav-wavpack: encode: value {value} is outside the spec §4.2 step 5 interval [{low}, {high}]"
+            ),
+            Error::BlockSamplesTooLarge(n) => write!(
+                f,
+                "oxideav-wavpack: block_samples {n} exceeds the per-block decode ceiling \
+                 (anti-amplification guard)"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

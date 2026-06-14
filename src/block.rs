@@ -50,6 +50,29 @@ use crate::samples::{
     decode_packed_samples_mono_from_entropy, decode_packed_samples_stereo_from_entropy,
 };
 
+/// Anti-amplification ceiling on the per-block decoded sample count.
+///
+/// The wiki "Block structure" listing
+/// (`docs/audio/wavpack/wiki/WavPack.wiki`) gives `block_samples` as a
+/// bare 32-bit field with no documented upper bound, and the spec §4.2
+/// step 1 zero-run fast path lets a single ~63-bit run word expand to
+/// ~`2^31` zero samples — so the emitted count is **not** bounded by the
+/// `0x0A` payload byte length. Without a ceiling, a ~44-byte block can
+/// set `block_samples` near `u32::MAX` and force
+/// [`WavPackBlock::decode_samples`] to grow a multi-gigabyte output
+/// `Vec` before the bitstream genuinely runs dry — an allocation
+/// amplification denial of service.
+///
+/// `1 << 26` (67,108,864) samples per channel corresponds to roughly 25
+/// minutes of mono audio at 44.1 kHz carried in a single block — far
+/// beyond any plausible real block — while keeping the worst-case eager
+/// allocation bounded at a few hundred megabytes. A block whose
+/// `block_samples` exceeds this surfaces
+/// [`Error::BlockSamplesTooLarge`](crate::Error::BlockSamplesTooLarge)
+/// rather than attempting the allocation. This is a defensive
+/// engineering bound, not a spec-mandated limit.
+pub const MAX_DECODE_SAMPLES_PER_BLOCK: u32 = 1 << 26;
+
 /// Named WavPack v.4 feature the round-15/199 per-sample loop does not
 /// yet support, surfaced through
 /// [`Error::UnsupportedBlockFeature`](crate::Error::UnsupportedBlockFeature)
@@ -607,6 +630,15 @@ impl<'a> WavPackBlock<'a> {
 
         // Round-4 expander on the 0x05 payload + round-201 wrappers on
         // the 0x0A payload give us the whole pipe in two calls.
+        // Anti-amplification guard: `block_samples` is an unbounded
+        // 32-bit field and the spec §4.2 step 1 zero-run path lets it
+        // expand far beyond the `0x0A` payload byte length, so an absurd
+        // value must be rejected before it sizes the per-sample loop's
+        // output `Vec`. See [`MAX_DECODE_SAMPLES_PER_BLOCK`].
+        if header.block_samples > MAX_DECODE_SAMPLES_PER_BLOCK {
+            return Err(Error::BlockSamplesTooLarge(header.block_samples));
+        }
+
         let entropy = expand_entropy(entropy_sub.payload)?;
         let count = header.block_samples as usize;
 
@@ -1809,6 +1841,43 @@ mod tests {
         assert!(block.header.flags.is_block_data_mono());
         let got = block.decode_samples().expect("decode samples");
         assert_eq!(got, vec![0]);
+    }
+
+    #[test]
+    fn decode_samples_rejects_absurd_block_samples_without_oom() {
+        // Regression (round 296): the spec §4.2 step 1 zero-run path lets
+        // a tiny 0x0A payload's `block_samples` field expand without a
+        // payload-byte bound. A block claiming a near-`u32::MAX`
+        // `block_samples` while carrying a 2-byte payload must surface a
+        // typed `BlockSamplesTooLarge` rejection rather than attempting a
+        // multi-gigabyte `Vec` for the per-sample loop.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0xFF, 0xFF]);
+        let flags = flags_with(1 << 2); // mono
+        let bytes = synthesise_block(0x2100_0001, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        let err = block.decode_samples();
+        assert_eq!(err, Err(Error::BlockSamplesTooLarge(0x2100_0001)));
+    }
+
+    #[test]
+    fn decode_samples_accepts_block_samples_at_the_ceiling() {
+        // The guard rejects strictly above MAX_DECODE_SAMPLES_PER_BLOCK;
+        // a block exactly at the ceiling is still attempted (and here
+        // surfaces a truncation error from the per-sample loop, not the
+        // size guard — proving the boundary is inclusive of the ceiling).
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0xFF, 0xFF]);
+        let flags = flags_with(1 << 2);
+        let bytes = synthesise_block(MAX_DECODE_SAMPLES_PER_BLOCK, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        let err = block.decode_samples();
+        assert!(
+            !matches!(err, Err(Error::BlockSamplesTooLarge(_))),
+            "ceiling value must not trip the size guard, got {err:?}"
+        );
     }
 
     #[test]
