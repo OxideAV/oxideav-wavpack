@@ -563,6 +563,10 @@ impl<'a> WavPackBlock<'a> {
     ///   medians to seed from.
     /// * [`Error::BlockMissingPackedSamples`] — the block carries no
     ///   `0x0A` packed-samples sub-block.
+    /// * [`Error::PackedSamplesOddLength`] — the `0x0A` packed-samples
+    ///   payload has an odd byte count, which
+    ///   `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 rejects
+    ///   ("byte length must be even or the block is rejected").
     ///
     /// Errors from [`crate::expand_entropy`] and the per-sample loop
     /// (truncation, EOF, malformed `EntropyInfo`, …) are propagated
@@ -625,8 +629,13 @@ impl<'a> WavPackBlock<'a> {
         // per-sample loop to have inputs.
         let entropy_sub =
             find_entropy_info(&self.sub_blocks).ok_or(Error::BlockMissingEntropyInfo)?;
-        let packed =
-            find_packed_samples(&self.sub_blocks).ok_or(Error::BlockMissingPackedSamples)?;
+        let packed = find_packed_samples(&self.sub_blocks)
+            .ok_or(Error::BlockMissingPackedSamples)?
+            // Spec §1: the 0x0A main-bitstream payload byte length must
+            // be even or the block is rejected (the reader binds it as
+            // 16-bit words). Refuse an odd payload before the per-sample
+            // loop runs.
+            .validate_length()?;
 
         // Round-4 expander on the 0x05 payload + round-201 wrappers on
         // the 0x0A payload give us the whole pipe in two calls.
@@ -1859,6 +1868,56 @@ mod tests {
         let (block, _) = parse_block(&bytes).expect("parse block");
         let err = block.decode_samples();
         assert_eq!(err, Err(Error::BlockSamplesTooLarge(0x2100_0001)));
+    }
+
+    /// Append a `0x0A` packed-samples sub-block whose walker-returned
+    /// payload is ODD-length, using the wiki `0x40` odd-size framing flag:
+    /// the on-disk size field counts `(odd_payload.len() + 1) / 2` words
+    /// and the encoder appends one trailing pad byte the round-2 walker
+    /// strips, so the walker hands `decode_samples` an odd payload.
+    fn append_packed_samples_odd(payload: &mut Vec<u8>, odd_payload: &[u8]) {
+        assert!(odd_payload.len() % 2 == 1, "helper expects an odd payload");
+        let words = odd_payload.len().div_ceil(2) as u8;
+        payload.push(0x0A | crate::ID_FLAG_ODD_SIZE);
+        payload.push(words);
+        payload.extend_from_slice(odd_payload);
+        payload.push(0x00); // padding byte the odd-size flag accounts for
+    }
+
+    #[test]
+    fn decode_samples_rejects_odd_length_packed_samples_payload() {
+        // Spec §1: the 0x0A main-bitstream payload byte length must be
+        // even or the block is rejected. A walker-stripped odd payload
+        // (one real byte, framed via the 0x40 odd-size flag) must surface
+        // a typed `PackedSamplesOddLength` rejection — distinct from the
+        // framing pad, which the walker already removed.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples_odd(&mut payload, &[0x00]);
+        let flags = flags_with(1 << 2); // mono
+        let bytes = synthesise_block(1, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        // The walker should hand back a 1-byte (odd) 0x0A payload.
+        let packed = find_packed_samples(&block.sub_blocks).expect("0x0A present");
+        assert_eq!(packed.len(), 1);
+        assert_eq!(
+            block.decode_samples(),
+            Err(Error::PackedSamplesOddLength(1))
+        );
+    }
+
+    #[test]
+    fn decode_samples_accepts_even_length_packed_samples_payload() {
+        // The companion to the odd-rejection test: a plain even-length
+        // 0x0A payload decodes normally (one `0` sample), proving the
+        // spec §1 gate fires only on odd payloads.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with(1 << 2);
+        let bytes = synthesise_block(1, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.decode_samples(), Ok(vec![0]));
     }
 
     #[test]

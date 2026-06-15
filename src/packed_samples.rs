@@ -34,16 +34,32 @@
 //! decoder. The median-adaptation amount docs gap that gates the
 //! stateful payload loop is unchanged.
 //!
-//! ## Length: unconstrained by the wiki
+//! ## Length: the spec §1 even-byte rule
 //!
-//! The wiki places **no** size constraint on the `0x0A` payload (the
-//! sample count is determined by the block header's `block_samples`,
-//! and the entropy-coded bitstream packs `block_samples` Golomb
-//! codewords into however many bytes the encoder chose). Even the empty
-//! payload (zero bytes) is structurally valid — it would mean a
-//! metadata-only block, or a block whose `block_samples` is zero. The
-//! constructor therefore accepts any byte slice (including the empty
-//! one) without rejection.
+//! The wiki "Samples coding" section places **no** numeric size on the
+//! `0x0A` payload (the sample count is determined by the block header's
+//! `block_samples`, and the entropy-coded bitstream packs
+//! `block_samples` Golomb codewords into however many bytes the encoder
+//! chose). The clean-room entropy doc
+//! `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 narrows that
+//! with one structural rule: the main-bitstream payload "byte length
+//! must be even or the block is rejected" — the reader binds the `0x0A`
+//! payload to the per-stream main bitstream as 16-bit words. (The
+//! round-2 metadata walker has already stripped the optional odd-size
+//! *framing* padding byte, so an odd length here is an odd *payload*,
+//! distinct from the framing pad.)
+//!
+//! [`PackedSamples::new`] is a verbatim, infallible view constructor and
+//! does **not** apply that rule (it stays a `const fn` over any slice,
+//! so a caller probing a payload — including the empty one — can always
+//! wrap it). The even-byte rule is surfaced separately as the
+//! [`PackedSamples::is_even_length`] predicate, the
+//! [`PackedSamples::validate_length`] checked accessor, and the
+//! [`validate_packed_samples`] free constructor, and is enforced by the
+//! round-206 [`crate::WavPackBlock::decode_samples`] composer before the
+//! per-sample loop runs. The empty payload (zero bytes) is even and so
+//! passes — it would mean a metadata-only block, or a block whose
+//! `block_samples` is zero.
 //!
 //! ## Bit order
 //!
@@ -53,6 +69,7 @@
 //! factory honours that convention exactly because it constructs a
 //! [`crate::BitReader`] which is the only reader the crate exposes.
 
+use crate::error::{Error, Result};
 use crate::samples::BitReader;
 
 /// Typed view of the `0x0A` packed-samples sub-block payload — the
@@ -99,6 +116,38 @@ impl<'a> PackedSamples<'a> {
         self.bytes.is_empty()
     }
 
+    /// `true` when the payload length is even, the structural rule the
+    /// clean-room entropy doc
+    /// `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 places on
+    /// the `0x0A` main bitstream ("byte length must be even or the block
+    /// is rejected"). The empty payload (zero bytes) is even and so
+    /// reports `true`.
+    ///
+    /// Pure predicate: reads nothing and mutates nothing. Use
+    /// [`Self::validate_length`] for the checked-accessor form that
+    /// surfaces [`Error::PackedSamplesOddLength`] on an odd payload.
+    pub const fn is_even_length(&self) -> bool {
+        self.bytes.len() % 2 == 0
+    }
+
+    /// Return `Ok(*self)` when the payload satisfies the spec §1 even-byte
+    /// rule (see [`Self::is_even_length`]), or
+    /// [`Error::PackedSamplesOddLength`] carrying the observed byte count
+    /// when the payload is odd.
+    ///
+    /// The view itself is always constructible from any slice via
+    /// [`Self::new`]; this accessor is the explicit gate a decode path
+    /// applies before binding the payload to the per-sample loop. The
+    /// round-206 [`crate::WavPackBlock::decode_samples`] composer calls it
+    /// for exactly that reason.
+    pub const fn validate_length(&self) -> Result<Self> {
+        if self.is_even_length() {
+            Ok(Self { bytes: self.bytes })
+        } else {
+            Err(Error::PackedSamplesOddLength(self.bytes.len()))
+        }
+    }
+
     /// Construct a fresh [`BitReader`] positioned at bit 0 of the
     /// payload, ready to feed [`crate::decode_run_length`] /
     /// [`crate::decode_sample_value`] / [`crate::decode_sample`].
@@ -124,6 +173,20 @@ impl<'a> PackedSamples<'a> {
 /// / `decode_sample_value`.
 pub fn expand_packed_samples(payload: &[u8]) -> PackedSamples<'_> {
     PackedSamples::new(payload)
+}
+
+/// Construct a [`PackedSamples`] view over a `0x0A` sub-block payload,
+/// applying the clean-room entropy doc
+/// `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 even-byte rule
+/// ("byte length must be even or the block is rejected").
+///
+/// The checked counterpart to [`expand_packed_samples`]: returns the
+/// typed view for an even-length (including empty) payload and
+/// [`Error::PackedSamplesOddLength`] carrying the observed byte count for
+/// an odd-length payload. Equivalent to
+/// `PackedSamples::new(payload).validate_length()`.
+pub const fn validate_packed_samples(payload: &[u8]) -> Result<PackedSamples<'_>> {
+    PackedSamples::new(payload).validate_length()
 }
 
 #[cfg(test)]
@@ -204,6 +267,67 @@ mod tests {
         // Any read against an empty packed-samples view should report
         // truncation — the wiki places no zero-fill contract.
         assert_eq!(r.get_bit(), Err(crate::Error::Truncated));
+    }
+
+    #[test]
+    fn is_even_length_classifies_payload_parity() {
+        // Empty is even (spec §1 even-byte rule: empty passes).
+        assert!(PackedSamples::new(&[]).is_even_length());
+        // Even lengths pass.
+        assert!(PackedSamples::new(&[0x00, 0x00]).is_even_length());
+        assert!(PackedSamples::new(&[0x01, 0x02, 0x03, 0x04]).is_even_length());
+        // Odd lengths fail.
+        assert!(!PackedSamples::new(&[0x00]).is_even_length());
+        assert!(!PackedSamples::new(&[0x01, 0x02, 0x03]).is_even_length());
+    }
+
+    #[test]
+    fn validate_length_accepts_even_and_empty_payloads() {
+        let empty = PackedSamples::new(&[]);
+        assert_eq!(empty.validate_length(), Ok(empty));
+
+        let even = PackedSamples::new(&[0xDE, 0xAD]);
+        let validated = even.validate_length().expect("even payload validates");
+        assert_eq!(validated.bytes(), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn validate_length_rejects_odd_payload_with_observed_count() {
+        let odd = PackedSamples::new(&[0x01, 0x02, 0x03]);
+        assert_eq!(
+            odd.validate_length(),
+            Err(crate::Error::PackedSamplesOddLength(3))
+        );
+        // One-byte payload reports a count of 1.
+        assert_eq!(
+            PackedSamples::new(&[0xFF]).validate_length(),
+            Err(crate::Error::PackedSamplesOddLength(1))
+        );
+    }
+
+    #[test]
+    fn validate_packed_samples_free_fn_matches_method() {
+        let even = [0x11, 0x22, 0x33, 0x44];
+        assert_eq!(
+            validate_packed_samples(&even),
+            PackedSamples::new(&even).validate_length()
+        );
+        let odd = [0x11, 0x22, 0x33];
+        assert_eq!(
+            validate_packed_samples(&odd),
+            Err(crate::Error::PackedSamplesOddLength(3))
+        );
+        // Empty passes the free constructor too.
+        assert!(validate_packed_samples(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_length_is_const_evaluable() {
+        const EVEN: Result<PackedSamples<'static>> =
+            PackedSamples::new(&[0xAA, 0xBB]).validate_length();
+        const ODD: Result<PackedSamples<'static>> = PackedSamples::new(&[0xAA]).validate_length();
+        assert!(EVEN.is_ok());
+        assert_eq!(ODD, Err(crate::Error::PackedSamplesOddLength(1)));
     }
 
     #[test]

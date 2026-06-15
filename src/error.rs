@@ -50,6 +50,17 @@ pub enum Error {
     /// the wiki "IDs" listing ("16-byte MD5 sum of raw audio data").
     /// The contained number is the observed byte count.
     Md5ChecksumLength(usize),
+    /// A `0x0A` packed-samples sub-block had an odd-length payload. The
+    /// clean-room entropy doc
+    /// `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 states the
+    /// main-bitstream payload "byte length must be even or the block is
+    /// rejected" — the reader binds the `0x0A` payload to the per-stream
+    /// main bitstream as 16-bit words, so an odd byte count is a
+    /// malformed sub-block. (The round-2 walker has already stripped the
+    /// optional odd-size *metadata-framing* padding byte, so an odd
+    /// length surviving to this check is an odd *payload*, distinct from
+    /// the framing pad.) The contained number is the observed byte count.
+    PackedSamplesOddLength(usize),
     /// The Golomb mantissa decode of a `0x0A` sample reached `add == 0`
     /// (a median of `1`), where the wiki "Samples coding" pseudocode's
     /// `k = log2(add)` and `getbits(k - 1)` are undefined (`log2(0)` and
@@ -231,6 +242,10 @@ impl core::fmt::Display for Error {
             Error::Md5ChecksumLength(n) => write!(
                 f,
                 "oxideav-wavpack: 0x26 MD5-checksum payload has {n} bytes (expected 16)"
+            ),
+            Error::PackedSamplesOddLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x0A packed-samples payload has {n} bytes (must be even per spec \u{00A7}1)"
             ),
             Error::GolombDegenerateInterval(add) => write!(
                 f,

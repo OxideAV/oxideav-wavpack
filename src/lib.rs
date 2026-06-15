@@ -854,7 +854,7 @@ pub use crate::metadata::{
     MD5_DIGEST_BYTES,
 };
 pub use crate::overflow_bits::{expand_packed_overflow_bits, PackedOverflowBits};
-pub use crate::packed_samples::{expand_packed_samples, PackedSamples};
+pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples, PackedSamples};
 pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
     decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy, decode_run_length,

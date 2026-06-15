@@ -5,6 +5,38 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
+**Round 312 — spec §1 even-byte rule for the `0x0A` packed-samples
+payload lifted onto the typed surface + enforced in the block decode
+composer. The clean-room entropy doc
+`docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 narrows the
+otherwise length-unconstrained `0x0A` main bitstream with one
+structural rule: the reader binds the payload as 16-bit words, so its
+"byte length must be even or the block is rejected". (The round-2
+metadata walker has already stripped the optional `0x40` odd-size
+*framing* pad, so an odd length surviving this check is an odd
+*payload*, distinct from the pad.) Through round 296 the
+[`PackedSamples`] view accepted any slice without applying that rule
+and [`WavPackBlock::decode_samples`] never checked it. New
+[`PackedSamples::is_even_length`] is the pure `const` predicate
+(empty → `true`); new [`PackedSamples::validate_length`] is the
+`const` checked accessor returning the view for an even/empty payload
+and the new typed [`Error::PackedSamplesOddLength`] (carrying the
+observed byte count) for an odd one; new free function
+[`validate_packed_samples`] is the `const`
+`PackedSamples::new(p).validate_length()` shorthand. The round-206
+[`WavPackBlock::decode_samples`] composer now calls `validate_length`
+on the `0x0A` sub-block before the per-sample loop, so a malformed
+odd-payload block surfaces `PackedSamplesOddLength` instead of
+attempting a decode over a partial trailing word. The infallible
+verbatim [`PackedSamples::new`] constructor is unchanged (a probe can
+still wrap any slice). 7 net-new tests (645 total, up from 638): the
+even/odd/empty predicate; `validate_length` accept (even + empty) /
+reject (odd, with observed count) / const-evaluability; the free-fn
+parity with the method; and at the block level, `decode_samples`
+rejecting a `0x40`-framed odd `0x0A` payload with
+`PackedSamplesOddLength(1)` while the even companion still decodes to
+`[0]`.**
+
 **Round 296 — `decode_stream` cargo-fuzz target + three decode-side
 hardening fixes it surfaced. New `fuzz/` libfuzzer sub-crate fuzzes the
 broadest public decode entry point (`decode_stream`): block-header
@@ -1084,10 +1116,26 @@ Public API:
   / [`PackedSamples::len`] / [`PackedSamples::is_empty`] introspection
   plus a [`PackedSamples::bit_reader`] factory that yields a fresh
   [`BitReader`] positioned at bit 0 — the round-2 walker → round-5/6/7
-  decoder handoff in one call. The wiki places no length constraint on
-  the payload (the sample count is conveyed out-of-band by the block
-  header's `block_samples`), so any byte slice, including the empty
-  one, is accepted without rejection.
+  decoder handoff in one call. The wiki places no numeric length on the
+  payload (the sample count is conveyed out-of-band by the block
+  header's `block_samples`), so [`PackedSamples::new`] /
+  [`expand_packed_samples`] accept any byte slice, including the empty
+  one, without rejection. The spec §1 even-byte rule (round 312) is
+  surfaced separately as [`PackedSamples::is_even_length`] /
+  [`PackedSamples::validate_length`] / [`validate_packed_samples`].
+- [`PackedSamples::is_even_length`] / [`PackedSamples::validate_length`]
+  / [`validate_packed_samples`] (round 312) — the spec §1 rule that the
+  `0x0A` main-bitstream payload "byte length must be even or the block
+  is rejected" (the reader binds the payload as 16-bit words; the
+  round-2 walker has already stripped the `0x40` odd-size framing pad,
+  so an odd length here is an odd *payload*). `is_even_length` is the
+  pure `const` predicate (empty → `true`); `validate_length` is the
+  `const` checked accessor returning the view for an even/empty payload
+  and [`Error::PackedSamplesOddLength`] (carrying the observed byte
+  count) for an odd one; `validate_packed_samples` is the `const`
+  free-function shorthand for `PackedSamples::new(p).validate_length()`.
+  [`WavPackBlock::decode_samples`] calls `validate_length` before the
+  per-sample loop, so an odd-payload block is refused up front.
 - [`BitReader::byte_position`] / [`BitReader::bit_position`] /
   [`BitReader::bits_consumed`] — cursor accessors naming the reader's
   position in the underlying byte slice. `bits_consumed` clamps at the
