@@ -34,6 +34,15 @@ Working surface:
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
   bit-for-bit.
+* **Block CRC** — the §5 running 32-bit sample CRC is computed by a
+  `BlockCrc` accumulator (`push_mono` / `push_stereo_pair` /
+  `push_joint_stereo_pair`, `matches`) and the `crc_mono` /
+  `crc_stereo_interleaved` / `crc_joint_stereo_interleaved` one-shot
+  helpers. The mono `crc*3 + s` and stereo `crc*9 + 3L + R` steps, the
+  `0xffffffff` seed, and the joint-stereo mid/side undo
+  (`undo_joint_stereo`) that precedes the stereo step are implemented and
+  pinned to the spec's worked CRC vectors; `matches` verifies a computed
+  CRC against the stored header CRC.
 
 ## Public API sketch
 
@@ -63,9 +72,13 @@ silently decoded as independent L/R, which would emit the mid/side
 residuals); the gates are stereo-only, so mono / false-stereo blocks
 with the bits set still decode. The decorrelation,
 hybrid-correction (`.wvc`), and overflow-bit sub-block payloads have
-typed views but no consuming decode pass. CRC verification is not done
-(the staged docs do not specify the polynomial / byte span — the CRC is
-surfaced verbatim). A full `.wv` block *writer* (header + sub-block
+typed views but no consuming decode pass. The §5 block CRC is now
+*computed* (over decoded mono / stereo / joint-stereo PCM) and can be
+checked against the stored header word via `BlockCrc::matches`, but the
+end-to-end decode pipeline does not yet run the CRC at block end to mute
+mismatched blocks (that is gated on the decorrelation/hybrid loop); the
+extension CRC (`crc_x`, §5.5) over `0x0C` wide/float data is likewise
+pending its consumer. A full `.wv` block *writer* (header + sub-block
 framing around the entropy encoder) is not yet assembled. The crate is
 not yet wired into the `oxideav-core` framework registry — there is no
 `Decoder` / `Encoder` trait impl or `register` entry point.
@@ -73,13 +86,16 @@ not yet wired into the `oxideav-core` framework registry — there is no
 ## Provenance
 
 Clean-room from the staged material under `docs/audio/wavpack/`: the
-block-structure and sub-block-ID wiki listing and the clean-room
-entropy-decode trace `docs/audio/wavpack/spec/wavpack-entropy-decode.md`.
-No external library source, archived prior history, or online resources
-were consulted at any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes
-the `decode_stream` entry point; 638 unit tests synthesise minimal
-valid headers / sub-blocks / bitstreams and poison each field to
-exercise the accept / reject boundaries.
+block-structure and sub-block-ID wiki listing, the clean-room
+entropy-decode trace `docs/audio/wavpack/spec/wavpack-entropy-decode.md`,
+and — for the block CRC — `§5` of the clean-room decorrelation/CRC trace
+`docs/audio/wavpack/spec/wavpack-decorrelation.md`. No external library
+source, archived prior history, or online resources were consulted at
+any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
+entry point; 662 unit tests synthesise minimal valid headers /
+sub-blocks / bitstreams and poison each field to exercise the accept /
+reject boundaries, and pin the §5 CRC primitives to the spec's worked
+mono / stereo CRC vectors.
 
 ## License
 

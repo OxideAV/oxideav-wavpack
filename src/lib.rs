@@ -811,6 +811,7 @@
 mod block;
 mod block_header;
 mod correction;
+mod crc;
 mod decorrelation;
 mod entropy;
 mod error;
@@ -832,6 +833,10 @@ pub use crate::block_header::{
     MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,
 };
 pub use crate::correction::{expand_packed_correction_data, PackedCorrectionData};
+pub use crate::crc::{
+    crc_joint_stereo_interleaved, crc_mono, crc_stereo_interleaved, undo_joint_stereo, update_mono,
+    update_stereo, BlockCrc, CRC_INIT, JOINT_STEREO_FLAG,
+};
 pub use crate::decorrelation::{
     decorrelation_sample_count, expand_samples, expand_terms, expand_weights,
     partition_decorrelation_samples, weights_per_term, DecorrelationSamples, DecorrelationTerms,

@@ -8,6 +8,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 325 — §5 running block-CRC primitives over decoded PCM.
+
+  New `crc` module implements the clean-room decorrelation/CRC trace
+  (`docs/audio/wavpack/spec/wavpack-decorrelation.md` §5): the
+  `0xffffffff` seed (`CRC_INIT`), the mono step `crc*3 + s`
+  (`update_mono`), the stereo step `crc*9 + 3L + R` (`update_stereo`),
+  and the joint-stereo mid/side undo `R -= L>>1; L += R`
+  (`undo_joint_stereo`) that the spec applies before the stereo step. A
+  `BlockCrc` accumulator (`push_mono` / `push_stereo_pair` /
+  `push_joint_stereo_pair` / `value` / `matches`) and the one-shot
+  `crc_mono` / `crc_stereo_interleaved` / `crc_joint_stereo_interleaved`
+  helpers are re-exported. All arithmetic uses 32-bit wrap-around with
+  samples folded in as their two's-complement `u32` bit patterns. 27 new
+  tests pin both of the spec §7 worked CRC vectors (mono
+  `[3,-2,5,0,-7] → 0xfffffff0`, stereo `[(3,-2),(5,0),(-7,9)] →
+  0xffffffd9`), the seed, the shift-form equivalence of the stereo step,
+  the joint-stereo undo round-trip across a range, accumulator/free-fn
+  parity, trailing-odd-sample handling, order/perturbation sensitivity,
+  and the `matches` verification arms. This computes the CRC but does not
+  yet wire it into the block-end mute path (gated on the
+  decorrelation/hybrid decode loop); the extension CRC (`crc_x`, §5.5)
+  remains pending its `0x0C` consumer.
+
 - Round 320 — typed refusal of joint-stereo / cross-channel
   decorrelation stereo blocks.
 
