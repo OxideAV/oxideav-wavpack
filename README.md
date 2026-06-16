@@ -55,7 +55,13 @@ if block.is_audio_block() {
 `WavPackBlock::decode_samples` refuses the following with a typed
 `Error::UnsupportedBlockFeature`: hybrid (lossy) blocks, float and
 32-bit-int sample data, multichannel members, decorrelation pre-pass
-blocks, and low-latency / robust block layouts. The decorrelation,
+blocks, low-latency / robust block layouts, and — on stereo blocks —
+joint-stereo (mid/side, flag bit 4) and cross-channel decorrelation
+(flag bit 5). The two inter-channel transforms have no formula in the
+staged docs, so a block carrying either flag is refused (rather than
+silently decoded as independent L/R, which would emit the mid/side
+residuals); the gates are stereo-only, so mono / false-stereo blocks
+with the bits set still decode. The decorrelation,
 hybrid-correction (`.wvc`), and overflow-bit sub-block payloads have
 typed views but no consuming decode pass. CRC verification is not done
 (the staged docs do not specify the polynomial / byte span — the CRC is

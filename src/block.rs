@@ -122,6 +122,23 @@ pub enum UnsupportedBlockFeature {
     /// set. The composer is conservative and refuses experimental
     /// blocks; the per-sample primitives themselves stay callable.
     RobustBlock,
+    /// Wiki bit 4 ("joint stereo coding scheme") is set on a stereo
+    /// block. The two entropy-decoded channels are a mid/side (sum /
+    /// difference) pair that must be run through the inverse joint-stereo
+    /// transform before they are valid left / right PCM. The staged docs
+    /// under `docs/audio/wavpack/` name the flag (wiki "Flags meaning"
+    /// bit 4) but do not specify the inverse transform, so decoding the
+    /// two channels independently would emit the mid/side residuals
+    /// rather than reconstructed L/R. The composer refuses these blocks
+    /// with this typed tag rather than returning silently-wrong PCM.
+    JointStereo,
+    /// Wiki bit 5 ("cross-decorrelation scheme is used") is set on a
+    /// stereo block. The block applies an inter-channel decorrelation
+    /// pass whose arithmetic the staged docs do not specify (the wiki
+    /// "Flags meaning" listing names bit 5 but gives no formula), so the
+    /// medians-only per-sample loop cannot reconstruct the true L/R PCM.
+    /// Refused with this typed tag rather than emitting wrong output.
+    CrossChannelDecorrelation,
 }
 
 impl core::fmt::Display for UnsupportedBlockFeature {
@@ -140,6 +157,10 @@ impl core::fmt::Display for UnsupportedBlockFeature {
                 "low-latency block (flag bit 31, wiki \"do not decode\")"
             }
             UnsupportedBlockFeature::RobustBlock => "robust experimental block (flag bit 28)",
+            UnsupportedBlockFeature::JointStereo => "joint-stereo (mid/side) coding (flag bit 4)",
+            UnsupportedBlockFeature::CrossChannelDecorrelation => {
+                "cross-channel decorrelation (flag bit 5)"
+            }
         };
         f.write_str(name)
     }
@@ -552,6 +573,18 @@ impl<'a> WavPackBlock<'a> {
     /// * [`UnsupportedBlockFeature::RobustBlock`] — wiki bit 28
     ///   "robust block (experimental, okay to ignore)" set; the
     ///   composer is conservative about experimental gating.
+    /// * [`UnsupportedBlockFeature::JointStereo`] — wiki bit 4
+    ///   ("joint stereo coding scheme") set on a stereo block; the two
+    ///   decoded channels are a mid/side pair whose inverse transform is
+    ///   undocumented in the staged docs, so decoding them independently
+    ///   would emit residuals rather than reconstructed L/R PCM.
+    /// * [`UnsupportedBlockFeature::CrossChannelDecorrelation`] — wiki
+    ///   bit 5 ("cross-decorrelation scheme is used") set on a stereo
+    ///   block; the inter-channel decorrelation formula is undocumented.
+    ///
+    /// Both inter-channel refusals are gated on
+    /// [`Flags::is_block_data_mono`] being `false` — a mono / false-stereo
+    /// block has only one decoded channel and is unaffected.
     ///
     /// Structural refusals (separate from feature gates):
     ///
@@ -623,6 +656,32 @@ impl<'a> WavPackBlock<'a> {
             return Err(Error::UnsupportedBlockFeature(
                 UnsupportedBlockFeature::Decorrelation,
             ));
+        }
+        // Inter-channel transforms only apply to genuinely-stereo block
+        // data (two decoded channels). A mono or false-stereo block
+        // carries a single channel, so these flags — even if a malformed
+        // encoder left them set — have no second channel to combine and
+        // are not a correctness hazard for the mono path. Guard on
+        // `is_block_data_mono()` so the mono / false-stereo loop is not
+        // needlessly refused.
+        if !flags.is_block_data_mono() {
+            // Wiki bit 4: the two decoded channels are a mid/side pair
+            // that needs the inverse joint-stereo transform (undocumented
+            // in the staged docs) before they are valid L/R PCM.
+            // Decoding them independently would emit the mid/side
+            // residuals, so refuse rather than return wrong samples.
+            if flags.joint_stereo {
+                return Err(Error::UnsupportedBlockFeature(
+                    UnsupportedBlockFeature::JointStereo,
+                ));
+            }
+            // Wiki bit 5: inter-channel (cross) decorrelation, formula
+            // not in the staged docs. Same hazard, same refusal.
+            if flags.cross_channel_decorrelation {
+                return Err(Error::UnsupportedBlockFeature(
+                    UnsupportedBlockFeature::CrossChannelDecorrelation,
+                ));
+            }
         }
 
         // Structural sub-block lookup. Both must be present for the
@@ -2103,6 +2162,111 @@ mod tests {
     }
 
     #[test]
+    fn decode_samples_rejects_joint_stereo_block() {
+        // Bit 4 set on a stereo block → mid/side coding. The inverse
+        // joint-stereo transform is undocumented in the staged docs, so
+        // decoding the two channels independently would emit mid/side
+        // residuals rather than reconstructed L/R PCM. The composer
+        // refuses with a typed feature tag instead of returning wrong
+        // samples.
+        let mut payload = Vec::new();
+        append_entropy_info_stereo_minimal(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        // Stereo (mono bit clear) + bit 4 joint-stereo.
+        let bytes = synthesise_block(1, flags_with(1 << 4), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.header.flags.mono);
+        assert!(block.header.flags.joint_stereo);
+        let err = block
+            .decode_samples()
+            .expect_err("must refuse joint-stereo");
+        assert_eq!(
+            err,
+            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::JointStereo)
+        );
+    }
+
+    #[test]
+    fn decode_samples_rejects_cross_channel_decorrelation_block() {
+        // Bit 5 set on a stereo block → inter-channel decorrelation, a
+        // pass whose arithmetic the staged docs do not specify. Same
+        // correctness hazard as joint-stereo, same typed refusal.
+        let mut payload = Vec::new();
+        append_entropy_info_stereo_minimal(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 5), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.header.flags.mono);
+        assert!(block.header.flags.cross_channel_decorrelation);
+        let err = block
+            .decode_samples()
+            .expect_err("must refuse cross-channel decorrelation");
+        assert_eq!(
+            err,
+            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::CrossChannelDecorrelation)
+        );
+    }
+
+    #[test]
+    fn decode_samples_joint_stereo_takes_priority_over_cross_decorrelation() {
+        // Both bit 4 and bit 5 set: the composer checks joint-stereo
+        // first, so the reported tag is JointStereo. Pins the gate order
+        // so the diagnostic is stable for callers.
+        let mut payload = Vec::new();
+        append_entropy_info_stereo_minimal(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with((1 << 4) | (1 << 5)), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        let err = block.decode_samples().expect_err("must refuse");
+        assert_eq!(
+            err,
+            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::JointStereo)
+        );
+    }
+
+    #[test]
+    fn decode_samples_mono_block_ignores_inter_channel_flags() {
+        // A mono block carries a single decoded channel, so the bit 4 /
+        // bit 5 inter-channel flags have no second channel to combine and
+        // must NOT trip the stereo-only gates. Even with both bits set the
+        // mono path decodes normally (here: one `0` sample). Guards
+        // against the gate being placed before the mono/stereo split.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        // bit 2 mono + bit 4 joint + bit 5 cross.
+        let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 4) | (1 << 5)), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.header.flags.is_block_data_mono());
+        assert!(block.header.flags.joint_stereo);
+        assert!(block.header.flags.cross_channel_decorrelation);
+        let got = block
+            .decode_samples()
+            .expect("mono decode ignores inter-channel flags");
+        assert_eq!(got, vec![0]);
+    }
+
+    #[test]
+    fn decode_samples_false_stereo_block_ignores_inter_channel_flags() {
+        // A false-stereo block (bit 30) is stereo at the stream level but
+        // mono at the block level, so it too has a single decoded channel
+        // and must not trip the inter-channel gates.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        // bit 30 false_stereo + bit 4 joint + bit 5 cross (mono bit clear).
+        let bytes = synthesise_block(1, flags_with((1 << 30) | (1 << 4) | (1 << 5)), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.header.flags.mono);
+        assert!(block.header.flags.false_stereo);
+        assert!(block.header.flags.is_block_data_mono());
+        let got = block
+            .decode_samples()
+            .expect("false-stereo decode ignores inter-channel flags");
+        assert_eq!(got, vec![0]);
+    }
+
+    #[test]
     fn decode_samples_rejects_block_with_decorrelation_terms_sub_block() {
         // A `0x02` (decorrelation terms) sub-block presence is the
         // tell-tale that the encoder ran a prediction pass; without a
@@ -2244,6 +2408,11 @@ mod tests {
             ),
             (UnsupportedBlockFeature::LowLatencyBlock, "flag bit 31"),
             (UnsupportedBlockFeature::RobustBlock, "flag bit 28"),
+            (UnsupportedBlockFeature::JointStereo, "flag bit 4"),
+            (
+                UnsupportedBlockFeature::CrossChannelDecorrelation,
+                "flag bit 5",
+            ),
         ];
         for (feat, substring) in cases {
             let rendered = format!("{feat}");

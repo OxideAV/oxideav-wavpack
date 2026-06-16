@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 320 — typed refusal of joint-stereo / cross-channel
+  decorrelation stereo blocks.
+
+  `WavPackBlock::decode_samples` now refuses a stereo block carrying the
+  wiki "Flags meaning" bit 4 ("joint stereo coding scheme") or bit 5
+  ("cross-decorrelation scheme is used") with two new
+  `UnsupportedBlockFeature` variants (`JointStereo`,
+  `CrossChannelDecorrelation`). Both flags select an inter-channel
+  transform whose inverse arithmetic is not specified in the staged docs
+  under `docs/audio/wavpack/`; the prior code decoded the two channels
+  independently, silently emitting the mid/side residuals instead of
+  reconstructed left/right PCM. The gates are stereo-only (keyed on
+  `Flags::is_block_data_mono`), so mono and false-stereo blocks with the
+  bits set still decode normally. Six new tests cover the two refusals,
+  the gate-order priority, the combined-flag case, and the mono /
+  false-stereo pass-through, plus two new `Display` round-trip cases.
+
 - Round 296 — `decode_stream` cargo-fuzz target + seed corpus.
 
   New `fuzz/` libfuzzer sub-crate with a `decode_stream` target driving
