@@ -87,7 +87,7 @@
 //!   C-style snippet without `int` / `signed char` typing. Read as a
 //!   signed 8-bit byte here because (a) `n > 0` is the only branch
 //!   guard, which assumes signed `n`; and (b) cross-decorrelation
-//!   weights are documented as signed in every other WavPack reference
+//!   weights are documented as signed throughout the WavPack spec
 //!   (we have not consulted those, but the sign convention is the only
 //!   reading that makes the `n > 0` branch meaningful — for unsigned
 //!   bytes that branch would fire for everything except 0).
@@ -611,11 +611,11 @@ pub(crate) fn expand_sample_word(mantissa_byte: u8, exponent_byte: u8) -> i32 {
 ///
 /// The multiply is performed in `i64` so that a wide (`>16`-bit) sample
 /// times a `±1024` weight cannot overflow before the shift; the spec
-/// notes the reference uses an algebraically equivalent split-multiply
+/// notes the spec uses an algebraically equivalent split-multiply
 /// for the same reason on 32-bit targets, but the widened product
 /// computes the identical `weight·sample/1024` rounded value. The
 /// arithmetic right shift floors toward negative infinity, matching the
-/// reference's signed `>>`.
+/// spec.s signed `>>`.
 ///
 /// Sanity (spec §7): `apply_weight(1024, 100) == 100` (unity) and
 /// `apply_weight(512, 100) == 50` (half gain).
@@ -635,7 +635,7 @@ pub fn apply_weight(weight: i32, sample: i32) -> i32 {
 /// * otherwise the weight gains `delta` when `source` and `result` share
 ///   a sign and loses `delta` when their signs differ.
 ///
-/// This is the plain-arithmetic form of the branch-free reference
+/// This is the plain-arithmetic form of the branch-free canonical form
 /// expression `weight += ((source ^ result) >> 31 ? -delta : delta)`
 /// (the sign of the product selects the direction). `delta` is the
 /// per-pass weight step carried in the high 3 bits of the term byte
@@ -647,7 +647,7 @@ pub fn update_weight(weight: i32, delta: i32, source: i32, result: i32) -> i32 {
     }
     // Same sign → add delta, opposite sign → subtract delta. Using the
     // product's sign avoids a separate signum of each operand and
-    // mirrors the reference's `(source ^ result) >> 31` test.
+    // mirrors the spec's `(source ^ result) >> 31` test.
     if (source ^ result) < 0 {
         weight.wrapping_sub(delta)
     } else {
@@ -660,7 +660,7 @@ pub fn update_weight(weight: i32, delta: i32, source: i32, result: i32) -> i32 {
 ///
 /// Spec §3.5 (`update_weight_clip`): the cross terms clamp the working
 /// weight's **magnitude** to [`WEIGHT_CLIP`] (`1024`, unity) so the
-/// zero-delay feedback loop cannot run the weight away. The reference
+/// zero-delay feedback loop cannot run the weight away. The spec
 /// performs the step on the magnitude and clamps before restoring the
 /// sign:
 ///
@@ -675,8 +675,8 @@ pub fn update_weight(weight: i32, delta: i32, source: i32, result: i32) -> i32 {
 /// and `result` share a sign the new weight is `min(weight + delta,
 /// 1024)`; when their signs differ it is `-min(delta - weight, 1024)`.
 /// Both reduce to "move the magnitude toward unity by `delta`, capped at
-/// `1024`, then carry the same sign the unclamped reference would" — the
-/// step is computed exactly as the reference's signed `i32` arithmetic
+/// `1024`, then carry the same sign the unclamped update would" — the
+/// step is computed exactly as the spec's signed `i32` arithmetic
 /// so the clamp boundary matches bit-for-bit.
 #[inline]
 pub fn update_weight_clip(weight: i32, delta: i32, source: i32, result: i32) -> i32 {
@@ -686,7 +686,7 @@ pub fn update_weight_clip(weight: i32, delta: i32, source: i32, result: i32) -> 
     // s = (source ^ result) >> 31: 0 when signs agree, -1 when they
     // differ. The `>> 31` is an arithmetic shift of the sign bit.
     let s = (source ^ result) >> 31;
-    // w = (weight ^ s) + (delta - s): the reference's magnitude step.
+    // w = (weight ^ s) + (delta - s): the spec's magnitude step.
     let mut w = (weight ^ s).wrapping_add(delta.wrapping_sub(s));
     if w > WEIGHT_CLIP {
         w = WEIGHT_CLIP;
@@ -1260,7 +1260,7 @@ mod tests {
     #[test]
     fn apply_weight_arithmetic_shift_floors_negatives() {
         // A small product floors toward negative infinity (arithmetic
-        // >>), matching the reference's signed shift. weight = 1,
+        // >>), matching the spec's signed shift. weight = 1,
         // sample = -1 → (-1 + 512) >> 10 = 511 >> 10 = 0.
         assert_eq!(apply_weight(1, -1), 0);
         // weight = 1, sample = -1024 → (-1024 + 512) >> 10
@@ -1327,13 +1327,13 @@ mod tests {
     fn update_weight_clip_opposite_sign_uses_reference_magnitude_form() {
         // Opposite sign (s = -1): weight = -min(delta - weight, 1024).
         // For weight = 900, delta = 7: -min(7 - 900, 1024)
-        // = -min(-893, 1024) = -(-893) = 893. The reference magnitude
+        // = -min(-893, 1024) = -(-893) = 893. The spec magnitude
         // step shrinks the positive weight toward zero by delta-ish and
         // re-signs; our faithful transcription matches the branch-free
         // arithmetic exactly.
         assert_eq!(update_weight_clip(900, 7, -4, 9), 893);
         // A negative starting weight with opposite-sign operands:
-        // weight = -900, s = -1 (source/result differ). The reference
+        // weight = -900, s = -1 (source/result differ). The spec
         // arithmetic: w = (-900 ^ -1) + (7 - (-1)) = 899 + 8 = 907,
         // not > 1024, weight = (907 ^ -1) - (-1) = -908 + 1 = -907.
         assert_eq!(update_weight_clip(-900, 7, 4, -9), -907);

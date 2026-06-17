@@ -4,7 +4,7 @@
 //! decoder recomputes the CRC as it emits samples and, at the block's last
 //! sample, compares it against the stored block CRC
 //! ([`crate::WavPackBlockHeader::crc`]); a mismatch marks the block as
-//! corrupt (the reference decoder zeroes/mutes the affected buffer).
+//! corrupt (a conformant decoder zeroes/mutes the affected buffer).
 //!
 //! This module implements exactly the documented accumulation arithmetic
 //! from the staged spec
@@ -16,7 +16,7 @@
 //! ## Arithmetic (spec §5)
 //!
 //! The CRC is a multiply-accumulate over a 32-bit register that wraps
-//! (the reference uses unsigned 32-bit wrap-around, so all math here is
+//! (the spec uses unsigned 32-bit wrap-around, so all math here is
 //! [`u32::wrapping_add`] / [`u32::wrapping_mul`] on the register, with
 //! samples folded in as their two's-complement `u32` bit pattern):
 //!
@@ -37,7 +37,7 @@
 //!   against the stored block CRC; equal means the decoded samples match.
 //!
 //! The `s`, `L`, `R` samples are folded in as `u32` two's-complement bit
-//! patterns (`sample as u32`), matching the reference register where the
+//! patterns (`sample as u32`), matching the canonical register where the
 //! signed sample is added to an unsigned 32-bit accumulator.
 //!
 //! The extension CRC (`crc_x`, spec §5.5) covers the `0x0C` wide/float
@@ -66,7 +66,7 @@ pub fn update_mono(crc: u32, sample: i32) -> u32 {
 ///
 /// `crc' = crc * 9 + 3 * L + R`, with both samples taken as their
 /// two's-complement `u32` bit patterns and the whole expression evaluated
-/// with 32-bit wrap-around. The reference writes this as
+/// with 32-bit wrap-around. The spec writes this as
 /// `crc + (crc << 3) + (L << 1) + L + R`, which is algebraically the same
 /// (`crc + 8*crc = 9*crc`, `2*L + L = 3*L`).
 ///
@@ -91,7 +91,7 @@ pub fn update_stereo(crc: u32, left: i32, right: i32) -> u32 {
 /// ```
 ///
 /// The shift is an arithmetic right shift (Rust `>>` on `i32` is
-/// arithmetic), matching the reference's signed `>>`. Returns the
+/// arithmetic), matching the spec.s signed `>>`. Returns the
 /// recovered `(left, right)`. Only invoke this when the block's
 /// [`JOINT_STEREO_FLAG`] is set.
 #[inline]
@@ -167,7 +167,7 @@ impl BlockCrc {
     /// Whether the accumulated CRC equals a stored block CRC (spec §5.6).
     ///
     /// A `true` result means the decoded samples folded so far reproduce
-    /// the CRC the block header recorded; the reference decoder mutes the
+    /// the CRC the block header recorded; a conformant decoder mutes the
     /// block on a `false` result.
     #[inline]
     #[must_use]
@@ -193,7 +193,7 @@ pub fn crc_mono(samples: &[i32]) -> u32 {
 /// L/R form (spec §5.3).
 ///
 /// `samples` is interleaved `[L0, R0, L1, R1, ...]`; a trailing odd
-/// element (an incomplete pair) is ignored, matching the reference's
+/// element (an incomplete pair) is ignored, matching the spec.s
 /// pair-at-a-time accumulation. For joint-stereo blocks the caller must
 /// undo mid/side first (see [`crc_joint_stereo_interleaved`]).
 #[must_use]
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn stereo_step_is_crc_times_nine_plus_3l_plus_r() {
-        // Direct formula vs the shift form used by the reference.
+        // Direct formula vs the shift form used by the canonical decoder.
         let (l, r) = (5i32, -3i32);
         let crc = 0x1234_5678u32;
         let direct = crc

@@ -18,7 +18,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the shift), `update_weight` (§3.4, the LMS-style `±delta` adaptation —
   no change when either operand is zero, `+delta` on matching signs,
   `-delta` on opposite signs), and `update_weight_clip` (§3.5, the
-  cross-channel variant that performs the reference's branch-free
+  cross-channel variant that performs the spec's branch-free
   magnitude step and clamps to `±1024`). New `WEIGHT_SHIFT` (`10`),
   `WEIGHT_ROUND_BIAS` (`512`), and `WEIGHT_CLIP` (`1024`) constants name
   the §6 scale/round/clip values; all three functions plus the constants
