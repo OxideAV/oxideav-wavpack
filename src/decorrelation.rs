@@ -128,6 +128,22 @@ pub const SAMPLE_ON_WIRE_BYTES: usize = 2;
 /// ("high 8 bits are exponent-9").
 pub const SAMPLE_EXPONENT_BIAS: i32 = 9;
 
+/// Right-shift applied to the `weight * sample` product in
+/// [`apply_weight`]. Weights are normalised so that `1 << WEIGHT_SHIFT`
+/// (`1024`) is unity gain. (Spec §3.1 / §6: "weight scale shift" `10`.)
+pub const WEIGHT_SHIFT: u32 = 10;
+
+/// Rounding addend applied before the [`WEIGHT_SHIFT`] right-shift in
+/// [`apply_weight`] (`1 << (WEIGHT_SHIFT - 1)` = `512`). (Spec §3.1 /
+/// §6: "weight round bias" `512`.)
+pub const WEIGHT_ROUND_BIAS: i64 = 1 << (WEIGHT_SHIFT - 1);
+
+/// Working-weight magnitude limit — `1024` is unity gain and the
+/// largest magnitude a clipped weight update ([`update_weight_clip`])
+/// allows the cross-channel terms to reach. (Spec §3.5 / §6: "weight
+/// unity / clip" `±1024`.)
+pub const WEIGHT_CLIP: i32 = 1 << WEIGHT_SHIFT;
+
 /// Classification of a single predictor term code per the wiki
 /// "Possible predictor values" listing in the
 /// `docs/audio/wavpack/wiki/WavPack.wiki` "Decorrelation terms" section:
@@ -581,6 +597,102 @@ pub(crate) fn expand_sample_word(mantissa_byte: u8, exponent_byte: u8) -> i32 {
         }
         mantissa >> abs_shift
     }
+}
+
+/// Scale a decorrelation predictor sample by a working weight.
+///
+/// Spec §3.1 (`apply_weight`): the predicted contribution of a
+/// decorrelation pass is `weight * sample` divided down by `2^10` with a
+/// rounding bias, where weights are normalised so `1024` is unity gain:
+///
+/// ```text
+/// apply_weight(weight, sample) = (weight * sample + 512) >> 10
+/// ```
+///
+/// The multiply is performed in `i64` so that a wide (`>16`-bit) sample
+/// times a `±1024` weight cannot overflow before the shift; the spec
+/// notes the reference uses an algebraically equivalent split-multiply
+/// for the same reason on 32-bit targets, but the widened product
+/// computes the identical `weight·sample/1024` rounded value. The
+/// arithmetic right shift floors toward negative infinity, matching the
+/// reference's signed `>>`.
+///
+/// Sanity (spec §7): `apply_weight(1024, 100) == 100` (unity) and
+/// `apply_weight(512, 100) == 50` (half gain).
+#[inline]
+pub fn apply_weight(weight: i32, sample: i32) -> i32 {
+    let product = weight as i64 * sample as i64 + WEIGHT_ROUND_BIAS;
+    (product >> WEIGHT_SHIFT) as i32
+}
+
+/// Nudge a decorrelation pass weight toward better prediction after a
+/// reconstructed sample (the LMS-style adaptation step).
+///
+/// Spec §3.4 (`update_weight`): given the predictor `source` and the
+/// entropy residual `result`, the weight moves by `±delta`:
+///
+/// * if either `source` or `result` is zero, the weight is unchanged;
+/// * otherwise the weight gains `delta` when `source` and `result` share
+///   a sign and loses `delta` when their signs differ.
+///
+/// This is the plain-arithmetic form of the branch-free reference
+/// expression `weight += ((source ^ result) >> 31 ? -delta : delta)`
+/// (the sign of the product selects the direction). `delta` is the
+/// per-pass weight step carried in the high 3 bits of the term byte
+/// (range `0..=7`).
+#[inline]
+pub fn update_weight(weight: i32, delta: i32, source: i32, result: i32) -> i32 {
+    if source == 0 || result == 0 {
+        return weight;
+    }
+    // Same sign → add delta, opposite sign → subtract delta. Using the
+    // product's sign avoids a separate signum of each operand and
+    // mirrors the reference's `(source ^ result) >> 31` test.
+    if (source ^ result) < 0 {
+        weight.wrapping_sub(delta)
+    } else {
+        weight.wrapping_add(delta)
+    }
+}
+
+/// Clipped variant of [`update_weight`] used by the zero-delay
+/// cross-channel terms (`-1`/`-2`/`-3`).
+///
+/// Spec §3.5 (`update_weight_clip`): the cross terms clamp the working
+/// weight's **magnitude** to [`WEIGHT_CLIP`] (`1024`, unity) so the
+/// zero-delay feedback loop cannot run the weight away. The reference
+/// performs the step on the magnitude and clamps before restoring the
+/// sign:
+///
+/// ```text
+/// s = (source ^ result) >> 31;     // 0 if same sign, -1 if opposite
+/// w = (weight ^ s) + (delta - s);  // step the magnitude up by delta
+/// if (w > 1024) w = 1024;          // clamp magnitude
+/// weight = (w ^ s) - s;            // restore sign
+/// ```
+///
+/// Resolving the branch-free `^`/`-` magnitude algebra: when `source`
+/// and `result` share a sign the new weight is `min(weight + delta,
+/// 1024)`; when their signs differ it is `-min(delta - weight, 1024)`.
+/// Both reduce to "move the magnitude toward unity by `delta`, capped at
+/// `1024`, then carry the same sign the unclamped reference would" — the
+/// step is computed exactly as the reference's signed `i32` arithmetic
+/// so the clamp boundary matches bit-for-bit.
+#[inline]
+pub fn update_weight_clip(weight: i32, delta: i32, source: i32, result: i32) -> i32 {
+    if source == 0 || result == 0 {
+        return weight;
+    }
+    // s = (source ^ result) >> 31: 0 when signs agree, -1 when they
+    // differ. The `>> 31` is an arithmetic shift of the sign bit.
+    let s = (source ^ result) >> 31;
+    // w = (weight ^ s) + (delta - s): the reference's magnitude step.
+    let mut w = (weight ^ s).wrapping_add(delta.wrapping_sub(s));
+    if w > WEIGHT_CLIP {
+        w = WEIGHT_CLIP;
+    }
+    // weight = (w ^ s) - s: restore the sign s encoded.
+    (w ^ s).wrapping_sub(s)
 }
 
 #[cfg(test)]
@@ -1117,5 +1229,129 @@ mod tests {
         // byte (0x00); 0x00 → shift = -9, which fits the < 32 branch.
         // We can't reach abs_shift >= 32 from the wire alone, but
         // the guard is there for defence in depth.
+    }
+
+    // ---- apply_weight (spec §3.1) ----
+
+    #[test]
+    fn apply_weight_unity_is_identity() {
+        // Spec §7: apply_weight(1024, x) == x. 1024 is unity gain.
+        assert_eq!(apply_weight(1024, 100), 100);
+        assert_eq!(apply_weight(1024, -100), -100);
+        assert_eq!(apply_weight(1024, 0), 0);
+        // The +512 rounding bias does not perturb unity for any sample:
+        // (1024*x + 512) >> 10 = x + (512 >> 10) = x.
+        assert_eq!(apply_weight(1024, 1), 1);
+        assert_eq!(apply_weight(1024, 1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn apply_weight_half_gain_rounds_with_bias() {
+        // Spec §7: apply_weight(512, 100) == 50. (512*100 + 512) >> 10
+        // = (51200 + 512) >> 10 = 51712 >> 10 = 50.
+        assert_eq!(apply_weight(512, 100), 50);
+        // The +512 bias rounds toward +infinity at the half boundary:
+        // sample = 1 with weight 512 → (512 + 512) >> 10 = 1024 >> 10 = 1.
+        assert_eq!(apply_weight(512, 1), 1);
+        // weight = 512, sample = -1 → (-512 + 512) >> 10 = 0.
+        assert_eq!(apply_weight(512, -1), 0);
+    }
+
+    #[test]
+    fn apply_weight_arithmetic_shift_floors_negatives() {
+        // A small product floors toward negative infinity (arithmetic
+        // >>), matching the reference's signed shift. weight = 1,
+        // sample = -1 → (-1 + 512) >> 10 = 511 >> 10 = 0.
+        assert_eq!(apply_weight(1, -1), 0);
+        // weight = 1, sample = -1024 → (-1024 + 512) >> 10
+        // = -512 >> 10 = -1 (arithmetic shift, not truncation to 0).
+        assert_eq!(apply_weight(1, -1024), -1);
+    }
+
+    #[test]
+    fn apply_weight_wide_sample_does_not_overflow() {
+        // A 24-bit sample times a -1024 weight overflows i32 before the
+        // shift; the i64 product keeps it exact. sample = 0x7FFFFF,
+        // weight = -1024 → -(0x7FFFFF) after the /1024 scale.
+        let sample = 0x7F_FFFF;
+        assert_eq!(apply_weight(-1024, sample), -sample);
+        assert_eq!(apply_weight(1024, sample), sample);
+    }
+
+    // ---- update_weight (spec §3.4) ----
+
+    #[test]
+    fn update_weight_zero_operand_is_no_change() {
+        // Spec §3.4: if either source or result is zero, no change.
+        assert_eq!(update_weight(700, 2, 0, 5), 700);
+        assert_eq!(update_weight(700, 2, 5, 0), 700);
+        assert_eq!(update_weight(700, 2, 0, 0), 700);
+    }
+
+    #[test]
+    fn update_weight_same_sign_adds_delta() {
+        // Spec §3.4: same sign → add delta.
+        assert_eq!(update_weight(700, 3, 4, 9), 703);
+        assert_eq!(update_weight(700, 3, -4, -9), 703);
+        // delta = 0 is a documented value (high 3 bits can be 0).
+        assert_eq!(update_weight(700, 0, 4, 9), 700);
+    }
+
+    #[test]
+    fn update_weight_opposite_sign_subtracts_delta() {
+        // Spec §3.4: opposite sign → subtract delta.
+        assert_eq!(update_weight(700, 3, -4, 9), 697);
+        assert_eq!(update_weight(700, 3, 4, -9), 697);
+        // A negative weight steps the same way.
+        assert_eq!(update_weight(-700, 5, 4, -9), -705);
+    }
+
+    // ---- update_weight_clip (spec §3.5) ----
+
+    #[test]
+    fn update_weight_clip_zero_operand_is_no_change() {
+        assert_eq!(update_weight_clip(900, 2, 0, 5), 900);
+        assert_eq!(update_weight_clip(900, 2, 5, 0), 900);
+    }
+
+    #[test]
+    fn update_weight_clip_same_sign_grows_then_clamps() {
+        // Same sign (s = 0): weight = min(weight + delta, 1024).
+        assert_eq!(update_weight_clip(900, 7, 4, 9), 907);
+        // At the cap the magnitude stops at 1024.
+        assert_eq!(update_weight_clip(1020, 7, 4, 9), WEIGHT_CLIP);
+        assert_eq!(update_weight_clip(1024, 7, 4, 9), WEIGHT_CLIP);
+    }
+
+    #[test]
+    fn update_weight_clip_opposite_sign_uses_reference_magnitude_form() {
+        // Opposite sign (s = -1): weight = -min(delta - weight, 1024).
+        // For weight = 900, delta = 7: -min(7 - 900, 1024)
+        // = -min(-893, 1024) = -(-893) = 893. The reference magnitude
+        // step shrinks the positive weight toward zero by delta-ish and
+        // re-signs; our faithful transcription matches the branch-free
+        // arithmetic exactly.
+        assert_eq!(update_weight_clip(900, 7, -4, 9), 893);
+        // A negative starting weight with opposite-sign operands:
+        // weight = -900, s = -1 (source/result differ). The reference
+        // arithmetic: w = (-900 ^ -1) + (7 - (-1)) = 899 + 8 = 907,
+        // not > 1024, weight = (907 ^ -1) - (-1) = -908 + 1 = -907.
+        assert_eq!(update_weight_clip(-900, 7, 4, -9), -907);
+    }
+
+    #[test]
+    fn update_weight_clip_caps_magnitude_at_unity_both_signs() {
+        // Drive the magnitude past 1024 from both sign directions and
+        // confirm it clamps to ±1024 (unity), never running away.
+        // Same sign, large positive weight.
+        assert_eq!(update_weight_clip(1024, 7, 1, 1), WEIGHT_CLIP);
+        // Same sign, large negative weight (s = 0 keeps the sign):
+        // w = (-1024 ^ 0) + (7 - 0) = -1017, not > 1024, re-sign → -1017.
+        // To exceed the cap on the negative side the magnitude form must
+        // be exercised with opposite-sign operands.
+        // weight = -1024, opposite sign: w = (-1024 ^ -1) + (7+1)
+        // = 1023 + 8 = 1031 > 1024 → 1024, weight = (1024 ^ -1) + 1
+        // = -1025 + 1 = -1024.
+        assert_eq!(update_weight_clip(-1024, 7, 4, -9), -WEIGHT_CLIP);
     }
 }

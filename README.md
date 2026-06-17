@@ -30,6 +30,14 @@ Working surface:
   truncated-binary mantissa, sign reconstruction) and composed by
   `WavPackBlock::decode_samples` for mono / stereo / false-stereo
   blocks.
+* **Decorrelation primitives** — the §3 inverse-prediction scalar
+  arithmetic is exposed as standalone functions: `apply_weight` (§3.1,
+  `(weight*sample + 512) >> 10`, `1024` == unity), `update_weight` (§3.4
+  LMS `±delta` adaptation) and `update_weight_clip` (§3.5 cross-channel
+  variant clamped to `±1024`), alongside the metadata expanders for the
+  `0x02`/`0x03`/`0x04` terms / weights / seed-samples sub-blocks. The
+  per-term reconstruction loop that composes these primitives over the
+  residual buffer is not yet assembled.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -70,9 +78,12 @@ joint-stereo (mid/side, flag bit 4) and cross-channel decorrelation
 staged docs, so a block carrying either flag is refused (rather than
 silently decoded as independent L/R, which would emit the mid/side
 residuals); the gates are stereo-only, so mono / false-stereo blocks
-with the bits set still decode. The decorrelation,
-hybrid-correction (`.wvc`), and overflow-bit sub-block payloads have
-typed views but no consuming decode pass. The §5 block CRC is now
+with the bits set still decode. The decorrelation sub-block payloads
+have typed views and the §3 inverse-prediction scalar primitives
+(`apply_weight` / `update_weight` / `update_weight_clip`), but the
+per-term reconstruction loop that runs them over the residual buffer is
+not yet assembled; the hybrid-correction (`.wvc`) and overflow-bit
+sub-block payloads have typed views but no consuming decode pass. The §5 block CRC is now
 *computed* (over decoded mono / stereo / joint-stereo PCM) and can be
 checked against the stored header word via `BlockCrc::matches`, but the
 end-to-end decode pipeline does not yet run the CRC at block end to mute
@@ -88,14 +99,17 @@ not yet wired into the `oxideav-core` framework registry — there is no
 Clean-room from the staged material under `docs/audio/wavpack/`: the
 block-structure and sub-block-ID wiki listing, the clean-room
 entropy-decode trace `docs/audio/wavpack/spec/wavpack-entropy-decode.md`,
-and — for the block CRC — `§5` of the clean-room decorrelation/CRC trace
+and — for the block CRC (`§5`) and the decorrelation weight arithmetic
+(`§3` + the `§6` constants summary + the `§7` sanity vectors) — the
+clean-room decorrelation/CRC trace
 `docs/audio/wavpack/spec/wavpack-decorrelation.md`. No external library
 source, archived prior history, or online resources were consulted at
 any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
-entry point; 662 unit tests synthesise minimal valid headers /
+entry point; 673 unit tests synthesise minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
-reject boundaries, and pin the §5 CRC primitives to the spec's worked
-mono / stereo CRC vectors.
+reject boundaries, pin the §5 CRC primitives to the spec's worked
+mono / stereo CRC vectors, and pin the §3 decorrelation weight
+arithmetic to the spec's §7 sanity vectors.
 
 ## License
 

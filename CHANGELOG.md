@@ -8,6 +8,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 329 — §3 decorrelation inverse-prediction arithmetic primitives.
+
+  `decorrelation` now exposes the three core scalar primitives of the
+  inverse-prediction loop from the clean-room decorrelation trace
+  (`docs/audio/wavpack/spec/wavpack-decorrelation.md` §3): `apply_weight`
+  (§3.1, `(weight*sample + 512) >> 10` with the `1024`-is-unity scaling,
+  computed via an `i64` product so wide samples cannot overflow before
+  the shift), `update_weight` (§3.4, the LMS-style `±delta` adaptation —
+  no change when either operand is zero, `+delta` on matching signs,
+  `-delta` on opposite signs), and `update_weight_clip` (§3.5, the
+  cross-channel variant that performs the reference's branch-free
+  magnitude step and clamps to `±1024`). New `WEIGHT_SHIFT` (`10`),
+  `WEIGHT_ROUND_BIAS` (`512`), and `WEIGHT_CLIP` (`1024`) constants name
+  the §6 scale/round/clip values; all three functions plus the constants
+  are re-exported. 11 new tests pin the §7 sanity vectors
+  (`apply_weight(1024, x) == x`, `apply_weight(512, 100) == 50`), the
+  wide-sample no-overflow path, the arithmetic-shift flooring of
+  negatives, the zero-operand / same-sign / opposite-sign arms of both
+  weight updates, and the magnitude clamp at `±1024` from both sign
+  directions. These are the building blocks of the per-term
+  reconstruction loop (§3.2/§3.3); wiring them into a consuming decode
+  pass over the entropy residuals remains later-round work.
+
 - Round 325 — §5 running block-CRC primitives over decoded PCM.
 
   New `crc` module implements the clean-room decorrelation/CRC trace
