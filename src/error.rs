@@ -234,6 +234,27 @@ pub enum Error {
         /// The number of seed samples supplied for that term/channel.
         supplied: usize,
     },
+    /// The `0x03` decorrelation-weights payload did not carry one weight
+    /// per decorrelation pass (mono) — the spec §3.6 / wiki "Each
+    /// decorrelation term should have one or two weights depending on
+    /// channels". For a mono block the weight count must equal the term
+    /// count exactly; the assembler reports the expected (term) count and
+    /// the observed weight count here.
+    DecorrelationWeightCountMismatch {
+        /// Number of decorrelation terms (`0x02`) — the expected weight
+        /// count for a mono block.
+        expected: usize,
+        /// Number of weights actually present in the `0x03` payload.
+        actual: usize,
+    },
+    /// A block carried a `0x03` decorrelation-weights and/or `0x04`
+    /// decorrelation-samples sub-block without the `0x02`
+    /// decorrelation-terms sub-block that names the passes those weights
+    /// and seeds belong to. Spec §1 lists all three as the decorrelation
+    /// configuration; the assembler cannot reconstruct passes from
+    /// weights/seeds alone (the term list drives the per-pass arithmetic
+    /// and the per-term seed/weight counts).
+    DecorrelationTermsMissing,
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -338,6 +359,13 @@ impl core::fmt::Display for Error {
             Error::DecorrelationSeedUnderflow { term, supplied } => write!(
                 f,
                 "oxideav-wavpack: decorrelation term {term} needs more seed-history samples than the {supplied} supplied"
+            ),
+            Error::DecorrelationWeightCountMismatch { expected, actual } => write!(
+                f,
+                "oxideav-wavpack: 0x03 decorrelation-weights payload carried {actual} weights for {expected} mono passes"
+            ),
+            Error::DecorrelationTermsMissing => f.write_str(
+                "oxideav-wavpack: block carries 0x03/0x04 decorrelation metadata without the 0x02 terms sub-block",
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

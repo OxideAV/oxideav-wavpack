@@ -46,7 +46,23 @@ Working surface:
   `0x04` samples, and `decode_term_byte` reads the spec's `+5`-biased term
   encoding (distinct from the wiki-listing reading of `expand_terms`). The
   passes are pinned to a forward/inverse round trip across every term and
-  multi-pass stacks.
+  multi-pass stacks. `assemble_mono_passes` turns the raw
+  `0x02`/`0x03`/`0x04` payloads into an application-ordered `DecorrPass`
+  list, applying the spec §3.7 reverse-storage convention (on-wire passes
+  are stored last-applied-first; the assembler reverses them so the
+  decoder undoes the encoder's last pass first), the spec `+5` term-byte
+  encoding, one weight per pass, and the per-term seed partition.
+* **Mono lossless decode → reconstructed PCM** — `decode_samples` now
+  runs the full lossless pipeline for a **mono** (or false-stereo) block
+  carrying decorrelation: entropy-decode the `0x0A` residuals, assemble
+  the passes from `0x02`/`0x03`/`0x04`, then run `decorrelate_mono` over
+  the residual buffer in place to reconstruct the PCM. This is the first
+  end-to-end reconstructed-PCM path through the prediction stage; it is
+  pinned by a round-trip that encodes a residual buffer into the `0x0A`
+  bitstream, attaches a multi-pass decorrelation config, and confirms the
+  decode reproduces the standalone `decorrelate_mono` output. Stereo
+  decorrelation stays refused (the `0x04` per-channel seed-interleaving
+  order for two channels is not in the staged docs).
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -80,21 +96,23 @@ if block.is_audio_block() {
 
 `WavPackBlock::decode_samples` refuses the following with a typed
 `Error::UnsupportedBlockFeature`: hybrid (lossy) blocks, float and
-32-bit-int sample data, multichannel members, decorrelation pre-pass
+32-bit-int sample data, multichannel members, **stereo** decorrelation
 blocks, low-latency / robust block layouts, and — on stereo blocks —
 joint-stereo (mid/side, flag bit 4) and cross-channel decorrelation
 (flag bit 5). The two inter-channel transforms have no formula in the
 staged docs, so a block carrying either flag is refused (rather than
 silently decoded as independent L/R, which would emit the mid/side
 residuals); the gates are stereo-only, so mono / false-stereo blocks
-with the bits set still decode. The decorrelation sub-block payloads
-have typed views and the §3 inverse-prediction scalar primitives
-(`apply_weight` / `update_weight` / `update_weight_clip`) and the
-per-term reconstruction loop (`decorrelate_mono` / `decorrelate_stereo`)
-that runs them over the residual buffer, but the loop is not yet wired
-into `WavPackBlock::decode_samples` (the block-level composer still
-refuses decorrelation blocks pending the `0x02`/`0x03`/`0x04` →
-`DecorrPass` assembly and reverse-order unpacking); the
+with the bits set still decode. **Mono** decorrelation is now wired all
+the way through `decode_samples` (entropy → residuals →
+`assemble_mono_passes` → `decorrelate_mono` → PCM); stereo decorrelation
+remains refused because the `0x04` per-channel seed-interleaving order
+for a two-channel block is not specified in the staged docs (the per-term
+seed *count* is, but not how the A/B seed groups interleave on the wire).
+The decorrelation sub-block payloads have typed views and the §3
+inverse-prediction scalar primitives (`apply_weight` / `update_weight` /
+`update_weight_clip`) plus the per-term reconstruction loop
+(`decorrelate_mono` / `decorrelate_stereo`); the
 hybrid-correction (`.wvc`) and overflow-bit
 sub-block payloads have typed views but no consuming decode pass. The §5 block CRC is now
 *computed* (over decoded mono / stereo / joint-stereo PCM) and can be

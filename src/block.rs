@@ -38,6 +38,7 @@
 //! round adds no sample-level state and so is not impacted by that gap.
 
 use crate::block_header::{parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN};
+use crate::decorrelation::{assemble_mono_passes, decorrelate_mono};
 use crate::entropy::{expand_entropy, EntropyInfo};
 use crate::error::{Error, Result};
 use crate::metadata::{
@@ -652,7 +653,15 @@ impl<'a> WavPackBlock<'a> {
                 UnsupportedBlockFeature::MultichannelMember,
             ));
         }
-        if self.has_decorrelation() {
+        // Decorrelation: the mono lossless path is wired (the per-channel
+        // term arithmetic + weight adaptation + §3.7 reverse-order pass
+        // assembly are fully specified for a single channel). The stereo
+        // decorrelation path stays refused below — the `0x04` per-channel
+        // seed-interleaving order for a two-channel block is not specified
+        // in the staged docs. So defer the decorrelation refusal until
+        // after the mono/stereo split.
+        let has_decorr = self.has_decorrelation();
+        if has_decorr && !flags.is_block_data_mono() {
             return Err(Error::UnsupportedBlockFeature(
                 UnsupportedBlockFeature::Decorrelation,
             ));
@@ -711,10 +720,39 @@ impl<'a> WavPackBlock<'a> {
         let count = header.block_samples as usize;
 
         if flags.is_block_data_mono() {
-            decode_packed_samples_mono_from_entropy(&packed, &entropy, count)
+            let mut residuals = decode_packed_samples_mono_from_entropy(&packed, &entropy, count)?;
+            if has_decorr {
+                // The entropy stream carried residuals, not PCM. Assemble
+                // the §3.7 application-ordered pass list from the
+                // 0x02/0x03/0x04 sub-blocks and run the §3.2 inverse
+                // prediction loop over the residual buffer in place,
+                // reconstructing the lossless PCM samples.
+                let (terms, weights, samples) = self.decorr_payloads();
+                let mut passes = assemble_mono_passes(terms, weights, samples)?;
+                decorrelate_mono(&mut passes, &mut residuals)?;
+            }
+            Ok(residuals)
         } else {
             decode_packed_samples_stereo_from_entropy(&packed, &entropy, count)
         }
+    }
+
+    /// Borrow the raw `0x02` / `0x03` / `0x04` decorrelation sub-block
+    /// payloads (each defaulting to an empty slice when the sub-block is
+    /// absent), for feeding the decorrelation-pass assembler. The first
+    /// occurrence of each ID wins (the metadata walker preserves wire
+    /// order). Round 339.
+    fn decorr_payloads(&self) -> (&[u8], &[u8], &[u8]) {
+        let pick = |id: SubBlockId| {
+            self.find_sub_block(id)
+                .map(|sb| sb.payload)
+                .unwrap_or(&[][..])
+        };
+        (
+            pick(SubBlockId::DecorrelationTerms),
+            pick(SubBlockId::DecorrelationWeights),
+            pick(SubBlockId::DecorrelationSamples),
+        )
     }
 
     /// Number of `i32` PCM slots [`Self::decode_samples`] would emit on
@@ -1912,6 +1950,77 @@ mod tests {
     }
 
     #[test]
+    fn decode_samples_mono_decorrelation_reconstructs_pcm_end_to_end() {
+        use crate::decorrelation::{
+            assemble_mono_passes, decorrelate_mono, TERM_BYTE_BIAS, TERM_PREDICTOR_BITS,
+            TERM_PREDICTOR_MASK,
+        };
+        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+
+        // Build a residual buffer, encode it into the 0x0A bitstream
+        // (seeded from the 0x05 entropy info), attach a 0x02/0x03/0x04
+        // decorrelation config, and confirm the full decode path
+        // reconstructs the same PCM the standalone `decorrelate_mono`
+        // produces from those residuals. This pins the entropy → residual
+        // → decorrelation → PCM wiring inside `decode_samples`.
+        let residuals: Vec<i32> = vec![5, -3, 8, 0, 12, -7, 4, 1, -2, 9, 6, -1];
+
+        // Application order: term 1 (delta 2) then term 17 (delta 3).
+        let term_byte = |term: i8, delta: u8| -> u8 {
+            (((term + TERM_BYTE_BIAS) as u8) & TERM_PREDICTOR_MASK) | (delta << TERM_PREDICTOR_BITS)
+        };
+        let seed_word = |v: i32| -> [u8; 2] { [v as i8 as u8, 9] };
+
+        // Wire order = reverse application order: [term 17, term 1].
+        let app = [(1i8, 2u8, 5u8, vec![4]), (17i8, 3u8, 10u8, vec![6, 5])];
+        let mut terms_payload = Vec::new();
+        let mut weights_payload = Vec::new();
+        let mut samples_payload = Vec::new();
+        for (t, d, wbyte, seeds) in app.iter().rev() {
+            terms_payload.push(term_byte(*t, *d));
+            weights_payload.push(*wbyte);
+            for &s in seeds {
+                samples_payload.extend_from_slice(&seed_word(s));
+            }
+        }
+
+        // Expected PCM: decorrelate the residuals with the same assembled
+        // passes (the assembler is independently round-trip-tested).
+        let mut expected_passes =
+            assemble_mono_passes(&terms_payload, &weights_payload, &samples_payload)
+                .expect("assemble passes");
+        let mut expected = residuals.clone();
+        decorrelate_mono(&mut expected_passes, &mut expected).expect("decorrelate");
+
+        // Encode the residuals into a 0x0A payload using medians seeded
+        // from the same 0x05 info the decoder will read (the mono-zero
+        // helper writes a six-byte all-zero 0x05 payload → medians 0,0,0).
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("expand entropy info");
+        let mut enc_medians =
+            AdaptiveMedians::from_entropy(&info_block, 0).expect("seed encoder medians");
+        let packed_0a =
+            encode_packed_samples_mono(&residuals, &mut enc_medians).expect("encode residuals");
+
+        // Assemble the full block payload.
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x02, &terms_payload);
+        append_small_sub_block(&mut payload, 0x03, &weights_payload);
+        append_small_sub_block(&mut payload, 0x04, &samples_payload);
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &packed_0a);
+
+        let flags = flags_with(1 << 2); // mono
+        let bytes = synthesise_block(residuals.len() as u32, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_decorrelation());
+        let got = block.decode_samples().expect("decode mono decorrelation");
+        assert_eq!(got, expected, "mono decorrelation decode mismatch");
+        // Sanity: the decorrelation actually changed the samples (the
+        // path is not a silent identity pass-through).
+        assert_ne!(got, residuals);
+    }
+
+    #[test]
     fn decode_samples_rejects_absurd_block_samples_without_oom() {
         // Regression (round 296): the spec §4.2 step 1 zero-run path lets
         // a tiny 0x0A payload's `block_samples` field expand without a
@@ -2267,12 +2376,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_samples_rejects_block_with_decorrelation_terms_sub_block() {
-        // A `0x02` (decorrelation terms) sub-block presence is the
-        // tell-tale that the encoder ran a prediction pass; without a
-        // matching consumer in the decoder, the composer must refuse.
+    fn decode_samples_rejects_mono_decorrelation_with_invalid_term_byte() {
+        // A `0x02` term byte of `0x00` decodes (spec `+5` bias) to
+        // `term = -5`, outside the valid set — the mono decorrelation
+        // path is now wired, so the block is refused with the precise
+        // `InvalidDecorrelationTerm` rather than the blanket
+        // Decorrelation feature gate.
         let mut payload = Vec::new();
-        append_small_sub_block(&mut payload, 0x02, &[0u8; 2]); // 1 term
+        append_small_sub_block(&mut payload, 0x02, &[0u8; 2]); // two 0x00 term bytes
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
         let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
@@ -2280,19 +2391,15 @@ mod tests {
         assert!(block.has_decorrelation());
         let err = block
             .decode_samples()
-            .expect_err("must refuse decorrelation");
-        assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Decorrelation)
-        );
+            .expect_err("must refuse invalid term byte");
+        assert_eq!(err, Error::InvalidDecorrelationTerm(-5));
     }
 
     #[test]
-    fn decode_samples_rejects_block_with_decorrelation_weights_sub_block() {
-        // The `has_decorrelation` predicate fires on any one of the
-        // 0x02/0x03/0x04 sub-blocks. Test the 0x03 path independently
-        // so a future change to the predicate doesn't silently drop
-        // detection of either of the other two.
+    fn decode_samples_rejects_mono_decorrelation_weights_without_terms() {
+        // A `0x03` weights sub-block with no `0x02` terms cannot name the
+        // passes the weights belong to; the assembler reports the precise
+        // `DecorrelationTermsMissing`.
         let mut payload = Vec::new();
         append_small_sub_block(&mut payload, 0x03, &[0u8; 2]);
         append_entropy_info_mono_zero(&mut payload);
@@ -2301,15 +2408,12 @@ mod tests {
         let (block, _) = parse_block(&bytes).expect("parse block");
         let err = block
             .decode_samples()
-            .expect_err("must refuse 0x03 decorrelation");
-        assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Decorrelation)
-        );
+            .expect_err("must refuse 0x03 without 0x02");
+        assert_eq!(err, Error::DecorrelationTermsMissing);
     }
 
     #[test]
-    fn decode_samples_rejects_block_with_decorrelation_samples_sub_block() {
+    fn decode_samples_rejects_mono_decorrelation_samples_without_terms() {
         let mut payload = Vec::new();
         append_small_sub_block(&mut payload, 0x04, &[0u8; 2]);
         append_entropy_info_mono_zero(&mut payload);
@@ -2318,7 +2422,28 @@ mod tests {
         let (block, _) = parse_block(&bytes).expect("parse block");
         let err = block
             .decode_samples()
-            .expect_err("must refuse 0x04 decorrelation");
+            .expect_err("must refuse 0x04 without 0x02");
+        assert_eq!(err, Error::DecorrelationTermsMissing);
+    }
+
+    #[test]
+    fn decode_samples_refuses_stereo_decorrelation() {
+        // The stereo decorrelation seed-interleaving order is not in the
+        // staged docs, so a genuinely-stereo block carrying any of the
+        // 0x02/0x03/0x04 sub-blocks is still refused with the blanket
+        // Decorrelation feature gate (mono is wired; stereo is not).
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x02, &[0x06, 0x07]); // term 1, term 2
+        append_entropy_info_stereo_minimal(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        // No mono / false-stereo bit → genuinely stereo block data.
+        let bytes = synthesise_block(1, flags_with(0), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.has_decorrelation());
+        assert!(!block.header.flags.is_block_data_mono());
+        let err = block
+            .decode_samples()
+            .expect_err("stereo decorrelation must be refused");
         assert_eq!(
             err,
             Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Decorrelation)

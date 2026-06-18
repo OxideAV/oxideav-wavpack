@@ -1041,6 +1041,131 @@ pub fn decorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
     Ok(())
 }
 
+/// Assemble the application-ordered [`DecorrPass`] list for a **mono**
+/// block from the three decorrelation sub-block payloads.
+///
+/// Inputs are the raw `0x02` (terms), `0x03` (weights) and `0x04`
+/// (seed samples) payloads. The returned passes are in
+/// *application* order — the order [`decorrelate_mono`] consumes — so a
+/// caller decodes residuals → PCM with one further call.
+///
+/// ## Wire vs application order (spec §3.7)
+///
+/// The `0x02`/`0x03`/`0x04` metadata stores the passes in the **reverse**
+/// of application order (the encoder's last-applied pass is stored first).
+/// This helper therefore:
+///
+/// 1. reads each `0x02` byte with the **spec** encoding
+///    ([`decode_term_byte`]: `term = (byte & 0x1f) - 5`, delta in the top
+///    3 bits) — distinct from the unbiased wiki reading of
+///    [`expand_terms`];
+/// 2. expands the `0x03` weight bytes ([`expand_weight_byte`]) one per
+///    pass (mono = one weight per term);
+/// 3. expands the `0x04` seed words and partitions them per term **in
+///    wire order** (each term consumes [`seed_count`] samples), then
+/// 4. reverses the term / weight / seed-group lists together so the
+///    returned passes are application-ordered.
+///
+/// ## Errors
+///
+/// * [`Error::DecorrelationTermsMissing`] — `terms_payload` is empty but
+///   weights/seeds are present (cannot reconstruct passes without terms).
+/// * [`Error::InvalidDecorrelationTerm`] — a term byte decodes outside
+///   the spec valid set `{1..8, 17, 18, -1, -2, -3}`.
+/// * [`Error::CrossTermOnMono`] — a cross term (`-1`/`-2`/`-3`) appears in
+///   a mono block (spec §2.1 rejects negative terms for mono).
+/// * [`Error::TooManyDecorrelationPasses`] — more than [`MAX_NTERMS`]
+///   terms.
+/// * [`Error::DecorrelationWeightCountMismatch`] — the `0x03` payload did
+///   not carry exactly one weight per term.
+/// * [`Error::DecorrelationSamplesOddByteCount`] — the `0x04` payload has
+///   an odd byte length.
+/// * [`Error::DecorrelationSampleCountMismatch`] — the `0x04` seed count
+///   does not match the sum of per-term seed counts.
+/// * [`Error::DecorrelationSeedUnderflow`] — a term's seed group is short
+///   (surfaced by [`DecorrPass::new`]).
+pub fn assemble_mono_passes(
+    terms_payload: &[u8],
+    weights_payload: &[u8],
+    samples_payload: &[u8],
+) -> Result<Vec<DecorrPass>> {
+    // Decode the spec-encoded term bytes (wire order).
+    let mut terms = Vec::with_capacity(terms_payload.len());
+    let mut deltas = Vec::with_capacity(terms_payload.len());
+    for &byte in terms_payload {
+        let (term, delta) = decode_term_byte(byte);
+        if !is_valid_term(term) {
+            return Err(Error::InvalidDecorrelationTerm(term));
+        }
+        if is_cross_term(term) {
+            // Spec §2.1: negative (cross) terms are rejected for mono.
+            return Err(Error::CrossTermOnMono(term));
+        }
+        terms.push(term);
+        deltas.push(delta);
+    }
+
+    if terms.is_empty() {
+        // A mono block with no terms is a no-op decorrelation; but if the
+        // caller handed weights/seeds without terms there is nothing to
+        // pin them to.
+        if !weights_payload.is_empty() || !samples_payload.is_empty() {
+            return Err(Error::DecorrelationTermsMissing);
+        }
+        return Ok(Vec::new());
+    }
+    if terms.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(terms.len()));
+    }
+
+    // Mono: exactly one weight per pass (spec §3.6 / wiki "one or two
+    // weights depending on channels").
+    let weights: Vec<i32> = weights_payload
+        .iter()
+        .map(|&b| expand_weight_byte(b))
+        .collect();
+    if weights.len() != terms.len() {
+        return Err(Error::DecorrelationWeightCountMismatch {
+            expected: terms.len(),
+            actual: weights.len(),
+        });
+    }
+
+    // Expand and partition the seed samples per term, in wire order. The
+    // total must equal the sum of per-term seed counts.
+    let seeds = expand_samples(samples_payload)?;
+    let expected_seeds: usize = terms.iter().map(|&t| seed_count(t)).sum();
+    if seeds.samples.len() != expected_seeds {
+        return Err(Error::DecorrelationSampleCountMismatch {
+            expected: expected_seeds,
+            actual: seeds.samples.len(),
+        });
+    }
+    let mut seed_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
+    let mut cursor = 0usize;
+    for &t in &terms {
+        let n = seed_count(t);
+        seed_groups.push(&seeds.samples[cursor..cursor + n]);
+        cursor += n;
+    }
+
+    // Build passes in wire order, then reverse to application order so the
+    // first pass returned undoes the encoder's last-applied pass (§3.7).
+    let mut passes = Vec::with_capacity(terms.len());
+    for i in 0..terms.len() {
+        passes.push(DecorrPass::new(
+            terms[i],
+            deltas[i],
+            weights[i],
+            0,
+            seed_groups[i],
+            &[],
+        )?);
+    }
+    passes.reverse();
+    Ok(passes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2050,5 +2175,161 @@ mod tests {
             .collect();
         decorrelate_mono(&mut passes, &mut buf).unwrap();
         assert_eq!(buf, pcm, "multi-pass mono round-trip failed");
+    }
+
+    // ---- assemble_mono_passes (0x02/0x03/0x04 → application-ordered passes) ----
+
+    /// Encode one spec-format `0x02` term byte: low 5 bits = `term + 5`,
+    /// high 3 bits = `delta`.
+    fn term_byte(term: i8, delta: u8) -> u8 {
+        (((term + TERM_BYTE_BIAS) as u8) & TERM_PREDICTOR_MASK) | (delta << TERM_PREDICTOR_BITS)
+    }
+
+    /// Encode a `0x04` seed word for a small value that expands back
+    /// exactly: with `exponent_byte = 9` the expander leaves the signed
+    /// mantissa untouched (shift = 0), so `[v as i8 as u8, 9]` round-trips
+    /// to `v` for any `v` in `-128..=127`.
+    fn seed_word(v: i32) -> [u8; 2] {
+        [v as i8 as u8, 9]
+    }
+
+    #[test]
+    fn assemble_mono_reverses_wire_order() {
+        // Wire stores last-applied pass first; the assembler returns
+        // application order, so the first returned pass is the LAST wire
+        // term. Two terms, distinct so the reversal is observable.
+        let terms = vec![term_byte(1, 2), term_byte(3, 4)];
+        // Mono: one weight per pass. Weight byte b expands to b*8 (no +)
+        // for non-positive b; pick weights that round-trip simply.
+        let weights = vec![5u8, 0x80]; // 5*8=40 (+adj), -128*8=-1024
+                                       // Seeds in wire order: term 1 needs 1, term 3 needs 3 → 4 words.
+        let mut samples = Vec::new();
+        samples.extend_from_slice(&seed_word(7)); // term 1 seed
+        for v in [11, 12, 13] {
+            samples.extend_from_slice(&seed_word(v)); // term 3 seeds
+        }
+
+        let passes = assemble_mono_passes(&terms, &weights, &samples).unwrap();
+        assert_eq!(passes.len(), 2);
+        // Application order: term-3 pass first (it was stored last), term-1 second.
+        assert_eq!(passes[0].term, 3);
+        assert_eq!(passes[0].delta, 4);
+        assert_eq!(passes[1].term, 1);
+        assert_eq!(passes[1].delta, 2);
+        // Weights are paired with their own wire term, then reversed
+        // together — term-3's weight (0x80 → -1024) leads.
+        assert_eq!(passes[0].weight_a, expand_weight_byte(0x80));
+        assert_eq!(passes[1].weight_a, expand_weight_byte(5));
+    }
+
+    #[test]
+    fn assemble_mono_end_to_end_matches_hand_built_passes() {
+        // Build residuals from PCM via the forward encoder (wire/encode
+        // order = last applied first), feed the assembler the matching
+        // 0x02/0x03/0x04 payloads, and confirm decode reconstructs PCM.
+        let pcm: Vec<i32> = (0..32).map(|i| ((i * 37) % 101) - 50).collect();
+        // Application order: term 1 then term 17. Weight *bytes* chosen
+        // freely; the matching app weight is whatever the expander yields,
+        // so the forward encoder and the assembler agree by construction.
+        let app_terms = [(1i8, 2u8), (17i8, 3u8)];
+        let app_seeds: [Vec<i32>; 2] = [vec![4], vec![6, 5]];
+        let app_weight_bytes = [5u8, 10u8];
+        let app_weights = [
+            expand_weight_byte(app_weight_bytes[0]),
+            expand_weight_byte(app_weight_bytes[1]),
+        ];
+
+        // Forward (encode) applies passes in reverse application order.
+        let mut buf = pcm.clone();
+        for idx in (0..app_terms.len()).rev() {
+            let (t, d) = app_terms[idx];
+            buf = forward_mono(t, d as i32, app_weights[idx], &app_seeds[idx], &buf);
+        }
+        let residuals = buf;
+
+        // Wire order = reverse of application order.
+        let mut terms_payload = Vec::new();
+        let mut weights_payload = Vec::new();
+        let mut samples_payload = Vec::new();
+        for idx in (0..app_terms.len()).rev() {
+            let (t, d) = app_terms[idx];
+            terms_payload.push(term_byte(t, d));
+            weights_payload.push(app_weight_bytes[idx]);
+            for &s in &app_seeds[idx] {
+                samples_payload.extend_from_slice(&seed_word(s));
+            }
+        }
+
+        let mut passes =
+            assemble_mono_passes(&terms_payload, &weights_payload, &samples_payload).unwrap();
+        let mut decoded = residuals.clone();
+        decorrelate_mono(&mut passes, &mut decoded).unwrap();
+        assert_eq!(
+            decoded, pcm,
+            "assembled mono decode did not reconstruct PCM"
+        );
+    }
+
+    #[test]
+    fn assemble_mono_rejects_cross_term() {
+        // term field 4 → 4 - 5 = -1 (cross), invalid for mono.
+        let terms = vec![term_byte(-1, 0)];
+        assert_eq!(
+            assemble_mono_passes(&terms, &[0], &[]),
+            Err(Error::CrossTermOnMono(-1))
+        );
+    }
+
+    #[test]
+    fn assemble_mono_rejects_weight_count_mismatch() {
+        let terms = vec![term_byte(1, 0), term_byte(2, 0)];
+        // Two terms, one weight. (Weight count is checked before seeds.)
+        assert_eq!(
+            assemble_mono_passes(&terms, &[5], &[]),
+            Err(Error::DecorrelationWeightCountMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn assemble_mono_rejects_seed_count_mismatch() {
+        // term 1 needs 1 seed; supply 0.
+        let terms = vec![term_byte(1, 0)];
+        assert_eq!(
+            assemble_mono_passes(&terms, &[5], &[]),
+            Err(Error::DecorrelationSampleCountMismatch {
+                expected: 1,
+                actual: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn assemble_mono_weights_without_terms_rejected() {
+        assert_eq!(
+            assemble_mono_passes(&[], &[5], &[]),
+            Err(Error::DecorrelationTermsMissing)
+        );
+    }
+
+    #[test]
+    fn assemble_mono_empty_is_no_op() {
+        assert_eq!(assemble_mono_passes(&[], &[], &[]).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn assemble_mono_rejects_too_many_passes() {
+        let terms: Vec<u8> = (0..=MAX_NTERMS).map(|_| term_byte(1, 0)).collect();
+        let weights: Vec<u8> = (0..=MAX_NTERMS).map(|_| 5u8).collect();
+        let mut samples = Vec::new();
+        for _ in 0..=MAX_NTERMS {
+            samples.extend_from_slice(&seed_word(0));
+        }
+        assert_eq!(
+            assemble_mono_passes(&terms, &weights, &samples),
+            Err(Error::TooManyDecorrelationPasses(MAX_NTERMS + 1))
+        );
     }
 }

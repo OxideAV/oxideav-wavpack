@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 339 — mono lossless decode reaches reconstructed PCM.
+
+  `decode_samples` now runs the full lossless decode pipeline for a
+  **mono** (or false-stereo) block carrying decorrelation: the `0x0A`
+  entropy stream is decoded into residuals, the `0x02`/`0x03`/`0x04`
+  sub-blocks are assembled into an application-ordered `DecorrPass` list
+  by the new `decorrelation::assemble_mono_passes`, and `decorrelate_mono`
+  runs the §3.2 inverse-prediction loop over the residual buffer in place
+  to reconstruct PCM — the first end-to-end reconstructed-PCM path through
+  the prediction stage. `assemble_mono_passes` applies the spec §3.7
+  reverse-storage convention (on-wire passes stored last-applied-first;
+  reversed to application order), the spec `+5` term-byte encoding
+  (`decode_term_byte`), one weight per pass, and the per-term seed
+  partition, with typed rejects: new `Error::DecorrelationWeightCountMismatch`
+  (weight count ≠ term count) and `Error::DecorrelationTermsMissing`
+  (`0x03`/`0x04` present without `0x02`), reusing
+  `InvalidDecorrelationTerm` / `CrossTermOnMono` /
+  `TooManyDecorrelationPasses` / `DecorrelationSampleCountMismatch` /
+  `DecorrelationSeedUnderflow`. Stereo decorrelation stays refused
+  (`UnsupportedBlockFeature::Decorrelation`) — the `0x04` per-channel
+  seed-interleaving order for two channels is not in the staged docs. 23
+  new tests (696 total): assembler reverse-order + reject paths, and a
+  block-level round-trip that encodes a residual buffer into the `0x0A`
+  bitstream, attaches a multi-pass config, and confirms `decode_samples`
+  reproduces the standalone `decorrelate_mono` output.
+
 - Round 335 — §3.2/§3.3/§3.7 decorrelation inverse-prediction loop.
 
   `decorrelation` now assembles the per-term reconstruction loop that
