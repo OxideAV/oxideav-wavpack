@@ -695,6 +695,352 @@ pub fn update_weight_clip(weight: i32, delta: i32, source: i32, result: i32) -> 
     (w ^ s).wrapping_sub(s)
 }
 
+/// `+5` bias the spec applies to the low-5-bit term field of a `0x02`
+/// decorr-terms byte. Spec §2.1 / §6 ("term-byte bias +5"): the on-wire
+/// term is recovered as `(byte & 0x1f) - 5`.
+///
+/// This is the encoding used by the clean-room decorrelation trace
+/// `docs/audio/wavpack/spec/wavpack-decorrelation.md`, distinct from the
+/// raw `byte & 0x1f` reading of the older wiki listing consumed by
+/// [`expand_terms`]. The two coexist because they describe two different
+/// documented sources; the prediction loop ([`decorrelate_mono`] /
+/// [`decorrelate_stereo`]) speaks the spec encoding.
+pub const TERM_BYTE_BIAS: i8 = 5;
+
+/// Maximum single-tap fixed-lag term — also the per-channel history
+/// ring size. Spec §6 (`MAX_TERM`): `8`.
+pub const MAX_TERM: i8 = 8;
+
+/// Maximum number of decorrelation passes per block. Spec §6
+/// (`MAX_NTERMS`): `16`.
+pub const MAX_NTERMS: usize = 16;
+
+/// `true` when `term` is one of the valid decorrelation term values the
+/// spec §2 enumerates: `{1..8, 17, 18, -1, -2, -3}`. A term of `0`, or
+/// anything outside that set, is invalid (spec §2.1).
+pub const fn is_valid_term(term: i8) -> bool {
+    matches!(term, 1..=8 | 17 | 18 | -1 | -2 | -3)
+}
+
+/// Decode the term + delta carried in one `0x02` decorr-terms byte using
+/// the **spec** encoding (`docs/audio/wavpack/spec/wavpack-decorrelation.md`
+/// §2.1 / §6): the low 5 bits hold the term biased by `+5`
+/// (`term = (byte & 0x1f) - 5`) and the high 3 bits hold the per-pass
+/// `delta` (`(byte >> 5) & 0x7`).
+///
+/// This is distinct from [`expand_terms`], which reads the *unbiased*
+/// `byte & 0x1f` of the older wiki listing. The two coexist because they
+/// describe two different documented sources; [`DecorrPass`] /
+/// [`decorrelate_mono`] / [`decorrelate_stereo`] consume the spec
+/// encoding, so a caller assembling passes from `0x02` bytes should use
+/// this function. Returns the `(term, delta)` pair; the term is not
+/// validated here (use [`is_valid_term`] / [`DecorrPass::new`] to reject
+/// the invalid set).
+pub const fn decode_term_byte(byte: u8) -> (i8, i32) {
+    let term = (byte & TERM_PREDICTOR_MASK) as i8 - TERM_BYTE_BIAS;
+    let delta = ((byte >> TERM_PREDICTOR_BITS) & TERM_DELTA_MASK) as i32;
+    (term, delta)
+}
+
+/// `true` when `term` is a cross-channel (negative) predictor
+/// (`-1`/`-2`/`-3`), which is valid for stereo data only (spec §2.1 /
+/// §3.3).
+pub const fn is_cross_term(term: i8) -> bool {
+    matches!(term, -3..=-1)
+}
+
+/// One decorrelation pass: the inverse-prediction state the loop carries
+/// for a single `0x02` term across the whole sample buffer.
+///
+/// Spec §3 (`struct decorr_pass`): a pass owns its term, the per-pass
+/// `delta` weight step, the working weight(s) (one per channel — stereo
+/// passes carry two), and the per-channel history the predictor reads.
+/// History is a fixed ring of [`MAX_TERM`] (`8`) slots per channel so the
+/// `1..8` fixed-lag terms can index `(m + t) & 7`; the `17`/`18`
+/// extrapolators and the cross terms use only the first two / first slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecorrPass {
+    /// The decorrelation term (`{1..8, 17, 18, -1, -2, -3}`).
+    pub term: i8,
+    /// The per-pass weight adaptation step (`delta`, range `0..=7`).
+    pub delta: i32,
+    /// Working weight for channel A (and the only weight for mono).
+    pub weight_a: i32,
+    /// Working weight for channel B (unused on mono passes).
+    pub weight_b: i32,
+    /// Channel-A history ring (`8` slots; `0` = empty).
+    history_a: [i32; MAX_TERM as usize],
+    /// Channel-B history ring (`8` slots; `0` = empty).
+    history_b: [i32; MAX_TERM as usize],
+}
+
+impl DecorrPass {
+    /// Build a pass from its term, delta and starting weight(s), seeding
+    /// the per-channel history from the `0x04` decorr-samples expansion.
+    ///
+    /// Spec §3.6: terms `17`/`18` are primed with 2 seeds per channel,
+    /// terms `1..8` with `term` seeds per channel, and cross terms with
+    /// 1 seed per channel. The seeds arrive newest-first per the spec's
+    /// history convention (`s[n-1]` first); they are placed so that the
+    /// predictor's first read sees the correct lag. `seed_b` is ignored
+    /// on a mono pass (pass it `&[]`).
+    ///
+    /// Returns [`Error::InvalidDecorrelationTerm`] for a term outside the
+    /// spec's valid set, and [`Error::DecorrelationSeedUnderflow`] when a
+    /// channel does not supply enough seed samples for the term.
+    pub fn new(
+        term: i8,
+        delta: i32,
+        weight_a: i32,
+        weight_b: i32,
+        seed_a: &[i32],
+        seed_b: &[i32],
+    ) -> Result<Self> {
+        if !is_valid_term(term) {
+            return Err(Error::InvalidDecorrelationTerm(term));
+        }
+        let mut history_a = [0i32; MAX_TERM as usize];
+        let mut history_b = [0i32; MAX_TERM as usize];
+        seed_history(term, seed_a, &mut history_a)?;
+        // A cross term seeds both channels; a per-channel term that the
+        // caller is driving in stereo also seeds B. A mono caller passes
+        // an empty slice and B stays zeroed.
+        if !seed_b.is_empty() || is_cross_term(term) {
+            seed_history(term, seed_b, &mut history_b)?;
+        }
+        Ok(DecorrPass {
+            term,
+            delta,
+            weight_a,
+            weight_b,
+            history_a,
+            history_b,
+        })
+    }
+}
+
+/// Number of seed-history samples per channel the spec §3.6 ties to a
+/// term: `17`/`18` → 2, `1..8` → `term`, cross terms → 1.
+const fn seed_count(term: i8) -> usize {
+    match term {
+        17 | 18 => 2,
+        -3..=-1 => 1,
+        t if t >= 1 && t <= MAX_TERM => t as usize,
+        _ => 0,
+    }
+}
+
+/// Place the `0x04` seed samples for `term` into a fresh history ring.
+///
+/// Seeds arrive **newest-first** (`s[-1]`, `s[-2]`, …), matching the
+/// `0x04` decorr-samples wire order. The placement depends on how the
+/// loop reads the ring:
+///
+/// * **Fixed lag `1..8`**: the loop reads slot `m` (starting at `m=0`)
+///   and writes to `(m+t)&7`, so the first `t` reads consume slots
+///   `0..t-1` *before* any written value returns. Those slots must hold
+///   the seeds oldest-first — slot `0` = `s[-t]` (read first), …,
+///   slot `t-1` = `s[-1]`. Newest-first seeds are therefore reversed
+///   into slots `0..t-1`.
+/// * **Extrapolators `17`/`18`**: the loop reads `history[0]` as `s[-1]`
+///   and `history[1]` as `s[-2]`, so the newest-first seeds drop into
+///   slots `0`/`1` unchanged.
+/// * **Cross terms**: read `history[0]` only; the single seed lands in
+///   slot `0`.
+fn seed_history(term: i8, seed: &[i32], ring: &mut [i32; MAX_TERM as usize]) -> Result<()> {
+    let needed = seed_count(term);
+    if seed.len() < needed {
+        return Err(Error::DecorrelationSeedUnderflow {
+            term,
+            supplied: seed.len(),
+        });
+    }
+    if (1..=MAX_TERM).contains(&term) {
+        // Fixed lag: reverse newest-first seeds into slots 0..t-1 so the
+        // oldest seed (`s[-t]`) is read first.
+        for (i, &s) in seed.iter().take(needed).enumerate() {
+            ring[needed - 1 - i] = s;
+        }
+    } else {
+        // 17/18 (slot0=s[-1], slot1=s[-2]) and cross (slot0) keep order.
+        for (i, &s) in seed.iter().take(needed).enumerate() {
+            ring[i] = s;
+        }
+    }
+    Ok(())
+}
+
+/// Run the configured decorrelation passes over a **mono** residual
+/// buffer in place, turning entropy-decoded residuals into PCM.
+///
+/// Spec §3.2 / §3.7: each pass is applied over the whole buffer before
+/// the next begins, and the passes are supplied in **application order**
+/// (front-to-back; the caller has already reversed the on-wire
+/// `0x02`/`0x03`/`0x04` order per §3.7 so the first pass here undoes the
+/// last pass the encoder applied). For each sample `n` and term `t`:
+///
+/// 1. form the predictor from history (`s[n-t]`, `2a0-a1`, or
+///    `(3a0-a1)>>1`);
+/// 2. `s[n] = apply_weight(weight, pred) + residual`;
+/// 3. `weight = update_weight(weight, delta, pred, residual)`;
+/// 4. push `s[n]` into the channel history.
+///
+/// Cross terms (`-1`/`-2`/`-3`) are rejected for mono with
+/// [`Error::CrossTermOnMono`]; an over-long pass list trips
+/// [`Error::TooManyDecorrelationPasses`].
+pub fn decorrelate_mono(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result<()> {
+    if passes.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(passes.len()));
+    }
+    for pass in passes.iter() {
+        if is_cross_term(pass.term) {
+            return Err(Error::CrossTermOnMono(pass.term));
+        }
+    }
+    for pass in passes.iter_mut() {
+        // `m` is the rotating ring index for the 1..8 fixed-lag terms.
+        let mut m = 0usize;
+        for slot in buffer.iter_mut() {
+            let residual = *slot;
+            let pred = match pass.term {
+                17 => 2 * pass.history_a[0] - pass.history_a[1],
+                18 => (3 * pass.history_a[0] - pass.history_a[1]) >> 1,
+                // Fixed lag: read the current ring slot `m`. A value
+                // written here `t` iterations ago (to `(m'+t)&7`) is read
+                // again when `m` catches up, giving `s[n-t]` (§3.2 step 1
+                // / step 4 `(m+t)&7` write convention).
+                _ => pass.history_a[m & (MAX_TERM as usize - 1)],
+            };
+            let sample = apply_weight(pass.weight_a, pred).wrapping_add(residual);
+            pass.weight_a = update_weight(pass.weight_a, pass.delta, pred, residual);
+            *slot = sample;
+            // Push s[n] into history.
+            if pass.term == 17 || pass.term == 18 {
+                pass.history_a[1] = pass.history_a[0];
+                pass.history_a[0] = sample;
+            } else {
+                let w = (m + pass.term as usize) & (MAX_TERM as usize - 1);
+                pass.history_a[w] = sample;
+                m = m.wrapping_add(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run the configured decorrelation passes over an **interleaved stereo**
+/// residual buffer (`[L0, R0, L1, R1, …]`) in place.
+///
+/// Spec §3.2 / §3.3 / §3.7. Per-channel terms (`1..8`/`17`/`18`) run the
+/// §3.2 inverse step independently on A and B; the cross terms
+/// (`-1`/`-2`/`-3`) run the §3.3 zero-delay cross step with the clipped
+/// weight update ([`update_weight_clip`]). Passes are supplied in
+/// application order (see [`decorrelate_mono`]).
+///
+/// Returns [`Error::TooManyDecorrelationPasses`] for an over-long pass
+/// list; the buffer length must be even (one `R` per `L`) or the trailing
+/// odd sample is left untouched.
+pub fn decorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result<()> {
+    if passes.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(passes.len()));
+    }
+    let pairs = buffer.len() / 2;
+    for pass in passes.iter_mut() {
+        let mut m = 0usize;
+        for p in 0..pairs {
+            let li = 2 * p;
+            let ri = li + 1;
+            let res_a = buffer[li];
+            let res_b = buffer[ri];
+            match pass.term {
+                // Cross terms: zero-delay, clipped weight update (§3.3).
+                -1 => {
+                    // A from stored history, then B from the just-built A.
+                    let pred_a = pass.history_a[0];
+                    let a = apply_weight(pass.weight_a, pred_a).wrapping_add(res_a);
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
+                    let b = apply_weight(pass.weight_b, a).wrapping_add(res_b);
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, a, res_b);
+                    buffer[li] = a;
+                    buffer[ri] = b;
+                    pass.history_a[0] = b;
+                }
+                -2 => {
+                    // B from stored history, then A from the just-built B.
+                    let pred_b = pass.history_b[0];
+                    let b = apply_weight(pass.weight_b, pred_b).wrapping_add(res_b);
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
+                    let a = apply_weight(pass.weight_a, b).wrapping_add(res_a);
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, b, res_a);
+                    buffer[li] = a;
+                    buffer[ri] = b;
+                    pass.history_b[0] = a;
+                }
+                -3 => {
+                    // Each from the other's stored previous value, then
+                    // swap the stored history.
+                    let pred_a = pass.history_b[0];
+                    let pred_b = pass.history_a[0];
+                    let a = apply_weight(pass.weight_a, pred_a).wrapping_add(res_a);
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
+                    let b = apply_weight(pass.weight_b, pred_b).wrapping_add(res_b);
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
+                    buffer[li] = a;
+                    buffer[ri] = b;
+                    pass.history_a[0] = a;
+                    pass.history_b[0] = b;
+                }
+                // Per-channel two-sample extrapolators (§3.2).
+                17 => {
+                    let pa = 2 * pass.history_a[0] - pass.history_a[1];
+                    let pb = 2 * pass.history_b[0] - pass.history_b[1];
+                    let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
+                    let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
+                    buffer[li] = a;
+                    buffer[ri] = b;
+                    pass.history_a[1] = pass.history_a[0];
+                    pass.history_a[0] = a;
+                    pass.history_b[1] = pass.history_b[0];
+                    pass.history_b[0] = b;
+                }
+                18 => {
+                    let pa = (3 * pass.history_a[0] - pass.history_a[1]) >> 1;
+                    let pb = (3 * pass.history_b[0] - pass.history_b[1]) >> 1;
+                    let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
+                    let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
+                    buffer[li] = a;
+                    buffer[ri] = b;
+                    pass.history_a[1] = pass.history_a[0];
+                    pass.history_a[0] = a;
+                    pass.history_b[1] = pass.history_b[0];
+                    pass.history_b[0] = b;
+                }
+                // Fixed-lag terms 1..8 (§3.2), per channel.
+                t => {
+                    let rd = m & (MAX_TERM as usize - 1);
+                    let pa = pass.history_a[rd];
+                    let pb = pass.history_b[rd];
+                    let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
+                    let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
+                    buffer[li] = a;
+                    buffer[ri] = b;
+                    let w = (m + t as usize) & (MAX_TERM as usize - 1);
+                    pass.history_a[w] = a;
+                    pass.history_b[w] = b;
+                    m = m.wrapping_add(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,5 +1699,356 @@ mod tests {
         // = 1023 + 8 = 1031 > 1024 → 1024, weight = (1024 ^ -1) + 1
         // = -1025 + 1 = -1024.
         assert_eq!(update_weight_clip(-1024, 7, 4, -9), -WEIGHT_CLIP);
+    }
+
+    // ---- Prediction loop (§3.2 / §3.3 / §3.7) ----
+
+    // A standalone forward (encode) pass for a single mono term: the exact
+    // arithmetic inverse of `decorrelate_mono`'s per-sample step. Used only
+    // by the round-trip tests to prove the decode loop inverts the encode.
+    fn forward_mono(term: i8, delta: i32, weight0: i32, seed: &[i32], pcm: &[i32]) -> Vec<i32> {
+        let mut ring = [0i32; MAX_TERM as usize];
+        seed_history(term, seed, &mut ring).unwrap();
+        let mut weight = weight0;
+        let mut m = 0usize;
+        let mut out = Vec::with_capacity(pcm.len());
+        for &sample in pcm {
+            let pred = match term {
+                17 => 2 * ring[0] - ring[1],
+                18 => (3 * ring[0] - ring[1]) >> 1,
+                _ => ring[m & (MAX_TERM as usize - 1)],
+            };
+            // Encode: residual = sample - apply_weight(weight, pred).
+            let residual = sample.wrapping_sub(apply_weight(weight, pred));
+            weight = update_weight(weight, delta, pred, residual);
+            if term == 17 || term == 18 {
+                ring[1] = ring[0];
+                ring[0] = sample;
+            } else {
+                ring[(m + term as usize) & (MAX_TERM as usize - 1)] = sample;
+                m = m.wrapping_add(1);
+            }
+            out.push(residual);
+        }
+        out
+    }
+
+    fn round_trip_mono(term: i8, delta: i32, weight0: i32, seed: &[i32], pcm: &[i32]) {
+        let mut residuals = forward_mono(term, delta, weight0, seed, pcm);
+        let mut pass = DecorrPass::new(term, delta, weight0, 0, seed, &[]).unwrap();
+        decorrelate_mono(std::slice::from_mut(&mut pass), &mut residuals).unwrap();
+        assert_eq!(residuals, pcm, "mono round-trip failed for term {term}");
+    }
+
+    #[test]
+    fn decode_term_byte_applies_plus5_bias() {
+        // term field 6 → 6 - 5 = 1, delta in high 3 bits.
+        assert_eq!(decode_term_byte(0x06), (1, 0));
+        // (3 << 5) | (8+5=13) → term 8, delta 3.
+        assert_eq!(decode_term_byte((3 << 5) | 13), (8, 3));
+        // term field 4 → 4 - 5 = -1 (cross), delta 7.
+        assert_eq!(decode_term_byte((7 << 5) | 4), (-1, 7));
+        // 17 + 5 = 22 → term 17.
+        assert_eq!(decode_term_byte(22).0, 17);
+    }
+
+    #[test]
+    fn is_valid_term_matches_spec_set() {
+        for t in [1, 2, 3, 4, 5, 6, 7, 8, 17, 18, -1, -2, -3] {
+            assert!(is_valid_term(t), "term {t} should be valid");
+        }
+        for t in [0, 9, 16, 19, -4, -5, 100i8.wrapping_add(0)] {
+            assert!(!is_valid_term(t), "term {t} should be invalid");
+        }
+    }
+
+    #[test]
+    fn new_pass_rejects_invalid_term() {
+        assert_eq!(
+            DecorrPass::new(0, 0, 0, 0, &[], &[]),
+            Err(Error::InvalidDecorrelationTerm(0))
+        );
+        assert_eq!(
+            DecorrPass::new(9, 0, 0, 0, &[], &[]),
+            Err(Error::InvalidDecorrelationTerm(9))
+        );
+    }
+
+    #[test]
+    fn new_pass_rejects_seed_underflow() {
+        // Term 3 needs 3 seeds; supply 2.
+        assert_eq!(
+            DecorrPass::new(3, 0, 1024, 0, &[10, 20], &[]),
+            Err(Error::DecorrelationSeedUnderflow {
+                term: 3,
+                supplied: 2,
+            })
+        );
+        // Term 17 needs 2 seeds; supply 1.
+        assert_eq!(
+            DecorrPass::new(17, 0, 1024, 0, &[10], &[]),
+            Err(Error::DecorrelationSeedUnderflow {
+                term: 17,
+                supplied: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn mono_round_trip_fixed_lag_terms() {
+        let pcm = [
+            100, 132, 90, 75, 210, -40, -33, 12, 255, 300, 280, 260, 0, -1, 5,
+        ];
+        // Seeds newest-first; supply 8 so any lag 1..8 is primed.
+        let seed = [50, 40, 30, 20, 10, 0, -10, -20];
+        for term in 1..=8i8 {
+            round_trip_mono(term, 2, 700, &seed[..term as usize], &pcm);
+        }
+    }
+
+    #[test]
+    fn mono_round_trip_extrapolate_terms() {
+        let pcm = [10, 12, 9, 7, 21, -4, -3, 1, 25, 30, 28, 26, 0, -1, 5, 8, 9];
+        let seed = [5, 3]; // s[-1]=5, s[-2]=3
+        round_trip_mono(17, 3, 900, &seed, &pcm);
+        round_trip_mono(18, 1, 512, &seed, &pcm);
+    }
+
+    #[test]
+    fn mono_round_trip_zero_weight_zero_delta() {
+        // weight 0 / delta 0: residual == sample (apply_weight(0,·)=0,
+        // weight never moves). The loop must be a no-op identity.
+        let pcm = [7, -3, 42, 0, 99];
+        round_trip_mono(1, 0, 0, &[0], &pcm);
+        // delta 0, unity weight, term 1: still an exact inverse.
+        round_trip_mono(1, 0, 1024, &[3], &pcm);
+    }
+
+    #[test]
+    fn mono_rejects_cross_term() {
+        let mut pass = DecorrPass::new(-1, 0, 0, 0, &[0], &[0]).unwrap();
+        let mut buf = [1, 2, 3];
+        assert_eq!(
+            decorrelate_mono(std::slice::from_mut(&mut pass), &mut buf),
+            Err(Error::CrossTermOnMono(-1))
+        );
+    }
+
+    #[test]
+    fn too_many_passes_rejected() {
+        let mut passes: Vec<DecorrPass> = (0..MAX_NTERMS + 1)
+            .map(|_| DecorrPass::new(1, 0, 0, 0, &[0], &[]).unwrap())
+            .collect();
+        let mut buf = [1, 2, 3];
+        assert_eq!(
+            decorrelate_mono(&mut passes, &mut buf),
+            Err(Error::TooManyDecorrelationPasses(MAX_NTERMS + 1))
+        );
+    }
+
+    // --- stereo ---
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_stereo(
+        term: i8,
+        delta: i32,
+        wa0: i32,
+        wb0: i32,
+        seed_a: &[i32],
+        seed_b: &[i32],
+        pcm: &[i32],
+    ) -> Vec<i32> {
+        // Mirror decorrelate_stereo's per-sample arithmetic, inverted.
+        let mut ra = [0i32; MAX_TERM as usize];
+        let mut rb = [0i32; MAX_TERM as usize];
+        seed_history(term, seed_a, &mut ra).unwrap();
+        seed_history(term, seed_b, &mut rb).unwrap();
+        let mut wa = wa0;
+        let mut wb = wb0;
+        let mut m = 0usize;
+        let mut out = vec![0i32; pcm.len()];
+        let pairs = pcm.len() / 2;
+        for p in 0..pairs {
+            let li = 2 * p;
+            let ri = li + 1;
+            let sa = pcm[li];
+            let sb = pcm[ri];
+            match term {
+                -1 => {
+                    let pred_a = ra[0];
+                    let resa = sa.wrapping_sub(apply_weight(wa, pred_a));
+                    wa = update_weight_clip(wa, delta, pred_a, resa);
+                    let resb = sb.wrapping_sub(apply_weight(wb, sa));
+                    wb = update_weight_clip(wb, delta, sa, resb);
+                    out[li] = resa;
+                    out[ri] = resb;
+                    ra[0] = sb;
+                }
+                -2 => {
+                    let pred_b = rb[0];
+                    let resb = sb.wrapping_sub(apply_weight(wb, pred_b));
+                    wb = update_weight_clip(wb, delta, pred_b, resb);
+                    let resa = sa.wrapping_sub(apply_weight(wa, sb));
+                    wa = update_weight_clip(wa, delta, sb, resa);
+                    out[li] = resa;
+                    out[ri] = resb;
+                    rb[0] = sa;
+                }
+                -3 => {
+                    let pred_a = rb[0];
+                    let pred_b = ra[0];
+                    let resa = sa.wrapping_sub(apply_weight(wa, pred_a));
+                    wa = update_weight_clip(wa, delta, pred_a, resa);
+                    let resb = sb.wrapping_sub(apply_weight(wb, pred_b));
+                    wb = update_weight_clip(wb, delta, pred_b, resb);
+                    out[li] = resa;
+                    out[ri] = resb;
+                    ra[0] = sa;
+                    rb[0] = sb;
+                }
+                17 => {
+                    let pa = 2 * ra[0] - ra[1];
+                    let pb = 2 * rb[0] - rb[1];
+                    out[li] = sa.wrapping_sub(apply_weight(wa, pa));
+                    out[ri] = sb.wrapping_sub(apply_weight(wb, pb));
+                    wa = update_weight(wa, delta, pa, out[li]);
+                    wb = update_weight(wb, delta, pb, out[ri]);
+                    ra[1] = ra[0];
+                    ra[0] = sa;
+                    rb[1] = rb[0];
+                    rb[0] = sb;
+                }
+                18 => {
+                    let pa = (3 * ra[0] - ra[1]) >> 1;
+                    let pb = (3 * rb[0] - rb[1]) >> 1;
+                    out[li] = sa.wrapping_sub(apply_weight(wa, pa));
+                    out[ri] = sb.wrapping_sub(apply_weight(wb, pb));
+                    wa = update_weight(wa, delta, pa, out[li]);
+                    wb = update_weight(wb, delta, pb, out[ri]);
+                    ra[1] = ra[0];
+                    ra[0] = sa;
+                    rb[1] = rb[0];
+                    rb[0] = sb;
+                }
+                t => {
+                    let rd = m & (MAX_TERM as usize - 1);
+                    let pa = ra[rd];
+                    let pb = rb[rd];
+                    out[li] = sa.wrapping_sub(apply_weight(wa, pa));
+                    out[ri] = sb.wrapping_sub(apply_weight(wb, pb));
+                    wa = update_weight(wa, delta, pa, out[li]);
+                    wb = update_weight(wb, delta, pb, out[ri]);
+                    let w = (m + t as usize) & (MAX_TERM as usize - 1);
+                    ra[w] = sa;
+                    rb[w] = sb;
+                    m = m.wrapping_add(1);
+                }
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn round_trip_stereo(
+        term: i8,
+        delta: i32,
+        wa0: i32,
+        wb0: i32,
+        seed_a: &[i32],
+        seed_b: &[i32],
+        pcm: &[i32],
+    ) {
+        let mut residuals = forward_stereo(term, delta, wa0, wb0, seed_a, seed_b, pcm);
+        let mut pass = DecorrPass::new(term, delta, wa0, wb0, seed_a, seed_b).unwrap();
+        decorrelate_stereo(std::slice::from_mut(&mut pass), &mut residuals).unwrap();
+        assert_eq!(residuals, pcm, "stereo round-trip failed for term {term}");
+    }
+
+    #[test]
+    fn stereo_round_trip_per_channel_terms() {
+        let pcm = [
+            100, -90, 132, 88, 90, -75, 75, 60, 210, -200, -40, 33, -33, 21, 12, -9,
+        ];
+        let seed = [50, 40, 30, 20, 10, 0, -10, -20];
+        for term in 1..=8i8 {
+            round_trip_stereo(
+                term,
+                2,
+                700,
+                650,
+                &seed[..term as usize],
+                &seed[..term as usize],
+                &pcm,
+            );
+        }
+        round_trip_stereo(17, 3, 900, 800, &[5, 3], &[6, 4], &pcm);
+        round_trip_stereo(18, 1, 512, 480, &[5, 3], &[6, 4], &pcm);
+    }
+
+    #[test]
+    fn stereo_round_trip_cross_terms() {
+        let pcm = [
+            100, -90, 132, 88, 90, -75, 75, 60, 210, -200, -40, 33, -33, 21, 12, -9,
+        ];
+        round_trip_stereo(-1, 2, 300, 400, &[10], &[20], &pcm);
+        round_trip_stereo(-2, 3, 350, 450, &[11], &[21], &pcm);
+        round_trip_stereo(-3, 1, 200, 250, &[12], &[22], &pcm);
+    }
+
+    #[test]
+    fn stereo_round_trip_multi_pass() {
+        // A realistic stack: a cross term, then two per-channel terms,
+        // applied in order. Build residuals by running the forward of each
+        // pass in reverse order, then decode forward and recover the PCM.
+        let pcm: Vec<i32> = (0..40).map(|i| ((i * 37) % 211) - 100).collect();
+        let terms = [(-3i8, 1i32), (2, 2), (18, 3)];
+        let seeds: [(Vec<i32>, Vec<i32>); 3] = [
+            (vec![3], vec![5]),
+            (vec![7, 0], vec![9, 0]),
+            (vec![1, 2], vec![3, 4]),
+        ];
+        let weights = [(200, 220), (600, 640), (512, 500)];
+
+        // Forward-encode: apply passes in REVERSE of decode order (decode
+        // undoes last-encoded first), each over the running buffer.
+        let mut buf = pcm.clone();
+        for idx in (0..terms.len()).rev() {
+            let (t, d) = terms[idx];
+            let (wa, wb) = weights[idx];
+            buf = forward_stereo(t, d, wa, wb, &seeds[idx].0, &seeds[idx].1, &buf);
+        }
+
+        // Decode: passes in forward (application) order.
+        let mut passes: Vec<DecorrPass> = (0..terms.len())
+            .map(|idx| {
+                let (t, d) = terms[idx];
+                let (wa, wb) = weights[idx];
+                DecorrPass::new(t, d, wa, wb, &seeds[idx].0, &seeds[idx].1).unwrap()
+            })
+            .collect();
+        decorrelate_stereo(&mut passes, &mut buf).unwrap();
+        assert_eq!(buf, pcm, "multi-pass stereo round-trip failed");
+    }
+
+    #[test]
+    fn mono_round_trip_multi_pass() {
+        let pcm: Vec<i32> = (0..40).map(|i| ((i * 53) % 173) - 80).collect();
+        let terms = [(1i8, 2i32), (3, 1), (17, 3)];
+        let seeds: [Vec<i32>; 3] = [vec![4], vec![1, 2, 3], vec![5, 6]];
+        let weights = [600, 700, 512];
+
+        let mut buf = pcm.clone();
+        for idx in (0..terms.len()).rev() {
+            let (t, d) = terms[idx];
+            buf = forward_mono(t, d, weights[idx], &seeds[idx], &buf);
+        }
+        let mut passes: Vec<DecorrPass> = (0..terms.len())
+            .map(|idx| {
+                let (t, d) = terms[idx];
+                DecorrPass::new(t, d, weights[idx], 0, &seeds[idx], &[]).unwrap()
+            })
+            .collect();
+        decorrelate_mono(&mut passes, &mut buf).unwrap();
+        assert_eq!(buf, pcm, "multi-pass mono round-trip failed");
     }
 }

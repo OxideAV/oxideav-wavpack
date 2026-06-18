@@ -206,6 +206,34 @@ pub enum Error {
     /// anti-amplification guard, not a spec-mandated limit. The
     /// contained value is the offending `block_samples` field verbatim.
     BlockSamplesTooLarge(u32),
+    /// A decorrelation pass list carried a term value outside the
+    /// clean-room spec's valid set `{1..8, 17, 18, -1, -2, -3}`
+    /// (`docs/audio/wavpack/spec/wavpack-decorrelation.md` §2 / §2.1: a
+    /// term of `0`, or any value outside that set, is rejected). The
+    /// contained value is the offending term code.
+    InvalidDecorrelationTerm(i8),
+    /// A negative (cross-channel) decorrelation term `-1`/`-2`/`-3` was
+    /// configured for a mono pass. Spec §2.1: "negative terms are
+    /// rejected for mono data" — they predict one stereo channel from
+    /// the other and have no meaning on a single channel. The contained
+    /// value is the offending term code.
+    CrossTermOnMono(i8),
+    /// The number of decorrelation passes exceeded the spec's
+    /// `MAX_NTERMS` ceiling
+    /// (`docs/audio/wavpack/spec/wavpack-decorrelation.md` §6: 16). The
+    /// contained value is the observed pass count.
+    TooManyDecorrelationPasses(usize),
+    /// A decorrelation pass did not carry enough seed-history samples to
+    /// prime its predictor. Spec §3.6: terms `17`/`18` need 2 seeds,
+    /// terms `1..8` need `term` seeds, and cross terms need 1 seed (per
+    /// channel). The contained values are the term and the count of
+    /// seed samples supplied.
+    DecorrelationSeedUnderflow {
+        /// The term whose seed history was short.
+        term: i8,
+        /// The number of seed samples supplied for that term/channel.
+        supplied: usize,
+    },
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -294,6 +322,22 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-wavpack: block_samples {n} exceeds the per-block decode ceiling \
                  (anti-amplification guard)"
+            ),
+            Error::InvalidDecorrelationTerm(t) => write!(
+                f,
+                "oxideav-wavpack: decorrelation term {t} is outside the valid set {{1..8, 17, 18, -1, -2, -3}}"
+            ),
+            Error::CrossTermOnMono(t) => write!(
+                f,
+                "oxideav-wavpack: cross-channel decorrelation term {t} is invalid for mono data"
+            ),
+            Error::TooManyDecorrelationPasses(n) => write!(
+                f,
+                "oxideav-wavpack: {n} decorrelation passes exceeds the MAX_NTERMS ceiling of 16"
+            ),
+            Error::DecorrelationSeedUnderflow { term, supplied } => write!(
+                f,
+                "oxideav-wavpack: decorrelation term {term} needs more seed-history samples than the {supplied} supplied"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

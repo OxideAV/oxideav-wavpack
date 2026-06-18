@@ -838,12 +838,13 @@ pub use crate::crc::{
     update_stereo, BlockCrc, CRC_INIT, JOINT_STEREO_FLAG,
 };
 pub use crate::decorrelation::{
-    apply_weight, decorrelation_sample_count, expand_samples, expand_terms, expand_weights,
-    partition_decorrelation_samples, update_weight, update_weight_clip, weights_per_term,
-    DecorrelationSamples, DecorrelationTerms, DecorrelationWeights, TermKind,
-    MAX_DECORRELATION_SAMPLES_PER_TERM, MAX_DOCUMENTED_TERM, SAMPLE_EXPONENT_BIAS,
-    SAMPLE_ON_WIRE_BYTES, TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS,
-    TERM_PREDICTOR_MASK, WEIGHT_CLIP, WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
+    apply_weight, decode_term_byte, decorrelate_mono, decorrelate_stereo,
+    decorrelation_sample_count, expand_samples, expand_terms, expand_weights, is_cross_term,
+    is_valid_term, partition_decorrelation_samples, update_weight, update_weight_clip,
+    weights_per_term, DecorrPass, DecorrelationSamples, DecorrelationTerms, DecorrelationWeights,
+    TermKind, MAX_DECORRELATION_SAMPLES_PER_TERM, MAX_DOCUMENTED_TERM, MAX_NTERMS, MAX_TERM,
+    SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES, TERM_BYTE_BIAS, TERM_DELTA_BITS, TERM_DELTA_MASK,
+    TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, WEIGHT_CLIP, WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
 };
 pub use crate::entropy::{
     expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,

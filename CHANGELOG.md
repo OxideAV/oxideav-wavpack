@@ -8,6 +8,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 335 — §3.2/§3.3/§3.7 decorrelation inverse-prediction loop.
+
+  `decorrelation` now assembles the per-term reconstruction loop that
+  composes the round-329 scalar primitives over a residual buffer, from
+  the clean-room decorrelation trace
+  (`docs/audio/wavpack/spec/wavpack-decorrelation.md`). New `DecorrPass`
+  carries a term, per-pass `delta`, per-channel working weight(s) and an
+  8-slot (`MAX_TERM`) per-channel history ring seeded from the `0x04`
+  decorr-samples (`DecorrPass::new`, with `Error::InvalidDecorrelationTerm`
+  / `Error::DecorrelationSeedUnderflow` rejections). `decorrelate_mono`
+  and `decorrelate_stereo` run an ordered pass list in place over the
+  whole buffer per pass (§3.7 application order): the fixed-lag terms
+  `1..8` read `history[m]` / write `history[(m+t)&7]` and the
+  extrapolators `17`/`18` shift a 2-tap history, both via `apply_weight`
+  + `update_weight` (§3.2); the zero-delay cross terms `-1`/`-2`/`-3`
+  (stereo only) use `update_weight_clip` (§3.3). `decode_term_byte` reads
+  the spec's `+5`-biased term encoding (§2.1, distinct from `expand_terms`
+  which reads the older wiki listing). New `is_valid_term` /
+  `is_cross_term` predicates and `MAX_TERM` (`8`) / `MAX_NTERMS` (`16`) /
+  `TERM_BYTE_BIAS` (`5`) constants name the §6 values. 13 new tests pin a
+  forward-encode / inverse-decode round trip across every term and
+  multi-pass mono + stereo stacks, plus the rejection boundaries
+  (`CrossTermOnMono`, `TooManyDecorrelationPasses`). The loop is not yet
+  wired into `WavPackBlock::decode_samples`.
+
 - Round 329 — §3 decorrelation inverse-prediction arithmetic primitives.
 
   `decorrelation` now exposes the three core scalar primitives of the

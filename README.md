@@ -36,8 +36,17 @@ Working surface:
   LMS `±delta` adaptation) and `update_weight_clip` (§3.5 cross-channel
   variant clamped to `±1024`), alongside the metadata expanders for the
   `0x02`/`0x03`/`0x04` terms / weights / seed-samples sub-blocks. The
-  per-term reconstruction loop that composes these primitives over the
-  residual buffer is not yet assembled.
+  per-term inverse-prediction loop is now assembled: `decorrelate_mono`
+  and `decorrelate_stereo` run an ordered list of `DecorrPass` passes over
+  a residual buffer in place (§3.7 whole-buffer-per-pass, application
+  order), composing `apply_weight` / `update_weight` for the fixed-lag
+  (`1..8`) and extrapolate (`17`/`18`) terms and `update_weight_clip` for
+  the zero-delay cross terms (`-1`/`-2`/`-3`, stereo only). `DecorrPass`
+  carries the per-channel 8-slot history ring (`MAX_TERM`), seeded from the
+  `0x04` samples, and `decode_term_byte` reads the spec's `+5`-biased term
+  encoding (distinct from the wiki-listing reading of `expand_terms`). The
+  passes are pinned to a forward/inverse round trip across every term and
+  multi-pass stacks.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -80,9 +89,13 @@ silently decoded as independent L/R, which would emit the mid/side
 residuals); the gates are stereo-only, so mono / false-stereo blocks
 with the bits set still decode. The decorrelation sub-block payloads
 have typed views and the §3 inverse-prediction scalar primitives
-(`apply_weight` / `update_weight` / `update_weight_clip`), but the
-per-term reconstruction loop that runs them over the residual buffer is
-not yet assembled; the hybrid-correction (`.wvc`) and overflow-bit
+(`apply_weight` / `update_weight` / `update_weight_clip`) and the
+per-term reconstruction loop (`decorrelate_mono` / `decorrelate_stereo`)
+that runs them over the residual buffer, but the loop is not yet wired
+into `WavPackBlock::decode_samples` (the block-level composer still
+refuses decorrelation blocks pending the `0x02`/`0x03`/`0x04` →
+`DecorrPass` assembly and reverse-order unpacking); the
+hybrid-correction (`.wvc`) and overflow-bit
 sub-block payloads have typed views but no consuming decode pass. The §5 block CRC is now
 *computed* (over decoded mono / stereo / joint-stereo PCM) and can be
 checked against the stored header word via `BlockCrc::matches`, but the
