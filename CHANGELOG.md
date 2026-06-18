@@ -8,6 +8,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 339 — block-level CRC verification ties §5 to the decode path.
+
+  New `WavPackBlock::verify_decoded_crc` decodes the block's PCM, folds
+  the §5 running CRC over the reconstructed samples (mono via `crc_mono`,
+  non-joint stereo via `crc_stereo_interleaved` — the same channel
+  dispatch `decode_samples` uses, so the CRC covers post-decorrelation
+  PCM), and compares against the stored header CRC word
+  (`WavPackBlock::crc`). Returns `Ok(true)` / `Ok(false)` per §5.6 (a
+  conformant decoder mutes on `false`) and propagates any
+  `decode_samples` error verbatim. Non-mutating checker — callers apply
+  the mute themselves. 4 new tests pin a correct-CRC match, a wrong-CRC
+  miss, error propagation through a refused (hybrid) block, and a match
+  over a multi-pass mono decorrelation block (CRC folded over the
+  reconstructed PCM, not the residuals).
+
 - Round 339 — mono lossless decode reaches reconstructed PCM.
 
   `decode_samples` now runs the full lossless decode pipeline for a

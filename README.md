@@ -75,7 +75,12 @@ Working surface:
   `0xffffffff` seed, and the joint-stereo mid/side undo
   (`undo_joint_stereo`) that precedes the stereo step are implemented and
   pinned to the spec's worked CRC vectors; `matches` verifies a computed
-  CRC against the stored header CRC.
+  CRC against the stored header CRC. The block-level
+  `WavPackBlock::verify_decoded_crc` now ties the CRC to the decode path:
+  it decodes the block's PCM, folds the §5 mono / stereo CRC over the
+  reconstructed samples (post-decorrelation), and reports whether it
+  matches the stored header word — a non-mutating §5.6 checker (callers
+  apply the spec's mute-on-mismatch themselves).
 
 ## Public API sketch
 
@@ -114,13 +119,14 @@ inverse-prediction scalar primitives (`apply_weight` / `update_weight` /
 `update_weight_clip`) plus the per-term reconstruction loop
 (`decorrelate_mono` / `decorrelate_stereo`); the
 hybrid-correction (`.wvc`) and overflow-bit
-sub-block payloads have typed views but no consuming decode pass. The §5 block CRC is now
-*computed* (over decoded mono / stereo / joint-stereo PCM) and can be
-checked against the stored header word via `BlockCrc::matches`, but the
-end-to-end decode pipeline does not yet run the CRC at block end to mute
-mismatched blocks (that is gated on the decorrelation/hybrid loop); the
-extension CRC (`crc_x`, §5.5) over `0x0C` wide/float data is likewise
-pending its consumer. A full `.wv` block *writer* (header + sub-block
+sub-block payloads have typed views but no consuming decode pass. The §5
+block CRC is *computed* over decoded mono / stereo / joint-stereo PCM and
+exposed at block level via `WavPackBlock::verify_decoded_crc` (decode +
+fold + compare against the stored header word), but the streaming decode
+pipeline does not yet auto-run the CRC at block end to *mute* mismatched
+blocks (`verify_decoded_crc` is a non-mutating checker; auto-mute is the
+next step). The extension CRC (`crc_x`, §5.5) over `0x0C` wide/float data
+is likewise pending its consumer. A full `.wv` block *writer* (header + sub-block
 framing around the entropy encoder) is not yet assembled. The crate is
 not yet wired into the `oxideav-core` framework registry — there is no
 `Decoder` / `Encoder` trait impl or `register` entry point.

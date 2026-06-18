@@ -737,6 +737,39 @@ impl<'a> WavPackBlock<'a> {
         }
     }
 
+    /// Decode this block's PCM ([`Self::decode_samples`]) and verify the
+    /// running §5 block CRC against the stored header CRC word
+    /// ([`Self::crc`]).
+    ///
+    /// Returns `Ok(true)` when the recomputed CRC matches the stored word
+    /// (spec §5.6: a conformant decoder would *keep* the block), `Ok(false)`
+    /// when it does not (spec §5.6: a conformant decoder would *mute* the
+    /// block by zeroing it). Any error [`Self::decode_samples`] raises
+    /// (unsupported feature, structural shortfall, malformed payload) is
+    /// propagated verbatim.
+    ///
+    /// The CRC is folded over the decoded PCM in the spec's per-channel
+    /// shape: [`crate::crc::crc_mono`] for a mono / false-stereo block and
+    /// [`crate::crc::crc_stereo_interleaved`] for a (non-joint) stereo
+    /// block — matching the channel dispatch [`Self::decode_samples`]
+    /// itself uses. Joint-stereo blocks are never reached here because
+    /// `decode_samples` refuses them upstream; when that path is wired the
+    /// mid/side undo of [`crate::crc::crc_joint_stereo_interleaved`] will
+    /// be selected on the joint flag.
+    ///
+    /// This is a non-mutating *checker* — it does not alter the decoded
+    /// buffer on mismatch. Callers wanting the spec's mute behaviour zero
+    /// the returned PCM themselves on `Ok(false)`. Round 339.
+    pub fn verify_decoded_crc(&self) -> Result<bool> {
+        let pcm = self.decode_samples()?;
+        let computed = if self.header.flags.is_block_data_mono() {
+            crate::crc::crc_mono(&pcm)
+        } else {
+            crate::crc::crc_stereo_interleaved(&pcm)
+        };
+        Ok(computed == self.header.crc())
+    }
+
     /// Borrow the raw `0x02` / `0x03` / `0x04` decorrelation sub-block
     /// payloads (each defaulting to an empty slice when the sub-block is
     /// absent), for feeding the decorrelation-pass assembler. The first
@@ -2018,6 +2051,111 @@ mod tests {
         // Sanity: the decorrelation actually changed the samples (the
         // path is not a silent identity pass-through).
         assert_ne!(got, residuals);
+    }
+
+    #[test]
+    fn verify_decoded_crc_matches_when_header_crc_is_correct() {
+        // Decode the canonical one-zero mono block, compute its true §5
+        // mono CRC, stamp it into the header CRC field (bytes 16..20), and
+        // confirm verify_decoded_crc reports a match.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with(1 << 2); // mono
+        let mut bytes = synthesise_block(1, flags, &payload);
+
+        // PCM is [0]; its §5.2 mono CRC seeds 0xffffffff and folds 0.
+        let expected_crc = crate::crc::crc_mono(&[0]);
+        bytes[28..32].copy_from_slice(&expected_crc.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.crc(), expected_crc);
+        assert!(block.verify_decoded_crc().expect("verify"));
+    }
+
+    #[test]
+    fn verify_decoded_crc_fails_when_header_crc_is_wrong() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with(1 << 2); // mono
+        let mut bytes = synthesise_block(1, flags, &payload);
+
+        let wrong = crate::crc::crc_mono(&[0]).wrapping_add(1);
+        bytes[28..32].copy_from_slice(&wrong.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.verify_decoded_crc().expect("verify"));
+    }
+
+    #[test]
+    fn verify_decoded_crc_propagates_decode_errors() {
+        // A hybrid block is refused by decode_samples; verify_decoded_crc
+        // surfaces the same typed error rather than a CRC result.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with((1 << 2) | (1 << 3)); // mono + hybrid
+        let bytes = synthesise_block(1, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(
+            block.verify_decoded_crc(),
+            Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::Hybrid
+            ))
+        );
+    }
+
+    #[test]
+    fn verify_decoded_crc_matches_for_mono_decorrelation_block() {
+        use crate::decorrelation::{
+            assemble_mono_passes, decorrelate_mono, TERM_BYTE_BIAS, TERM_PREDICTOR_BITS,
+            TERM_PREDICTOR_MASK,
+        };
+        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+
+        // Reconstruct PCM from a decorrelation block (as the end-to-end
+        // decode test does), compute its §5 CRC over the reconstructed
+        // samples, stamp it, and confirm verify_decoded_crc agrees — the
+        // CRC is folded over the post-decorrelation PCM, not the residuals.
+        let residuals: Vec<i32> = vec![5, -3, 8, 0, 12, -7, 4, 1];
+        let term_byte = |term: i8, delta: u8| -> u8 {
+            (((term + TERM_BYTE_BIAS) as u8) & TERM_PREDICTOR_MASK) | (delta << TERM_PREDICTOR_BITS)
+        };
+        let seed_word = |v: i32| -> [u8; 2] { [v as i8 as u8, 9] };
+        // Two passes (even-length 0x02/0x03 payloads). Wire order is
+        // reverse application order: store [term 2, term 1].
+        let terms_payload = vec![term_byte(2, 1), term_byte(1, 2)];
+        let weights_payload = vec![6u8, 4u8];
+        let mut samples_payload = Vec::new();
+        // term 2 needs 2 seeds (wire-first), term 1 needs 1 seed.
+        for &s in &[3, 4, 7] {
+            samples_payload.extend_from_slice(&seed_word(s));
+        }
+
+        let mut passes = assemble_mono_passes(&terms_payload, &weights_payload, &samples_payload)
+            .expect("assemble");
+        let mut expected_pcm = residuals.clone();
+        decorrelate_mono(&mut passes, &mut expected_pcm).expect("decorrelate");
+        let expected_crc = crate::crc::crc_mono(&expected_pcm);
+
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
+        let mut enc_medians = AdaptiveMedians::from_entropy(&info_block, 0).expect("medians");
+        let packed_0a = encode_packed_samples_mono(&residuals, &mut enc_medians).expect("encode");
+
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x02, &terms_payload);
+        append_small_sub_block(&mut payload, 0x03, &weights_payload);
+        append_small_sub_block(&mut payload, 0x04, &samples_payload);
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &packed_0a);
+
+        let flags = flags_with(1 << 2); // mono
+        let mut bytes = synthesise_block(residuals.len() as u32, flags, &payload);
+        bytes[28..32].copy_from_slice(&expected_crc.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.verify_decoded_crc().expect("verify decorr crc"));
     }
 
     #[test]
