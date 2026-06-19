@@ -41,8 +41,17 @@
 //! signed sample is added to an unsigned 32-bit accumulator.
 //!
 //! The extension CRC (`crc_x`, spec §5.5) covers the `0x0C` wide/float
-//! extension stream and lives on a separate register; it is decode-stage
-//! work gated on the extension consumer and is not implemented here.
+//! extension stream and lives on a *separate* register. It folds in each
+//! reassembled wide/float sample as `crc_x = crc_x * 9 + 3*lo + hi`,
+//! where `lo = v & 0xffff` and `hi = (v >> 16) & 0xffff` are the low and
+//! high 16-bit halves of the 32-bit reassembled value, and is compared
+//! against the stored extension CRC at block end alongside the main CRC.
+//! It is seeded to the same `0xffff_ffff` (spec §5.1) and is modelled
+//! here by [`update_extension`] / [`ExtensionCrc`] / [`crc_extension`].
+//! The wiring of the `0x0C` consumer that produces the reassembled
+//! values stays gated on the (undocumented) extension-stream layout; this
+//! module provides the §5.5 accumulation arithmetic so the consumer, when
+//! it lands, has a pinned fold to drive.
 
 /// The CRC register seed used at block open (spec §5.1): `0xffff_ffff`.
 pub const CRC_INIT: u32 = 0xffff_ffff;
@@ -79,6 +88,33 @@ pub fn update_stereo(crc: u32, left: i32, right: i32) -> u32 {
     crc.wrapping_mul(9)
         .wrapping_add((left as u32).wrapping_mul(3))
         .wrapping_add(right as u32)
+}
+
+/// Folds one reassembled wide/float `0x0C` extension sample into a
+/// running *extension* CRC register (spec §5.5).
+///
+/// `crc_x' = crc_x * 9 + 3 * lo + hi`, where `lo = v & 0xffff` and
+/// `hi = (v >> 16) & 0xffff` are the low and high 16-bit halves of the
+/// reassembled 32-bit value `v`, taken as its two's-complement `u32` bit
+/// pattern, with the whole expression evaluated with 32-bit wrap-around.
+/// The spec writes this as
+/// `crc = crc * 9 + (v & 0xffff) * 3 + ((v >> 16) & 0xffff)`.
+///
+/// This register is separate from the main sample CRC (the main register
+/// folds decoded PCM via [`update_mono`] / [`update_stereo`]); the
+/// extension register covers only the `0x0C` wide/float reassembly stream
+/// (spec §5.5) and is compared against the stored extension CRC at block
+/// end alongside the main CRC (spec §5.6).
+#[inline]
+#[must_use]
+pub fn update_extension(crc_x: u32, value: i32) -> u32 {
+    let v = value as u32;
+    let lo = v & 0xffff;
+    let hi = (v >> 16) & 0xffff;
+    crc_x
+        .wrapping_mul(9)
+        .wrapping_add(lo.wrapping_mul(3))
+        .wrapping_add(hi)
 }
 
 /// Undoes WavPack joint (mid/side) stereo for one decoded pair (spec §5.4).
@@ -174,6 +210,70 @@ impl BlockCrc {
     pub fn matches(self, stored: u32) -> bool {
         self.crc == stored
     }
+}
+
+/// A running WavPack *extension* CRC accumulator (spec §5.5).
+///
+/// Separate register from [`BlockCrc`]: this one covers only the `0x0C`
+/// wide/float reassembly stream. Seed with [`ExtensionCrc::new`], fold
+/// each reassembled wide/float value in with [`ExtensionCrc::push`], then
+/// read the register with [`ExtensionCrc::value`] or compare it against
+/// the stored extension CRC with [`ExtensionCrc::matches`] (spec §5.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionCrc {
+    crc_x: u32,
+}
+
+impl Default for ExtensionCrc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtensionCrc {
+    /// Creates a fresh extension accumulator seeded to [`CRC_INIT`]
+    /// (spec §5.1: `crc` and `crc_x` are both seeded `0xffff_ffff`).
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self { crc_x: CRC_INIT }
+    }
+
+    /// Folds one reassembled wide/float `0x0C` extension value (spec §5.5).
+    #[inline]
+    pub fn push(&mut self, value: i32) {
+        self.crc_x = update_extension(self.crc_x, value);
+    }
+
+    /// The current extension-CRC register value (spec §5.6 comparison input).
+    #[inline]
+    #[must_use]
+    pub fn value(self) -> u32 {
+        self.crc_x
+    }
+
+    /// Whether the accumulated extension CRC equals a stored extension
+    /// CRC word (spec §5.6). A conformant decoder mutes the block when
+    /// *either* the main CRC or the extension CRC fails to match.
+    #[inline]
+    #[must_use]
+    pub fn matches(self, stored: u32) -> bool {
+        self.crc_x == stored
+    }
+}
+
+/// Computes the extension CRC of a slice of reassembled wide/float `0x0C`
+/// values (spec §5.5).
+///
+/// Seeds with [`CRC_INIT`] and folds every value in order. Equivalent to
+/// a fresh [`ExtensionCrc`] driven by [`ExtensionCrc::push`].
+#[must_use]
+pub fn crc_extension(values: &[i32]) -> u32 {
+    let mut crc_x = CRC_INIT;
+    for &v in values {
+        crc_x = update_extension(crc_x, v);
+    }
+    crc_x
 }
 
 /// Computes the block CRC of a slice of decoded mono samples (spec §5.2).
@@ -422,5 +522,96 @@ mod tests {
     fn mono_crc_is_order_dependent() {
         // A multiply-accumulate CRC must depend on sample order.
         assert_ne!(crc_mono(&[1, 2, 3]), crc_mono(&[3, 2, 1]));
+    }
+
+    // ---- extension CRC (spec §5.5) ---------------------------------
+
+    // Independent reimplementation of the §5.5 step from the documented
+    // formula alone, used to pin update_extension.
+    fn ext_step(crc_x: u32, v: i32) -> u32 {
+        let u = v as u32;
+        let lo = u & 0xffff;
+        let hi = (u >> 16) & 0xffff;
+        crc_x
+            .wrapping_mul(9)
+            .wrapping_add(lo.wrapping_mul(3))
+            .wrapping_add(hi)
+    }
+
+    #[test]
+    fn extension_step_matches_spec_formula() {
+        // crc_x = crc_x*9 + 3*lo + hi over a range of values/registers.
+        for crc_x in [0u32, 1, CRC_INIT, 0x1234_5678, 0xffff_0000] {
+            for v in [0i32, 1, -1, 5, -7, 0x0001_0001, i32::MIN, i32::MAX] {
+                assert_eq!(update_extension(crc_x, v), ext_step(crc_x, v));
+            }
+        }
+    }
+
+    #[test]
+    fn extension_splits_lo_and_hi_halves() {
+        // A value whose low and high halves differ exercises both terms.
+        // v = 0x0002_0003 → lo = 3, hi = 2 → from seed 0:
+        //   0*9 + 3*3 + 2 = 11.
+        assert_eq!(update_extension(0, 0x0002_0003), 11);
+    }
+
+    #[test]
+    fn extension_negative_value_folds_as_twos_complement() {
+        // v = -1 = 0xffff_ffff → lo = 0xffff, hi = 0xffff. From seed 0:
+        //   0*9 + 3*0xffff + 0xffff = 4*0xffff = 0x0003_fffc.
+        assert_eq!(update_extension(0, -1), 0x0003_fffc);
+    }
+
+    #[test]
+    fn extension_accumulator_matches_free_function() {
+        let values = [3i32, -2, 5, 0, -7, 0x0001_0001];
+        let mut acc = ExtensionCrc::new();
+        for &v in &values {
+            acc.push(v);
+        }
+        assert_eq!(acc.value(), crc_extension(&values));
+    }
+
+    #[test]
+    fn extension_fresh_accumulator_holds_the_seed() {
+        assert_eq!(ExtensionCrc::new().value(), CRC_INIT);
+        assert_eq!(ExtensionCrc::default(), ExtensionCrc::new());
+    }
+
+    #[test]
+    fn extension_empty_input_yields_the_seed() {
+        assert_eq!(crc_extension(&[]), CRC_INIT);
+        assert_eq!(ExtensionCrc::new().value(), CRC_INIT);
+    }
+
+    #[test]
+    fn extension_matches_is_true_for_computed_and_false_otherwise() {
+        let values = [3i32, -2, 5, 0, -7];
+        let crc_x = crc_extension(&values);
+        let mut acc = ExtensionCrc::new();
+        for &v in &values {
+            acc.push(v);
+        }
+        assert!(acc.matches(crc_x));
+        assert!(!acc.matches(crc_x.wrapping_add(1)));
+        assert!(!acc.matches(0xdead_beef));
+    }
+
+    #[test]
+    fn extension_is_order_dependent_and_change_sensitive() {
+        assert_ne!(crc_extension(&[1, 2, 3]), crc_extension(&[3, 2, 1]));
+        assert_ne!(
+            crc_extension(&[3, -2, 5, 0, -7]),
+            crc_extension(&[3, -2, 5, 1, -7])
+        );
+    }
+
+    #[test]
+    fn extension_register_is_independent_of_main_register() {
+        // The two registers use different multipliers (3 vs 9 for mono),
+        // so folding the same values through each must diverge.
+        let values = [3i32, -2, 5, 0, -7];
+        assert_ne!(crc_mono(&values), crc_extension(&values));
     }
 }

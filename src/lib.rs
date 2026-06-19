@@ -834,8 +834,9 @@ pub use crate::block_header::{
 };
 pub use crate::correction::{expand_packed_correction_data, PackedCorrectionData};
 pub use crate::crc::{
-    crc_joint_stereo_interleaved, crc_mono, crc_stereo_interleaved, undo_joint_stereo, update_mono,
-    update_stereo, BlockCrc, CRC_INIT, JOINT_STEREO_FLAG,
+    crc_extension, crc_joint_stereo_interleaved, crc_mono, crc_stereo_interleaved,
+    undo_joint_stereo, update_extension, update_mono, update_stereo, BlockCrc, ExtensionCrc,
+    CRC_INIT, JOINT_STEREO_FLAG,
 };
 pub use crate::decorrelation::{
     apply_weight, decode_term_byte, decorrelate_mono, decorrelate_stereo,
