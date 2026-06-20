@@ -776,12 +776,51 @@ impl<'a> WavPackBlock<'a> {
     /// the returned PCM themselves on `Ok(false)`. Round 339.
     pub fn verify_decoded_crc(&self) -> Result<bool> {
         let pcm = self.decode_samples()?;
-        let computed = if self.header.flags.is_block_data_mono() {
-            crate::crc::crc_mono(&pcm)
+        Ok(self.crc_of_decoded(&pcm) == self.header.crc())
+    }
+
+    /// Fold the spec §5 running CRC over an already-decoded PCM buffer in
+    /// the block's per-channel shape ([`crate::crc::crc_mono`] for mono /
+    /// false-stereo, [`crate::crc::crc_stereo_interleaved`] for stereo).
+    ///
+    /// The buffer must be the true-L/R output [`Self::decode_samples`]
+    /// produces (the §5.4 mid/side undo already applied), so the plain
+    /// stereo CRC step is correct for both joint and non-joint blocks.
+    fn crc_of_decoded(&self, pcm: &[i32]) -> u32 {
+        if self.header.flags.is_block_data_mono() {
+            crate::crc::crc_mono(pcm)
         } else {
-            crate::crc::crc_stereo_interleaved(&pcm)
-        };
-        Ok(computed == self.header.crc())
+            crate::crc::crc_stereo_interleaved(pcm)
+        }
+    }
+
+    /// Decode this block's PCM and apply the spec §5.6 CRC *mute gate*:
+    /// recompute the running block CRC over the decoded samples and, on a
+    /// mismatch with the stored header CRC word, zero the returned buffer
+    /// (the spec's "mute the block" behaviour) — otherwise return the
+    /// decoded PCM unchanged.
+    ///
+    /// Returns `(pcm, crc_ok)`:
+    ///
+    /// * `crc_ok == true` — the recomputed CRC matched; `pcm` is the
+    ///   decoded samples.
+    /// * `crc_ok == false` — the CRC did **not** match; `pcm` is a buffer
+    ///   of the correct length filled with `0` (spec §5.6: a conformant
+    ///   decoder mutes a corrupt block rather than emitting its samples).
+    ///
+    /// Unlike [`Self::verify_decoded_crc`] (a non-mutating checker), this
+    /// is the spec-faithful decode-with-gate: callers that want the
+    /// decoder's defined behaviour on a bad block use this and need not
+    /// implement the mute themselves. Any error [`Self::decode_samples`]
+    /// raises is propagated verbatim.
+    pub fn decode_samples_muted(&self) -> Result<(Vec<i32>, bool)> {
+        let mut pcm = self.decode_samples()?;
+        let crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        if !crc_ok {
+            // Spec §5.6: mute (zero) the block on a CRC mismatch.
+            pcm.iter_mut().for_each(|s| *s = 0);
+        }
+        Ok((pcm, crc_ok))
     }
 
     /// Borrow the raw `0x02` / `0x03` / `0x04` decorrelation sub-block
@@ -2100,6 +2139,75 @@ mod tests {
 
         let (block, _) = parse_block(&bytes).expect("parse block");
         assert!(!block.verify_decoded_crc().expect("verify"));
+    }
+
+    #[test]
+    fn decode_samples_muted_returns_pcm_when_crc_matches() {
+        // Canonical one-zero mono block with a correct stored CRC: the
+        // gate keeps the decoded samples and reports crc_ok = true.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with(1 << 2); // mono
+        let mut bytes = synthesise_block(1, flags, &payload);
+        let expected_crc = crate::crc::crc_mono(&[0]);
+        bytes[28..32].copy_from_slice(&expected_crc.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        let (pcm, crc_ok) = block.decode_samples_muted().expect("decode");
+        assert!(crc_ok, "matching CRC should report ok");
+        assert_eq!(pcm, vec![0]);
+    }
+
+    #[test]
+    fn decode_samples_muted_zeros_pcm_on_crc_mismatch() {
+        // A non-zero mono PCM block with a deliberately-wrong stored CRC:
+        // the §5.6 mute gate zeros the buffer and reports crc_ok = false,
+        // while preserving the decoded length.
+        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+
+        let pcm = vec![5i32, -3, 8, 0];
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
+        let mut enc_medians = AdaptiveMedians::from_entropy(&info_block, 0).expect("medians");
+        let packed = encode_packed_samples_mono(&pcm, &mut enc_medians).expect("encode");
+
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &packed);
+        let flags = flags_with(1 << 2); // mono
+        let mut bytes = synthesise_block(pcm.len() as u32, flags, &payload);
+        // Stamp a CRC that is guaranteed NOT to match.
+        let wrong = crate::crc::crc_mono(&pcm).wrapping_add(1);
+        bytes[28..32].copy_from_slice(&wrong.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        // Sanity: the plain decode reproduces the true PCM.
+        assert_eq!(block.decode_samples().expect("decode"), pcm);
+        let (muted, crc_ok) = block.decode_samples_muted().expect("decode muted");
+        assert!(!crc_ok, "wrong CRC should report not-ok");
+        assert_eq!(
+            muted,
+            vec![0; pcm.len()],
+            "mismatch must mute (zero) the block"
+        );
+    }
+
+    #[test]
+    fn decode_samples_muted_propagates_decode_errors() {
+        // A hybrid block is refused by decode_samples; the muted gate
+        // surfaces the same typed error rather than a (pcm, bool) pair.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let flags = flags_with((1 << 2) | (1 << 3)); // mono + hybrid
+        let bytes = synthesise_block(1, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(
+            block.decode_samples_muted(),
+            Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::Hybrid
+            ))
+        );
     }
 
     #[test]
