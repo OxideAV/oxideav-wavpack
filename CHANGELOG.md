@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 354 — left-shift final-normalization fixup (`fixup` module).
+
+  New `fixup` module implements the wiki flag-bits-13..=17 "left-shift
+  places when bitdepth is not a multiple of 8 (e.g. 12-bit, 20-bit)"
+  final-normalization stage: `apply_left_shift(sample, left_shift)` =
+  `sample << left_shift` (the identity for whole-byte depths where
+  `left_shift == 0`), and the whole-buffer `apply_left_shift_buffer`. The
+  shift is the inverse of the encoder's narrowing arithmetic right shift,
+  restoring container-scaled PCM from the narrow magnitude the prediction
+  loop reconstructs. Per the decorrelation-spec doc §1 pipeline ordering
+  and §5.2 ("after decorrelation, before final shift"), this fixup runs
+  *after* the running CRC is folded over the pre-shift samples, so it is a
+  standalone stage independent of the CRC fold. Pinned by tests covering
+  zero-shift identity, power-of-two scaling, sign preservation, the
+  encoder-right-shift inverse over a range, malformed large-shift
+  wrap-safety, and the buffer/per-element equivalence.
+
 - Round 348 — stereo lossless decode + joint-stereo undo + §5.6 CRC mute
   gate, driving the decorrelation milestone to working stereo decode.
 

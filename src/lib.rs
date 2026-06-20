@@ -815,6 +815,7 @@ mod crc;
 mod decorrelation;
 mod entropy;
 mod error;
+mod fixup;
 mod metadata;
 mod overflow_bits;
 mod packed_samples;
@@ -853,6 +854,7 @@ pub use crate::entropy::{
     STEREO_PAYLOAD_BYTES,
 };
 pub use crate::error::{Error, Result};
+pub use crate::fixup::{apply_left_shift, apply_left_shift_buffer};
 pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
