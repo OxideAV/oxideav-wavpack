@@ -615,7 +615,46 @@ impl<'a> WavPackBlock<'a> {
     /// of a multi-block file behave like independent decodes (which is
     /// what plain stereo `.wv` carries on the wire anyway — each block
     /// carries a fresh `0x05` seed). Round 206.
+    ///
+    /// ## Final left-shift normalization (round 354)
+    ///
+    /// The returned PCM has the wiki flag-bits-13..=17 *left-shift fixup*
+    /// applied: when the block's effective bit-depth is not a whole number
+    /// of bytes (12-bit, 20-bit, …) the encoder narrowed every sample and
+    /// recorded the dropped trailing-zero count in [`Flags::left_shift`];
+    /// the decoder reconstructs the narrow magnitude through the prediction
+    /// loop and then shifts each sample left by that count to restore the
+    /// container-scaled PCM ([`crate::apply_left_shift_buffer`]). For the
+    /// common whole-byte depths `left_shift` is `0` and this is the
+    /// identity. The shift is applied *after* the running block CRC is
+    /// folded over the pre-shift samples (decorrelation-spec doc §1
+    /// pipeline + §5.2 "before final shift"), so the CRC checkers
+    /// ([`Self::verify_decoded_crc`], [`Self::decode_samples_muted`]) fold
+    /// the pre-shift buffer to compare against the stored header CRC.
     pub fn decode_samples(&self) -> Result<Vec<i32>> {
+        let mut pcm = self.decode_samples_preshift()?;
+        // Spec §1 pipeline / §5.2: the left-shift fixup is the final
+        // normalization stage, applied after the CRC fold. The CRC paths
+        // call `decode_samples_preshift` directly and fold the pre-shift
+        // buffer, so applying the shift here keeps the public PCM correct
+        // without disturbing the CRC comparison.
+        crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
+        Ok(pcm)
+    }
+
+    /// Decode this block's PCM up to but **not including** the final
+    /// left-shift normalization fixup — i.e. the buffer in the exact form
+    /// the running §5 block CRC is computed over (decorrelation-spec doc §1
+    /// pipeline: "… joint-stereo undo → accumulate CRC → shift/clip
+    /// fixups", and §5.2 "after decorrelation, **before final shift**").
+    ///
+    /// [`Self::decode_samples`] wraps this and applies the wiki
+    /// flag-bits-13..=17 left-shift ([`crate::apply_left_shift_buffer`]) to
+    /// produce the final container-scaled PCM; the CRC checkers
+    /// ([`Self::verify_decoded_crc`] / [`Self::decode_samples_muted`]) fold
+    /// this pre-shift buffer directly so the comparison matches the stored
+    /// header CRC, then apply the shift to whatever PCM they return.
+    fn decode_samples_preshift(&self) -> Result<Vec<i32>> {
         let header = &self.header;
         let flags = &header.flags;
 
@@ -781,7 +820,11 @@ impl<'a> WavPackBlock<'a> {
     /// buffer on mismatch. Callers wanting the spec's mute behaviour zero
     /// the returned PCM themselves on `Ok(false)`. Round 339.
     pub fn verify_decoded_crc(&self) -> Result<bool> {
-        let pcm = self.decode_samples()?;
+        // Spec §5.2 / §1: the CRC is folded over the *pre-shift* samples
+        // (before the final left-shift normalization). Fold the pre-shift
+        // buffer so the comparison matches the stored header CRC even for
+        // sub-byte-depth blocks (non-zero `left_shift`).
+        let pcm = self.decode_samples_preshift()?;
         Ok(self.crc_of_decoded(&pcm) == self.header.crc())
     }
 
@@ -820,10 +863,19 @@ impl<'a> WavPackBlock<'a> {
     /// implement the mute themselves. Any error [`Self::decode_samples`]
     /// raises is propagated verbatim.
     pub fn decode_samples_muted(&self) -> Result<(Vec<i32>, bool)> {
-        let mut pcm = self.decode_samples()?;
+        // Spec §1 pipeline / §5.2: the running CRC is computed over the
+        // pre-shift samples ("before final shift"). Fold the pre-shift
+        // buffer, then apply the left-shift fixup to whatever PCM we emit.
+        let mut pcm = self.decode_samples_preshift()?;
         let crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
-        if !crc_ok {
-            // Spec §5.6: mute (zero) the block on a CRC mismatch.
+        if crc_ok {
+            // CRC matched: emit the final container-scaled PCM (apply the
+            // wiki bits-13..=17 left-shift normalization the public
+            // `decode_samples` would).
+            crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
+        } else {
+            // Spec §5.6: mute (zero) the block on a CRC mismatch. A zeroed
+            // buffer is shift-invariant, so no fixup is needed.
             pcm.iter_mut().for_each(|s| *s = 0);
         }
         Ok((pcm, crc_ok))
@@ -2151,6 +2203,162 @@ mod tests {
         // Sanity: the decorrelation actually changed the samples (the
         // path is not a silent identity pass-through).
         assert_ne!(got, residuals);
+    }
+
+    // ---- left-shift final-normalization fixup wiring (round 354) -------
+
+    /// Build a known-PCM mono decorrelation block plus the unshifted PCM
+    /// the decode produces, returning `(block_bytes, unshifted_pcm)`. The
+    /// caller stamps `left_shift` into the flag word (bits 13..=17) to
+    /// exercise the final normalization stage. Reuses the residual/term
+    /// layout the end-to-end decorrelation test pins.
+    fn synthesise_mono_decorr_block_with_left_shift(left_shift: u32) -> (Vec<u8>, Vec<i32>) {
+        use crate::decorrelation::{
+            assemble_mono_passes, decorrelate_mono, TERM_BYTE_BIAS, TERM_PREDICTOR_BITS,
+            TERM_PREDICTOR_MASK,
+        };
+        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+
+        let residuals: Vec<i32> = vec![5, -3, 8, 0, 12, -7, 4, 1, -2, 9, 6, -1];
+        let term_byte = |term: i8, delta: u8| -> u8 {
+            (((term + TERM_BYTE_BIAS) as u8) & TERM_PREDICTOR_MASK) | (delta << TERM_PREDICTOR_BITS)
+        };
+        let seed_word = |v: i32| -> [u8; 2] { [v as i8 as u8, 9] };
+        let app = [(1i8, 2u8, 5u8, vec![4]), (17i8, 3u8, 10u8, vec![6, 5])];
+        let mut terms_payload = Vec::new();
+        let mut weights_payload = Vec::new();
+        let mut samples_payload = Vec::new();
+        for (t, d, wbyte, seeds) in app.iter().rev() {
+            terms_payload.push(term_byte(*t, *d));
+            weights_payload.push(*wbyte);
+            for &s in seeds {
+                samples_payload.extend_from_slice(&seed_word(s));
+            }
+        }
+
+        // The unshifted PCM the prediction loop reconstructs.
+        let mut passes = assemble_mono_passes(&terms_payload, &weights_payload, &samples_payload)
+            .expect("assemble passes");
+        let mut unshifted = residuals.clone();
+        decorrelate_mono(&mut passes, &mut unshifted).expect("decorrelate");
+
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("expand entropy info");
+        let mut enc_medians =
+            AdaptiveMedians::from_entropy(&info_block, 0).expect("seed encoder medians");
+        let packed_0a =
+            encode_packed_samples_mono(&residuals, &mut enc_medians).expect("encode residuals");
+
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x02, &terms_payload);
+        append_small_sub_block(&mut payload, 0x03, &weights_payload);
+        append_small_sub_block(&mut payload, 0x04, &samples_payload);
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &packed_0a);
+
+        let flags = flags_with((1 << 2) | (left_shift << 13)); // mono + left_shift
+        let bytes = synthesise_block(residuals.len() as u32, flags, &payload);
+        (bytes, unshifted)
+    }
+
+    #[test]
+    fn decode_samples_applies_left_shift_to_reconstructed_pcm() {
+        // A non-zero left_shift (bits 13..=17) must scale every decoded
+        // sample left by that count — the wiki sub-byte-depth fixup.
+        let shift = 4u32;
+        let (bytes, unshifted) = synthesise_mono_decorr_block_with_left_shift(shift);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.header.flags.left_shift, shift as u8);
+
+        let got = block.decode_samples().expect("decode with left shift");
+        let expected: Vec<i32> = unshifted.iter().map(|&s| s << shift).collect();
+        assert_eq!(got, expected, "left-shift fixup not applied");
+        // The shift actually changed the buffer (non-trivial fixup).
+        assert_ne!(got, unshifted);
+    }
+
+    #[test]
+    fn decode_samples_zero_left_shift_is_identity() {
+        // left_shift == 0 (whole-byte depth) must leave the reconstructed
+        // PCM untouched — the fixup is the identity.
+        let (bytes, unshifted) = synthesise_mono_decorr_block_with_left_shift(0);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.header.flags.left_shift, 0);
+        let got = block.decode_samples().expect("decode no shift");
+        assert_eq!(got, unshifted);
+    }
+
+    #[test]
+    fn verify_decoded_crc_folds_pre_shift_samples() {
+        // The §5 block CRC is computed over the *pre-shift* samples
+        // (spec §1 pipeline / §5.2 "before final shift"). Stamp the
+        // pre-shift CRC into the header and confirm verify reports a match
+        // even though the emitted PCM is shifted.
+        let shift = 3u32;
+        let (mut bytes, unshifted) = synthesise_mono_decorr_block_with_left_shift(shift);
+        let pre_shift_crc = crate::crc::crc_mono(&unshifted);
+        bytes[28..32].copy_from_slice(&pre_shift_crc.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.crc(), pre_shift_crc);
+        assert!(
+            block.verify_decoded_crc().expect("verify"),
+            "CRC must be folded over pre-shift samples"
+        );
+
+        // And the publicly-decoded PCM is the shifted form.
+        let got = block.decode_samples().expect("decode");
+        let expected: Vec<i32> = unshifted.iter().map(|&s| s << shift).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn verify_decoded_crc_fails_if_post_shift_crc_stamped() {
+        // Stamping the *post-shift* CRC must NOT verify — proving the
+        // checker folds pre-shift, not the emitted PCM.
+        let shift = 3u32;
+        let (mut bytes, unshifted) = synthesise_mono_decorr_block_with_left_shift(shift);
+        let shifted: Vec<i32> = unshifted.iter().map(|&s| s << shift).collect();
+        let post_shift_crc = crate::crc::crc_mono(&shifted);
+        // Only meaningful if the two CRCs actually differ.
+        assert_ne!(post_shift_crc, crate::crc::crc_mono(&unshifted));
+        bytes[28..32].copy_from_slice(&post_shift_crc.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(
+            !block.verify_decoded_crc().expect("verify"),
+            "post-shift CRC must not match the pre-shift fold"
+        );
+    }
+
+    #[test]
+    fn decode_samples_muted_applies_left_shift_on_crc_match() {
+        // The mute gate folds the pre-shift CRC; on a match it must emit
+        // the shifted PCM (the same the public decode_samples returns).
+        let shift = 2u32;
+        let (mut bytes, unshifted) = synthesise_mono_decorr_block_with_left_shift(shift);
+        let pre_shift_crc = crate::crc::crc_mono(&unshifted);
+        bytes[28..32].copy_from_slice(&pre_shift_crc.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        let (pcm, crc_ok) = block.decode_samples_muted().expect("muted decode");
+        assert!(crc_ok, "pre-shift CRC must match");
+        let expected: Vec<i32> = unshifted.iter().map(|&s| s << shift).collect();
+        assert_eq!(pcm, expected, "muted decode must emit shifted PCM on match");
+    }
+
+    #[test]
+    fn decode_samples_muted_zeros_block_on_mismatch_regardless_of_shift() {
+        // On a CRC mismatch the block is muted (zeroed); a zeroed buffer is
+        // shift-invariant, so the output is all zeros of the right length.
+        let shift = 5u32;
+        let (mut bytes, unshifted) = synthesise_mono_decorr_block_with_left_shift(shift);
+        let wrong = crate::crc::crc_mono(&unshifted).wrapping_add(1);
+        bytes[28..32].copy_from_slice(&wrong.to_le_bytes());
+
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        let (pcm, crc_ok) = block.decode_samples_muted().expect("muted decode");
+        assert!(!crc_ok);
+        assert_eq!(pcm, vec![0; unshifted.len()]);
     }
 
     #[test]

@@ -25,6 +25,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   encoder-right-shift inverse over a range, malformed large-shift
   wrap-safety, and the buffer/per-element equivalence.
 
+  `WavPackBlock::decode_samples` now applies that fixup as its final stage:
+  the reconstructed (post-decorrelation, post-joint-undo) buffer is shifted
+  left by [`Flags::left_shift`] before return, so sub-byte-depth blocks
+  (12-bit, 20-bit, …) emit correctly container-scaled PCM rather than the
+  narrow magnitude. The decode body is split into a private
+  `decode_samples_preshift` (the pre-shift buffer the CRC is computed over)
+  wrapped by the shifting `decode_samples`; the CRC paths
+  (`verify_decoded_crc`, `decode_samples_muted`) fold the pre-shift buffer
+  to match the stored header CRC (spec §1 pipeline / §5.2 "before final
+  shift"), then `decode_samples_muted` applies the shift to the emitted PCM
+  on a CRC match and zeroes (mutes) on a mismatch. Pinned by tests that
+  decode a known mono decorrelation block at several `left_shift` values
+  and confirm: the emitted PCM is the shifted reconstruction, zero shift is
+  the identity, the CRC verifies against the *pre-shift* fold (and fails if
+  the post-shift CRC is stamped), and the mute gate shifts-on-match /
+  zeroes-on-mismatch.
+
 - Round 348 — stereo lossless decode + joint-stereo undo + §5.6 CRC mute
   gate, driving the decorrelation milestone to working stereo decode.
 
