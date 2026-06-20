@@ -1742,6 +1742,47 @@ pub fn decode_stream(bytes: &[u8]) -> Result<Vec<i32>> {
     Ok(out)
 }
 
+/// Decode every audio block in a WavPack byte buffer with the spec §5.6
+/// per-block CRC mute gate applied, concatenating the PCM.
+///
+/// This is the CRC-validating twin of [`decode_stream`]: each audio
+/// block is decoded through [`WavPackBlock::decode_samples_muted`], so a
+/// block whose recomputed running CRC does not match its stored header
+/// CRC word contributes a run of zeros (a muted block) instead of its
+/// samples — exactly what a conformant decoder emits for a corrupt block
+/// rather than aborting the whole stream.
+///
+/// Returns `(pcm, all_crc_ok)`:
+///
+/// * `pcm` — the concatenated decoded (and per-block CRC-gated) samples,
+///   in on-disk order, with the same per-block shape [`decode_stream`]
+///   produces (mono = `block_samples` `i32`s, stereo = `block_samples *
+///   2` interleaved).
+/// * `all_crc_ok` — `true` only when *every* decoded block's CRC matched;
+///   `false` if any block was muted.
+///
+/// Parse and decode (unsupported-feature / malformed-payload) errors are
+/// still surfaced verbatim from the first failing block — a CRC mismatch
+/// is *not* an error (it is the defined mute behaviour), but a structural
+/// failure is. Metadata-only blocks contribute nothing and do not affect
+/// `all_crc_ok`.
+pub fn decode_stream_muted(bytes: &[u8]) -> Result<(Vec<i32>, bool)> {
+    let mut out: Vec<i32> = Vec::new();
+    let mut all_crc_ok = true;
+    for parsed in iter_blocks(bytes) {
+        let block = parsed?;
+        // Skip metadata-only / zero-sample blocks — they carry no PCM and
+        // have no CRC to gate (decode_samples would raise BlockHasNoAudio).
+        if !block.header.is_audio_block() {
+            continue;
+        }
+        let (pcm, crc_ok) = block.decode_samples_muted()?;
+        all_crc_ok &= crc_ok;
+        out.extend_from_slice(&pcm);
+    }
+    Ok((out, all_crc_ok))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3589,6 +3630,72 @@ mod tests {
         bytes.extend_from_slice(&audio);
 
         let pcm = decode_stream(&bytes).expect("decode stream with leading metadata");
+        assert_eq!(pcm, vec![0]);
+    }
+
+    /// A one-zero mono block with its §5 CRC stamped correctly, so the
+    /// §5.6 mute gate keeps it.
+    fn synthesise_crc_correct_mono_block_one_zero_sample() -> Vec<u8> {
+        let mut bytes = synthesise_decodable_mono_block_one_zero_sample();
+        let crc = crate::crc::crc_mono(&[0]);
+        bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decode_stream_muted_all_blocks_pass_when_crc_correct() {
+        // Two CRC-correct one-zero mono blocks: all_crc_ok is true and the
+        // PCM is the concatenation of the (un-muted) decoded samples.
+        let block = synthesise_crc_correct_mono_block_one_zero_sample();
+        let mut bytes = block.clone();
+        bytes.extend_from_slice(&block);
+
+        let (pcm, all_crc_ok) = decode_stream_muted(&bytes).expect("decode muted stream");
+        assert!(all_crc_ok, "both blocks have correct CRC");
+        assert_eq!(pcm, vec![0, 0]);
+    }
+
+    #[test]
+    fn decode_stream_muted_mutes_only_the_bad_block() {
+        // [good][bad] where the bad block carries a non-zero sample but a
+        // wrong CRC: the good block's sample survives, the bad block is
+        // zeroed, and all_crc_ok is false.
+        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+
+        let good = synthesise_crc_correct_mono_block_one_zero_sample();
+
+        // Bad block: a real non-zero mono PCM with a deliberately wrong CRC.
+        let pcm = vec![7i32, -2];
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
+        let mut enc_medians = AdaptiveMedians::from_entropy(&info_block, 0).expect("medians");
+        let packed = encode_packed_samples_mono(&pcm, &mut enc_medians).expect("encode");
+        let mut bad_payload = Vec::new();
+        append_entropy_info_mono_zero(&mut bad_payload);
+        append_packed_samples(&mut bad_payload, &packed);
+        let mut bad = synthesise_block(pcm.len() as u32, flags_with(1 << 2), &bad_payload);
+        let wrong = crate::crc::crc_mono(&pcm).wrapping_add(1);
+        bad[28..32].copy_from_slice(&wrong.to_le_bytes());
+
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&bad);
+
+        let (out, all_crc_ok) = decode_stream_muted(&bytes).expect("decode muted stream");
+        assert!(!all_crc_ok, "one block has a wrong CRC");
+        // Good block contributes [0]; bad block is muted to [0, 0].
+        assert_eq!(out, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_stream_muted_skips_metadata_only_blocks() {
+        // A leading metadata-only block must not affect all_crc_ok and
+        // must contribute no PCM.
+        let metadata_only = synthesise_header_bytes(MIN_CK_SIZE);
+        let audio = synthesise_crc_correct_mono_block_one_zero_sample();
+        let mut bytes = metadata_only;
+        bytes.extend_from_slice(&audio);
+
+        let (pcm, all_crc_ok) = decode_stream_muted(&bytes).expect("decode muted stream");
+        assert!(all_crc_ok);
         assert_eq!(pcm, vec![0]);
     }
 
