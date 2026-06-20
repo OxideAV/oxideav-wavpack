@@ -1166,6 +1166,131 @@ pub fn assemble_mono_passes(
     Ok(passes)
 }
 
+/// Assemble the application-ordered [`DecorrPass`] list for a **stereo**
+/// block from the three decorrelation sub-block payloads.
+///
+/// Inputs are the raw `0x02` (terms), `0x03` (weights) and `0x04`
+/// (seed samples) payloads of a two-channel block. The returned passes
+/// are in *application* order (the order [`decorrelate_stereo`]
+/// consumes), so a caller turns an interleaved `[L0, R0, L1, R1, …]`
+/// residual buffer into PCM with one further call.
+///
+/// ## Per-channel layout (spec §3.6 / §3.7)
+///
+/// A stereo block stores, **per pass**, the state for *both* channels:
+///
+/// * **Weights (`0x03`)**: "one signed byte per pass per channel", so a
+///   stereo pass carries two weight bytes laid out channel-A-then-channel-B
+///   within the pass. The payload therefore holds `2 * nterms` bytes.
+/// * **Seed samples (`0x04`)**: "per channel", with the per-channel count
+///   tied to the term class ([`seed_count`]: `17`/`18` → 2, `1..8` → `term`,
+///   cross → 1). A stereo pass stores channel A's seeds followed by
+///   channel B's seeds, so each pass consumes `2 * seed_count(term)` words.
+///
+/// As with mono, the `0x02`/`0x03`/`0x04` metadata stores the passes in
+/// the **reverse** of application order (encoder's last-applied pass
+/// first), so this helper builds the passes in wire order and reverses
+/// the whole list at the end (§3.7).
+///
+/// Cross terms (`-1`/`-2`/`-3`) are *valid* here — they are the
+/// zero-delay inter-channel predictors the stereo loop runs with the
+/// clipped weight update; a cross term seeds 1 sample per channel.
+///
+/// ## Errors
+///
+/// * [`Error::DecorrelationTermsMissing`] — `terms_payload` is empty but
+///   weights/seeds are present.
+/// * [`Error::InvalidDecorrelationTerm`] — a term byte decodes outside
+///   the spec valid set `{1..8, 17, 18, -1, -2, -3}`.
+/// * [`Error::TooManyDecorrelationPasses`] — more than [`MAX_NTERMS`].
+/// * [`Error::DecorrelationWeightCountMismatch`] — the `0x03` payload did
+///   not carry exactly `2 * nterms` weight bytes.
+/// * [`Error::DecorrelationSamplesOddByteCount`] — the `0x04` payload has
+///   an odd byte length.
+/// * [`Error::DecorrelationSampleCountMismatch`] — the `0x04` seed count
+///   does not equal `2 * Σ seed_count(term)`.
+/// * [`Error::DecorrelationSeedUnderflow`] — a per-channel seed group is
+///   short (surfaced by [`DecorrPass::new`]).
+pub fn assemble_stereo_passes(
+    terms_payload: &[u8],
+    weights_payload: &[u8],
+    samples_payload: &[u8],
+) -> Result<Vec<DecorrPass>> {
+    // Decode the spec-encoded term bytes (wire order). Cross terms ARE
+    // allowed on stereo, so we do not reject negative terms here.
+    let mut terms = Vec::with_capacity(terms_payload.len());
+    let mut deltas = Vec::with_capacity(terms_payload.len());
+    for &byte in terms_payload {
+        let (term, delta) = decode_term_byte(byte);
+        if !is_valid_term(term) {
+            return Err(Error::InvalidDecorrelationTerm(term));
+        }
+        terms.push(term);
+        deltas.push(delta);
+    }
+
+    if terms.is_empty() {
+        if !weights_payload.is_empty() || !samples_payload.is_empty() {
+            return Err(Error::DecorrelationTermsMissing);
+        }
+        return Ok(Vec::new());
+    }
+    if terms.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(terms.len()));
+    }
+
+    // Stereo: two weights per pass (channel A then channel B within a
+    // pass) per spec §3.6 "one signed byte per pass per channel".
+    let weights: Vec<i32> = weights_payload
+        .iter()
+        .map(|&b| expand_weight_byte(b))
+        .collect();
+    if weights.len() != terms.len() * 2 {
+        return Err(Error::DecorrelationWeightCountMismatch {
+            expected: terms.len() * 2,
+            actual: weights.len(),
+        });
+    }
+
+    // Expand and partition the seed samples per pass. Each pass consumes
+    // channel A's seeds (seed_count words) followed by channel B's seeds
+    // (another seed_count words).
+    let seeds = expand_samples(samples_payload)?;
+    let expected_seeds: usize = terms.iter().map(|&t| seed_count(t) * 2).sum();
+    if seeds.samples.len() != expected_seeds {
+        return Err(Error::DecorrelationSampleCountMismatch {
+            expected: expected_seeds,
+            actual: seeds.samples.len(),
+        });
+    }
+    let mut seed_a_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
+    let mut seed_b_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
+    let mut cursor = 0usize;
+    for &t in &terms {
+        let n = seed_count(t);
+        seed_a_groups.push(&seeds.samples[cursor..cursor + n]);
+        cursor += n;
+        seed_b_groups.push(&seeds.samples[cursor..cursor + n]);
+        cursor += n;
+    }
+
+    // Build passes in wire order (weight_a = weights[2i], weight_b =
+    // weights[2i+1]), then reverse to application order (§3.7).
+    let mut passes = Vec::with_capacity(terms.len());
+    for i in 0..terms.len() {
+        passes.push(DecorrPass::new(
+            terms[i],
+            deltas[i],
+            weights[2 * i],
+            weights[2 * i + 1],
+            seed_a_groups[i],
+            seed_b_groups[i],
+        )?);
+    }
+    passes.reverse();
+    Ok(passes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2330,6 +2455,186 @@ mod tests {
         assert_eq!(
             assemble_mono_passes(&terms, &weights, &samples),
             Err(Error::TooManyDecorrelationPasses(MAX_NTERMS + 1))
+        );
+    }
+
+    // ---- assemble_stereo_passes (0x02/0x03/0x04 → application-ordered passes) ----
+
+    #[test]
+    fn assemble_stereo_end_to_end_per_channel_terms() {
+        // Multi-pass stereo: per-channel terms + an extrapolator. Build
+        // residuals via the forward encoder (reverse application order),
+        // feed the assembler the matching 0x02/0x03/0x04 payloads, and
+        // confirm decode reconstructs the interleaved PCM.
+        let pcm: Vec<i32> = (0..32).map(|i| ((i * 41) % 137) - 68).collect();
+        // Application order: term 2 then term 17.
+        let app_terms = [(2i8, 2u8), (17i8, 3u8)];
+        let app_seeds_a: [Vec<i32>; 2] = [vec![7, 4], vec![6, 5]];
+        let app_seeds_b: [Vec<i32>; 2] = [vec![-3, 2], vec![1, -2]];
+        let app_wbytes_a = [5u8, 10u8];
+        let app_wbytes_b = [8u8, 3u8];
+        let app_wa: Vec<i32> = app_wbytes_a
+            .iter()
+            .map(|&b| expand_weight_byte(b))
+            .collect();
+        let app_wb: Vec<i32> = app_wbytes_b
+            .iter()
+            .map(|&b| expand_weight_byte(b))
+            .collect();
+
+        // Forward encode applies passes in reverse application order.
+        let mut buf = pcm.clone();
+        for idx in (0..app_terms.len()).rev() {
+            let (t, d) = app_terms[idx];
+            buf = forward_stereo(
+                t,
+                d as i32,
+                app_wa[idx],
+                app_wb[idx],
+                &app_seeds_a[idx],
+                &app_seeds_b[idx],
+                &buf,
+            );
+        }
+        let residuals = buf;
+
+        // Wire order = reverse of application order. Weights per pass:
+        // channel A then channel B. Seeds per pass: A's seeds then B's.
+        let mut terms_payload = Vec::new();
+        let mut weights_payload = Vec::new();
+        let mut samples_payload = Vec::new();
+        for idx in (0..app_terms.len()).rev() {
+            let (t, d) = app_terms[idx];
+            terms_payload.push(term_byte(t, d));
+            weights_payload.push(app_wbytes_a[idx]);
+            weights_payload.push(app_wbytes_b[idx]);
+            for &s in &app_seeds_a[idx] {
+                samples_payload.extend_from_slice(&seed_word(s));
+            }
+            for &s in &app_seeds_b[idx] {
+                samples_payload.extend_from_slice(&seed_word(s));
+            }
+        }
+
+        let mut passes =
+            assemble_stereo_passes(&terms_payload, &weights_payload, &samples_payload).unwrap();
+        let mut decoded = residuals.clone();
+        decorrelate_stereo(&mut passes, &mut decoded).unwrap();
+        assert_eq!(
+            decoded, pcm,
+            "assembled stereo decode did not reconstruct PCM"
+        );
+    }
+
+    #[test]
+    fn assemble_stereo_end_to_end_cross_term() {
+        // A single cross term (-1) is valid for stereo and uses the
+        // clipped weight update; round-trip through the assembler.
+        let pcm: Vec<i32> = (0..24).map(|i| ((i * 29) % 91) - 45).collect();
+        let app_term = (-1i8, 1u8);
+        let seed_a = [9];
+        let seed_b = [-4];
+        let wbyte_a = 6u8;
+        let wbyte_b = 7u8;
+        let wa = expand_weight_byte(wbyte_a);
+        let wb = expand_weight_byte(wbyte_b);
+
+        let residuals = forward_stereo(
+            app_term.0,
+            app_term.1 as i32,
+            wa,
+            wb,
+            &seed_a,
+            &seed_b,
+            &pcm,
+        );
+
+        // Single pass: wire == application order.
+        let terms_payload = vec![term_byte(app_term.0, app_term.1)];
+        let weights_payload = vec![wbyte_a, wbyte_b];
+        let mut samples_payload = Vec::new();
+        samples_payload.extend_from_slice(&seed_word(seed_a[0]));
+        samples_payload.extend_from_slice(&seed_word(seed_b[0]));
+
+        let mut passes =
+            assemble_stereo_passes(&terms_payload, &weights_payload, &samples_payload).unwrap();
+        let mut decoded = residuals.clone();
+        decorrelate_stereo(&mut passes, &mut decoded).unwrap();
+        assert_eq!(decoded, pcm, "assembled stereo cross-term decode failed");
+    }
+
+    #[test]
+    fn assemble_stereo_reverses_wire_order() {
+        // Two distinct terms; the assembler must return application order
+        // (the first returned pass is the LAST wire term).
+        let terms = vec![term_byte(1, 2), term_byte(3, 4)];
+        // 2 weights per pass (A, B).
+        let weights = vec![5u8, 6u8, 0x80u8, 7u8];
+        // Seeds wire order: term 1 (1/ch → A,B = 2 words), term 3 (3/ch →
+        // 6 words).
+        let mut samples = Vec::new();
+        for v in [1, 2] {
+            samples.extend_from_slice(&seed_word(v));
+        }
+        for v in [3, 4, 5, 6, 7, 8] {
+            samples.extend_from_slice(&seed_word(v));
+        }
+        let passes = assemble_stereo_passes(&terms, &weights, &samples).unwrap();
+        assert_eq!(passes.len(), 2);
+        // Application order: first pass is wire term 3, second is wire term 1.
+        assert_eq!(passes[0].term, 3);
+        assert_eq!(passes[1].term, 1);
+    }
+
+    #[test]
+    fn assemble_stereo_rejects_weight_count_mismatch() {
+        // One term needs 2 weights; supply 1.
+        let terms = vec![term_byte(1, 0)];
+        assert_eq!(
+            assemble_stereo_passes(&terms, &[5], &[]),
+            Err(Error::DecorrelationWeightCountMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn assemble_stereo_rejects_seed_count_mismatch() {
+        // term 1 needs 1 seed per channel = 2 words; supply 0.
+        let terms = vec![term_byte(1, 0)];
+        assert_eq!(
+            assemble_stereo_passes(&terms, &[5, 6], &[]),
+            Err(Error::DecorrelationSampleCountMismatch {
+                expected: 2,
+                actual: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn assemble_stereo_accepts_cross_term_in_terms() {
+        // -1 cross term must NOT be rejected (stereo allows it).
+        let terms = vec![term_byte(-1, 0)];
+        let weights = vec![5u8, 6u8];
+        let mut samples = Vec::new();
+        samples.extend_from_slice(&seed_word(1));
+        samples.extend_from_slice(&seed_word(2));
+        let passes = assemble_stereo_passes(&terms, &weights, &samples).unwrap();
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].term, -1);
+    }
+
+    #[test]
+    fn assemble_stereo_empty_is_no_op() {
+        assert_eq!(assemble_stereo_passes(&[], &[], &[]).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn assemble_stereo_weights_without_terms_rejected() {
+        assert_eq!(
+            assemble_stereo_passes(&[], &[5, 6], &[]),
+            Err(Error::DecorrelationTermsMissing)
         );
     }
 }
