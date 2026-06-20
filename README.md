@@ -67,6 +67,21 @@ Working surface:
   (encode a residual buffer into the `0x0A` bitstream, attach a multi-pass
   decorrelation config, confirm decode reproduces the standalone engine
   output) for both channel shapes and cross terms.
+* **Left-shift final normalization** — `decode_samples`' last stage applies
+  the wiki flag-bits-13..=17 *left-shift fixup* (`fixup` module:
+  `apply_left_shift` / `apply_left_shift_buffer`): when a block's effective
+  bit-depth is not a whole number of bytes (12-bit, 20-bit, …) the encoder
+  narrows each sample and records the dropped trailing-zero count, and the
+  decoder shifts the reconstructed magnitude left by that count to restore
+  container-scaled PCM (the identity for whole-byte depths, where
+  `left_shift == 0`). Per the decorrelation-spec doc §1 pipeline and §5.2
+  ("before final shift") this runs *after* the running CRC is folded over
+  the pre-shift samples, so the decode body splits into a private
+  pre-shift path the CRC checkers (`verify_decoded_crc`,
+  `decode_samples_muted`) fold, with the shift applied to the emitted PCM
+  afterward (and skipped on a muted/zeroed block). Pinned by mono and
+  stereo decode tests at several shift counts, the pre-shift-CRC fold (and
+  its post-shift-CRC negative), and a whole-byte-depth identity guard.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -130,6 +145,13 @@ level via `WavPackBlock::verify_decoded_crc` (non-mutating checker) and
 stream level via `decode_stream_muted`. The extension CRC (`crc_x`, §5.5)
 over `0x0C` wide/float data is pending its consumer.
 
+The **left-shift** half of the decorrelation-spec §1 "shift/clip fixups"
+stage is now applied (see the working-surface bullet above); the **clip**
+half is the wiki flag-bits-18..=22 `max_magnitude`, which the wiki
+documents only as an optimisation *hint* ("can be used to optimize
+decoding arithmetic"), not a value the decoder must clamp against, so no
+clip is applied for correctness.
+
 The **hybrid** (lossy main + `.wvc` correction) decode path is the next
 milestone but is **blocked on a docs gap**: the staged docs describe the
 correction-stream consumer semantics (decorr doc §4 — read two residuals
@@ -160,11 +182,14 @@ clean-room decorrelation/CRC trace
 `docs/audio/wavpack/spec/wavpack-decorrelation.md`. No external library
 source, archived prior history, or online resources were consulted at
 any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
-entry point; 673 unit tests synthesise minimal valid headers /
+entry point; 739 unit tests synthesise minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
-mono / stereo CRC vectors, and pin the §3 decorrelation weight
-arithmetic to the spec's §7 sanity vectors.
+mono / stereo CRC vectors, pin the §3 decorrelation weight
+arithmetic to the spec's §7 sanity vectors, and pin the wiki
+flag-bits-13..=17 left-shift fixup (the decorrelation-spec §1 "shift"
+normalization stage) end-to-end for mono and stereo decode plus its
+pre-shift CRC ordering.
 
 ## License
 
