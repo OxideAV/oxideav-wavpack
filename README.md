@@ -52,17 +52,21 @@ Working surface:
   are stored last-applied-first; the assembler reverses them so the
   decoder undoes the encoder's last pass first), the spec `+5` term-byte
   encoding, one weight per pass, and the per-term seed partition.
-* **Mono lossless decode → reconstructed PCM** — `decode_samples` now
+  `assemble_stereo_passes` is the two-channel twin: per spec §3.6 it reads
+  two weight bytes per pass (channel A then B) and partitions the `0x04`
+  seeds per channel with the term-class count (2 / `term` / 1), accepting
+  the cross terms (`-1`/`-2`/`-3`) that are valid only for stereo.
+* **Mono + stereo lossless decode → reconstructed PCM** — `decode_samples`
   runs the full lossless pipeline for a **mono** (or false-stereo) block
-  carrying decorrelation: entropy-decode the `0x0A` residuals, assemble
-  the passes from `0x02`/`0x03`/`0x04`, then run `decorrelate_mono` over
-  the residual buffer in place to reconstruct the PCM. This is the first
-  end-to-end reconstructed-PCM path through the prediction stage; it is
-  pinned by a round-trip that encodes a residual buffer into the `0x0A`
-  bitstream, attaches a multi-pass decorrelation config, and confirms the
-  decode reproduces the standalone `decorrelate_mono` output. Stereo
-  decorrelation stays refused (the `0x04` per-channel seed-interleaving
-  order for two channels is not in the staged docs).
+  and for a **stereo** block carrying decorrelation: entropy-decode the
+  `0x0A` residuals, assemble the passes from `0x02`/`0x03`/`0x04`, then run
+  `decorrelate_mono` / `decorrelate_stereo` over the residual buffer in
+  place to reconstruct the PCM. Joint (mid/side) stereo blocks are
+  finished with the spec §5.4 `R -= L>>1; L += R` undo applied per pair
+  after decorrelation. The path is pinned by forward/inverse round-trips
+  (encode a residual buffer into the `0x0A` bitstream, attach a multi-pass
+  decorrelation config, confirm decode reproduces the standalone engine
+  output) for both channel shapes and cross terms.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -76,24 +80,32 @@ Working surface:
   (`undo_joint_stereo`) that precedes the stereo step are implemented and
   pinned to the spec's worked CRC vectors; `matches` verifies a computed
   CRC against the stored header CRC. The block-level
-  `WavPackBlock::verify_decoded_crc` now ties the CRC to the decode path:
-  it decodes the block's PCM, folds the §5 mono / stereo CRC over the
-  reconstructed samples (post-decorrelation), and reports whether it
-  matches the stored header word — a non-mutating §5.6 checker (callers
-  apply the spec's mute-on-mismatch themselves).
+  `WavPackBlock::verify_decoded_crc` ties the CRC to the decode path: it
+  decodes the block's PCM, folds the §5 mono / stereo CRC over the
+  reconstructed samples (post-decorrelation, post-joint-undo), and reports
+  whether it matches the stored header word — a non-mutating §5.6 checker.
+  `WavPackBlock::decode_samples_muted` is the spec-faithful gate: it
+  returns `(pcm, crc_ok)` and, on a mismatch, zeros the buffer (the §5.6
+  "mute the corrupt block" behaviour). `decode_stream_muted` lifts that
+  gate to the whole stream — each audio block is CRC-gated and muted
+  independently, returning the concatenated PCM plus an `all_crc_ok` flag.
 
 ## Public API sketch
 
 ```rust
-use oxideav_wavpack::{parse_block, decode_stream};
+use oxideav_wavpack::{parse_block, decode_stream, decode_stream_muted};
 
 // Whole-stream decode → interleaved Vec<i32> PCM:
 let pcm = decode_stream(file_bytes)?;
 
+// Or with the spec §5.6 per-block CRC mute gate applied:
+let (pcm, all_crc_ok) = decode_stream_muted(file_bytes)?;
+
 // Or walk block-by-block:
 let (block, _tail) = parse_block(file_bytes)?;
 if block.is_audio_block() {
-    let samples = block.decode_samples()?;
+    let samples = block.decode_samples()?;        // mono / stereo lossless
+    let (samples, crc_ok) = block.decode_samples_muted()?; // CRC-gated
 }
 ```
 
@@ -101,35 +113,41 @@ if block.is_audio_block() {
 
 `WavPackBlock::decode_samples` refuses the following with a typed
 `Error::UnsupportedBlockFeature`: hybrid (lossy) blocks, float and
-32-bit-int sample data, multichannel members, **stereo** decorrelation
-blocks, low-latency / robust block layouts, and — on stereo blocks —
-joint-stereo (mid/side, flag bit 4) and cross-channel decorrelation
-(flag bit 5). The two inter-channel transforms have no formula in the
-staged docs, so a block carrying either flag is refused (rather than
-silently decoded as independent L/R, which would emit the mid/side
-residuals); the gates are stereo-only, so mono / false-stereo blocks
-with the bits set still decode. **Mono** decorrelation is now wired all
-the way through `decode_samples` (entropy → residuals →
-`assemble_mono_passes` → `decorrelate_mono` → PCM); stereo decorrelation
-remains refused because the `0x04` per-channel seed-interleaving order
-for a two-channel block is not specified in the staged docs (the per-term
-seed *count* is, but not how the A/B seed groups interleave on the wire).
-The decorrelation sub-block payloads have typed views and the §3
-inverse-prediction scalar primitives (`apply_weight` / `update_weight` /
-`update_weight_clip`) plus the per-term reconstruction loop
-(`decorrelate_mono` / `decorrelate_stereo`); the
-hybrid-correction (`.wvc`) and overflow-bit
-sub-block payloads have typed views but no consuming decode pass. The §5
-block CRC is *computed* over decoded mono / stereo / joint-stereo PCM and
-exposed at block level via `WavPackBlock::verify_decoded_crc` (decode +
-fold + compare against the stored header word), but the streaming decode
-pipeline does not yet auto-run the CRC at block end to *mute* mismatched
-blocks (`verify_decoded_crc` is a non-mutating checker; auto-mute is the
-next step). The extension CRC (`crc_x`, §5.5) over `0x0C` wide/float data
-is likewise pending its consumer. A full `.wv` block *writer* (header + sub-block
-framing around the entropy encoder) is not yet assembled. The crate is
-not yet wired into the `oxideav-core` framework registry — there is no
-`Decoder` / `Encoder` trait impl or `register` entry point.
+32-bit-int sample data, multichannel members, low-latency / robust block
+layouts, and — on non-hybrid stereo blocks — the `CROSS_DECORR` flag
+(bit 5). **Mono and stereo** lossless decorrelation are now wired all the
+way through `decode_samples` (entropy → residuals →
+`assemble_mono_passes` / `assemble_stereo_passes` → `decorrelate_mono` /
+`decorrelate_stereo` → PCM), including the negative cross terms
+(`-1`/`-2`/`-3`) on stereo and the spec §5.4 joint-stereo (mid/side) undo.
+The `CROSS_DECORR` flag stays refused on a lossless stereo block because
+the staged decorrelation doc §4.1 documents it only in the hybrid-stereo
+correction-folding context — so it has no defined main-stream meaning
+here (the lossless inter-channel predictors are the negative `0x02` decorr
+*terms*, which **are** decoded). The §5 block CRC is exposed at block
+level via `WavPackBlock::verify_decoded_crc` (non-mutating checker) and
+`WavPackBlock::decode_samples_muted` (the spec §5.6 mute gate), and at
+stream level via `decode_stream_muted`. The extension CRC (`crc_x`, §5.5)
+over `0x0C` wide/float data is pending its consumer.
+
+The **hybrid** (lossy main + `.wvc` correction) decode path is the next
+milestone but is **blocked on a docs gap**: the staged docs describe the
+correction-stream consumer semantics (decorr doc §4 — read two residuals
+per sample, fold the correction pre- or post-decorrelation per
+`CROSS_DECORR`, optional `HYBRID_SHAPE` error-feedback) and note that the
+lossy main-stream `0x0A` decode replaces the §4.2 step-6 truncated-binary
+mantissa with a binary-search refinement loop over `[low, high]` *until
+the interval is within `error_limit`* — but the **derivation of
+`error_limit`** itself (the `update_error_limit` rule from the hybrid
+profile / `slow_level` / bitrate) and the **`read_shaping_info` metadata
+layout** are named in the provenance index but not transcribed into the
+spec. Without `error_limit` the lossy main stream cannot be decoded, so
+hybrid stays refused.
+
+A full `.wv` block *writer* (header + sub-block framing around the entropy
+encoder) is not yet assembled. The crate is not yet wired into the
+`oxideav-core` framework registry — there is no `Decoder` / `Encoder`
+trait impl or `register` entry point.
 
 ## Provenance
 

@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 348 — stereo lossless decode + joint-stereo undo + §5.6 CRC mute
+  gate, driving the decorrelation milestone to working stereo decode.
+
+  `assemble_stereo_passes` builds the §3.7 application-ordered
+  `DecorrPass` list for a two-channel block from the `0x02`/`0x03`/`0x04`
+  payloads: per spec §3.6, two weight bytes per pass (channel A then B)
+  and the `0x04` seeds partitioned per channel with the term-class count
+  (2 / `term` / 1), accepting the cross terms (`-1`/`-2`/`-3`) valid only
+  for stereo. `WavPackBlock::decode_samples` now decodes a stereo
+  decorrelation block (entropy → `assemble_stereo_passes` →
+  `decorrelate_stereo`) and applies the spec §5.4 joint (mid/side) undo
+  (`R -= L>>1; L += R`) per pair after decorrelation. The stereo
+  decorrelation and joint-stereo decode refusals are lifted; the
+  `CROSS_DECORR` flag (bit 5) stays refused on non-hybrid stereo blocks
+  (documented only in the hybrid context, §4.1).
+
+  `WavPackBlock::decode_samples_muted` is the spec §5.6 mute gate: it
+  recomputes the running §5 CRC over the decoded PCM and, on a mismatch,
+  zeros the buffer (the "mute the corrupt block" behaviour), returning
+  `(pcm, crc_ok)`. `decode_stream_muted` lifts that gate to the whole
+  stream — each audio block is CRC-gated and muted independently —
+  returning the concatenated PCM and an `all_crc_ok` flag.
+
+  14 new tests: stereo assembler end-to-end per-channel + cross-term
+  round-trips, reverse-order and count-mismatch gates, in-block stereo
+  decorrelation + joint-stereo decode, the block- and stream-level mute
+  gates (keep on match, mute the bad block, metadata-only skipping).
+
 - Round 339 — block-level CRC verification ties §5 to the decode path.
 
   New `WavPackBlock::verify_decoded_crc` decodes the block's PCM, folds
