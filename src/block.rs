@@ -112,10 +112,12 @@ pub enum UnsupportedBlockFeature {
     /// per-sample loop is per-block and cannot stitch grouped blocks.
     MultichannelMember,
     /// The block carries at least one of the `0x02` / `0x03` / `0x04`
-    /// decorrelation sub-blocks (terms / weights / samples). The
-    /// round-3 expanders produce typed views but no prediction-loop
-    /// consumer exists yet, so the medians-only per-sample loop would
-    /// emit residuals rather than reconstructed samples.
+    /// decorrelation sub-blocks (terms / weights / samples).
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** — both mono
+    /// and stereo lossless decorrelation are now decoded (entropy →
+    /// `assemble_*_passes` → `decorrelate_*` → PCM). Retained as a public
+    /// variant for API stability and for callers that gate on it.
     Decorrelation,
     /// Wiki bit 31 ("low-latency block (experimental, do not decode if
     /// encountered)") is set. The wiki explicitly bars decode of this
@@ -126,21 +128,23 @@ pub enum UnsupportedBlockFeature {
     /// blocks; the per-sample primitives themselves stay callable.
     RobustBlock,
     /// Wiki bit 4 ("joint stereo coding scheme") is set on a stereo
-    /// block. The two entropy-decoded channels are a mid/side (sum /
-    /// difference) pair that must be run through the inverse joint-stereo
-    /// transform before they are valid left / right PCM. The staged docs
-    /// under `docs/audio/wavpack/` name the flag (wiki "Flags meaning"
-    /// bit 4) but do not specify the inverse transform, so decoding the
-    /// two channels independently would emit the mid/side residuals
-    /// rather than reconstructed L/R. The composer refuses these blocks
-    /// with this typed tag rather than returning silently-wrong PCM.
+    /// block: the two decoded channels are a mid/side (sum / difference)
+    /// pair.
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** — the spec
+    /// §5.4 inverse joint-stereo transform (`R -= L>>1; L += R`) is now
+    /// applied per pair after decorrelation. Retained as a public variant
+    /// for API stability.
     JointStereo,
-    /// Wiki bit 5 ("cross-decorrelation scheme is used") is set on a
-    /// stereo block. The block applies an inter-channel decorrelation
-    /// pass whose arithmetic the staged docs do not specify (the wiki
-    /// "Flags meaning" listing names bit 5 but gives no formula), so the
-    /// medians-only per-sample loop cannot reconstruct the true L/R PCM.
-    /// Refused with this typed tag rather than emitting wrong output.
+    /// Wiki bit 5 (`CROSS_DECORR`, "cross-decorrelation scheme is used")
+    /// is set on a stereo block. The staged decorrelation-spec doc §4.1
+    /// documents this flag only in the hybrid-stereo correction-folding
+    /// context (a zero-delay correction fold *before* the decorrelation
+    /// passes); on a non-hybrid lossless main-stream block it has no
+    /// documented meaning, so the block is refused rather than decoded
+    /// with a guessed transform. (The lossless inter-channel predictors
+    /// are the negative `0x02` decorr *terms* `-1`/`-2`/`-3`, which ARE
+    /// decoded by the stereo path.)
     CrossChannelDecorrelation,
 }
 
@@ -245,10 +249,12 @@ impl<'a> WavPackBlock<'a> {
     }
 
     /// Block carries at least one of the three `0x02` / `0x03` / `0x04`
-    /// decorrelation sub-blocks. The current per-sample loop has no
-    /// prediction-pass consumer for the round-3 typed views, so the
-    /// presence of any one of these sub-blocks gates [`Self::decode_samples`]
-    /// off via [`UnsupportedBlockFeature::Decorrelation`]. Round 206.
+    /// decorrelation sub-blocks. [`Self::decode_samples`] consumes these
+    /// for both mono and stereo lossless blocks (entropy residuals →
+    /// `assemble_mono_passes` / `assemble_stereo_passes` →
+    /// `decorrelate_mono` / `decorrelate_stereo` → PCM), so this predicate
+    /// reports whether the decode runs the §3 prediction loop rather than
+    /// passing the entropy output through unchanged. Round 206.
     pub fn has_decorrelation(&self) -> bool {
         self.contains_sub_block(SubBlockId::DecorrelationTerms)
             || self.contains_sub_block(SubBlockId::DecorrelationWeights)
