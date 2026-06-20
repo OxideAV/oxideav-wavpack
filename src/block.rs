@@ -2959,6 +2959,102 @@ mod tests {
     }
 
     #[test]
+    fn decode_samples_applies_left_shift_to_both_stereo_channels() {
+        // The left-shift fixup runs over the whole interleaved [L,R,L,R…]
+        // buffer, so both channels of a stereo block are scaled. Build a
+        // stereo decorrelation block that reconstructs known non-zero PCM,
+        // stamp a non-zero left_shift, and confirm every interleaved slot
+        // is shifted.
+        use crate::decorrelation::{assemble_stereo_passes, decorrelate_stereo};
+        use crate::samples::{encode_packed_samples_stereo, AdaptiveMedians};
+
+        // Interleaved stereo residuals [L0,R0,L1,R1,…].
+        let residuals: Vec<i32> = vec![5, -3, 8, 2, 12, -7, 4, 1];
+
+        // Two passes (term 1 then term 2), delta 0, keeping every metadata
+        // payload even-length. Stereo → 2 weight bytes (A,B) per pass.
+        // Wire order is reverse application order; with symmetric content
+        // here the order is immaterial to the even-length goal.
+        let terms_payload = vec![0x06u8, 0x07u8]; // term 1 (=6), term 2 (=7)
+        let weights_payload = vec![10u8, 12u8, 8u8, 6u8]; // (A,B) per pass
+        let seed_word = |v: i32| -> [u8; 2] { [v as i8 as u8, 9] };
+        let mut samples_payload = Vec::new();
+        // Wire-stored last-pass-first: term 2 → 2 seeds/channel (4 words),
+        // term 1 → 1 seed/channel (2 words). Total 6 words = 12 bytes.
+        samples_payload.extend_from_slice(&seed_word(3)); // term2 A seed 0
+        samples_payload.extend_from_slice(&seed_word(-1)); // term2 A seed 1
+        samples_payload.extend_from_slice(&seed_word(2)); // term2 B seed 0
+        samples_payload.extend_from_slice(&seed_word(-4)); // term2 B seed 1
+        samples_payload.extend_from_slice(&seed_word(4)); // term1 A seed
+        samples_payload.extend_from_slice(&seed_word(-2)); // term1 B seed
+
+        // Expected (pre-shift) PCM from the standalone stereo engine.
+        let mut passes = assemble_stereo_passes(&terms_payload, &weights_payload, &samples_payload)
+            .expect("assemble stereo passes");
+        let mut unshifted = residuals.clone();
+        decorrelate_stereo(&mut passes, &mut unshifted).expect("decorrelate stereo");
+
+        // Encode the residuals into a 0x0A payload seeded from the same
+        // minimal-stereo 0x05 info the decoder reads.
+        let mut stereo_info = Vec::new();
+        append_entropy_info_stereo_minimal(&mut stereo_info);
+        // The 0x05 payload bytes (skip the 2-byte sub-block header).
+        let info_payload = &stereo_info[2..];
+        let info_block = crate::entropy::expand_entropy(info_payload).expect("expand stereo info");
+        let enc_a = AdaptiveMedians::from_entropy(&info_block, 0).expect("seed A");
+        let enc_b = AdaptiveMedians::from_entropy(&info_block, 1).expect("seed B");
+        let mut enc_medians = [enc_a, enc_b];
+        let mut packed_0a = encode_packed_samples_stereo(&residuals, &mut enc_medians)
+            .expect("encode stereo residuals");
+        // The 0x0A payload must be even-length (spec §1: it binds as 16-bit
+        // words). Pad with a trailing zero byte the reader never reaches
+        // (decode stops after `block_samples` frames).
+        if packed_0a.len() % 2 != 0 {
+            packed_0a.push(0);
+        }
+
+        let shift = 3u32;
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x02, &terms_payload);
+        append_small_sub_block(&mut payload, 0x03, &weights_payload);
+        append_small_sub_block(&mut payload, 0x04, &samples_payload);
+        append_entropy_info_stereo_minimal(&mut payload);
+        append_packed_samples(&mut payload, &packed_0a);
+
+        // Genuinely-stereo block (no mono bit) + left_shift in bits 13..=17.
+        let flags = flags_with(shift << 13);
+        let frames = (residuals.len() / 2) as u32;
+        let bytes = synthesise_block(frames, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.header.flags.is_block_data_mono());
+        assert_eq!(block.header.flags.left_shift, shift as u8);
+
+        let got = block.decode_samples().expect("stereo decode with shift");
+        let expected: Vec<i32> = unshifted.iter().map(|&s| s << shift).collect();
+        assert_eq!(got, expected, "both stereo channels must be left-shifted");
+        assert_ne!(got, unshifted);
+    }
+
+    #[test]
+    fn left_shift_zero_for_whole_byte_depth_blocks() {
+        // Every existing whole-byte-depth synthesiser leaves bits 13..=17
+        // clear, so the fixup is the identity and prior decode results are
+        // unchanged — a regression guard that the new stage did not alter
+        // the common path.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.header.flags.left_shift, 0);
+        // `flags_with` leaves bits 0..=1 clear → bytes_per_sample = 1 (an
+        // 8-bit container); with left_shift 0 the effective depth is 8.
+        assert_eq!(block.header.flags.bytes_per_sample(), 1);
+        assert_eq!(block.header.flags.effective_bit_depth(), 8);
+        assert_eq!(block.decode_samples().expect("decode"), vec![0]);
+    }
+
+    #[test]
     fn has_decorrelation_returns_true_for_each_of_the_three_sub_blocks() {
         // Per-sub-block sanity sweep so the OR-of-three predicate stays
         // honest as the metadata enum grows.
