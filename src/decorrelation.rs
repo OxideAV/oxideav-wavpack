@@ -1041,6 +1041,189 @@ pub fn decorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
     Ok(())
 }
 
+/// Run the configured decorrelation passes **forward** (encode side) over a
+/// **mono** PCM buffer in place, turning PCM samples into entropy-ready
+/// residuals — the exact arithmetic inverse of [`decorrelate_mono`].
+///
+/// Spec §3.2 / §3.7, inverted. [`decorrelate_mono`] consumes the passes in
+/// *application order* (front-to-back) and, for each sample, reconstructs
+/// `s[n] = apply_weight(weight, pred) + residual`. The encoder forms the
+/// same predictor from the same history and emits
+/// `residual = s[n] - apply_weight(weight, pred)`, pushing the original
+/// PCM sample `s[n]` (not the residual) into history exactly as the
+/// decoder pushes its reconstructed `s[n]`. The weight is then nudged by
+/// the identical [`update_weight`] step on `(pred, residual)`, so the two
+/// directions evolve byte-identical pass state.
+///
+/// ## Pass order (§3.7)
+///
+/// The decoder undoes the encoder's passes in reverse: the *first* pass in
+/// the application-ordered list is the *last* pass the encoder applied. So
+/// this forward routine walks the same list **back-to-front** (last slot
+/// first), and a `decorrelate_mono` over the application-ordered list
+/// reproduces the original PCM. Callers therefore pass the *same*
+/// application-ordered `DecorrPass` list to both directions; no manual
+/// reversal is needed.
+///
+/// Each pass's `weight_a` / `history_a` mutate in place across the buffer
+/// (the running encode state), so a caller wanting to re-run a pass must
+/// rebuild it from its seeds (e.g. via [`DecorrPass::new`]). Cross terms
+/// (`-1`/`-2`/`-3`) are rejected for mono with [`Error::CrossTermOnMono`];
+/// an over-long pass list trips [`Error::TooManyDecorrelationPasses`].
+pub fn recorrelate_mono(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result<()> {
+    if passes.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(passes.len()));
+    }
+    for pass in passes.iter() {
+        if is_cross_term(pass.term) {
+            return Err(Error::CrossTermOnMono(pass.term));
+        }
+    }
+    // Encode applies passes in the reverse of the decoder's application
+    // order: the decoder undoes the encoder's last pass first.
+    for pass in passes.iter_mut().rev() {
+        let mut m = 0usize;
+        for slot in buffer.iter_mut() {
+            let sample = *slot;
+            let pred = match pass.term {
+                17 => 2 * pass.history_a[0] - pass.history_a[1],
+                18 => (3 * pass.history_a[0] - pass.history_a[1]) >> 1,
+                _ => pass.history_a[m & (MAX_TERM as usize - 1)],
+            };
+            // Inverse of `s[n] = apply_weight(w, pred) + residual`.
+            let residual = sample.wrapping_sub(apply_weight(pass.weight_a, pred));
+            pass.weight_a = update_weight(pass.weight_a, pass.delta, pred, residual);
+            *slot = residual;
+            // Push the ORIGINAL PCM sample into history — the decoder
+            // pushes its reconstructed `s[n]`, which equals this sample.
+            if pass.term == 17 || pass.term == 18 {
+                pass.history_a[1] = pass.history_a[0];
+                pass.history_a[0] = sample;
+            } else {
+                let w = (m + pass.term as usize) & (MAX_TERM as usize - 1);
+                pass.history_a[w] = sample;
+                m = m.wrapping_add(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run the configured decorrelation passes **forward** (encode side) over
+/// an **interleaved stereo** PCM buffer (`[L0, R0, L1, R1, …]`) in place —
+/// the exact arithmetic inverse of [`decorrelate_stereo`].
+///
+/// Spec §3.2 / §3.3 / §3.7, inverted. Per-channel terms (`1..8`/`17`/`18`)
+/// emit `residual = sample - apply_weight(weight, pred)` independently on
+/// A and B; the cross terms (`-1`/`-2`/`-3`) invert the §3.3 zero-delay
+/// step with the clipped weight update ([`update_weight_clip`]). For each
+/// cross term the encoder forms the predictor from the *original* PCM of
+/// the partner channel (the value the decoder reconstructs), matching the
+/// decoder's "predict from the just-reconstructed channel" arithmetic.
+///
+/// As with [`recorrelate_mono`], the passes are supplied in *application
+/// order* (the same list [`decorrelate_stereo`] consumes) and walked
+/// **back-to-front**, so a subsequent `decorrelate_stereo` over the
+/// application-ordered list reproduces the original interleaved PCM. The
+/// buffer length must be even (one `R` per `L`); a trailing odd sample is
+/// left untouched. Over-long pass lists trip
+/// [`Error::TooManyDecorrelationPasses`].
+pub fn recorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result<()> {
+    if passes.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(passes.len()));
+    }
+    let pairs = buffer.len() / 2;
+    for pass in passes.iter_mut().rev() {
+        let mut m = 0usize;
+        for p in 0..pairs {
+            let li = 2 * p;
+            let ri = li + 1;
+            let sa = buffer[li];
+            let sb = buffer[ri];
+            match pass.term {
+                -1 => {
+                    let pred_a = pass.history_a[0];
+                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pred_a));
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
+                    // B predicted from the original A (decoder uses the
+                    // reconstructed A, which equals `sa`).
+                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, sa));
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, sa, res_b);
+                    buffer[li] = res_a;
+                    buffer[ri] = res_b;
+                    pass.history_a[0] = sb;
+                }
+                -2 => {
+                    let pred_b = pass.history_b[0];
+                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pred_b));
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
+                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, sb));
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, sb, res_a);
+                    buffer[li] = res_a;
+                    buffer[ri] = res_b;
+                    pass.history_b[0] = sa;
+                }
+                -3 => {
+                    let pred_a = pass.history_b[0];
+                    let pred_b = pass.history_a[0];
+                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pred_a));
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
+                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pred_b));
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
+                    buffer[li] = res_a;
+                    buffer[ri] = res_b;
+                    pass.history_a[0] = sa;
+                    pass.history_b[0] = sb;
+                }
+                17 => {
+                    let pa = 2 * pass.history_a[0] - pass.history_a[1];
+                    let pb = 2 * pass.history_b[0] - pass.history_b[1];
+                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
+                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
+                    buffer[li] = res_a;
+                    buffer[ri] = res_b;
+                    pass.history_a[1] = pass.history_a[0];
+                    pass.history_a[0] = sa;
+                    pass.history_b[1] = pass.history_b[0];
+                    pass.history_b[0] = sb;
+                }
+                18 => {
+                    let pa = (3 * pass.history_a[0] - pass.history_a[1]) >> 1;
+                    let pb = (3 * pass.history_b[0] - pass.history_b[1]) >> 1;
+                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
+                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
+                    buffer[li] = res_a;
+                    buffer[ri] = res_b;
+                    pass.history_a[1] = pass.history_a[0];
+                    pass.history_a[0] = sa;
+                    pass.history_b[1] = pass.history_b[0];
+                    pass.history_b[0] = sb;
+                }
+                t => {
+                    let rd = m & (MAX_TERM as usize - 1);
+                    let pa = pass.history_a[rd];
+                    let pb = pass.history_b[rd];
+                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
+                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
+                    buffer[li] = res_a;
+                    buffer[ri] = res_b;
+                    let w = (m + t as usize) & (MAX_TERM as usize - 1);
+                    pass.history_a[w] = sa;
+                    pass.history_b[w] = sb;
+                    m = m.wrapping_add(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Assemble the application-ordered [`DecorrPass`] list for a **mono**
 /// block from the three decorrelation sub-block payloads.
 ///
@@ -2300,6 +2483,246 @@ mod tests {
             .collect();
         decorrelate_mono(&mut passes, &mut buf).unwrap();
         assert_eq!(buf, pcm, "multi-pass mono round-trip failed");
+    }
+
+    // ---- public forward encoders: recorrelate_mono / recorrelate_stereo ----
+
+    // `(term, delta, weight, seeds)` for a mono pass.
+    type MonoSpec = (i8, i32, i32, Vec<i32>);
+    // `(term, delta, weight_a, weight_b, seeds_a, seeds_b)` for a stereo pass.
+    type StereoSpec = (i8, i32, i32, i32, Vec<i32>, Vec<i32>);
+
+    // Build a fresh application-ordered pass list (rebuilt from seeds each
+    // call so its state is pristine).
+    fn build_mono_passes(specs: &[MonoSpec]) -> Vec<DecorrPass> {
+        specs
+            .iter()
+            .map(|(t, d, w, s)| DecorrPass::new(*t, *d, *w, 0, s, &[]).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn recorrelate_mono_inverts_decorrelate_mono_single_pass() {
+        let pcm = [
+            100, 132, 90, 75, 210, -40, -33, 12, 255, 300, 280, 260, 0, -1, 5,
+        ];
+        let seed = [50, 40, 30, 20, 10, 0, -10, -20];
+        for term in 1..=8i8 {
+            let specs = vec![(term, 2, 700, seed[..term as usize].to_vec())];
+            let mut enc = build_mono_passes(&specs);
+            let mut buf = pcm.to_vec();
+            recorrelate_mono(&mut enc, &mut buf).unwrap();
+            // Decode the residuals with a PRISTINE pass list (same config).
+            let mut dec = build_mono_passes(&specs);
+            decorrelate_mono(&mut dec, &mut buf).unwrap();
+            assert_eq!(buf, pcm, "public mono round-trip failed for term {term}");
+        }
+        // Extrapolators.
+        for term in [17i8, 18] {
+            let specs = vec![(term, 3, 900, vec![5, 3])];
+            let mut enc = build_mono_passes(&specs);
+            let mut buf = pcm.to_vec();
+            recorrelate_mono(&mut enc, &mut buf).unwrap();
+            let mut dec = build_mono_passes(&specs);
+            decorrelate_mono(&mut dec, &mut buf).unwrap();
+            assert_eq!(buf, pcm, "public mono round-trip failed for term {term}");
+        }
+    }
+
+    #[test]
+    fn recorrelate_mono_inverts_decorrelate_mono_multi_pass() {
+        let pcm: Vec<i32> = (0..40).map(|i| ((i * 53) % 173) - 80).collect();
+        let specs = vec![
+            (1i8, 2i32, 600i32, vec![4]),
+            (3, 1, 700, vec![1, 2, 3]),
+            (17, 3, 512, vec![5, 6]),
+        ];
+        let mut enc = build_mono_passes(&specs);
+        let mut buf = pcm.clone();
+        recorrelate_mono(&mut enc, &mut buf).unwrap();
+        let mut dec = build_mono_passes(&specs);
+        decorrelate_mono(&mut dec, &mut buf).unwrap();
+        assert_eq!(buf, pcm, "public multi-pass mono round-trip failed");
+    }
+
+    #[test]
+    fn recorrelate_mono_matches_private_forward_helper() {
+        // The public encoder must produce the SAME residuals as the
+        // private single-pass `forward_mono` for a one-pass config.
+        let pcm = [10, 12, 9, 7, 21, -4, -3, 1, 25, 30, 28, 26, 0, -1, 5];
+        let seed = [40, 30, 20, 10, 0, -10, -20, -30];
+        for term in 1..=8i8 {
+            let expected = forward_mono(term, 2, 700, &seed[..term as usize], &pcm);
+            let mut enc = build_mono_passes(&[(term, 2, 700, seed[..term as usize].to_vec())]);
+            let mut buf = pcm.to_vec();
+            recorrelate_mono(&mut enc, &mut buf).unwrap();
+            assert_eq!(buf, expected, "recorrelate_mono mismatch for term {term}");
+        }
+    }
+
+    #[test]
+    fn recorrelate_mono_rejects_cross_term() {
+        let mut passes = vec![DecorrPass::new(-1, 0, 0, 0, &[0], &[0]).unwrap()];
+        let mut buf = [1, 2, 3];
+        assert_eq!(
+            recorrelate_mono(&mut passes, &mut buf),
+            Err(Error::CrossTermOnMono(-1))
+        );
+    }
+
+    #[test]
+    fn recorrelate_mono_rejects_too_many_passes() {
+        let mut passes: Vec<DecorrPass> = (0..MAX_NTERMS + 1)
+            .map(|_| DecorrPass::new(1, 0, 0, 0, &[0], &[]).unwrap())
+            .collect();
+        let mut buf = [1, 2, 3];
+        assert_eq!(
+            recorrelate_mono(&mut passes, &mut buf),
+            Err(Error::TooManyDecorrelationPasses(MAX_NTERMS + 1))
+        );
+    }
+
+    fn build_stereo_passes(specs: &[StereoSpec]) -> Vec<DecorrPass> {
+        specs
+            .iter()
+            .map(|(t, d, wa, wb, sa, sb)| DecorrPass::new(*t, *d, *wa, *wb, sa, sb).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn recorrelate_stereo_inverts_decorrelate_stereo_single_pass() {
+        let pcm = [
+            100, -90, 132, 88, 90, -75, 75, 60, 210, -200, -40, 33, -33, 21, 12, -9,
+        ];
+        let seed = [50, 40, 30, 20, 10, 0, -10, -20];
+        for term in 1..=8i8 {
+            let specs = vec![(
+                term,
+                2,
+                700,
+                650,
+                seed[..term as usize].to_vec(),
+                seed[..term as usize].to_vec(),
+            )];
+            let mut enc = build_stereo_passes(&specs);
+            let mut buf = pcm.to_vec();
+            recorrelate_stereo(&mut enc, &mut buf).unwrap();
+            let mut dec = build_stereo_passes(&specs);
+            decorrelate_stereo(&mut dec, &mut buf).unwrap();
+            assert_eq!(buf, pcm, "public stereo round-trip failed for term {term}");
+        }
+        for (term, sa, sb) in [(17i8, vec![5, 3], vec![6, 4]), (18, vec![5, 3], vec![6, 4])] {
+            let specs = vec![(term, 3, 900, 800, sa, sb)];
+            let mut enc = build_stereo_passes(&specs);
+            let mut buf = pcm.to_vec();
+            recorrelate_stereo(&mut enc, &mut buf).unwrap();
+            let mut dec = build_stereo_passes(&specs);
+            decorrelate_stereo(&mut dec, &mut buf).unwrap();
+            assert_eq!(buf, pcm, "public stereo round-trip failed for term {term}");
+        }
+    }
+
+    #[test]
+    fn recorrelate_stereo_inverts_decorrelate_stereo_cross_terms() {
+        let pcm = [
+            100, -90, 132, 88, 90, -75, 75, 60, 210, -200, -40, 33, -33, 21, 12, -9,
+        ];
+        for (term, d, wa, wb, sa, sb) in [
+            (-1i8, 2i32, 300i32, 400i32, 10i32, 20i32),
+            (-2, 3, 350, 450, 11, 21),
+            (-3, 1, 200, 250, 12, 22),
+        ] {
+            let specs = vec![(term, d, wa, wb, vec![sa], vec![sb])];
+            let mut enc = build_stereo_passes(&specs);
+            let mut buf = pcm.to_vec();
+            recorrelate_stereo(&mut enc, &mut buf).unwrap();
+            let mut dec = build_stereo_passes(&specs);
+            decorrelate_stereo(&mut dec, &mut buf).unwrap();
+            assert_eq!(
+                buf, pcm,
+                "public stereo cross round-trip failed for term {term}"
+            );
+        }
+    }
+
+    #[test]
+    fn recorrelate_stereo_inverts_decorrelate_stereo_multi_pass() {
+        let pcm: Vec<i32> = (0..40).map(|i| ((i * 37) % 211) - 100).collect();
+        let specs = vec![
+            (-3i8, 1i32, 200i32, 220i32, vec![3], vec![5]),
+            (2, 2, 600, 640, vec![7, 0], vec![9, 0]),
+            (18, 3, 512, 500, vec![1, 2], vec![3, 4]),
+        ];
+        let mut enc = build_stereo_passes(&specs);
+        let mut buf = pcm.clone();
+        recorrelate_stereo(&mut enc, &mut buf).unwrap();
+        let mut dec = build_stereo_passes(&specs);
+        decorrelate_stereo(&mut dec, &mut buf).unwrap();
+        assert_eq!(buf, pcm, "public multi-pass stereo round-trip failed");
+    }
+
+    #[test]
+    fn recorrelate_stereo_matches_private_forward_helper() {
+        let pcm = [
+            100, -90, 132, 88, 90, -75, 75, 60, 210, -200, -40, 33, -33, 21, 12, -9,
+        ];
+        let seed = [50, 40, 30, 20, 10, 0, -10, -20];
+        for term in 1..=8i8 {
+            let expected = forward_stereo(
+                term,
+                2,
+                700,
+                650,
+                &seed[..term as usize],
+                &seed[..term as usize],
+                &pcm,
+            );
+            let mut enc = build_stereo_passes(&[(
+                term,
+                2,
+                700,
+                650,
+                seed[..term as usize].to_vec(),
+                seed[..term as usize].to_vec(),
+            )]);
+            let mut buf = pcm.to_vec();
+            recorrelate_stereo(&mut enc, &mut buf).unwrap();
+            assert_eq!(buf, expected, "recorrelate_stereo mismatch for term {term}");
+        }
+    }
+
+    #[test]
+    fn recorrelate_stereo_rejects_too_many_passes() {
+        let mut passes: Vec<DecorrPass> = (0..MAX_NTERMS + 1)
+            .map(|_| DecorrPass::new(1, 0, 0, 0, &[0], &[0]).unwrap())
+            .collect();
+        let mut buf = [1, 2, 3, 4];
+        assert_eq!(
+            recorrelate_stereo(&mut passes, &mut buf),
+            Err(Error::TooManyDecorrelationPasses(MAX_NTERMS + 1))
+        );
+    }
+
+    #[test]
+    fn recorrelate_mono_empty_passes_is_identity() {
+        let pcm = [7, -3, 42, 0, 99];
+        let mut buf = pcm.to_vec();
+        recorrelate_mono(&mut [], &mut buf).unwrap();
+        assert_eq!(buf, pcm, "no passes must leave the buffer unchanged");
+    }
+
+    #[test]
+    fn recorrelate_stereo_leaves_trailing_odd_sample() {
+        // Odd-length buffer: the last unpaired sample is untouched.
+        let specs = vec![(1i8, 2i32, 600i32, 640i32, vec![4], vec![5])];
+        let mut enc = build_stereo_passes(&specs);
+        let mut buf = vec![10, 20, 30, 40, 99];
+        recorrelate_stereo(&mut enc, &mut buf).unwrap();
+        assert_eq!(buf[4], 99, "trailing odd sample must be untouched");
+        // Re-decode the two pairs and confirm they recover the inputs.
+        let mut dec = build_stereo_passes(&specs);
+        decorrelate_stereo(&mut dec, &mut buf).unwrap();
+        assert_eq!(&buf[..4], &[10, 20, 30, 40]);
     }
 
     // ---- assemble_mono_passes (0x02/0x03/0x04 → application-ordered passes) ----

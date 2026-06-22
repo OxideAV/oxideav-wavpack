@@ -8,6 +8,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 360 — public forward (encode) decorrelation: `recorrelate_mono`
+  / `recorrelate_stereo`, the exact arithmetic inverse of
+  `decorrelate_mono` / `decorrelate_stereo`.
+
+  The decorrelation decode loop (residuals → PCM) was public, but the
+  forward direction (PCM → residuals) existed only as private
+  single-pass test helpers (`forward_mono` / `forward_stereo`). The new
+  `recorrelate_mono` / `recorrelate_stereo` lift that arithmetic to the
+  public, multi-pass `&mut [DecorrPass]` surface, completing the encode
+  side of the decorrelation-spec §3 pipeline. For each sample they form
+  the same predictor from the same history the decoder reads and emit
+  `residual = sample - apply_weight(weight, pred)` (the inverse of the
+  decoder's `sample = apply_weight(weight, pred) + residual`), push the
+  original PCM sample into history exactly as the decoder pushes its
+  reconstructed sample, and nudge the weight with the identical
+  `update_weight` / `update_weight_clip` step on `(pred, residual)` — so
+  the two directions evolve byte-identical pass state. Per spec §3.7 the
+  decoder undoes the encoder's passes in reverse, so both directions
+  accept the *same* application-ordered pass list and the encoder walks
+  it back-to-front internally (no caller-side reversal). Per-channel
+  terms (`1..8`/`17`/`18`) invert §3.2, cross terms (`-1`/`-2`/`-3`)
+  invert the §3.3 zero-delay step with the clipped weight update;
+  `recorrelate_mono` rejects cross terms (`Error::CrossTermOnMono`) and
+  both reject over-long lists (`Error::TooManyDecorrelationPasses`).
+  Pinned by 12 new tests (751 total, up from 739): single-pass and
+  multi-pass `recorrelate ∘ decorrelate` round-trips over a *shared*
+  application-ordered pass list reproduce the original PCM for every
+  fixed-lag / extrapolate / cross term and a mixed stack; the public
+  encoders match the private `forward_*` helpers bit-for-bit; empty-pass
+  identity; the stereo trailing-odd-sample passthrough; and the
+  cross-term / over-long-list refusal arms.
+
 - Round 354 — left-shift final-normalization fixup (`fixup` module).
 
   New `fixup` module implements the wiki flag-bits-13..=17 "left-shift

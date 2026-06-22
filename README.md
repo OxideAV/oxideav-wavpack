@@ -86,6 +86,21 @@ Working surface:
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
   bit-for-bit.
+* **Decorrelation encode** — `recorrelate_mono` / `recorrelate_stereo`
+  are the exact arithmetic inverse of `decorrelate_mono` /
+  `decorrelate_stereo` (decorrelation-spec §3 forward direction:
+  PCM → residuals). They emit `residual = sample - apply_weight(weight,
+  pred)` for the same predictor the decoder reads, push the original PCM
+  sample into history as the decoder pushes its reconstructed sample, and
+  apply the identical `update_weight` / `update_weight_clip` step — so
+  both directions evolve byte-identical pass state. Per spec §3.7 both
+  accept the *same* application-ordered `DecorrPass` list (the encoder
+  walks it back-to-front, undoing the decoder's reversal), covering every
+  fixed-lag (`1..8`) / extrapolate (`17`/`18`) / cross (`-1`/`-2`/`-3`)
+  term and multi-pass stacks. Pinned by `recorrelate ∘ decorrelate`
+  round-trips over a shared pass list (mono + stereo, single + multi
+  pass + cross terms) that reproduce the original PCM, parity against the
+  private single-pass forward helpers, and the refusal arms.
 * **Block CRC** — the §5 running 32-bit sample CRC is computed by a
   `BlockCrc` accumulator (`push_mono` / `push_stereo_pair` /
   `push_joint_stereo_pair`, `matches`) and the `crc_mono` /
@@ -182,14 +197,16 @@ clean-room decorrelation/CRC trace
 `docs/audio/wavpack/spec/wavpack-decorrelation.md`. No external library
 source, archived prior history, or online resources were consulted at
 any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
-entry point; 739 unit tests synthesise minimal valid headers /
+entry point; 751 unit tests synthesise minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
 mono / stereo CRC vectors, pin the §3 decorrelation weight
-arithmetic to the spec's §7 sanity vectors, and pin the wiki
-flag-bits-13..=17 left-shift fixup (the decorrelation-spec §1 "shift"
-normalization stage) end-to-end for mono and stereo decode plus its
-pre-shift CRC ordering.
+arithmetic to the spec's §7 sanity vectors, pin the §3 forward
+decorrelation encoder (`recorrelate_mono` / `recorrelate_stereo`) as the
+exact inverse of the decode loop via shared-pass-list round-trips, and
+pin the wiki flag-bits-13..=17 left-shift fixup (the decorrelation-spec
+§1 "shift" normalization stage) end-to-end for mono and stereo decode
+plus its pre-shift CRC ordering.
 
 ## License
 
