@@ -443,6 +443,76 @@ impl<'a> WavPackBlock<'a> {
         self.has_packed_correction_data() || self.has_noise_shaping_profile()
     }
 
+    /// Which decorrelation-spec §4.1 correction-fold placement this block's
+    /// flag word selects ([`crate::CorrectionFold`]).
+    ///
+    /// Derived from the block header's raw flag word: the
+    /// `HYBRID_SHAPE` / `NEW_SHAPING` bits select
+    /// [`crate::CorrectionFold::NoiseShaped`], `CROSS_DECORR` selects
+    /// [`crate::CorrectionFold::PreDecorrelationCross`], and otherwise the
+    /// default [`crate::CorrectionFold::PostDecorrelation`] raw add applies.
+    /// Only the post-decorrelation placement is folded end-to-end by
+    /// [`Self::fold_hybrid_correction`]; the other two require, respectively,
+    /// re-running decorrelation after a pre-pass fold or the (undocumented)
+    /// noise-shaping filter. Round 367.
+    pub fn hybrid_correction_placement(&self) -> crate::CorrectionFold {
+        crate::CorrectionFold::from_flags(self.header.flags.raw)
+    }
+
+    /// Recover lossless PCM from an already-decoded **lossy** buffer and a
+    /// matching buffer of correction residuals, applying the
+    /// decorrelation-spec §4.1 post-decorrelation correction fold.
+    ///
+    /// In hybrid mode the lossy main stream (`0x0A`) is made lossless by
+    /// folding a correction residual (read from the `0x0B` stream) into
+    /// each reconstructed sample. For the common case — a mono block, or a
+    /// stereo block *without* `CROSS_DECORR`, and *without* noise shaping —
+    /// the spec §4.1 fold is the per-sample raw add
+    /// `lossless = reconstructed + correction` after the decorrelation
+    /// passes and joint-stereo undo have produced the reconstructed lossy
+    /// buffer. This method applies exactly that fold (via
+    /// [`crate::fold_correction`]) element-wise.
+    ///
+    /// `lossy` is the reconstructed lossy PCM in the same shape
+    /// [`Self::decode_samples`] returns (mono samples, or interleaved
+    /// `[L0, R0, …]` for stereo); `correction` is the correction residual
+    /// for each of those samples in the same order. The result is the
+    /// recovered lossless PCM.
+    ///
+    /// This is a pure arithmetic consumer: it does **not** decode either
+    /// entropy stream (the lossy main stream's `error_limit`-driven decode
+    /// and the correction stream's own entropy decode are separate, and the
+    /// former remains a documented gap). It lets a caller that has obtained
+    /// both buffers by other means recover lossless samples with one call.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::HybridFoldPlacementUnsupported`] — the block's flags
+    ///   select [`crate::CorrectionFold::PreDecorrelationCross`] or
+    ///   [`crate::CorrectionFold::NoiseShaped`], neither of which is a plain
+    ///   post-decorrelation raw add.
+    /// * [`Error::HybridCorrectionLengthMismatch`] — `correction.len() !=
+    ///   lossy.len()` (the §4.1 fold reads exactly one correction residual
+    ///   per decoded sample).
+    ///
+    /// Round 367.
+    pub fn fold_hybrid_correction(&self, lossy: &[i32], correction: &[i32]) -> Result<Vec<i32>> {
+        if !self.hybrid_correction_placement().is_supported_raw_fold() {
+            return Err(Error::HybridFoldPlacementUnsupported);
+        }
+        if lossy.len() != correction.len() {
+            return Err(Error::HybridCorrectionLengthMismatch {
+                lossy: lossy.len(),
+                correction: correction.len(),
+            });
+        }
+        Ok(lossy
+            .iter()
+            .zip(correction.iter())
+            .map(|(&s, &c)| crate::fold_correction(s, c))
+            .collect())
+    }
+
     /// Borrow the first `0x0B` packed-correction-data sub-block, or
     /// `None` when none is present. Block-level pairing with the free
     /// [`crate::find_packed_correction_data_sub_block`] finder. Use
@@ -5630,5 +5700,93 @@ mod tests {
         assert!(!parsed[0].is_final_audio_block_in_file());
         assert!(!parsed[1].is_final_audio_block_in_file());
         assert!(parsed[2].is_final_audio_block_in_file());
+    }
+
+    // ---- round 367: block-level hybrid correction fold (§4.1) -------
+
+    #[test]
+    fn hybrid_placement_is_post_decorrelation_for_a_plain_hybrid_block() {
+        // mono (bit 2) + hybrid (bit 3), no cross / no shaping.
+        let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 3)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        assert_eq!(
+            block.hybrid_correction_placement(),
+            crate::CorrectionFold::PostDecorrelation
+        );
+    }
+
+    #[test]
+    fn hybrid_placement_is_cross_when_cross_decorr_set() {
+        // hybrid (bit 3) + CROSS_DECORR (bit 5).
+        let bytes = synthesise_block(1, flags_with((1 << 3) | (1 << 5)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        assert_eq!(
+            block.hybrid_correction_placement(),
+            crate::CorrectionFold::PreDecorrelationCross
+        );
+    }
+
+    #[test]
+    fn hybrid_placement_is_shaped_when_shape_bit_set() {
+        // hybrid (bit 3) + HYBRID_SHAPE (bit 6).
+        let bytes = synthesise_block(1, flags_with((1 << 3) | (1 << 6)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        assert_eq!(
+            block.hybrid_correction_placement(),
+            crate::CorrectionFold::NoiseShaped
+        );
+    }
+
+    #[test]
+    fn fold_hybrid_correction_recovers_lossless_pcm() {
+        // A plain (post-decorrelation) hybrid block: the fold adds the
+        // correction residual to each reconstructed lossy sample.
+        let bytes = synthesise_block(4, flags_with((1 << 2) | (1 << 3)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        let lossy = [100i32, -200, 300, -400];
+        let correction = [3i32, -5, 0, 7];
+        let lossless = block.fold_hybrid_correction(&lossy, &correction).unwrap();
+        assert_eq!(lossless, vec![103, -205, 300, -393]);
+    }
+
+    #[test]
+    fn fold_hybrid_correction_zero_correction_is_identity() {
+        let bytes = synthesise_block(3, flags_with((1 << 2) | (1 << 3)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        let lossy = [7i32, -9, 11];
+        let out = block.fold_hybrid_correction(&lossy, &[0, 0, 0]).unwrap();
+        assert_eq!(out, lossy);
+    }
+
+    #[test]
+    fn fold_hybrid_correction_refuses_cross_decorr() {
+        let bytes = synthesise_block(2, flags_with((1 << 3) | (1 << 5)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        let err = block.fold_hybrid_correction(&[1, 2], &[0, 0]).unwrap_err();
+        assert!(matches!(err, Error::HybridFoldPlacementUnsupported));
+    }
+
+    #[test]
+    fn fold_hybrid_correction_refuses_noise_shaping() {
+        let bytes = synthesise_block(2, flags_with((1 << 3) | (1 << 6)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        let err = block.fold_hybrid_correction(&[1, 2], &[0, 0]).unwrap_err();
+        assert!(matches!(err, Error::HybridFoldPlacementUnsupported));
+    }
+
+    #[test]
+    fn fold_hybrid_correction_refuses_length_mismatch() {
+        let bytes = synthesise_block(3, flags_with((1 << 2) | (1 << 3)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        let err = block
+            .fold_hybrid_correction(&[1, 2, 3], &[0, 0])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::HybridCorrectionLengthMismatch {
+                lossy: 3,
+                correction: 2
+            }
+        ));
     }
 }

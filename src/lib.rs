@@ -858,8 +858,8 @@ pub use crate::error::{Error, Result};
 pub use crate::fixup::{apply_left_shift, apply_left_shift_buffer};
 pub use crate::hybrid::{
     flags_select_shaping, fold_correction, fold_correction_pair, fold_correction_pre_decorrelation,
-    fold_correction_pre_decorrelation_pair, split_correction, CROSS_DECORR_FLAG, HYBRID_FLAG,
-    HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
+    fold_correction_pre_decorrelation_pair, split_correction, CorrectionFold, CROSS_DECORR_FLAG,
+    HYBRID_FLAG, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
 };
 pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,

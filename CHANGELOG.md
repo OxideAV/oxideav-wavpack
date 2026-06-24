@@ -8,6 +8,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 367 — block-level hybrid correction fold + fold-placement selector.
+
+  `CorrectionFold` (in `hybrid`) names the three decorrelation-spec §4.1
+  fold placements — `PostDecorrelation` (the mono / non-`CROSS_DECORR`
+  stereo raw add), `PreDecorrelationCross` (the `CROSS_DECORR` `0x20`
+  zero-delay fold before the decorrelation passes), and `NoiseShaped` (the
+  `HYBRID_SHAPE` / `NEW_SHAPING` error-feedback filter) — and
+  `CorrectionFold::from_flags` selects the placement from a block's 32-bit
+  flag word (shaping wins, then cross, then the default post-decorrelation
+  add). `is_supported_raw_fold` reports whether the placement is the plain
+  raw add this crate applies end-to-end.
+
+  `WavPackBlock::hybrid_correction_placement` surfaces that selector at the
+  block level, and `WavPackBlock::fold_hybrid_correction(lossy, correction)`
+  applies the §4.1 post-decorrelation fold element-wise — recovering
+  lossless PCM from a reconstructed lossy buffer plus a matching
+  correction-residual buffer (one residual per decoded sample). It refuses
+  the `CROSS_DECORR` / noise-shaped placements
+  (`Error::HybridFoldPlacementUnsupported`) and a length mismatch
+  (`Error::HybridCorrectionLengthMismatch`), the two new error variants.
+  It is a pure arithmetic consumer: it does not decode either entropy
+  stream (the lossy main stream's `error_limit`-driven decode stays a
+  documented gap), letting a caller that has both buffers recover lossless
+  samples in one call.
+
+  11 new tests (775 total, up from 764): the placement selector across the
+  plain / cross / shaped flag words (shaping-over-cross precedence), the
+  block-level placement accessor, the element-wise fold recovering lossless
+  PCM, the zero-correction identity, and the cross / shaped / length-mismatch
+  refusal arms.
+
 - Round 367 — hybrid-mode correction-fold arithmetic (`hybrid` module),
   driving the hybrid (lossy main + `.wvc` correction) milestone to the
   documented wall.

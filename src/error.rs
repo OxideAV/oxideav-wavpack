@@ -255,6 +255,25 @@ pub enum Error {
     /// weights/seeds alone (the term list drives the per-pass arithmetic
     /// and the per-term seed/weight counts).
     DecorrelationTermsMissing,
+    /// A hybrid correction-fold was requested with a correction buffer
+    /// whose length does not match the decoded lossy buffer. The
+    /// decorrelation-spec §4.1 fold reads exactly one correction residual
+    /// per decoded sample, so the two buffers must be the same length.
+    HybridCorrectionLengthMismatch {
+        /// Number of samples in the decoded lossy buffer.
+        lossy: usize,
+        /// Number of correction residuals supplied.
+        correction: usize,
+    },
+    /// A hybrid correction-fold was requested on a block whose flags
+    /// select a fold placement the §4.1-documented raw add does not cover:
+    /// the `CROSS_DECORR` (`0x20`) *pre*-decorrelation fold (which must run
+    /// before the decorrelation passes, not on the reconstructed output),
+    /// or the `HYBRID_SHAPE` (`0x40`) / `NEW_SHAPING` (`0x2000_0000`)
+    /// noise-shaped fold (whose `read_shaping_info` state layout is a
+    /// documented gap). The raw post-decorrelation fold is correct only
+    /// for the non-cross, non-shaped case.
+    HybridFoldPlacementUnsupported,
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -366,6 +385,13 @@ impl core::fmt::Display for Error {
             ),
             Error::DecorrelationTermsMissing => f.write_str(
                 "oxideav-wavpack: block carries 0x03/0x04 decorrelation metadata without the 0x02 terms sub-block",
+            ),
+            Error::HybridCorrectionLengthMismatch { lossy, correction } => write!(
+                f,
+                "oxideav-wavpack: hybrid correction-fold buffer mismatch — {correction} correction residuals for {lossy} decoded samples (must be equal)"
+            ),
+            Error::HybridFoldPlacementUnsupported => f.write_str(
+                "oxideav-wavpack: hybrid correction-fold requested on a CROSS_DECORR / noise-shaped block — only the non-cross, non-shaped post-decorrelation raw fold is supported",
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

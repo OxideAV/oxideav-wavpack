@@ -210,6 +210,62 @@ pub fn flags_select_shaping(flags: u32) -> bool {
     flags & (HYBRID_SHAPE_FLAG | NEW_SHAPING_FLAG) != 0
 }
 
+/// Which §4.1 correction-fold placement a block's flag word selects.
+///
+/// The fold *arithmetic* is the same raw add in every documented case
+/// (`value + correction`); what differs is **where** in the per-sample
+/// pipeline it runs and whether it is even a raw add. This enum names the
+/// placement so a consumer can dispatch (or refuse) correctly. Derive it
+/// from a block's 32-bit flag word with [`CorrectionFold::from_flags`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrectionFold {
+    /// The correction is added to the reconstructed sample **after** the
+    /// decorrelation passes (spec §4.1, `read_word += correction`). This
+    /// is the mono case and the stereo case *without* `CROSS_DECORR`. The
+    /// raw [`fold_correction`] / [`fold_correction_pair`] primitives apply.
+    PostDecorrelation,
+    /// The correction is folded into the lossy input **before** the
+    /// decorrelation passes (spec §4.1, the `CROSS_DECORR` `0x20`
+    /// zero-delay correction). Requires re-running decorrelation after the
+    /// fold, so it cannot be applied to a reconstructed output buffer;
+    /// [`fold_correction_pre_decorrelation`] applies at the input stage.
+    PreDecorrelationCross,
+    /// The correction is applied through the `HYBRID_SHAPE` / `NEW_SHAPING`
+    /// error-feedback filter (spec §4.1). Not a raw add; its
+    /// `read_shaping_info` state layout is a documented gap, so no fold is
+    /// available here.
+    NoiseShaped,
+}
+
+impl CorrectionFold {
+    /// Select the §4.1 fold placement from a block's 32-bit flag word.
+    ///
+    /// Precedence (a shaped block may also set `CROSS_DECORR`): the
+    /// noise-shaping bits win first (the whole fold is filtered, so the
+    /// placement question is moot), then `CROSS_DECORR`, then the default
+    /// post-decorrelation raw add.
+    #[must_use]
+    pub fn from_flags(flags: u32) -> Self {
+        if flags_select_shaping(flags) {
+            CorrectionFold::NoiseShaped
+        } else if flags & CROSS_DECORR_FLAG != 0 {
+            CorrectionFold::PreDecorrelationCross
+        } else {
+            CorrectionFold::PostDecorrelation
+        }
+    }
+
+    /// `true` when this placement is the plain post-decorrelation raw add
+    /// (the only fold this crate applies end-to-end). The other two
+    /// placements require either re-running decorrelation
+    /// ([`Self::PreDecorrelationCross`]) or the undocumented shaping filter
+    /// ([`Self::NoiseShaped`]).
+    #[must_use]
+    pub fn is_supported_raw_fold(self) -> bool {
+        matches!(self, CorrectionFold::PostDecorrelation)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +405,53 @@ mod tests {
         assert!(flags_select_shaping(HYBRID_SHAPE_FLAG | NEW_SHAPING_FLAG));
         // Mixed with unrelated bits set: still detected.
         assert!(flags_select_shaping(HYBRID_FLAG | HYBRID_SHAPE_FLAG));
+    }
+
+    // ---- fold placement selector -------------------------------------
+
+    #[test]
+    fn placement_defaults_to_post_decorrelation() {
+        // A plain hybrid block (no cross, no shaping) folds the correction
+        // after decorrelation.
+        assert_eq!(
+            CorrectionFold::from_flags(HYBRID_FLAG),
+            CorrectionFold::PostDecorrelation
+        );
+        assert_eq!(
+            CorrectionFold::from_flags(0),
+            CorrectionFold::PostDecorrelation
+        );
+        assert!(CorrectionFold::from_flags(HYBRID_FLAG).is_supported_raw_fold());
+    }
+
+    #[test]
+    fn placement_selects_cross_for_cross_decorr() {
+        assert_eq!(
+            CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG),
+            CorrectionFold::PreDecorrelationCross
+        );
+        assert!(
+            !CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG).is_supported_raw_fold()
+        );
+    }
+
+    #[test]
+    fn placement_selects_shaped_when_shaping_bits_set() {
+        assert_eq!(
+            CorrectionFold::from_flags(HYBRID_FLAG | HYBRID_SHAPE_FLAG),
+            CorrectionFold::NoiseShaped
+        );
+        assert_eq!(
+            CorrectionFold::from_flags(HYBRID_FLAG | NEW_SHAPING_FLAG),
+            CorrectionFold::NoiseShaped
+        );
+        // Shaping wins over cross when both are set.
+        assert_eq!(
+            CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG | HYBRID_SHAPE_FLAG),
+            CorrectionFold::NoiseShaped
+        );
+        assert!(
+            !CorrectionFold::from_flags(HYBRID_FLAG | HYBRID_SHAPE_FLAG).is_supported_raw_fold()
+        );
     }
 }
