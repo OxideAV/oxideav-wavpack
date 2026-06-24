@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 367 — hybrid-mode correction-fold arithmetic (`hybrid` module),
+  driving the hybrid (lossy main + `.wvc` correction) milestone to the
+  documented wall.
+
+  WavPack hybrid mode (flag bit 3, `HYBRID_FLAG` `0x08`) splits the signal
+  into a lossy main stream (`0x0A`) plus an optional correction stream
+  (`0x0B`); when the correction stream is present the decoder recovers the
+  exact original by folding a correction residual into the reconstructed
+  lossy value. The new `hybrid` module lifts that documented fold
+  (decorrelation-spec §4.1) onto the public typed surface, the same way the
+  §3 weight arithmetic, the §4.2 entropy ladder and the §5 CRC steps were
+  lifted: a pinned, exact building block the consuming decode path drives
+  when the remaining gaps close.
+
+  - `fold_correction(reconstructed, correction)` — the spec §4.1
+    post-decorrelation fold `original = reconstructed + correction` (the
+    spec's `read_word += correction[0]`), used for mono and for a stereo
+    block *without* `CROSS_DECORR`. `fold_correction_pair` applies it
+    per-channel to a reconstructed `(L, R)` pair.
+  - `fold_correction_pre_decorrelation(lossy, correction)` /
+    `fold_correction_pre_decorrelation_pair` — the spec §4.1
+    `CROSS_DECORR` (`0x20`) *pre*-decorrelation fold (`input = lossy +
+    correction`, the "no-delay" correction folded before the decorrelation
+    passes). Arithmetically the same add; the distinct typed name marks the
+    pipeline position so a consumer cannot fold a correction in the wrong
+    stage for a given `CROSS_DECORR` setting.
+  - `split_correction(original, lossy)` — the exact encode inverse
+    (`correction = original - lossy`), so
+    `fold_correction(lossy, split_correction(original, lossy)) ==
+    original`.
+  - `flags_select_shaping(flags)` — detects the `HYBRID_SHAPE` (`0x40`) /
+    `NEW_SHAPING` (`0x2000_0000`) noise-shaped fold, whose
+    `read_shaping_info` state layout is a documented gap; the raw-add fold
+    is correct only when this returns `false`. New `HYBRID_FLAG`,
+    `CROSS_DECORR_FLAG`, `HYBRID_SHAPE_FLAG`, `NEW_SHAPING_FLAG` constants
+    name the §6 flag bits.
+
+  All folds use 32-bit wrap-around (`wrapping_add` / `wrapping_sub`),
+  matching the canonical decoder's register arithmetic. 13 new tests (764
+  total, up from 751) pin the fold-∘-split lossless-recovery identity over
+  a value sweep and at the `i32` extremes (where the intermediate
+  correction wraps), the plain-add / plain-subtract arithmetic, the
+  zero-correction identity, the pre-/post-decorrelation arithmetic parity,
+  the per-channel pair folds, and the shaping-bit detection.
+
 - Round 360 — public forward (encode) decorrelation: `recorrelate_mono`
   / `recorrelate_stereo`, the exact arithmetic inverse of
   `decorrelate_mono` / `decorrelate_stereo`.

@@ -816,6 +816,7 @@ mod decorrelation;
 mod entropy;
 mod error;
 mod fixup;
+mod hybrid;
 mod metadata;
 mod overflow_bits;
 mod packed_samples;
@@ -855,6 +856,11 @@ pub use crate::entropy::{
 };
 pub use crate::error::{Error, Result};
 pub use crate::fixup::{apply_left_shift, apply_left_shift_buffer};
+pub use crate::hybrid::{
+    flags_select_shaping, fold_correction, fold_correction_pair, fold_correction_pre_decorrelation,
+    fold_correction_pre_decorrelation_pair, split_correction, CROSS_DECORR_FLAG, HYBRID_FLAG,
+    HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
+};
 pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
