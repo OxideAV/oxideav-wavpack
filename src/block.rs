@@ -513,6 +513,47 @@ impl<'a> WavPackBlock<'a> {
             .collect())
     }
 
+    /// Compute the correction residuals an encoder packs into the `0x0B`
+    /// stream — the exact forward (encode) inverse of
+    /// [`Self::fold_hybrid_correction`].
+    ///
+    /// Given the `original` lossless PCM and the `lossy` reconstruction the
+    /// hybrid encoder emitted into the main `0x0A` stream, returns the
+    /// per-sample correction residual `correction = original - lossy` (via
+    /// [`crate::split_correction`]) so that
+    /// `fold_hybrid_correction(lossy, split_hybrid_correction(original,
+    /// lossy)) == original`. Both buffers are in the same per-channel shape
+    /// [`Self::decode_samples`] uses (mono, or interleaved `[L0, R0, …]`).
+    ///
+    /// As with the decode-side fold, this is the plain post-decorrelation
+    /// (spec §4.1) case: the `CROSS_DECORR` / noise-shaped placements are
+    /// refused, and the two buffers must be the same length.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::HybridFoldPlacementUnsupported`] — the block's flags
+    ///   select a placement other than the post-decorrelation raw add.
+    /// * [`Error::HybridCorrectionLengthMismatch`] — `original.len() !=
+    ///   lossy.len()`.
+    ///
+    /// Round 367.
+    pub fn split_hybrid_correction(&self, original: &[i32], lossy: &[i32]) -> Result<Vec<i32>> {
+        if !self.hybrid_correction_placement().is_supported_raw_fold() {
+            return Err(Error::HybridFoldPlacementUnsupported);
+        }
+        if original.len() != lossy.len() {
+            return Err(Error::HybridCorrectionLengthMismatch {
+                lossy: lossy.len(),
+                correction: original.len(),
+            });
+        }
+        Ok(original
+            .iter()
+            .zip(lossy.iter())
+            .map(|(&o, &s)| crate::split_correction(o, s))
+            .collect())
+    }
+
     /// Borrow the first `0x0B` packed-correction-data sub-block, or
     /// `None` when none is present. Block-level pairing with the free
     /// [`crate::find_packed_correction_data_sub_block`] finder. Use
@@ -5786,6 +5827,53 @@ mod tests {
             Error::HybridCorrectionLengthMismatch {
                 lossy: 3,
                 correction: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn split_hybrid_correction_is_the_forward_inverse_of_the_fold() {
+        // split(original, lossy) then fold(lossy, correction) == original.
+        let bytes = synthesise_block(4, flags_with((1 << 2) | (1 << 3)), &[]);
+        let (block, _) = parse_block(&bytes).unwrap();
+        let original = [103i32, -205, 300, -393];
+        let lossy = [100i32, -200, 300, -400];
+        let correction = block.split_hybrid_correction(&original, &lossy).unwrap();
+        assert_eq!(correction, vec![3, -5, 0, 7]);
+        let recovered = block.fold_hybrid_correction(&lossy, &correction).unwrap();
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn split_hybrid_correction_refuses_cross_and_shaped_and_mismatch() {
+        // CROSS_DECORR placement.
+        let cross = synthesise_block(2, flags_with((1 << 3) | (1 << 5)), &[]);
+        let (cblock, _) = parse_block(&cross).unwrap();
+        assert!(matches!(
+            cblock
+                .split_hybrid_correction(&[1, 2], &[0, 0])
+                .unwrap_err(),
+            Error::HybridFoldPlacementUnsupported
+        ));
+        // Noise-shaped placement.
+        let shaped = synthesise_block(2, flags_with((1 << 3) | (1 << 6)), &[]);
+        let (sblock, _) = parse_block(&shaped).unwrap();
+        assert!(matches!(
+            sblock
+                .split_hybrid_correction(&[1, 2], &[0, 0])
+                .unwrap_err(),
+            Error::HybridFoldPlacementUnsupported
+        ));
+        // Length mismatch on a plain block.
+        let plain = synthesise_block(3, flags_with((1 << 2) | (1 << 3)), &[]);
+        let (pblock, _) = parse_block(&plain).unwrap();
+        assert!(matches!(
+            pblock
+                .split_hybrid_correction(&[1, 2, 3], &[0])
+                .unwrap_err(),
+            Error::HybridCorrectionLengthMismatch {
+                lossy: 1,
+                correction: 3
             }
         ));
     }

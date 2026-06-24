@@ -167,19 +167,30 @@ documents only as an optimisation *hint* ("can be used to optimize
 decoding arithmetic"), not a value the decoder must clamp against, so no
 clip is applied for correctness.
 
-The **hybrid** (lossy main + `.wvc` correction) decode path is the next
-milestone but is **blocked on a docs gap**: the staged docs describe the
-correction-stream consumer semantics (decorr doc §4 — read two residuals
-per sample, fold the correction pre- or post-decorrelation per
-`CROSS_DECORR`, optional `HYBRID_SHAPE` error-feedback) and note that the
-lossy main-stream `0x0A` decode replaces the §4.2 step-6 truncated-binary
-mantissa with a binary-search refinement loop over `[low, high]` *until
-the interval is within `error_limit`* — but the **derivation of
-`error_limit`** itself (the `update_error_limit` rule from the hybrid
-profile / `slow_level` / bitrate) and the **`read_shaping_info` metadata
-layout** are named in the provenance index but not transcribed into the
-spec. Without `error_limit` the lossy main stream cannot be decoded, so
-hybrid stays refused.
+The **hybrid** (lossy main + `.wvc` correction) decode path's documented
+*fold* arithmetic is now implemented (`hybrid` module + the block-level
+`fold_hybrid_correction` / `split_hybrid_correction` / `CorrectionFold`
+surface): the spec §4.1 post-decorrelation raw add
+`lossless = reconstructed + correction` that turns a reconstructed lossy
+buffer plus a matching correction-residual buffer into lossless PCM (and
+its exact encode inverse). The `CorrectionFold::from_flags` selector
+distinguishes the three §4.1 placements — post-decorrelation,
+`CROSS_DECORR` pre-decorrelation, and `HYBRID_SHAPE` / `NEW_SHAPING`
+noise-shaped — and the block-level fold applies the post-decorrelation
+case end-to-end while refusing the other two.
+
+The remaining **blocker on a docs gap** is the lossy main-stream entropy
+*decode* that would produce the lossy buffer the fold consumes: the staged
+docs note that the lossy `0x0A` decode replaces the §4.2 step-6
+truncated-binary mantissa with a binary-search refinement loop over
+`[low, high]` *until the interval is within `error_limit`* — but the
+**derivation of `error_limit`** itself (the `update_error_limit` rule from
+the hybrid profile / `slow_level` / bitrate) and the **`read_shaping_info`
+metadata layout** (for the noise-shaped fold) are named in the provenance
+index but not transcribed into the spec. Without `error_limit` the lossy
+main stream cannot be decoded from raw `.wv` bytes, so the *end-to-end*
+hybrid decode from a bitstream stays refused — but a caller holding both
+residual buffers can now recover lossless PCM via the block-level fold.
 
 A full `.wv` block *writer* (header + sub-block framing around the entropy
 encoder) is not yet assembled. The crate is not yet wired into the
@@ -197,16 +208,21 @@ clean-room decorrelation/CRC trace
 `docs/audio/wavpack/spec/wavpack-decorrelation.md`. No external library
 source, archived prior history, or online resources were consulted at
 any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
-entry point; 751 unit tests synthesise minimal valid headers /
+entry point; 777 unit tests synthesise minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
 mono / stereo CRC vectors, pin the §3 decorrelation weight
 arithmetic to the spec's §7 sanity vectors, pin the §3 forward
 decorrelation encoder (`recorrelate_mono` / `recorrelate_stereo`) as the
-exact inverse of the decode loop via shared-pass-list round-trips, and
-pin the wiki flag-bits-13..=17 left-shift fixup (the decorrelation-spec
-§1 "shift" normalization stage) end-to-end for mono and stereo decode
-plus its pre-shift CRC ordering.
+exact inverse of the decode loop via shared-pass-list round-trips, pin the
+wiki flag-bits-13..=17 left-shift fixup (the decorrelation-spec §1 "shift"
+normalization stage) end-to-end for mono and stereo decode plus its
+pre-shift CRC ordering, and pin the §4.1 hybrid correction-fold
+(`fold_correction` / `fold_correction_pre_decorrelation` /
+`split_correction` / `CorrectionFold` + the block-level
+`fold_hybrid_correction` / `split_hybrid_correction`) as the exact
+fold-∘-split lossless-recovery inverse across the post-decorrelation
+placement, with the `CROSS_DECORR` / noise-shaped placements refused.
 
 ## License
 

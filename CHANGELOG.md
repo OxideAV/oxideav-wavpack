@@ -8,6 +8,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 367 — forward (encode) block-level hybrid correction split.
+
+  `WavPackBlock::split_hybrid_correction(original, lossy)` is the exact
+  forward inverse of `fold_hybrid_correction`: it computes the per-sample
+  correction residual `correction = original - lossy` (via
+  `split_correction`) an encoder packs into the `0x0B` stream, so
+  `fold_hybrid_correction(lossy, split_hybrid_correction(original, lossy))
+  == original`. Like the decode-side fold it covers the plain
+  post-decorrelation (spec §4.1) placement only — refusing the
+  `CROSS_DECORR` / noise-shaped placements
+  (`Error::HybridFoldPlacementUnsupported`) and a length mismatch
+  (`Error::HybridCorrectionLengthMismatch`). 2 new tests (777 total, up
+  from 775): the split-then-fold forward-inverse round trip recovering the
+  original PCM, and the cross / shaped / length-mismatch refusal arms.
+
 - Round 367 — block-level hybrid correction fold + fold-placement selector.
 
   `CorrectionFold` (in `hybrid`) names the three decorrelation-spec §4.1
