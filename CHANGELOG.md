@@ -8,6 +8,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 372 — **joint (mid/side) stereo block encode**.
+  `encode_block_stereo_joint` applies the forward mid/side transform
+  (`mid = L - R; side = R + (mid >> 1)`, the exact inverse of the decoder's
+  spec §5.4 `undo_joint_stereo`) per `(L, R)` pair before entropy coding
+  and sets the joint-stereo flag (bit 4). The §5.4 `mid >> 1` truncation
+  cancels between the forward and inverse transforms, so the block is
+  bit-exactly lossless: `decode_stream(&out)? == pcm`. The §5 CRC is folded
+  over the true L/R (the decoder undoes joint stereo before the CRC step).
+  New export: `encode_block_stereo_joint`. 5 new tests (807 total): the
+  forward/inverse transform identity over a wide pair range, plain +
+  correlated-channel round-trips, the flag + CRC-gate check, and the
+  empty/odd refusals.
+
 - Round 372 — **lossless-with-decorrelation block encode**.
   `encode_block_mono_with_decorr` / `encode_block_stereo_with_decorr` take
   the raw `0x02` (terms) / `0x03` (weights) / `0x04` (seed samples)

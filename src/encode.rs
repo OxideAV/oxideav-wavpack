@@ -210,6 +210,29 @@ fn base_flags(bytes_per_sample: u8) -> u32 {
     u32::from(bps - 1) | STANDALONE_MULTICHANNEL_MARKER
 }
 
+/// Forward mid/side joint-stereo transform — the exact inverse of the
+/// decoder's spec §5.4 [`crate::crc::undo_joint_stereo`].
+///
+/// The decoder recovers `(left, right)` from a stored `(mid, side)` pair
+/// via `right = side - (mid >> 1); left = mid + right`. Inverting that
+/// for the encoder:
+///
+/// ```text
+/// mid  = left - right
+/// side = right + (mid >> 1)
+/// ```
+///
+/// The `mid >> 1` term the encoder adds is the *same* value the decoder
+/// subtracts (both derive `mid` identically), so the arithmetic-shift
+/// truncation cancels exactly and the transform is bit-reversible for
+/// every `(left, right)` pair — `undo_joint_stereo(forward_joint_stereo(l,
+/// r)) == (l, r)`.
+fn forward_joint_stereo(left: i32, right: i32) -> (i32, i32) {
+    let mid = left.wrapping_sub(right);
+    let side = right.wrapping_add(mid >> 1);
+    (mid, side)
+}
+
 /// Encode a mono (single-channel) PCM buffer into one complete `wvpk`
 /// block, with an optional forward decorrelation pass list.
 ///
@@ -434,6 +457,83 @@ pub fn encode_block_stereo(
 
     // Seed the encode medians from the same sets written to 0x05 so the
     // encoder and decoder share an identical median start.
+    let mut medians = [
+        AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
+        AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
+    ];
+    let packed = encode_packed_samples_stereo(&residuals, &mut medians)?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::PackedSamples.as_id_byte(),
+        &packed,
+    )?;
+
+    let block_samples =
+        u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    build_block(
+        metadata,
+        block_index,
+        total_samples,
+        block_samples,
+        flags_raw,
+        crc,
+    )
+}
+
+/// Encode an interleaved stereo PCM buffer into one complete **joint
+/// (mid/side) stereo** `wvpk` block — the raw (no-decorrelation) lossless
+/// path with the spec §5.4 joint-stereo flag (bit 4) set.
+///
+/// The forward mid/side transform ([`forward_joint_stereo`]) is applied
+/// per `(L, R)` pair before entropy coding; the decoder runs the inverse
+/// ([`crate::crc::undo_joint_stereo`]) after decode and computes the §5
+/// CRC over the recovered true L/R. The spec §5.4 `mid >> 1` truncation
+/// cancels between the forward and inverse transforms, so the block is
+/// bit-exactly lossless: `decode_stream(&out)? == pcm`.
+///
+/// Joint coding decorrelates the inter-channel redundancy of typical
+/// stereo material, so this is the compression-favouring stereo encode;
+/// [`encode_block_stereo`] is the plain (independent-channel) twin.
+pub fn encode_block_stereo_joint(
+    pcm: &[i32],
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+
+    // The §5 CRC is folded over the *true* L/R PCM (the decoder undoes
+    // joint stereo before the CRC step), so it is the same as the plain
+    // stereo CRC over the input.
+    let crc = crate::crc::crc_stereo_interleaved(pcm);
+
+    // Forward mid/side transform into the residual buffer the entropy
+    // stream carries.
+    let mut residuals = pcm.to_vec();
+    for pair in residuals.chunks_exact_mut(2) {
+        let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
+        pair[0] = mid;
+        pair[1] = side;
+    }
+
+    // base flags + joint-stereo bit 4.
+    let flags_raw = base_flags(bytes_per_sample) | crate::crc::JOINT_STEREO_FLAG;
+    let mut metadata = Vec::new();
+
+    let left_seed = [0, 0, 0];
+    let right_seed = [0, 0, 1];
+    let entropy_payload = pack_entropy_info(&[left_seed, right_seed]);
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::EntropyInfo.as_id_byte(),
+        &entropy_payload,
+    )?;
+
     let mut medians = [
         AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
         AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
@@ -869,6 +969,75 @@ mod tests {
     fn stereo_stream_odd_length_is_rejected() {
         assert!(matches!(
             encode_stream_stereo(&[1, 2, 3], 0, 2),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
+    }
+
+    // ---- joint (mid/side) stereo encode ----
+
+    /// The forward joint-stereo transform is the exact inverse of the
+    /// decoder's undo over a wide range of pairs.
+    #[test]
+    fn forward_joint_stereo_inverts_undo() {
+        for left in [-32768, -1000, -1, 0, 1, 7, 1000, 32767, 1_000_000] {
+            for right in [-32768, -3, 0, 5, 999, 32767, -1_000_000] {
+                let (mid, side) = forward_joint_stereo(left, right);
+                let (l2, r2) = crate::crc::undo_joint_stereo(mid, side);
+                assert_eq!((l2, r2), (left, right), "pair ({left}, {right})");
+            }
+        }
+    }
+
+    /// A joint-stereo block round-trips: the decoder undoes mid/side and
+    /// recovers the exact input L/R PCM.
+    #[test]
+    fn joint_stereo_block_round_trips() {
+        let pcm: Vec<i32> = vec![100, 98, 105, 103, 110, 108, 90, 92, 0, 0, -50, -48];
+        let block = encode_block_stereo_joint(&pcm, 2, 0, (pcm.len() / 2) as u32).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// A joint-stereo block sets the §5.4 joint flag (bit 4) and passes
+    /// its own CRC gate.
+    #[test]
+    fn joint_stereo_block_sets_flag_and_passes_crc() {
+        let pcm: Vec<i32> = vec![10, 11, 12, 13, 14, 15];
+        let block = encode_block_stereo_joint(&pcm, 2, 0, (pcm.len() / 2) as u32).unwrap();
+        let (hdr, _) = parse_block_header(&block).unwrap();
+        assert!(hdr.flags.joint_stereo);
+        assert!(!hdr.flags.mono);
+        let (decoded, ok) = crate::block::decode_stream_muted(&block).unwrap();
+        assert!(ok);
+        assert_eq!(decoded, pcm);
+    }
+
+    /// A larger correlated (near-equal L/R) pseudo-random joint block
+    /// round-trips — the case joint coding is designed for.
+    #[test]
+    fn joint_stereo_correlated_round_trips() {
+        let mut pcm = Vec::with_capacity(400);
+        let mut state: u32 = 0xFEED_FACE;
+        for _ in 0..200 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let l = (state >> 20) as i16 as i32 / 8;
+            // R close to L (high inter-channel correlation).
+            let r = l + ((state >> 8) as i8 as i32 % 5);
+            pcm.push(l);
+            pcm.push(r);
+        }
+        let block = encode_block_stereo_joint(&pcm, 2, 0, (pcm.len() / 2) as u32).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// Joint-stereo encode rejects an empty / odd-length buffer.
+    #[test]
+    fn joint_stereo_rejects_empty_and_odd() {
+        assert!(matches!(
+            encode_block_stereo_joint(&[], 2, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_joint(&[1, 2, 3], 2, 0, 1),
             Err(Error::EncodeStereoOddLength(3))
         ));
     }

@@ -853,8 +853,8 @@ pub use crate::decorrelation::{
 };
 pub use crate::encode::{
     encode_block_mono, encode_block_mono_with_decorr, encode_block_stereo,
-    encode_block_stereo_with_decorr, encode_stream_mono, encode_stream_stereo,
-    DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
+    encode_block_stereo_joint, encode_block_stereo_with_decorr, encode_stream_mono,
+    encode_stream_stereo, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
 };
 pub use crate::entropy::{
     expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,

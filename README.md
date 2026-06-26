@@ -111,6 +111,12 @@ Working surface:
   (`decode_stream(&out)? == pcm`) for fixed-lag (`1..8`), extrapolate
   (`17`/`18`) and stereo cross (`-1`/`-2`/`-3`) terms, single- and
   multi-pass.
+* **Joint (mid/side) stereo encode** — `encode_block_stereo_joint`
+  applies the forward mid/side transform (`mid = L - R; side = R + (mid >>
+  1)`, the exact inverse of the decoder's §5.4 `undo_joint_stereo`) and
+  sets the joint flag (bit 4). The `mid >> 1` truncation cancels between
+  forward and inverse, so the block stays bit-exactly lossless
+  (`decode_stream(&out)? == pcm`).
 * **Multi-block stream encode** — `encode_stream_mono` /
   `encode_stream_stereo` split a long PCM buffer into a chain of `wvpk`
   blocks (default `DEFAULT_BLOCK_SAMPLES`, caller-overridable per-channel
