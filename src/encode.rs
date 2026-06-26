@@ -286,6 +286,96 @@ pub fn encode_block_mono(
     )
 }
 
+/// Encode a mono PCM buffer into one complete `wvpk` block that carries a
+/// **decorrelation pass list described by its raw `0x02`/`0x03`/`0x04`
+/// metadata payloads** — the lossless-with-decorrelation encode path.
+///
+/// `terms` / `weights` / `samples` are the exact on-wire payloads of the
+/// `0x02` (decorr terms), `0x03` (decorr weights) and `0x04` (decorr seed
+/// samples) sub-blocks, in the same byte layout
+/// [`crate::decorrelation::assemble_mono_passes`] reads (wire order:
+/// encoder's last-applied pass first; spec §3.7). The function:
+///
+/// 1. Assembles the application-ordered pass list from those payloads
+///    (validating them — an invalid term / weight count / seed count is
+///    surfaced verbatim).
+/// 2. Runs the §3 forward prediction loop ([`recorrelate_mono`]) to turn
+///    the PCM into residuals.
+/// 3. Emits the three decorrelation sub-blocks **verbatim** (the exact
+///    bytes passed in) ahead of the `0x0A` packed residuals, so the
+///    decoder assembles the identical pass list and its inverse loop
+///    reconstructs the original PCM.
+///
+/// Emitting the payloads verbatim makes the round trip bit-exact by
+/// construction — the decoder reads back the same bytes it would have read
+/// from a real file — without re-deriving the log-packed weight / seed
+/// bytes from the working pass state. `decode_stream(&out)? == pcm`.
+pub fn encode_block_mono_with_decorr(
+    pcm: &[i32],
+    terms: &[u8],
+    weights: &[u8],
+    samples: &[u8],
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let crc = crate::crc::crc_mono(pcm);
+
+    // Validate the payloads + build the application-ordered passes, then
+    // run the forward prediction loop into the residual buffer.
+    let mut passes = crate::decorrelation::assemble_mono_passes(terms, weights, samples)?;
+    let mut residuals = pcm.to_vec();
+    recorrelate_mono(&mut passes, &mut residuals)?;
+
+    let flags_raw = base_flags(bytes_per_sample) | (1 << 2);
+    let mut metadata = Vec::new();
+
+    let entropy_payload = pack_entropy_info(&[[0, 0, 0]]);
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::EntropyInfo.as_id_byte(),
+        &entropy_payload,
+    )?;
+    // The three decorrelation sub-blocks, verbatim, in wire order.
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::DecorrelationTerms.as_id_byte(),
+        terms,
+    )?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::DecorrelationWeights.as_id_byte(),
+        weights,
+    )?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::DecorrelationSamples.as_id_byte(),
+        samples,
+    )?;
+
+    let mut medians = AdaptiveMedians::new([0, 0, 0]);
+    let packed = encode_packed_samples_mono(&residuals, &mut medians)?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::PackedSamples.as_id_byte(),
+        &packed,
+    )?;
+
+    let block_samples =
+        u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    build_block(
+        metadata,
+        block_index,
+        total_samples,
+        block_samples,
+        flags_raw,
+        crc,
+    )
+}
+
 /// Encode an interleaved (`[L0, R0, L1, R1, …]`) stereo PCM buffer into
 /// one complete `wvpk` block, with an optional forward decorrelation pass
 /// list.
@@ -344,6 +434,87 @@ pub fn encode_block_stereo(
 
     // Seed the encode medians from the same sets written to 0x05 so the
     // encoder and decoder share an identical median start.
+    let mut medians = [
+        AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
+        AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
+    ];
+    let packed = encode_packed_samples_stereo(&residuals, &mut medians)?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::PackedSamples.as_id_byte(),
+        &packed,
+    )?;
+
+    let block_samples =
+        u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    build_block(
+        metadata,
+        block_index,
+        total_samples,
+        block_samples,
+        flags_raw,
+        crc,
+    )
+}
+
+/// Encode an interleaved stereo PCM buffer into one complete `wvpk` block
+/// carrying a decorrelation pass list described by its raw
+/// `0x02`/`0x03`/`0x04` metadata payloads — the stereo twin of
+/// [`encode_block_mono_with_decorr`].
+///
+/// The payloads use the stereo wire layout
+/// [`crate::decorrelation::assemble_stereo_passes`] reads (two weight
+/// bytes per pass, per-channel seeds, cross terms allowed). The three
+/// sub-blocks are emitted verbatim so the round trip is bit-exact:
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_stereo_with_decorr(
+    pcm: &[i32],
+    terms: &[u8],
+    weights: &[u8],
+    samples: &[u8],
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let crc = crate::crc::crc_stereo_interleaved(pcm);
+
+    let mut passes = crate::decorrelation::assemble_stereo_passes(terms, weights, samples)?;
+    let mut residuals = pcm.to_vec();
+    recorrelate_stereo(&mut passes, &mut residuals)?;
+
+    let flags_raw = base_flags(bytes_per_sample);
+    let mut metadata = Vec::new();
+
+    let left_seed = [0, 0, 0];
+    let right_seed = [0, 0, 1];
+    let entropy_payload = pack_entropy_info(&[left_seed, right_seed]);
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::EntropyInfo.as_id_byte(),
+        &entropy_payload,
+    )?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::DecorrelationTerms.as_id_byte(),
+        terms,
+    )?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::DecorrelationWeights.as_id_byte(),
+        weights,
+    )?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::DecorrelationSamples.as_id_byte(),
+        samples,
+    )?;
+
     let mut medians = [
         AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
         AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
@@ -699,6 +870,167 @@ mod tests {
         assert!(matches!(
             encode_stream_stereo(&[1, 2, 3], 0, 2),
             Err(Error::EncodeStereoOddLength(3))
+        ));
+    }
+
+    // ---- decorrelation-with-payload encode round-trips ----
+
+    /// Spec-format `0x02` term byte: low 5 bits = `term + 5`, high 3 bits
+    /// = `delta`.
+    fn term_byte(term: i8, delta: u8) -> u8 {
+        (((term + 5) as u8) & 0x1f) | (delta << 5)
+    }
+
+    /// `0x04` seed word for a value in -128..=127 (exponent 9 = shift 0).
+    fn seed_word(v: i32) -> [u8; 2] {
+        [v as i8 as u8, 9]
+    }
+
+    /// A single fixed-lag (term 1) decorrelation pass round-trips through
+    /// the verbatim-payload encode path.
+    #[test]
+    fn mono_single_fixedlag_decorr_round_trips() {
+        let pcm: Vec<i32> = vec![5, 9, 14, 20, 27, 35, 30, 22, 10, -4, -20];
+        let terms = vec![term_byte(1, 2)];
+        let weights = vec![40u8]; // arbitrary representable weight byte
+        let samples = seed_word(3).to_vec(); // 1 seed for term 1
+        let block =
+            encode_block_mono_with_decorr(&pcm, &terms, &weights, &samples, 2, 0, pcm.len() as u32)
+                .unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// A multi-pass mono decorrelation (term 2 then term 1, in wire order)
+    /// round-trips.
+    #[test]
+    fn mono_multi_pass_decorr_round_trips() {
+        let mut pcm = Vec::with_capacity(300);
+        let mut state: u32 = 0xCAFE_F00D;
+        for _ in 0..300 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pcm.push((state >> 20) as i16 as i32 / 8);
+        }
+        // Wire order (encoder's last-applied first): term 2 then term 1.
+        let terms = vec![term_byte(2, 1), term_byte(1, 1)];
+        let weights = vec![30u8, 50u8];
+        // term 2 needs 2 seeds, term 1 needs 1 seed; flat in wire order.
+        let mut samples = Vec::new();
+        samples.extend_from_slice(&seed_word(1));
+        samples.extend_from_slice(&seed_word(-2));
+        samples.extend_from_slice(&seed_word(4));
+        let block =
+            encode_block_mono_with_decorr(&pcm, &terms, &weights, &samples, 2, 0, pcm.len() as u32)
+                .unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// An extrapolate term (17) round-trips.
+    #[test]
+    fn mono_extrapolate_term_round_trips() {
+        let pcm: Vec<i32> = vec![100, 110, 119, 127, 134, 140, 145, 149, 150];
+        let terms = vec![term_byte(17, 1)];
+        let weights = vec![60u8];
+        let mut samples = Vec::new();
+        samples.extend_from_slice(&seed_word(2)); // s[-1]
+        samples.extend_from_slice(&seed_word(1)); // s[-2]
+        let block =
+            encode_block_mono_with_decorr(&pcm, &terms, &weights, &samples, 2, 0, pcm.len() as u32)
+                .unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// A stereo decorrelation block with a fixed-lag term per channel
+    /// round-trips through the verbatim-payload path.
+    #[test]
+    fn stereo_decorr_round_trips() {
+        let mut pcm = Vec::with_capacity(240);
+        let mut state: u32 = 0x1357_9BDF;
+        for _ in 0..240 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            pcm.push((state >> 21) as i16 as i32 / 6);
+        }
+        let terms = vec![term_byte(1, 1)];
+        // Stereo: two weight bytes per pass (channel A then B).
+        let weights = vec![45u8, 35u8];
+        // term 1: 1 seed per channel → A then B.
+        let mut samples = Vec::new();
+        samples.extend_from_slice(&seed_word(2)); // A
+        samples.extend_from_slice(&seed_word(-1)); // B
+        let block = encode_block_stereo_with_decorr(
+            &pcm,
+            &terms,
+            &weights,
+            &samples,
+            2,
+            0,
+            (pcm.len() / 2) as u32,
+        )
+        .unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// A stereo cross term (-2) round-trips.
+    #[test]
+    fn stereo_cross_term_round_trips() {
+        let pcm: Vec<i32> = vec![10, 12, 14, 11, 9, 13, 8, 16, 6, 18, 4, 20];
+        let terms = vec![term_byte(-2, 1)];
+        let weights = vec![20u8, 25u8];
+        // cross term: 1 seed per channel.
+        let mut samples = Vec::new();
+        samples.extend_from_slice(&seed_word(1));
+        samples.extend_from_slice(&seed_word(1));
+        let block = encode_block_stereo_with_decorr(
+            &pcm,
+            &terms,
+            &weights,
+            &samples,
+            2,
+            0,
+            (pcm.len() / 2) as u32,
+        )
+        .unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// The decorr-with-payload path emits all five sub-blocks in the
+    /// documented order: 0x05, 0x02, 0x03, 0x04, 0x0A.
+    #[test]
+    fn decorr_block_sub_block_order() {
+        use crate::metadata::SubBlockId as Id;
+        let pcm: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let terms = vec![term_byte(1, 0)];
+        let weights = vec![0u8];
+        let samples = seed_word(0).to_vec();
+        let block =
+            encode_block_mono_with_decorr(&pcm, &terms, &weights, &samples, 2, 0, 5).unwrap();
+        let (_hdr, mut payload) = parse_block_header(&block).unwrap();
+        let expected = [
+            Id::EntropyInfo,
+            Id::DecorrelationTerms,
+            Id::DecorrelationWeights,
+            Id::DecorrelationSamples,
+            Id::PackedSamples,
+        ];
+        for want in expected {
+            let (sub, rest) = parse_metadata_sub_block(payload).unwrap();
+            assert_eq!(sub.id, want);
+            payload = rest;
+        }
+        assert!(payload.is_empty());
+    }
+
+    /// An invalid term byte in the payload is surfaced verbatim from the
+    /// assembler rather than producing a corrupt block.
+    #[test]
+    fn decorr_invalid_term_is_rejected() {
+        let pcm: Vec<i32> = vec![1, 2, 3];
+        // term 0 (byte & 0x1f == 5 → term 0) is invalid.
+        let terms = vec![term_byte(0, 0)];
+        let weights = vec![0u8];
+        let samples: Vec<u8> = Vec::new();
+        assert!(matches!(
+            encode_block_mono_with_decorr(&pcm, &terms, &weights, &samples, 2, 0, 3),
+            Err(Error::InvalidDecorrelationTerm(0))
         ));
     }
 

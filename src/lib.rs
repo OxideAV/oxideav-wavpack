@@ -852,7 +852,8 @@ pub use crate::decorrelation::{
     TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, WEIGHT_CLIP, WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
 };
 pub use crate::encode::{
-    encode_block_mono, encode_block_stereo, encode_stream_mono, encode_stream_stereo,
+    encode_block_mono, encode_block_mono_with_decorr, encode_block_stereo,
+    encode_block_stereo_with_decorr, encode_stream_mono, encode_stream_stereo,
     DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
 };
 pub use crate::entropy::{

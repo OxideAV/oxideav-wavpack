@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 372 — **lossless-with-decorrelation block encode**.
+  `encode_block_mono_with_decorr` / `encode_block_stereo_with_decorr` take
+  the raw `0x02` (terms) / `0x03` (weights) / `0x04` (seed samples)
+  metadata payloads, assemble + validate the application-ordered pass list
+  (`assemble_*_passes`), run the §3 forward prediction loop
+  (`recorrelate_*`) to turn the PCM into residuals, and emit the three
+  decorrelation sub-blocks **verbatim** ahead of the `0x0A` packed
+  residuals. Emitting the payloads byte-for-byte makes the round trip
+  bit-exact by construction (the decoder reads back the identical bytes
+  and reconstructs the original PCM) without re-deriving log-packed
+  weight/seed bytes from working pass state: `decode_stream(&out)? == pcm`
+  for fixed-lag (`1..8`), extrapolate (`17`/`18`) and stereo cross
+  (`-1`/`-2`/`-3`) terms, single- and multi-pass. An invalid term / weight
+  count / seed count is surfaced verbatim from the assembler. New exports:
+  `encode_block_mono_with_decorr`, `encode_block_stereo_with_decorr`. 7 new
+  tests (802 total): single-pass / multi-pass / extrapolate mono, stereo
+  fixed-lag + cross term, the 0x05/0x02/0x03/0x04/0x0A sub-block ordering,
+  and the invalid-term refusal.
+
 - Round 372 — **multi-block `.wv` stream encode**. `encode_stream_mono` /
   `encode_stream_stereo` split a long PCM buffer into a chain of `wvpk`
   blocks (default `DEFAULT_BLOCK_SAMPLES = 22050` per-channel samples per

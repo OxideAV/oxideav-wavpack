@@ -96,10 +96,21 @@ Working surface:
   gate, and reconstructs the exact input PCM. Covers the raw-residual
   (no-decorrelation) lossless path for mono / false-stereo and plain
   (non-joint) stereo; the forward-decorrelation `0x02`/`0x03`/`0x04`
-  metadata serializer is staged (refuses a non-empty pass list with
-  `Error::NotImplemented`). Hybrid / float / int32 / multichannel block
-  emission stay out of scope (the decoder refuses them; their wire layout
-  is a documented spec gap). Exported: `ENCODE_VERSION`.
+  metadata serializer driven directly from a `DecorrPass` list is staged
+  (refuses a non-empty pass list with `Error::NotImplemented`) — use the
+  verbatim-payload path below for decorrelated blocks. Hybrid / float /
+  int32 / multichannel block emission stay out of scope (the decoder
+  refuses them; their wire layout is a documented spec gap). Exported:
+  `ENCODE_VERSION`.
+* **Lossless-with-decorrelation encode** —
+  `encode_block_mono_with_decorr` / `encode_block_stereo_with_decorr` take
+  the raw `0x02`/`0x03`/`0x04` metadata payloads, assemble + validate the
+  pass list, run the §3 forward prediction loop (`recorrelate_*`) into
+  residuals, and emit the three decorrelation sub-blocks **verbatim**
+  ahead of the `0x0A` residuals — bit-exact by construction
+  (`decode_stream(&out)? == pcm`) for fixed-lag (`1..8`), extrapolate
+  (`17`/`18`) and stereo cross (`-1`/`-2`/`-3`) terms, single- and
+  multi-pass.
 * **Multi-block stream encode** — `encode_stream_mono` /
   `encode_stream_stereo` split a long PCM buffer into a chain of `wvpk`
   blocks (default `DEFAULT_BLOCK_SAMPLES`, caller-overridable per-channel
