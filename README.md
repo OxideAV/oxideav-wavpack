@@ -91,17 +91,13 @@ Working surface:
   packed-samples metadata sub-blocks (framed by the forward inverse of
   `parse_metadata_sub_block` — word-count size field, large-size escape,
   odd-size pad). The headline guarantee is
-  `decode_stream(&encode_block_mono(pcm, &[], …)?)? == pcm` (and the
-  stereo twin): the encoded block parses, passes its own §5.6 CRC mute
-  gate, and reconstructs the exact input PCM. Covers the raw-residual
-  (no-decorrelation) lossless path for mono / false-stereo and plain
-  (non-joint) stereo; the forward-decorrelation `0x02`/`0x03`/`0x04`
-  metadata serializer driven directly from a `DecorrPass` list is staged
-  (refuses a non-empty pass list with `Error::NotImplemented`) — use the
-  verbatim-payload path below for decorrelated blocks. Hybrid / float /
-  int32 / multichannel block emission stay out of scope (the decoder
-  refuses them; their wire layout is a documented spec gap). Exported:
-  `ENCODE_VERSION`.
+  `decode_stream(&encode_block_mono(pcm, …)?)? == pcm` (and the stereo
+  twin): the encoded block parses, passes its own §5.6 CRC mute gate, and
+  reconstructs the exact input PCM. These two are the raw (no-decorrelation)
+  path; the decorrelated / joint / shifted / multi-block variants below
+  cover the rest. Hybrid / float / int32 / multichannel block emission stay
+  out of scope (the decoder refuses them; their wire layout is a documented
+  spec gap). Exported: `ENCODE_VERSION`.
 * **Lossless-with-decorrelation encode** —
   `encode_block_mono_with_decorr` / `encode_block_stereo_with_decorr` take
   the raw `0x02`/`0x03`/`0x04` metadata payloads, assemble + validate the

@@ -13,8 +13,9 @@
 //!
 //! 1. `0x05` entropy-info sub-block (the three median seeds per channel,
 //!    log-packed per the wiki "Entropy info" section).
-//! 2. Optionally the `0x02`/`0x03`/`0x04` decorrelation metadata when a
-//!    forward decorrelation pass list is supplied.
+//! 2. The `0x02`/`0x03`/`0x04` decorrelation metadata for the
+//!    `*_with_decorr` entry points (emitted verbatim from the caller's
+//!    payloads).
 //! 3. `0x0A` packed-samples sub-block (the entropy-coded residuals).
 //! 4. The 32-byte fixed header with the spec §5 running CRC folded over
 //!    the PCM and the [`crate::block_header::Flags`] word reconstructed
@@ -24,24 +25,29 @@
 //!
 //! The headline guarantee is `decode_stream(&encode_block_mono(pcm,
 //! …)?)? == pcm` (and the stereo twin): an encoded block parses, passes
-//! its CRC gate, and reconstructs the exact input PCM. The
-//! "raw-residual" path (no decorrelation passes) is the simplest correct
-//! encoder — the entropy stream carries the PCM samples directly and the
-//! decoder's `has_decorrelation() == false` branch returns them
-//! unchanged. The decorrelation path runs the forward prediction loop
-//! first so the residuals the entropy stream carries are the
-//! post-decorrelation values the decoder's inverse loop expects.
+//! its CRC gate, and reconstructs the exact input PCM. The encode surface
+//! covers, all bit-exactly lossless:
+//!
+//! * raw (no-decorrelation) mono / stereo blocks
+//!   ([`encode_block_mono`] / [`encode_block_stereo`]);
+//! * decorrelated blocks driven by their raw `0x02`/`0x03`/`0x04`
+//!   payloads ([`encode_block_mono_with_decorr`] /
+//!   [`encode_block_stereo_with_decorr`]);
+//! * joint (mid/side) stereo ([`encode_block_stereo_joint`]);
+//! * sub-byte bit-depth via the left-shift fixup
+//!   ([`encode_block_mono_shifted`] / [`encode_block_stereo_shifted`]);
+//! * multi-block `.wv` streams ([`encode_stream_mono`] /
+//!   [`encode_stream_stereo`]).
 //!
 //! ## Scope
 //!
-//! This is the lossless integer encoder for mono / false-stereo and
-//! plain (non-joint) stereo blocks. Hybrid (`0x0B`/shaping), float
-//! (`0x08`/`0x0C`), int32 container mode, and multichannel (`0x0D`
-//! stream chaining) remain out of scope — the decoder refuses them and
-//! their wire layout is a documented spec gap.
+//! This is the lossless integer encoder. Hybrid (`0x0B`/shaping), float
+//! (`0x08`/`0x0C`), int32 container mode, and multichannel (`0x0D` stream
+//! chaining) block emission remain out of scope — the decoder refuses
+//! them and their wire layout is a documented spec gap.
 
 use crate::block_header::{MAGIC, MIN_CK_SIZE};
-use crate::decorrelation::{recorrelate_mono, recorrelate_stereo, DecorrPass};
+use crate::decorrelation::{recorrelate_mono, recorrelate_stereo};
 use crate::error::{Error, Result};
 use crate::metadata::{SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE};
 use crate::samples::{encode_packed_samples_mono, encode_packed_samples_stereo, AdaptiveMedians};
@@ -234,26 +240,22 @@ fn forward_joint_stereo(left: i32, right: i32) -> (i32, i32) {
 }
 
 /// Encode a mono (single-channel) PCM buffer into one complete `wvpk`
-/// block, with an optional forward decorrelation pass list.
+/// block via the raw (no-decorrelation) lossless path — the entropy
+/// stream carries the PCM verbatim and the decoder's no-decorrelation
+/// branch returns it unchanged.
 ///
-/// `pcm` is the channel's samples. When `passes` is empty the entropy
-/// stream carries the PCM verbatim (the decoder's no-decorrelation
-/// path). When non-empty, [`recorrelate_mono`] runs the spec §3 forward
-/// prediction loop first so the entropy stream carries the residuals the
-/// decoder's inverse loop reconstructs from — and the `0x02`/`0x03`/`0x04`
-/// decorrelation metadata describing those passes is emitted ahead of the
-/// `0x0A` sub-block.
+/// `pcm` is the channel's samples. `bytes_per_sample` (1..=4) sets the
+/// header bits 0..=1 width hint; `block_index` / `total_samples` populate
+/// the stream-position header fields (use
+/// [`crate::block_header::TOTAL_SAMPLES_UNKNOWN`] for a streaming total).
 ///
-/// `bytes_per_sample` (1..=4) sets the header bits 0..=1 width hint;
-/// `block_index` / `total_samples` populate the stream-position header
-/// fields (use [`crate::block_header::TOTAL_SAMPLES_UNKNOWN`] for a
-/// streaming total).
+/// For a decorrelated block use [`encode_block_mono_with_decorr`]; for
+/// sub-byte depth use [`encode_block_mono_shifted`].
 ///
 /// The returned bytes decode back to `pcm` exactly:
 /// `decode_stream(&out)? == pcm`.
 pub fn encode_block_mono(
     pcm: &[i32],
-    passes: &[DecorrPass],
     bytes_per_sample: u8,
     block_index: u32,
     total_samples: u32,
@@ -262,16 +264,12 @@ pub fn encode_block_mono(
         return Err(Error::EncodeEmptyAudio);
     }
 
-    // The spec §5 CRC is folded over the *decoded* (post-inverse) PCM —
-    // i.e. the input samples themselves, before any forward decorrelation.
+    // The spec §5 CRC is folded over the decoded PCM — i.e. the input
+    // samples themselves (the raw path carries them verbatim).
     let crc = crate::crc::crc_mono(pcm);
 
-    // Forward-decorrelate into the residual buffer the entropy stream
-    // carries. An empty pass list leaves the PCM unchanged (raw path).
-    let mut residuals = pcm.to_vec();
-    // Bit 2 (mono) per the wiki "Flags meaning". The presence of
-    // decorrelation passes does not set any header flag — the decoder
-    // keys off the 0x02/0x03/0x04 sub-blocks via has_decorrelation().
+    let residuals = pcm.to_vec();
+    // Bit 2 (mono) per the wiki "Flags meaning".
     let flags_raw = base_flags(bytes_per_sample) | (1 << 2);
     let mut metadata = Vec::new();
 
@@ -282,12 +280,6 @@ pub fn encode_block_mono(
         SubBlockId::EntropyInfo.as_id_byte(),
         &entropy_payload,
     )?;
-
-    if !passes.is_empty() {
-        let mut work = passes.to_vec();
-        recorrelate_mono(&mut work, &mut residuals)?;
-        append_decorr_metadata(&mut metadata, &work, false)?;
-    }
 
     let mut medians = AdaptiveMedians::new([0, 0, 0]);
     let packed = encode_packed_samples_mono(&residuals, &mut medians)?;
@@ -555,20 +547,17 @@ pub fn encode_block_mono_with_decorr(
 }
 
 /// Encode an interleaved (`[L0, R0, L1, R1, …]`) stereo PCM buffer into
-/// one complete `wvpk` block, with an optional forward decorrelation pass
-/// list.
+/// one complete `wvpk` block via the raw (no-decorrelation) lossless path.
 ///
-/// The interleaved length must be even (whole `[L, R]` pairs). Like the
-/// mono twin, an empty `passes` list carries the PCM verbatim; a
-/// non-empty list runs [`recorrelate_stereo`] first and emits the
-/// `0x02`/`0x03`/`0x04` decorrelation metadata. The block is plain
-/// (non-joint, non-cross) stereo — the joint-stereo / cross-decorrelation
-/// transforms are not applied on the encode side here.
+/// The interleaved length must be even (whole `[L, R]` pairs). The block
+/// is plain (non-joint, independent-channel) stereo. For a joint (mid/
+/// side) block use [`encode_block_stereo_joint`]; for a decorrelated
+/// block use [`encode_block_stereo_with_decorr`]; for sub-byte depth use
+/// [`encode_block_stereo_shifted`].
 ///
 /// `decode_stream(&out)? == pcm` exactly.
 pub fn encode_block_stereo(
     pcm: &[i32],
-    passes: &[DecorrPass],
     bytes_per_sample: u8,
     block_index: u32,
     total_samples: u32,
@@ -582,7 +571,7 @@ pub fn encode_block_stereo(
 
     let crc = crate::crc::crc_stereo_interleaved(pcm);
 
-    let mut residuals = pcm.to_vec();
+    let residuals = pcm.to_vec();
     let flags_raw = base_flags(bytes_per_sample); // mono bit clear
 
     let mut metadata = Vec::new();
@@ -603,12 +592,6 @@ pub fn encode_block_stereo(
         SubBlockId::EntropyInfo.as_id_byte(),
         &entropy_payload,
     )?;
-
-    if !passes.is_empty() {
-        let mut work = passes.to_vec();
-        recorrelate_stereo(&mut work, &mut residuals)?;
-        append_decorr_metadata(&mut metadata, &work, true)?;
-    }
 
     // Seed the encode medians from the same sets written to 0x05 so the
     // encoder and decoder share an identical median start.
@@ -830,7 +813,7 @@ pub fn encode_stream_mono(
     let mut out = Vec::new();
     let mut index: u32 = 0;
     for window in pcm.chunks(chunk) {
-        let block = encode_block_mono(window, &[], bytes_per_sample, index, total)?;
+        let block = encode_block_mono(window, bytes_per_sample, index, total)?;
         out.extend_from_slice(&block);
         index = index
             .checked_add(window.len() as u32)
@@ -864,36 +847,13 @@ pub fn encode_stream_stereo(
     let mut index: u32 = 0;
     // Two i32s per pair, so the interleaved chunk size is `pairs * 2`.
     for window in pcm.chunks(pairs * 2) {
-        let block = encode_block_stereo(window, &[], bytes_per_sample, index, total)?;
+        let block = encode_block_stereo(window, bytes_per_sample, index, total)?;
         out.extend_from_slice(&block);
         index = index
             .checked_add((window.len() / 2) as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
     }
     Ok(out)
-}
-
-/// Serialize the `0x02` (terms), `0x03` (weights) and `0x04` (seed
-/// samples) decorrelation metadata for a forward pass list into `out`.
-///
-/// The on-wire convention (decorrelation-spec §3.7) stores the passes in
-/// the **reverse** of decode-application order: the decoder fills its
-/// pass array back-to-front, so the encoder writes the
-/// last-applied-during-encode pass first. `passes` is in decode-apply
-/// order (the order [`recorrelate_mono`]/[`recorrelate_stereo`] consumed
-/// them — which is the reverse of the decode loop), so the wire order is
-/// `passes` reversed.
-///
-/// `stereo` selects the per-pass weight/seed channel multiplicity
-/// (two weights + per-channel seeds per pass for stereo, one each for
-/// mono) per spec §3.6.
-fn append_decorr_metadata(out: &mut Vec<u8>, passes: &[DecorrPass], stereo: bool) -> Result<()> {
-    let _ = (out, passes, stereo);
-    // The forward-decorrelation metadata serializer is staged in a
-    // follow-up: the raw-residual path (empty pass list) is the
-    // landed lossless round-trip. Reaching here with a non-empty pass
-    // list is a not-yet-wired encode configuration.
-    Err(Error::NotImplemented)
 }
 
 #[cfg(test)]
@@ -908,7 +868,7 @@ mod tests {
     #[test]
     fn mono_raw_round_trip_recovers_pcm() {
         let pcm: Vec<i32> = vec![0, 1, -1, 100, -100, 32767, -32768, 5, 5, 5, 0, 0, 12345];
-        let block = encode_block_mono(&pcm, &[], 2, 0, pcm.len() as u32).unwrap();
+        let block = encode_block_mono(&pcm, 2, 0, pcm.len() as u32).unwrap();
         let decoded = decode_stream(&block).unwrap();
         assert_eq!(decoded, pcm);
     }
@@ -918,7 +878,7 @@ mod tests {
     #[test]
     fn stereo_raw_round_trip_recovers_pcm() {
         let pcm: Vec<i32> = vec![0, 0, 1, -1, 100, -100, -5, 5, 32767, -32768, 7, 7];
-        let block = encode_block_stereo(&pcm, &[], 2, 0, (pcm.len() / 2) as u32).unwrap();
+        let block = encode_block_stereo(&pcm, 2, 0, (pcm.len() / 2) as u32).unwrap();
         let decoded = decode_stream(&block).unwrap();
         assert_eq!(decoded, pcm);
     }
@@ -928,7 +888,7 @@ mod tests {
     #[test]
     fn mono_block_header_round_trips_through_parser() {
         let pcm: Vec<i32> = vec![1, 2, 3, 4, 5];
-        let block = encode_block_mono(&pcm, &[], 3, 17, 99).unwrap();
+        let block = encode_block_mono(&pcm, 3, 17, 99).unwrap();
         let (hdr, _payload) = parse_block_header(&block).unwrap();
         assert_eq!(hdr.version, ENCODE_VERSION);
         assert_eq!(hdr.block_samples, 5);
@@ -948,7 +908,7 @@ mod tests {
     #[test]
     fn encoded_block_passes_crc_gate() {
         let pcm: Vec<i32> = vec![3, -2, 5, 0, -7, 42, -42, 1000];
-        let block = encode_block_mono(&pcm, &[], 2, 0, pcm.len() as u32).unwrap();
+        let block = encode_block_mono(&pcm, 2, 0, pcm.len() as u32).unwrap();
         let (decoded, all_ok) = crate::block::decode_stream_muted(&block).unwrap();
         assert!(all_ok, "encoded block must pass its own CRC gate");
         assert_eq!(decoded, pcm);
@@ -959,7 +919,7 @@ mod tests {
     #[test]
     fn mono_metadata_region_is_entropy_then_packed_samples() {
         let pcm: Vec<i32> = vec![10, 20, 30];
-        let block = encode_block_mono(&pcm, &[], 2, 0, 3).unwrap();
+        let block = encode_block_mono(&pcm, 2, 0, 3).unwrap();
         let (_hdr, mut payload) = parse_block_header(&block).unwrap();
         let (first, rest) = parse_metadata_sub_block(payload).unwrap();
         assert_eq!(first.id, SubBlockId::EntropyInfo);
@@ -978,11 +938,11 @@ mod tests {
     #[test]
     fn empty_pcm_is_rejected() {
         assert!(matches!(
-            encode_block_mono(&[], &[], 2, 0, 0),
+            encode_block_mono(&[], 2, 0, 0),
             Err(Error::EncodeEmptyAudio)
         ));
         assert!(matches!(
-            encode_block_stereo(&[], &[], 2, 0, 0),
+            encode_block_stereo(&[], 2, 0, 0),
             Err(Error::EncodeEmptyAudio)
         ));
     }
@@ -991,7 +951,7 @@ mod tests {
     #[test]
     fn stereo_odd_length_is_rejected() {
         assert!(matches!(
-            encode_block_stereo(&[1, 2, 3], &[], 2, 0, 1),
+            encode_block_stereo(&[1, 2, 3], 2, 0, 1),
             Err(Error::EncodeStereoOddLength(3))
         ));
     }
@@ -1001,7 +961,7 @@ mod tests {
     #[test]
     fn unknown_total_samples_round_trips() {
         let pcm: Vec<i32> = vec![7, 8, 9, 10];
-        let block = encode_block_mono(&pcm, &[], 2, 0, TOTAL_SAMPLES_UNKNOWN).unwrap();
+        let block = encode_block_mono(&pcm, 2, 0, TOTAL_SAMPLES_UNKNOWN).unwrap();
         let (hdr, _) = parse_block_header(&block).unwrap();
         assert_eq!(hdr.total_samples_in_file(), None);
         assert_eq!(decode_stream(&block).unwrap(), pcm);
@@ -1015,7 +975,7 @@ mod tests {
         pcm[0] = 1;
         pcm[40] = -3;
         pcm[63] = 7;
-        let block = encode_block_mono(&pcm, &[], 2, 0, pcm.len() as u32).unwrap();
+        let block = encode_block_mono(&pcm, 2, 0, pcm.len() as u32).unwrap();
         assert_eq!(decode_stream(&block).unwrap(), pcm);
     }
 
@@ -1030,7 +990,7 @@ mod tests {
             // Map into a +-20000 range so the words exercise the ladder.
             pcm.push((state >> 16) as i16 as i32 / 3);
         }
-        let block = encode_block_mono(&pcm, &[], 2, 0, pcm.len() as u32).unwrap();
+        let block = encode_block_mono(&pcm, 2, 0, pcm.len() as u32).unwrap();
         assert_eq!(decode_stream(&block).unwrap(), pcm);
     }
 
@@ -1043,7 +1003,7 @@ mod tests {
             state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
             pcm.push((state >> 17) as i16 as i32 / 2);
         }
-        let block = encode_block_stereo(&pcm, &[], 2, 0, (pcm.len() / 2) as u32).unwrap();
+        let block = encode_block_stereo(&pcm, 2, 0, (pcm.len() / 2) as u32).unwrap();
         assert_eq!(decode_stream(&block).unwrap(), pcm);
     }
 
@@ -1406,19 +1366,6 @@ mod tests {
         assert!(matches!(
             encode_block_mono_with_decorr(&pcm, &terms, &weights, &samples, 2, 0, 3),
             Err(Error::InvalidDecorrelationTerm(0))
-        ));
-    }
-
-    /// A non-empty decorrelation pass list is not yet wired (the
-    /// metadata serializer is staged); it surfaces NotImplemented rather
-    /// than silently dropping the passes.
-    #[test]
-    fn decorrelation_pass_list_is_not_yet_wired() {
-        let pcm: Vec<i32> = vec![1, 2, 3, 4];
-        let pass = DecorrPass::new(1, 1, 0, 0, &[0], &[]).unwrap();
-        assert!(matches!(
-            encode_block_mono(&pcm, std::slice::from_ref(&pass), 2, 0, 4),
-            Err(Error::NotImplemented)
         ));
     }
 }

@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Round 372 — `encode_block_mono` / `encode_block_stereo` dropped their
+  `passes: &[DecorrPass]` parameter (all added this same round, unreleased)
+  and are now the raw (no-decorrelation) lossless path only. Decorrelated
+  blocks go through the `*_with_decorr` payload entry points (the bit-exact
+  verbatim-payload path); the staged `Error::NotImplemented` decorr branch
+  is gone.
+
 ### Added
 
 - Round 372 — **sub-byte bit-depth (left-shift) block encode**.
