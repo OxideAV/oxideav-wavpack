@@ -8,6 +8,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 372 — **multi-block `.wv` stream encode**. `encode_stream_mono` /
+  `encode_stream_stereo` split a long PCM buffer into a chain of `wvpk`
+  blocks (default `DEFAULT_BLOCK_SAMPLES = 22050` per-channel samples per
+  block, caller-overridable), each with its `block_index` set to the
+  running per-channel sample offset and the file-global `total_samples`,
+  so the chain is a well-formed standalone file the stream walker decodes
+  back exactly: `decode_stream(&encode_stream_mono(pcm, …)?)? == pcm`. An
+  empty buffer yields an empty stream (a no-audio file); a `block_samples`
+  of `0` falls back to the default chunk. New exports:
+  `encode_stream_mono`, `encode_stream_stereo`, `DEFAULT_BLOCK_SAMPLES`. 6
+  new tests (795 total): mono + stereo multi-block round-trip over
+  pseudo-random buffers, block_index advancement, empty-stream, default-
+  chunk fallback, and the odd-length refusal arm.
+
 - Round 372 — **first complete encode → decode lossless round-trip**: the
   `encode` module assembles a whole `wvpk` block from a PCM buffer.
 

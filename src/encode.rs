@@ -367,6 +367,86 @@ pub fn encode_block_stereo(
     )
 }
 
+/// Default per-block sample count the stream encoders split a long PCM
+/// buffer into. A whole `.wv` file is a chain of `wvpk` blocks — the
+/// walker ([`crate::block::iter_decoded_blocks`]) concatenates their PCM
+/// — so a streaming encoder emits one block per fixed-size chunk. The
+/// value is a per-channel sample count (the wiki "samples in this block"
+/// header field), comfortably below the
+/// [`crate::block::MAX_DECODE_SAMPLES_PER_BLOCK`] decode ceiling.
+pub const DEFAULT_BLOCK_SAMPLES: usize = 22_050;
+
+/// Encode a mono PCM buffer into a multi-block `.wv` byte stream — a
+/// chain of `wvpk` blocks each carrying up to `block_samples` samples,
+/// in the order [`crate::block::decode_stream`] concatenates them.
+///
+/// Each block's `block_index` is set to the running per-channel sample
+/// offset (the wiki "offset in samples for current block" field) and
+/// every block carries the same file-global `total_samples`
+/// (`pcm.len()`), so the chain is a well-formed standalone file the
+/// stream walker decodes back to `pcm` exactly:
+/// `decode_stream(&encode_stream_mono(pcm, …)?)? == pcm`.
+///
+/// `block_samples` of `0` is treated as [`DEFAULT_BLOCK_SAMPLES`]. An
+/// empty `pcm` yields an empty stream (no blocks) rather than an error —
+/// a file with no audio.
+pub fn encode_stream_mono(
+    pcm: &[i32],
+    block_samples: usize,
+    bytes_per_sample: u8,
+) -> Result<Vec<u8>> {
+    let chunk = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(chunk) {
+        let block = encode_block_mono(window, &[], bytes_per_sample, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add(window.len() as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
+/// Encode an interleaved stereo PCM buffer into a multi-block `.wv` byte
+/// stream. The stereo twin of [`encode_stream_mono`]: `block_samples` is
+/// a per-channel pair count, so each block (bar the last) carries
+/// `block_samples * 2` interleaved `i32`s. The interleaved length must be
+/// even (whole `[L, R]` pairs).
+///
+/// `decode_stream(&encode_stream_stereo(pcm, …)?)? == pcm` exactly.
+pub fn encode_stream_stereo(
+    pcm: &[i32],
+    block_samples: usize,
+    bytes_per_sample: u8,
+) -> Result<Vec<u8>> {
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let pairs = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    // Two i32s per pair, so the interleaved chunk size is `pairs * 2`.
+    for window in pcm.chunks(pairs * 2) {
+        let block = encode_block_stereo(window, &[], bytes_per_sample, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add((window.len() / 2) as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
 /// Serialize the `0x02` (terms), `0x03` (weights) and `0x04` (seed
 /// samples) decorrelation metadata for a forward pass list into `out`.
 ///
@@ -539,6 +619,87 @@ mod tests {
         }
         let block = encode_block_stereo(&pcm, &[], 2, 0, (pcm.len() / 2) as u32).unwrap();
         assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// A multi-block mono stream round-trips: a PCM buffer longer than the
+    /// per-block chunk splits into several `wvpk` blocks the walker
+    /// concatenates back to the exact input.
+    #[test]
+    fn mono_multi_block_stream_round_trips() {
+        let mut pcm = Vec::with_capacity(1000);
+        let mut state: u32 = 0xDEAD_BEEF;
+        for _ in 0..1000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pcm.push((state >> 18) as i16 as i32 / 4);
+        }
+        // 7 samples per block forces ~143 blocks.
+        let stream = encode_stream_mono(&pcm, 7, 2).unwrap();
+        assert_eq!(decode_stream(&stream).unwrap(), pcm);
+        // More than one block was emitted.
+        assert!(crate::block::audio_block_count(&stream).unwrap() > 1);
+    }
+
+    /// A multi-block mono stream's block_index fields advance by each
+    /// block's sample count, and every block carries the file total.
+    #[test]
+    fn mono_stream_block_indices_advance() {
+        let pcm: Vec<i32> = (0..25).collect();
+        let stream = encode_stream_mono(&pcm, 10, 2).unwrap();
+        let mut payload = stream.as_slice();
+        let mut expected_index = 0u32;
+        let mut seen = 0;
+        while !payload.is_empty() {
+            let (hdr, _) = parse_block_header(payload).unwrap();
+            assert_eq!(hdr.block_index, expected_index);
+            assert_eq!(hdr.total_samples, 25);
+            expected_index += hdr.block_samples;
+            payload = &payload[8 + hdr.ck_size as usize..];
+            seen += 1;
+        }
+        assert_eq!(seen, 3); // 10 + 10 + 5
+        assert_eq!(expected_index, 25);
+    }
+
+    /// A multi-block stereo stream round-trips.
+    #[test]
+    fn stereo_multi_block_stream_round_trips() {
+        let mut pcm = Vec::with_capacity(800);
+        let mut state: u32 = 0x0BAD_F00D;
+        for _ in 0..800 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            pcm.push((state >> 19) as i16 as i32 / 3);
+        }
+        // 11 pairs per block.
+        let stream = encode_stream_stereo(&pcm, 11, 2).unwrap();
+        assert_eq!(decode_stream(&stream).unwrap(), pcm);
+        assert!(crate::block::audio_block_count(&stream).unwrap() > 1);
+    }
+
+    /// An empty PCM buffer yields an empty stream (a file with no audio),
+    /// not an error.
+    #[test]
+    fn empty_stream_is_empty_not_an_error() {
+        assert!(encode_stream_mono(&[], 0, 2).unwrap().is_empty());
+        assert!(encode_stream_stereo(&[], 0, 2).unwrap().is_empty());
+    }
+
+    /// A block-samples of 0 falls back to the default chunk size and still
+    /// round-trips (a single block for a short buffer).
+    #[test]
+    fn zero_block_samples_uses_default_chunk() {
+        let pcm: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let stream = encode_stream_mono(&pcm, 0, 2).unwrap();
+        assert_eq!(decode_stream(&stream).unwrap(), pcm);
+        assert_eq!(crate::block::audio_block_count(&stream).unwrap(), 1);
+    }
+
+    /// An odd-length interleaved stereo stream is rejected.
+    #[test]
+    fn stereo_stream_odd_length_is_rejected() {
+        assert!(matches!(
+            encode_stream_stereo(&[1, 2, 3], 0, 2),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
     }
 
     /// A non-empty decorrelation pass list is not yet wired (the

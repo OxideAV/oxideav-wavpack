@@ -100,6 +100,13 @@ Working surface:
   `Error::NotImplemented`). Hybrid / float / int32 / multichannel block
   emission stay out of scope (the decoder refuses them; their wire layout
   is a documented spec gap). Exported: `ENCODE_VERSION`.
+* **Multi-block stream encode** — `encode_stream_mono` /
+  `encode_stream_stereo` split a long PCM buffer into a chain of `wvpk`
+  blocks (default `DEFAULT_BLOCK_SAMPLES`, caller-overridable per-channel
+  chunk size), each carrying the running `block_index` sample offset and
+  the file-global `total_samples`, so the chain is a standalone `.wv` file
+  the stream walker decodes back exactly:
+  `decode_stream(&encode_stream_mono(pcm, …)?)? == pcm`.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
