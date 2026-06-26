@@ -274,6 +274,20 @@ pub enum Error {
     /// documented gap). The raw post-decorrelation fold is correct only
     /// for the non-cross, non-shaped case.
     HybridFoldPlacementUnsupported,
+    /// A block-encode was requested with an empty PCM buffer. A WavPack
+    /// audio block carries `block_samples >= 1` (the wiki "samples in
+    /// this block" field is non-zero for an audio block); an encoder
+    /// emitting a zero-sample audio block has nothing to pack.
+    EncodeEmptyAudio,
+    /// A stereo block-encode was requested with an odd number of
+    /// interleaved samples. The stereo wire layout is whole `[L, R]`
+    /// pairs, so the interleaved buffer length must be even.
+    EncodeStereoOddLength(usize),
+    /// A block-encode produced a metadata region whose byte length
+    /// overflows the 24-bit `ck_size` field (the wiki "total block size"
+    /// header word). A single block cannot carry this much data; split
+    /// the PCM across multiple blocks.
+    EncodeBlockTooLarge(usize),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -392,6 +406,17 @@ impl core::fmt::Display for Error {
             ),
             Error::HybridFoldPlacementUnsupported => f.write_str(
                 "oxideav-wavpack: hybrid correction-fold requested on a CROSS_DECORR / noise-shaped block — only the non-cross, non-shaped post-decorrelation raw fold is supported",
+            ),
+            Error::EncodeEmptyAudio => f.write_str(
+                "oxideav-wavpack: encode_block: empty PCM buffer (an audio block carries block_samples >= 1)",
+            ),
+            Error::EncodeStereoOddLength(n) => write!(
+                f,
+                "oxideav-wavpack: encode_block: stereo PCM has {n} interleaved samples (must be an even count of [L, R] pairs)"
+            ),
+            Error::EncodeBlockTooLarge(n) => write!(
+                f,
+                "oxideav-wavpack: encode_block: metadata region is {n} bytes, overflowing the 24-bit ck_size field"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

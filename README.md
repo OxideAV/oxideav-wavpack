@@ -82,6 +82,24 @@ Working surface:
   afterward (and skipped on a muted/zeroed block). Pinned by mono and
   stereo decode tests at several shift counts, the pre-shift-CRC fold (and
   its post-shift-CRC negative), and a whole-byte-depth identity guard.
+* **Block encode (lossless round-trip)** — `encode_block_mono` /
+  `encode_block_stereo` assemble a whole `wvpk` block from a PCM buffer:
+  the 32-byte fixed header (spec §5 running CRC folded over the PCM, flag
+  word reconstructed from the block shape, version `0x0410`, standalone
+  multichannel marker so the decoder does not treat the block as a
+  multichannel member) followed by the `0x05` entropy-info and `0x0A`
+  packed-samples metadata sub-blocks (framed by the forward inverse of
+  `parse_metadata_sub_block` — word-count size field, large-size escape,
+  odd-size pad). The headline guarantee is
+  `decode_stream(&encode_block_mono(pcm, &[], …)?)? == pcm` (and the
+  stereo twin): the encoded block parses, passes its own §5.6 CRC mute
+  gate, and reconstructs the exact input PCM. Covers the raw-residual
+  (no-decorrelation) lossless path for mono / false-stereo and plain
+  (non-joint) stereo; the forward-decorrelation `0x02`/`0x03`/`0x04`
+  metadata serializer is staged (refuses a non-empty pass list with
+  `Error::NotImplemented`). Hybrid / float / int32 / multichannel block
+  emission stay out of scope (the decoder refuses them; their wire layout
+  is a documented spec gap). Exported: `ENCODE_VERSION`.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder

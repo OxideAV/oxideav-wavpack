@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 372 — **first complete encode → decode lossless round-trip**: the
+  `encode` module assembles a whole `wvpk` block from a PCM buffer.
+
+  `encode_block_mono(pcm, passes, bytes_per_sample, block_index,
+  total_samples)` and `encode_block_stereo(...)` frame the existing leaf
+  encoders (the §4.2 modified-Rice `encode_packed_samples_*` entropy writer
+  and the §3 `recorrelate_*` forward-prediction loop) into the wire byte
+  layout — a 32-byte fixed header (spec §5 running CRC folded over the PCM,
+  flags reconstructed from the block shape, version `0x0410`, standalone
+  multichannel marker) followed by the `0x05` entropy-info and `0x0A`
+  packed-samples metadata sub-blocks. The headline guarantee:
+  `decode_stream(&encode_block_mono(pcm, &[], …)?)? == pcm` (and the stereo
+  twin) — an encoded block parses, passes its own CRC mute gate, and
+  reconstructs the exact input PCM. Covers the raw-residual (no
+  decorrelation) lossless path for mono / false-stereo and plain
+  (non-joint) stereo blocks; the forward-decorrelation `0x02`/`0x03`/`0x04`
+  metadata serializer (`append_decorr_metadata`) is staged and refuses a
+  non-empty pass list with `Error::NotImplemented`. New exports:
+  `encode_block_mono`, `encode_block_stereo`, `ENCODE_VERSION`. New error
+  arms: `EncodeEmptyAudio`, `EncodeStereoOddLength`, `EncodeBlockTooLarge`.
+  12 new tests (789 total, up from 777): mono + stereo round-trip
+  (including 500/600-sample pseudo-random buffers + a zero-run-heavy
+  buffer), CRC-gate pass, header parse round-trip, sub-block ordering,
+  unknown-total preservation, and the empty / odd-length / not-yet-wired
+  refusal arms.
+
 - Round 367 — forward (encode) block-level hybrid correction split.
 
   `WavPackBlock::split_hybrid_correction(original, lossy)` is the exact
