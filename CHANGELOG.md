@@ -8,6 +8,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 372 — **sub-byte bit-depth (left-shift) block encode**.
+  `encode_block_mono_shifted` / `encode_block_stereo_shifted` encode audio
+  whose bit-depth is not a whole number of bytes (12-bit, 20-bit, …):
+  the encoder right-shifts each container-scaled sample by `left_shift`
+  (the inverse of the decoder's §1-pipeline final
+  `apply_left_shift_buffer`), folds the §5 CRC over the narrow values,
+  entropy-codes them, and sets the wiki flag-bits-13..=17 `left_shift`
+  field — so the decoder reconstructs `narrow << left_shift` and recovers
+  the input exactly: `decode_stream(&out)? == pcm`. Inputs must be a
+  multiple of `2^left_shift` (genuine sub-byte audio); a lossy low bit is
+  refused (`EncodeLeftShiftLosesData`), as is `left_shift == 0`
+  (`EncodeLeftShiftZero`). New exports: `encode_block_mono_shifted`,
+  `encode_block_stereo_shifted`. 4 new tests (811 total): 12-bit mono +
+  20-bit stereo round-trip with the flag check, and the zero-shift /
+  lossy-low-bit refusals.
+
 - Round 372 — **joint (mid/side) stereo block encode**.
   `encode_block_stereo_joint` applies the forward mid/side transform
   (`mid = L - R; side = R + (mid >> 1)`, the exact inverse of the decoder's

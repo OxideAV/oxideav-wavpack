@@ -111,6 +111,13 @@ Working surface:
   (`decode_stream(&out)? == pcm`) for fixed-lag (`1..8`), extrapolate
   (`17`/`18`) and stereo cross (`-1`/`-2`/`-3`) terms, single- and
   multi-pass.
+* **Sub-byte-depth (left-shift) encode** — `encode_block_mono_shifted` /
+  `encode_block_stereo_shifted` right-shift each container-scaled sample
+  by `left_shift` (inverse of the decoder's final §1
+  `apply_left_shift_buffer`), fold the §5 CRC over the narrow values, and
+  set the wiki flag-bits-13..=17 field, so 12-bit / 20-bit audio round-
+  trips exactly. Inputs must be a multiple of `2^left_shift`; a lossy low
+  bit is refused.
 * **Joint (mid/side) stereo encode** — `encode_block_stereo_joint`
   applies the forward mid/side transform (`mid = L - R; side = R + (mid >>
   1)`, the exact inverse of the decoder's §5.4 `undo_joint_stereo`) and

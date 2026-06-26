@@ -309,6 +309,161 @@ pub fn encode_block_mono(
     )
 }
 
+/// Right-shift a container-scaled PCM buffer by `left_shift` in place,
+/// recovering the narrow sample values the decoder's prediction loop
+/// reconstructs (the buffer the §5 CRC is folded over and the entropy
+/// stream carries). The exact inverse of the decoder's §1 pipeline final
+/// stage [`crate::fixup::apply_left_shift_buffer`].
+///
+/// Every sample must already be a multiple of `2^left_shift` (its low
+/// `left_shift` bits zero) — the decode reconstructs the container value
+/// as `narrow << left_shift`, so a non-zero low bit would be lost.
+/// [`Error::EncodeLeftShiftLosesData`] names the first offending sample.
+fn narrow_left_shift(buffer: &mut [i32], left_shift: u8) -> Result<()> {
+    let mask: i32 = (1i32 << left_shift) - 1;
+    for s in buffer.iter_mut() {
+        if *s & mask != 0 {
+            return Err(Error::EncodeLeftShiftLosesData(*s));
+        }
+        *s >>= left_shift;
+    }
+    Ok(())
+}
+
+/// Set the wiki flag-bits-13..=17 `left_shift` field in a flag word.
+fn with_left_shift(flags_raw: u32, left_shift: u8) -> u32 {
+    flags_raw | ((u32::from(left_shift) & 0b1_1111) << 13)
+}
+
+/// Encode a mono PCM buffer at a **sub-byte bit-depth** (e.g. 12-bit,
+/// 20-bit) into one complete `wvpk` block, setting the wiki
+/// flag-bits-13..=17 `left_shift` field so the decoder restores the
+/// container scale.
+///
+/// `left_shift` (`1..=31`) is the number of low zero bits the container
+/// format pads the narrow samples with. The encoder right-shifts each
+/// sample by `left_shift` (the inverse of the decoder's final §1
+/// normalization), folds the §5 CRC over those narrow values, and entropy-
+/// codes them; the decoder reads the narrow stream, verifies the CRC over
+/// the pre-shift buffer, then left-shifts back to the container scale —
+/// recovering `pcm` exactly: `decode_stream(&out)? == pcm`.
+///
+/// Every input sample must be a multiple of `2^left_shift` (its low
+/// `left_shift` bits zero, as genuine sub-byte-depth audio is); otherwise
+/// the shift would drop data and [`Error::EncodeLeftShiftLosesData`] is
+/// returned. A `left_shift` of `0` is rejected
+/// ([`Error::EncodeLeftShiftZero`]) — use [`encode_block_mono`] for the
+/// whole-byte case.
+pub fn encode_block_mono_shifted(
+    pcm: &[i32],
+    left_shift: u8,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if left_shift == 0 {
+        return Err(Error::EncodeLeftShiftZero);
+    }
+
+    // Narrow the container-scaled PCM to the values the decoder
+    // reconstructs *before* its final left-shift; the §5 CRC folds these.
+    let mut narrow = pcm.to_vec();
+    narrow_left_shift(&mut narrow, left_shift)?;
+    let crc = crate::crc::crc_mono(&narrow);
+
+    let flags_raw = with_left_shift(base_flags(bytes_per_sample) | (1 << 2), left_shift);
+    let mut metadata = Vec::new();
+
+    let entropy_payload = pack_entropy_info(&[[0, 0, 0]]);
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::EntropyInfo.as_id_byte(),
+        &entropy_payload,
+    )?;
+
+    let mut medians = AdaptiveMedians::new([0, 0, 0]);
+    let packed = encode_packed_samples_mono(&narrow, &mut medians)?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::PackedSamples.as_id_byte(),
+        &packed,
+    )?;
+
+    let block_samples =
+        u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    build_block(
+        metadata,
+        block_index,
+        total_samples,
+        block_samples,
+        flags_raw,
+        crc,
+    )
+}
+
+/// Encode an interleaved stereo PCM buffer at a sub-byte bit-depth into
+/// one complete `wvpk` block — the stereo twin of
+/// [`encode_block_mono_shifted`]. The interleaved length must be even.
+/// `decode_stream(&out)? == pcm` exactly.
+pub fn encode_block_stereo_shifted(
+    pcm: &[i32],
+    left_shift: u8,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    if left_shift == 0 {
+        return Err(Error::EncodeLeftShiftZero);
+    }
+
+    let mut narrow = pcm.to_vec();
+    narrow_left_shift(&mut narrow, left_shift)?;
+    let crc = crate::crc::crc_stereo_interleaved(&narrow);
+
+    let flags_raw = with_left_shift(base_flags(bytes_per_sample), left_shift);
+    let mut metadata = Vec::new();
+
+    let left_seed = [0, 0, 0];
+    let right_seed = [0, 0, 1];
+    let entropy_payload = pack_entropy_info(&[left_seed, right_seed]);
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::EntropyInfo.as_id_byte(),
+        &entropy_payload,
+    )?;
+
+    let mut medians = [
+        AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
+        AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
+    ];
+    let packed = encode_packed_samples_stereo(&narrow, &mut medians)?;
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::PackedSamples.as_id_byte(),
+        &packed,
+    )?;
+
+    let block_samples =
+        u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    build_block(
+        metadata,
+        block_index,
+        total_samples,
+        block_samples,
+        flags_raw,
+        crc,
+    )
+}
+
 /// Encode a mono PCM buffer into one complete `wvpk` block that carries a
 /// **decorrelation pass list described by its raw `0x02`/`0x03`/`0x04`
 /// metadata payloads** — the lossless-with-decorrelation encode path.
@@ -970,6 +1125,57 @@ mod tests {
         assert!(matches!(
             encode_stream_stereo(&[1, 2, 3], 0, 2),
             Err(Error::EncodeStereoOddLength(3))
+        ));
+    }
+
+    // ---- sub-byte-depth (left-shift) encode ----
+
+    /// A 12-bit mono buffer (values shifted left into a 16-bit container)
+    /// round-trips through the left-shift encode path.
+    #[test]
+    fn mono_shifted_round_trips() {
+        // 12-bit samples (in -2048..=2047) scaled into a 16-bit container
+        // by << 4 (left_shift = 4).
+        let narrow = [0i32, 1, -1, 2047, -2048, 100, -100, 500];
+        let pcm: Vec<i32> = narrow.iter().map(|&v| v << 4).collect();
+        let block = encode_block_mono_shifted(&pcm, 4, 2, 0, pcm.len() as u32).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+        let (hdr, _) = parse_block_header(&block).unwrap();
+        assert_eq!(hdr.flags.left_shift, 4);
+    }
+
+    /// A 20-bit stereo buffer (<< 12 into a 32-bit container) round-trips.
+    #[test]
+    fn stereo_shifted_round_trips() {
+        let narrow = [0i32, 5, -7, 1000, -1000, 524287, -524288, 42];
+        let pcm: Vec<i32> = narrow.iter().map(|&v| v << 12).collect();
+        let block = encode_block_stereo_shifted(&pcm, 12, 4, 0, (pcm.len() / 2) as u32).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+        let (hdr, _) = parse_block_header(&block).unwrap();
+        assert_eq!(hdr.flags.left_shift, 12);
+    }
+
+    /// A left-shift of 0 is rejected (use the whole-byte encoder).
+    #[test]
+    fn shifted_rejects_zero_shift() {
+        assert!(matches!(
+            encode_block_mono_shifted(&[16, 32], 0, 2, 0, 2),
+            Err(Error::EncodeLeftShiftZero)
+        ));
+        assert!(matches!(
+            encode_block_stereo_shifted(&[16, 32], 0, 2, 0, 1),
+            Err(Error::EncodeLeftShiftZero)
+        ));
+    }
+
+    /// A sample whose low bits the shift would drop is rejected (the
+    /// encode would not be lossless).
+    #[test]
+    fn shifted_rejects_lossy_low_bits() {
+        // 0b101 has a set bit below left_shift = 2.
+        assert!(matches!(
+            encode_block_mono_shifted(&[0b100, 0b101], 2, 2, 0, 2),
+            Err(Error::EncodeLeftShiftLosesData(0b101))
         ));
     }
 

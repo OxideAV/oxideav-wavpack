@@ -288,6 +288,17 @@ pub enum Error {
     /// header word). A single block cannot carry this much data; split
     /// the PCM across multiple blocks.
     EncodeBlockTooLarge(usize),
+    /// A left-shift (sub-byte bit-depth) block-encode was requested with
+    /// a `left_shift` of `0`. The shifted encoders are for genuine
+    /// non-whole-byte depths (12-bit, 20-bit, …); a shift of `0` is the
+    /// whole-byte case the plain encoders already cover.
+    EncodeLeftShiftZero,
+    /// A left-shift block-encode was given a sample whose low `left_shift`
+    /// bits are non-zero. The decoder reconstructs the container value as
+    /// `narrow << left_shift`, so the input must already be a multiple of
+    /// `2^left_shift` (its low bits zero) or the encode would not be
+    /// lossless. The offending sample value is carried for diagnostics.
+    EncodeLeftShiftLosesData(i32),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -417,6 +428,13 @@ impl core::fmt::Display for Error {
             Error::EncodeBlockTooLarge(n) => write!(
                 f,
                 "oxideav-wavpack: encode_block: metadata region is {n} bytes, overflowing the 24-bit ck_size field"
+            ),
+            Error::EncodeLeftShiftZero => f.write_str(
+                "oxideav-wavpack: encode_block_*_shifted: left_shift == 0 (use the plain whole-byte encoder)",
+            ),
+            Error::EncodeLeftShiftLosesData(v) => write!(
+                f,
+                "oxideav-wavpack: encode_block_*_shifted: sample {v} has non-zero low bits that left_shift would drop (input must be a multiple of 2^left_shift)"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",
