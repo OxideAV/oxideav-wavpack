@@ -17,6 +17,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 378 — **multichannel grouping decode**. A WavPack stream carrying
+  more than two channels splits each frame range across a *set* of member
+  blocks (wiki bits 11..=12: a first-block member opens the set, a
+  final-block member closes it, continuation members sit between). Each
+  member is an ordinary 1-channel (mono / false-stereo) or 2-channel
+  (stereo) block and decodes through the same lossless path standalone
+  blocks use — the grouping marker is a stream-shape signal, not a
+  decode-arithmetic one. New `decode_multichannel_stream` walks the member
+  blocks, decodes each via the new `WavPackBlock::decode_member_samples`
+  (which accepts the grouping marker instead of refusing it as
+  `MultichannelMember`), and interleaves the set's channels per frame into
+  a `DecodedStream { samples, channels }`. Standalone mono / stereo files
+  decode identically to `decode_stream` (with `channels` reported as 1 /
+  2); malformed grouping (stray final marker, unterminated set, per-member
+  `block_samples` disagreement, channel-count blowup) is refused with the
+  new typed errors `MultichannelSetMalformed` /
+  `MultichannelSampleCountMismatch` / `MultichannelTooManyChannels`.
+  Exported: `decode_multichannel_stream`, `DecodedStream`,
+  `WavPackBlock::decode_member_samples`, `MAX_MULTICHANNEL_CHANNELS`.
+
 - Round 372 — **sub-byte bit-depth (left-shift) block encode**.
   `encode_block_mono_shifted` / `encode_block_stereo_shifted` encode audio
   whose bit-depth is not a whole number of bytes (12-bit, 20-bit, …):

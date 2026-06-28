@@ -76,6 +76,19 @@ use crate::samples::{
 /// engineering bound, not a spec-mandated limit.
 pub const MAX_DECODE_SAMPLES_PER_BLOCK: u32 = 1 << 26;
 
+/// Maximum number of decoded channels a single multichannel set may sum
+/// to before [`decode_multichannel_stream`] refuses it with
+/// [`Error::MultichannelTooManyChannels`](crate::Error::MultichannelTooManyChannels).
+///
+/// A multichannel set is a run of 1- or 2-channel member blocks (wiki
+/// bits 11..=12 grouping); the sum of their channel counts is the
+/// interleaved frame width. WavPack's Microsoft-channel-mask carriage is
+/// a 32-bit mask, so 32 distinct speaker positions is the natural ceiling
+/// for a well-formed file; this bound guards against a malformed stream
+/// chaining unbounded members before the interleave buffer is sized. A
+/// defensive engineering bound, not a spec-mandated limit. Round 378.
+pub const MAX_MULTICHANNEL_CHANNELS: usize = 256;
+
 /// Named WavPack v.4 feature the round-15/199 per-sample loop does not
 /// yet support, surfaced through
 /// [`Error::UnsupportedBlockFeature`](crate::Error::UnsupportedBlockFeature)
@@ -766,6 +779,26 @@ impl<'a> WavPackBlock<'a> {
     /// this pre-shift buffer directly so the comparison matches the stored
     /// header CRC, then apply the shift to whatever PCM they return.
     fn decode_samples_preshift(&self) -> Result<Vec<i32>> {
+        self.decode_samples_preshift_inner(false)
+    }
+
+    /// Shared pre-shift decode body for both the standalone-block path
+    /// ([`Self::decode_samples_preshift`], `allow_member == false`) and the
+    /// multichannel-member path ([`Self::decode_member_preshift`],
+    /// `allow_member == true`).
+    ///
+    /// The only difference between a standalone block and a member of a
+    /// multi-block multichannel set is the wiki bits-11..=12 grouping
+    /// marker: the marker is a *stream-shape* signal (where this member's
+    /// channels sit in the interleaved frame), not a decode-arithmetic
+    /// signal. Every per-sample step — entropy decode, decorrelation,
+    /// joint-stereo undo, the §5 CRC fold and the final left-shift — is
+    /// identical for a member and a standalone block of the same channel
+    /// shape. So the member path reuses this whole body verbatim and only
+    /// suppresses the [`UnsupportedBlockFeature::MultichannelMember`]
+    /// refusal; the grouping itself is reassembled one layer up by
+    /// [`decode_multichannel_stream`].
+    fn decode_samples_preshift_inner(&self, allow_member: bool) -> Result<Vec<i32>> {
         let header = &self.header;
         let flags = &header.flags;
 
@@ -803,7 +836,7 @@ impl<'a> WavPackBlock<'a> {
                 UnsupportedBlockFeature::LowLatencyBlock,
             ));
         }
-        if flags.is_multichannel_member() {
+        if flags.is_multichannel_member() && !allow_member {
             return Err(Error::UnsupportedBlockFeature(
                 UnsupportedBlockFeature::MultichannelMember,
             ));
@@ -905,6 +938,57 @@ impl<'a> WavPackBlock<'a> {
             }
             Ok(residuals)
         }
+    }
+
+    /// `true` when this block carries `1` decoded channel (mono / false-
+    /// stereo, the [`Flags::is_block_data_mono`] union), `false` when it
+    /// carries `2` (interleaved stereo). The per-member channel count a
+    /// multichannel set sums over its members. Round 378.
+    fn member_channel_count(&self) -> usize {
+        if self.header.flags.is_block_data_mono() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Decode a **multichannel-set member** block's PCM up to but not
+    /// including the final left-shift fixup.
+    ///
+    /// Identical to [`Self::decode_samples_preshift`] except the
+    /// wiki-bits-11..=12 grouping marker is accepted instead of refused —
+    /// the marker is a stream-shape signal, not a decode-arithmetic one
+    /// (see [`Self::decode_samples_preshift_inner`]). The returned buffer
+    /// is the member's own channels in this block's shape (one `i32` per
+    /// sample for a 1-channel member, interleaved `L,R` for a 2-channel
+    /// member), in the pre-shift form the §5 CRC is folded over.
+    /// Round 378.
+    fn decode_member_preshift(&self) -> Result<Vec<i32>> {
+        self.decode_samples_preshift_inner(true)
+    }
+
+    /// Decode a **multichannel-set member** block's PCM, with the final
+    /// left-shift normalization applied (the public-PCM form).
+    ///
+    /// This is the member twin of [`Self::decode_samples`]: it decodes a
+    /// block that participates in a multi-block multichannel grouping
+    /// (wiki bits 11..=12 ≠ `0b11`) without raising
+    /// [`UnsupportedBlockFeature::MultichannelMember`], returning the
+    /// member's own `1` or `2` channels. A standalone block (marker
+    /// `0b11`) is also accepted — the result is then exactly
+    /// [`Self::decode_samples`]. Callers reassembling a full multichannel
+    /// frame interleave the per-member buffers via
+    /// [`decode_multichannel_stream`]; this method is the per-member leg.
+    ///
+    /// All other refusals ([`UnsupportedBlockFeature::Hybrid`],
+    /// `FloatData`, `Int32Mode`, `LowLatencyBlock`, `RobustBlock`,
+    /// `CrossChannelDecorrelation`) and structural errors still fire — a
+    /// member exercising those is no more decodable than a standalone
+    /// block that does. Round 378.
+    pub fn decode_member_samples(&self) -> Result<Vec<i32>> {
+        let mut pcm = self.decode_member_preshift()?;
+        crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
+        Ok(pcm)
     }
 
     /// Decode this block's PCM ([`Self::decode_samples`]) and verify the
@@ -1950,6 +2034,185 @@ pub fn decode_stream_muted(bytes: &[u8]) -> Result<(Vec<i32>, bool)> {
         out.extend_from_slice(&pcm);
     }
     Ok((out, all_crc_ok))
+}
+
+/// Decoded shape of a WavPack stream: the interleaved PCM plus the
+/// channel count of one interleaved frame.
+///
+/// [`decode_multichannel_stream`] returns this so a caller knows how to
+/// de-interleave the flat `samples` buffer: it holds whole frames of
+/// `channels` `i32`s each, in speaker order (the wiki bits-11..=12 member
+/// order — first-block member's channels first, then each continuation
+/// member, then the final-block member). For a plain mono file
+/// `channels == 1`; for plain stereo `channels == 2`; for a multichannel
+/// file `channels` is the per-frame sum across one set's members.
+/// Round 378.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedStream {
+    /// Interleaved PCM, `samples.len() == frames * channels`.
+    pub samples: Vec<i32>,
+    /// Number of channels in one interleaved frame.
+    pub channels: usize,
+}
+
+/// Decode a WavPack byte buffer that may carry **multichannel** audio
+/// (more than two channels grouped across member blocks) into a single
+/// interleaved [`DecodedStream`].
+///
+/// A multichannel WavPack file does not pack all channels into one block.
+/// Instead each frame range is split across a *set* of member blocks: the
+/// wiki bit-11 ("first block of multi-channel set") member opens the set,
+/// zero or more continuation members (neither marker) follow, and the
+/// wiki bit-12 ("last block of set") member closes it. Each member is an
+/// ordinary 1-channel (mono / false-stereo) or 2-channel (stereo) block
+/// and is decoded by the same lossless path standalone blocks use
+/// ([`WavPackBlock::decode_member_samples`]) — the grouping marker is a
+/// stream-shape signal, not a decode-arithmetic one. The set's channels
+/// are then the members' channels concatenated in member order, and the
+/// set's PCM is those channels interleaved per frame.
+///
+/// Shape contract:
+///
+/// * **Plain mono / stereo file** — every block is a standalone set
+///   (marker `0b11`); the result is identical to [`decode_stream`] with
+///   `channels` reported as `1` or `2`. (A file that mixes block shapes
+///   across sets keeps the first set's per-frame channel count as the
+///   stream's `channels`; see the mismatch refusal below.)
+/// * **Multichannel file** — `channels` is the summed per-frame channel
+///   count of one set's members, and `samples` holds whole interleaved
+///   frames.
+///
+/// Members of one set must agree on `block_samples` (they are the same
+/// frames' channels) — a mismatch raises
+/// [`Error::MultichannelSampleCountMismatch`]. A stray bit-12 marker with
+/// no open set, or a stream that ends mid-set, raises
+/// [`Error::MultichannelSetMalformed`]. A set whose summed channel count
+/// exceeds [`MAX_MULTICHANNEL_CHANNELS`] raises
+/// [`Error::MultichannelTooManyChannels`]. Per-member decode and parse
+/// errors propagate verbatim. Metadata-only blocks (`block_samples == 0`)
+/// are skipped and do not participate in a set.
+///
+/// All sets in a well-formed file carry the same per-frame channel count;
+/// this function reports the **first** set's count as the stream
+/// `channels` and concatenates every set's interleaved frames. Round 378.
+pub fn decode_multichannel_stream(bytes: &[u8]) -> Result<DecodedStream> {
+    // Per-set accumulator: the decoded per-member channel buffers of the
+    // currently-open set, plus the set's agreed frame count.
+    //
+    // Each member contributes its own `1` or `2` channel buffers; a set's
+    // interleaved output reads frame `f` as
+    // `[ch0[f], ch1[f], …, chN[f]]` across the members in wire order.
+    let mut out: Vec<i32> = Vec::new();
+    let mut stream_channels: Option<usize> = None;
+
+    // The channels of the currently-open set, each as a flat per-channel
+    // buffer of `frame_count` samples. `None` => no set is open.
+    let mut open_channels: Option<Vec<Vec<i32>>> = None;
+    let mut open_frames: u32 = 0;
+
+    for parsed in iter_blocks(bytes) {
+        let block = parsed?;
+        if !block.header.is_audio_block() {
+            // Metadata-only block: no PCM, not a set member. Per the wiki
+            // "Block structure" allowance for block_samples == 0.
+            continue;
+        }
+        let flags = &block.header.flags;
+        let is_first = flags.is_first_block();
+        let is_final = flags.is_final_block();
+        let block_samples = block.header.block_samples;
+
+        // A bit-11 member opens a fresh set. If a set is already open
+        // when a first-marker arrives, the previous set never saw its
+        // final marker — malformed.
+        if is_first {
+            if open_channels.is_some() {
+                return Err(Error::MultichannelSetMalformed);
+            }
+            open_channels = Some(Vec::new());
+            open_frames = block_samples;
+        } else if open_channels.is_none() {
+            // A continuation- or final-marker member with no open set is a
+            // stray grouping marker.
+            return Err(Error::MultichannelSetMalformed);
+        }
+
+        // All members of one set cover the same frame range.
+        if block_samples != open_frames {
+            return Err(Error::MultichannelSampleCountMismatch {
+                expected: open_frames,
+                found: block_samples,
+            });
+        }
+
+        // Decode this member's own 1 or 2 channels (the grouping marker is
+        // accepted, not refused), then split the interleaved buffer into
+        // per-channel flat buffers and append them to the open set.
+        let member_channels = block.member_channel_count();
+        let pcm = block.decode_member_samples()?;
+        let set = open_channels
+            .as_mut()
+            .expect("a set is open here (opened above or pre-existing)");
+        // Channel-cap guard: refuse before sizing the per-channel buffers.
+        if set.len() + member_channels > MAX_MULTICHANNEL_CHANNELS {
+            return Err(Error::MultichannelTooManyChannels(
+                set.len() + member_channels,
+            ));
+        }
+        if member_channels == 1 {
+            set.push(pcm);
+        } else {
+            // Interleaved [L0, R0, L1, R1, …] → two flat per-channel
+            // buffers.
+            let frames = pcm.len() / 2;
+            let mut left = Vec::with_capacity(frames);
+            let mut right = Vec::with_capacity(frames);
+            for frame in pcm.chunks_exact(2) {
+                left.push(frame[0]);
+                right.push(frame[1]);
+            }
+            set.push(left);
+            set.push(right);
+        }
+
+        // A bit-12 member closes the set: interleave its channels into
+        // whole frames and append to the stream output.
+        if is_final {
+            let set = open_channels.take().expect("set open at final marker");
+            let channels = set.len();
+            // Establish (or check) the stream's per-frame channel count.
+            match stream_channels {
+                None => stream_channels = Some(channels),
+                Some(prev) if prev != channels => {
+                    // Sets disagree on channel count — treat as a malformed
+                    // grouping rather than silently emitting ragged frames.
+                    return Err(Error::MultichannelSetMalformed);
+                }
+                Some(_) => {}
+            }
+            let frames = open_frames as usize;
+            out.reserve(frames * channels);
+            for f in 0..frames {
+                for ch in &set {
+                    // Each per-channel buffer has exactly `frames` samples
+                    // (the members agreed on `block_samples` above).
+                    out.push(ch[f]);
+                }
+            }
+            open_frames = 0;
+        }
+    }
+
+    // A set left open at end-of-stream never saw its final marker.
+    if open_channels.is_some() {
+        return Err(Error::MultichannelSetMalformed);
+    }
+
+    Ok(DecodedStream {
+        samples: out,
+        // An empty stream (no audio blocks) reports 0 channels.
+        channels: stream_channels.unwrap_or(0),
+    })
 }
 
 #[cfg(test)]
@@ -5876,5 +6139,209 @@ mod tests {
                 correction: 3
             }
         ));
+    }
+
+    // ---- Multichannel grouping decode (round 378) ----------------------
+
+    /// Patch the wiki bits-11..=12 multichannel grouping marker of an
+    /// already-encoded block in place. `marker` is the 2-bit value
+    /// (`0b01` = first, `0b10` = final, `0b00` = continuation, `0b11` =
+    /// standalone). The marker bits are independent of the §5 sample CRC
+    /// (which is folded over the PCM, not the flag word), so a
+    /// marker-patched block stays CRC-valid.
+    fn patch_marker(block: &mut [u8], marker: u32) {
+        let mut flags = u32::from_le_bytes([block[24], block[25], block[26], block[27]]);
+        flags &= !(0b11 << 11);
+        flags |= (marker & 0b11) << 11;
+        block[24..28].copy_from_slice(&flags.to_le_bytes());
+    }
+
+    /// Build a multichannel member block from a single channel of PCM
+    /// (mono member) carrying the supplied grouping marker.
+    fn mono_member(pcm: &[i32], block_index: u32, total: u32, marker: u32) -> Vec<u8> {
+        let mut b = crate::encode::encode_block_mono(pcm, 2, block_index, total).unwrap();
+        patch_marker(&mut b, marker);
+        b
+    }
+
+    /// Build a stereo member block from interleaved L/R PCM carrying the
+    /// supplied grouping marker.
+    fn stereo_member(pcm: &[i32], block_index: u32, total: u32, marker: u32) -> Vec<u8> {
+        let mut b = crate::encode::encode_block_stereo(pcm, 2, block_index, total).unwrap();
+        patch_marker(&mut b, marker);
+        b
+    }
+
+    #[test]
+    fn multichannel_three_mono_members_interleave_in_member_order() {
+        // A 3-channel set: three mono members, markers first / cont / final.
+        let c0 = [10, 11, 12, 13];
+        let c1 = [20, 21, 22, 23];
+        let c2 = [30, 31, 32, 33];
+        let total = 4;
+        let mut stream = mono_member(&c0, 0, total, 0b01);
+        stream.extend(mono_member(&c1, 0, total, 0b00));
+        stream.extend(mono_member(&c2, 0, total, 0b10));
+
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(decoded.channels, 3);
+        // Frames interleaved [c0,c1,c2] per frame, in member (speaker) order.
+        assert_eq!(
+            decoded.samples,
+            vec![10, 20, 30, 11, 21, 31, 12, 22, 32, 13, 23, 33]
+        );
+    }
+
+    #[test]
+    fn multichannel_mixed_mono_and_stereo_members() {
+        // 4-channel set: stereo member (2ch) then stereo member (2ch).
+        let front = [100, 200, 101, 201]; // L0 R0 L1 R1
+        let rear = [300, 400, 301, 401];
+        let total = 2;
+        let mut stream = stereo_member(&front, 0, total, 0b01);
+        stream.extend(stereo_member(&rear, 0, total, 0b10));
+
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(decoded.channels, 4);
+        // Per frame: front L, front R, rear L, rear R.
+        assert_eq!(
+            decoded.samples,
+            vec![100, 200, 300, 400, 101, 201, 301, 401]
+        );
+    }
+
+    #[test]
+    fn multichannel_mono_plus_stereo_member_mix() {
+        // 3-channel set: a mono centre member then a stereo member.
+        let centre = [7, 8, 9];
+        let lr = [1, 2, 3, 4, 5, 6]; // L0 R0 L1 R1 L2 R2
+        let total = 3;
+        let mut stream = mono_member(&centre, 0, total, 0b01);
+        stream.extend(stereo_member(&lr, 0, total, 0b10));
+
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(decoded.channels, 3);
+        // Per frame: centre, L, R.
+        assert_eq!(decoded.samples, vec![7, 1, 2, 8, 3, 4, 9, 5, 6]);
+    }
+
+    #[test]
+    fn multichannel_multiple_sets_concatenate() {
+        // Two 3-channel sets back to back (two frame ranges).
+        let total = 4;
+        let mut stream = mono_member(&[1, 2], 0, total, 0b01);
+        stream.extend(mono_member(&[3, 4], 0, total, 0b00));
+        stream.extend(mono_member(&[5, 6], 0, total, 0b10));
+        // Second set, block_index advanced.
+        stream.extend(mono_member(&[7, 8], 2, total, 0b01));
+        stream.extend(mono_member(&[9, 10], 2, total, 0b00));
+        stream.extend(mono_member(&[11, 12], 2, total, 0b10));
+
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(decoded.channels, 3);
+        assert_eq!(decoded.samples, vec![1, 3, 5, 2, 4, 6, 7, 9, 11, 8, 10, 12]);
+    }
+
+    #[test]
+    fn multichannel_standalone_mono_matches_decode_stream() {
+        // A plain mono file (standalone marker 0b11 on every block) decodes
+        // to the same PCM as decode_stream, with channels == 1.
+        let pcm = [3, -2, 5, 0, -7, 9];
+        let stream = crate::encode::encode_block_mono(&pcm, 2, 0, pcm.len() as u32).unwrap();
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.samples, decode_stream(&stream).unwrap());
+        assert_eq!(decoded.samples, pcm.to_vec());
+    }
+
+    #[test]
+    fn multichannel_standalone_stereo_matches_decode_stream() {
+        let pcm = [3, -2, 5, 0, -7, 9];
+        let stream =
+            crate::encode::encode_block_stereo(&pcm, 2, 0, (pcm.len() / 2) as u32).unwrap();
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.samples, decode_stream(&stream).unwrap());
+    }
+
+    #[test]
+    fn multichannel_stray_final_marker_is_malformed() {
+        // A final-marker block with no preceding first-marker.
+        let stream = mono_member(&[1, 2], 0, 2, 0b10);
+        assert!(matches!(
+            decode_multichannel_stream(&stream).unwrap_err(),
+            Error::MultichannelSetMalformed
+        ));
+    }
+
+    #[test]
+    fn multichannel_unterminated_set_is_malformed() {
+        // A first-marker block that never sees a final marker.
+        let stream = mono_member(&[1, 2], 0, 2, 0b01);
+        assert!(matches!(
+            decode_multichannel_stream(&stream).unwrap_err(),
+            Error::MultichannelSetMalformed
+        ));
+    }
+
+    #[test]
+    fn multichannel_double_first_marker_is_malformed() {
+        // Two first-markers without a final in between.
+        let mut stream = mono_member(&[1, 2], 0, 2, 0b01);
+        stream.extend(mono_member(&[3, 4], 0, 2, 0b01));
+        assert!(matches!(
+            decode_multichannel_stream(&stream).unwrap_err(),
+            Error::MultichannelSetMalformed
+        ));
+    }
+
+    #[test]
+    fn multichannel_member_sample_count_mismatch() {
+        // Members of one set disagree on block_samples.
+        let mut stream = mono_member(&[1, 2, 3], 0, 3, 0b01);
+        stream.extend(mono_member(&[4, 5], 0, 2, 0b10));
+        assert!(matches!(
+            decode_multichannel_stream(&stream).unwrap_err(),
+            Error::MultichannelSampleCountMismatch {
+                expected: 3,
+                found: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn multichannel_skips_metadata_only_blocks() {
+        // A leading metadata-only block (block_samples == 0) is not a set
+        // member and is skipped.
+        let meta_only = synthesise_block(0, flags_with(1 << 2), &[]);
+        let mut stream = meta_only;
+        stream.extend(mono_member(&[1, 2], 0, 2, 0b01));
+        stream.extend(mono_member(&[3, 4], 0, 2, 0b10));
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.samples, vec![1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn multichannel_empty_stream_reports_zero_channels() {
+        let decoded = decode_multichannel_stream(&[]).unwrap();
+        assert_eq!(decoded.channels, 0);
+        assert!(decoded.samples.is_empty());
+    }
+
+    #[test]
+    fn decode_member_samples_decodes_a_marked_member_standalone() {
+        // A single marked member decodes via decode_member_samples even
+        // though decode_samples would refuse it as a MultichannelMember.
+        let pcm = [5, -3, 8, 1];
+        let block = mono_member(&pcm, 0, 4, 0b01);
+        let (parsed, _) = parse_block(&block).unwrap();
+        // The public decode_samples refuses the grouped member.
+        assert!(matches!(
+            parsed.decode_samples().unwrap_err(),
+            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::MultichannelMember)
+        ));
+        // The member path accepts it and reproduces the PCM.
+        assert_eq!(parsed.decode_member_samples().unwrap(), pcm.to_vec());
     }
 }

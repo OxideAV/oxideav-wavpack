@@ -299,6 +299,32 @@ pub enum Error {
     /// `2^left_shift` (its low bits zero) or the encode would not be
     /// lossless. The offending sample value is carried for diagnostics.
     EncodeLeftShiftLosesData(i32),
+    /// A multichannel set was malformed: a member block carried the wiki
+    /// bit-12 "final block of set" marker without any preceding bit-11
+    /// "first block of set" marker having opened a set (or the stream
+    /// ended mid-set). The grouping walker in
+    /// [`crate::decode_multichannel_stream`] tracks an open set across
+    /// member blocks; a stray final-marker or an unterminated set is a
+    /// structural inconsistency in the wiki bits-11..=12 grouping.
+    MultichannelSetMalformed,
+    /// The member blocks of a multichannel set disagreed on
+    /// `block_samples` (the wiki "samples in this block" header word). All
+    /// members of one set cover the **same** sample range — they are the
+    /// channels of the same frames — so a per-member mismatch means the
+    /// blocks do not form a coherent set. Carries `(expected, found)`.
+    MultichannelSampleCountMismatch {
+        /// `block_samples` of the set's first (bit-11) member.
+        expected: u32,
+        /// `block_samples` of the offending later member.
+        found: u32,
+    },
+    /// A multichannel set's summed channel count exceeded the supported
+    /// maximum ([`crate::MAX_MULTICHANNEL_CHANNELS`]). A set is a run of
+    /// 1- or 2-channel member blocks; the sum is the multichannel width.
+    /// An absurd width (a malformed stream chaining unbounded members)
+    /// is refused before it sizes the interleave buffer. Carries the
+    /// channel count reached.
+    MultichannelTooManyChannels(usize),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -435,6 +461,17 @@ impl core::fmt::Display for Error {
             Error::EncodeLeftShiftLosesData(v) => write!(
                 f,
                 "oxideav-wavpack: encode_block_*_shifted: sample {v} has non-zero low bits that left_shift would drop (input must be a multiple of 2^left_shift)"
+            ),
+            Error::MultichannelSetMalformed => f.write_str(
+                "oxideav-wavpack: malformed multichannel set (stray final-block marker or unterminated set; wiki flag bits 11..=12)",
+            ),
+            Error::MultichannelSampleCountMismatch { expected, found } => write!(
+                f,
+                "oxideav-wavpack: multichannel set members disagree on block_samples (expected {expected}, found {found})"
+            ),
+            Error::MultichannelTooManyChannels(n) => write!(
+                f,
+                "oxideav-wavpack: multichannel set channel count {n} exceeds the supported maximum"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",
