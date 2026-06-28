@@ -42,3 +42,9 @@ name = "decode_stream"
 path = "fuzz_targets/decode_stream.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "decode_multichannel_stream"
+path = "fuzz_targets/decode_multichannel_stream.rs"
+test = false
+doc = false

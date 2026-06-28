@@ -127,6 +127,32 @@ Working surface:
   the file-global `total_samples`, so the chain is a standalone `.wv` file
   the stream walker decodes back exactly:
   `decode_stream(&encode_stream_mono(pcm, …)?)? == pcm`.
+* **Multichannel grouping decode + encode** — a WavPack stream carrying
+  more than two channels splits each frame range across a *set* of member
+  blocks (wiki bits 11..=12: a bit-11 member opens the set, continuation
+  members follow, a bit-12 member closes it). Each member is an ordinary
+  1-channel (mono / false-stereo) or 2-channel (stereo) block decoded by
+  the same lossless path standalone blocks use — the grouping marker is a
+  stream-shape signal, not a decode-arithmetic one. `decode_multichannel_stream`
+  walks the member blocks, decodes each via `WavPackBlock::decode_member_samples`
+  (which accepts the marker instead of refusing it as a
+  `MultichannelMember`), and interleaves the set's channels per frame into
+  a `DecodedStream { samples, channels }`; plain mono / stereo files decode
+  identically to `decode_stream` with `channels` reported as `1` / `2`.
+  `decode_multichannel_stream_muted` is the spec §5.6 per-member CRC-mute
+  twin (a member whose stored CRC mismatches is zeroed while the set's
+  other members survive). `encode_multichannel_stream` is the bit-exact
+  inverse: it de-interleaves a multichannel PCM buffer into one mono
+  member per channel, tags the grouping markers, and splits long buffers
+  into successive sets, so
+  `decode_multichannel_stream(&encode_multichannel_stream(pcm, channels, …)?)?.samples
+  == pcm` for any width `1..=MAX_MULTICHANNEL_CHANNELS` and frame count.
+  `multichannel_layout` reports the `MultichannelLayout { channels, sets }`
+  from block headers alone (no decode). Malformed grouping (stray final
+  marker, unterminated set, per-member `block_samples` disagreement,
+  channel-count blowup) is refused with the typed errors
+  `MultichannelSetMalformed` / `MultichannelSampleCountMismatch` /
+  `MultichannelTooManyChannels`.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -188,13 +214,18 @@ if block.is_audio_block() {
 
 `WavPackBlock::decode_samples` refuses the following with a typed
 `Error::UnsupportedBlockFeature`: hybrid (lossy) blocks, float and
-32-bit-int sample data, multichannel members, low-latency / robust block
-layouts, and — on non-hybrid stereo blocks — the `CROSS_DECORR` flag
-(bit 5). **Mono and stereo** lossless decorrelation are now wired all the
-way through `decode_samples` (entropy → residuals →
-`assemble_mono_passes` / `assemble_stereo_passes` → `decorrelate_mono` /
-`decorrelate_stereo` → PCM), including the negative cross terms
-(`-1`/`-2`/`-3`) on stereo and the spec §5.4 joint-stereo (mid/side) undo.
+32-bit-int sample data, low-latency / robust block layouts, and — on
+non-hybrid stereo blocks — the `CROSS_DECORR` flag (bit 5).
+**Multichannel members** are no longer a dead end: `decode_samples` still
+refuses a grouped member (its per-block shape can't stitch the set), but
+`WavPackBlock::decode_member_samples` decodes one, and the stream-level
+`decode_multichannel_stream` reassembles the whole interleaved frame from
+a stream's member sets (see the working-surface bullet). **Mono and
+stereo** lossless decorrelation are wired all the way through
+`decode_samples` (entropy → residuals → `assemble_mono_passes` /
+`assemble_stereo_passes` → `decorrelate_mono` / `decorrelate_stereo` →
+PCM), including the negative cross terms (`-1`/`-2`/`-3`) on stereo and
+the spec §5.4 joint-stereo (mid/side) undo.
 The `CROSS_DECORR` flag stays refused on a lossless stereo block because
 the staged decorrelation doc §4.1 documents it only in the hybrid-stereo
 correction-folding context — so it has no defined main-stream meaning
@@ -253,13 +284,17 @@ clean-room decorrelation/CRC trace
 `docs/audio/wavpack/spec/wavpack-decorrelation.md`. No external library
 source, archived prior history, or online resources were consulted at
 any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
-entry point; 777 unit tests synthesise minimal valid headers /
+and `decode_multichannel_stream` (plus its CRC-muted and `multichannel_layout`
+twins) entry points; 841 unit tests synthesise minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
 mono / stereo CRC vectors, pin the §3 decorrelation weight
 arithmetic to the spec's §7 sanity vectors, pin the §3 forward
 decorrelation encoder (`recorrelate_mono` / `recorrelate_stereo`) as the
 exact inverse of the decode loop via shared-pass-list round-trips, pin the
+multichannel grouping decode/encode (`decode_multichannel_stream` /
+`encode_multichannel_stream`) as a bit-exact interleave round-trip across
+channel widths and member-set splits, pin the
 wiki flag-bits-13..=17 left-shift fixup (the decorrelation-spec §1 "shift"
 normalization stage) end-to-end for mono and stereo decode plus its
 pre-shift CRC ordering, and pin the §4.1 hybrid correction-fold
