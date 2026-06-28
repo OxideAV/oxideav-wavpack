@@ -17,6 +17,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 378 — **multichannel stream encode**. `encode_multichannel_stream`
+  is the bit-exact inverse of `decode_multichannel_stream`: it takes an
+  interleaved multichannel PCM buffer plus a channel count and emits a
+  `.wv` byte stream where each channel is a mono member block carrying the
+  wiki bits-11..=12 grouping markers (first channel opens the set, last
+  closes it, middle channels continue), split across successive sets of
+  `block_samples` frames. `decode_multichannel_stream(&encode_multichannel_stream(pcm,
+  channels, …)?)?.samples == pcm` for any channel count `1..=256` and any
+  frame count, single- or multi-set. A single channel degenerates to a
+  plain standalone mono file. Exported: `encode_multichannel_stream`.
+
 - Round 378 — **multichannel grouping decode**. A WavPack stream carrying
   more than two channels splits each frame range across a *set* of member
   blocks (wiki bits 11..=12: a first-block member opens the set, a

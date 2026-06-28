@@ -216,6 +216,15 @@ fn base_flags(bytes_per_sample: u8) -> u32 {
     u32::from(bps - 1) | STANDALONE_MULTICHANNEL_MARKER
 }
 
+/// Replace the wiki bits-11..=12 multichannel grouping marker in a flag
+/// word. `marker` is the 2-bit grouping value (`0b11` standalone, `0b01`
+/// first-of-set, `0b00` continuation, `0b10` final-of-set). Used by the
+/// multichannel-member encoders to override the default standalone marker
+/// [`base_flags`] sets. Round 378.
+fn with_marker(flags: u32, marker: u32) -> u32 {
+    (flags & !(0b11 << 11)) | ((marker & 0b11) << 11)
+}
+
 /// Forward mid/side joint-stereo transform — the exact inverse of the
 /// decoder's spec §5.4 [`crate::crc::undo_joint_stereo`].
 ///
@@ -260,6 +269,29 @@ pub fn encode_block_mono(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
+    // The standalone marker (0b11) is the default — a self-contained
+    // single-block file. Multichannel members reuse the body below with a
+    // grouping marker via `encode_block_mono_marker`.
+    encode_block_mono_marker(pcm, bytes_per_sample, block_index, total_samples, 0b11)
+}
+
+/// Encode a mono PCM buffer into one `wvpk` block carrying the supplied
+/// wiki bits-11..=12 multichannel grouping `marker` (2 bits: `0b11`
+/// standalone, `0b01` first-of-set, `0b00` continuation, `0b10`
+/// final-of-set).
+///
+/// This is the marker-aware core of [`encode_block_mono`]; the public
+/// raw mono encoder passes `0b11` (standalone) and the multichannel
+/// encoder [`encode_multichannel_stream`] passes the per-member grouping
+/// markers. The marker bits sit outside the §5 sample CRC, so a member
+/// block stays CRC-valid for whatever marker is chosen. Round 378.
+fn encode_block_mono_marker(
+    pcm: &[i32],
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+    marker: u32,
+) -> Result<Vec<u8>> {
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
@@ -269,8 +301,9 @@ pub fn encode_block_mono(
     let crc = crate::crc::crc_mono(pcm);
 
     let residuals = pcm.to_vec();
-    // Bit 2 (mono) per the wiki "Flags meaning".
-    let flags_raw = base_flags(bytes_per_sample) | (1 << 2);
+    // Bit 2 (mono) per the wiki "Flags meaning", with the chosen grouping
+    // marker replacing the default standalone bits.
+    let flags_raw = with_marker(base_flags(bytes_per_sample), marker) | (1 << 2);
     let mut metadata = Vec::new();
 
     // 0x05 entropy info: a single zero-seed median set.
@@ -856,6 +889,98 @@ pub fn encode_stream_stereo(
     Ok(out)
 }
 
+/// Encode an interleaved multichannel PCM buffer into a `.wv` byte stream
+/// that [`crate::block::decode_multichannel_stream`] decodes back exactly.
+///
+/// `pcm` is interleaved by frame: `[ch0[0], ch1[0], …, chN-1[0], ch0[1],
+/// …]`, `channels` `i32`s per frame, `pcm.len() == frames * channels`.
+/// Each channel is emitted as its own **mono member block** (the simplest
+/// unambiguously-lossless grouping): for each frame range the member
+/// blocks carry the wiki bits-11..=12 grouping markers — the first
+/// channel's block is the first-of-set (`0b01`), the last channel's is the
+/// final-of-set (`0b10`), and the channels between are continuations
+/// (`0b00`). A long buffer is split into successive sets of
+/// `block_samples` frames each, all sharing the file-global
+/// `total_samples` (frame count) and advancing `block_index`.
+///
+/// The decoder reassembles the per-frame interleave from the member order
+/// (see `decode_multichannel_stream`), so:
+/// `decode_multichannel_stream(&encode_multichannel_stream(pcm, channels,
+/// …)?)?.samples == pcm` and `.channels == channels`.
+///
+/// `channels` must be `1..=MAX_MULTICHANNEL_CHANNELS` and divide
+/// `pcm.len()` evenly; a `block_samples` of `0` uses
+/// [`DEFAULT_BLOCK_SAMPLES`]. `channels == 1` produces a plain mono file
+/// (every block standalone-equivalent); `channels == 2` produces two
+/// mono members per frame range (a valid multichannel encoding of stereo,
+/// distinct from the joint/interleaved single-block stereo path). An
+/// empty `pcm` yields an empty stream. Round 378.
+pub fn encode_multichannel_stream(
+    pcm: &[i32],
+    channels: usize,
+    block_samples: usize,
+    bytes_per_sample: u8,
+) -> Result<Vec<u8>> {
+    if channels == 0 || channels > crate::block::MAX_MULTICHANNEL_CHANNELS {
+        return Err(Error::MultichannelTooManyChannels(channels));
+    }
+    if pcm.is_empty() {
+        return Ok(Vec::new());
+    }
+    if pcm.len() % channels != 0 {
+        // The interleaved buffer must be whole frames of `channels` each.
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let frames = pcm.len() / channels;
+    let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let chunk_frames = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+
+    let mut out = Vec::new();
+    let mut frame_start: usize = 0;
+    while frame_start < frames {
+        let frame_end = (frame_start + chunk_frames).min(frames);
+        let set_frames = frame_end - frame_start;
+        let block_index =
+            u32::try_from(frame_start).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+
+        // De-interleave this frame range into one mono buffer per channel
+        // and emit each as a member block with the right grouping marker.
+        for ch in 0..channels {
+            let mut channel_pcm = Vec::with_capacity(set_frames);
+            for f in frame_start..frame_end {
+                channel_pcm.push(pcm[f * channels + ch]);
+            }
+            // A single-channel set degenerates to a standalone block
+            // (both first- and final-of-set, i.e. marker 0b11); otherwise
+            // the first channel opens the set, the last closes it, and the
+            // channels between are continuations.
+            let marker = if channels == 1 {
+                0b11 // standalone (first + final)
+            } else if ch == 0 {
+                0b01 // first-of-set
+            } else if ch == channels - 1 {
+                0b10 // final-of-set
+            } else {
+                0b00 // continuation
+            };
+            let block = encode_block_mono_marker(
+                &channel_pcm,
+                bytes_per_sample,
+                block_index,
+                total,
+                marker,
+            )?;
+            out.extend_from_slice(&block);
+        }
+        frame_start = frame_end;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,5 +1492,103 @@ mod tests {
             encode_block_mono_with_decorr(&pcm, &terms, &weights, &samples, 2, 0, 3),
             Err(Error::InvalidDecorrelationTerm(0))
         ));
+    }
+
+    // ---- Multichannel stream encode round-trips (round 378) ------------
+
+    #[test]
+    fn multichannel_three_channel_round_trips() {
+        use crate::block::decode_multichannel_stream;
+        // 3 channels, 4 frames, interleaved [c0,c1,c2] per frame.
+        let pcm: Vec<i32> = vec![
+            10, 20, 30, // frame 0
+            11, 21, 31, // frame 1
+            -12, 22, -32, // frame 2
+            13, -23, 33, // frame 3
+        ];
+        let out = encode_multichannel_stream(&pcm, 3, 0, 2).unwrap();
+        let decoded = decode_multichannel_stream(&out).unwrap();
+        assert_eq!(decoded.channels, 3);
+        assert_eq!(decoded.samples, pcm);
+    }
+
+    #[test]
+    fn multichannel_six_channel_round_trips() {
+        use crate::block::decode_multichannel_stream;
+        // 6 channels (5.1 layout shape), 3 frames.
+        let mut pcm = Vec::new();
+        for f in 0..3i32 {
+            for ch in 0..6i32 {
+                pcm.push(f * 100 + ch);
+            }
+        }
+        let out = encode_multichannel_stream(&pcm, 6, 0, 2).unwrap();
+        let decoded = decode_multichannel_stream(&out).unwrap();
+        assert_eq!(decoded.channels, 6);
+        assert_eq!(decoded.samples, pcm);
+    }
+
+    #[test]
+    fn multichannel_split_into_multiple_sets_round_trips() {
+        use crate::block::decode_multichannel_stream;
+        // 4 channels, 5 frames, block_samples = 2 → 3 sets (2 + 2 + 1).
+        let mut pcm = Vec::new();
+        for f in 0..5i32 {
+            for ch in 0..4i32 {
+                pcm.push(f * 10 + ch);
+            }
+        }
+        let out = encode_multichannel_stream(&pcm, 4, 2, 2).unwrap();
+        let decoded = decode_multichannel_stream(&out).unwrap();
+        assert_eq!(decoded.channels, 4);
+        assert_eq!(decoded.samples, pcm);
+    }
+
+    #[test]
+    fn multichannel_single_channel_is_plain_mono() {
+        use crate::block::{decode_multichannel_stream, decode_stream};
+        let pcm: Vec<i32> = vec![3, -2, 5, 0, -7, 9];
+        let out = encode_multichannel_stream(&pcm, 1, 0, 2).unwrap();
+        let decoded = decode_multichannel_stream(&out).unwrap();
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.samples, pcm);
+        // A single-channel set is a standalone block — also decodes via the
+        // plain stream walker.
+        assert_eq!(decode_stream(&out).unwrap(), pcm);
+    }
+
+    #[test]
+    fn multichannel_empty_pcm_yields_empty_stream() {
+        let out = encode_multichannel_stream(&[], 3, 0, 2).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn multichannel_zero_channels_is_refused() {
+        assert!(matches!(
+            encode_multichannel_stream(&[1, 2, 3], 0, 0, 2),
+            Err(Error::MultichannelTooManyChannels(0))
+        ));
+    }
+
+    #[test]
+    fn multichannel_ragged_buffer_is_refused() {
+        // 7 samples is not a whole number of 3-channel frames.
+        assert!(matches!(
+            encode_multichannel_stream(&[1, 2, 3, 4, 5, 6, 7], 3, 0, 2),
+            Err(Error::EncodeStereoOddLength(7))
+        ));
+    }
+
+    #[test]
+    fn multichannel_round_trips_under_muted_member_crc() {
+        // Every member block carries a valid §5 CRC, so the muted decode
+        // path agrees with the plain one and reports all_crc_ok.
+        use crate::block::decode_multichannel_stream;
+        let pcm: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let out = encode_multichannel_stream(&pcm, 4, 0, 2).unwrap();
+        let decoded = decode_multichannel_stream(&out).unwrap();
+        assert_eq!(decoded.channels, 4);
+        assert_eq!(decoded.samples, pcm);
     }
 }
