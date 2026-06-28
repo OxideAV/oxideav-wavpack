@@ -6615,6 +6615,56 @@ mod tests {
     }
 
     #[test]
+    fn multichannel_false_stereo_member_counts_as_one_channel() {
+        // A false-stereo member (wiki bit 30: stereo container, mono data)
+        // carries one decoded channel, exactly like a plain mono member.
+        // Patch a mono member's flag word: clear bit 2 (mono), set bit 30
+        // (false_stereo). The data is still a single channel.
+        let total = 2;
+        let mut first = mono_member(&[10, 11], 0, total, 0b01);
+        {
+            let mut f = u32::from_le_bytes([first[24], first[25], first[26], first[27]]);
+            f &= !(1 << 2); // clear mono
+            f |= 1 << 30; // set false_stereo
+            first[24..28].copy_from_slice(&f.to_le_bytes());
+        }
+        let mut stream = first;
+        stream.extend(mono_member(&[20, 21], 0, total, 0b10));
+
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        // 2 channels: false-stereo member (1) + mono member (1).
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.samples, vec![10, 20, 11, 21]);
+        // Layout agrees.
+        assert_eq!(multichannel_layout(&stream).unwrap().channels, 2);
+    }
+
+    #[test]
+    fn multichannel_too_many_channels_is_refused() {
+        // A set whose summed channel count exceeds MAX_MULTICHANNEL_CHANNELS
+        // is refused before the interleave buffer is sized. Build a set of
+        // MAX + 1 mono members (first / continuations / final).
+        let total = 1;
+        let cap = MAX_MULTICHANNEL_CHANNELS;
+        let mut stream = mono_member(&[0], 0, total, 0b01);
+        for _ in 0..(cap - 1) {
+            stream.extend(mono_member(&[0], 0, total, 0b00));
+        }
+        // One more continuation pushes the count to cap + 1 before the final.
+        stream.extend(mono_member(&[0], 0, total, 0b00));
+        stream.extend(mono_member(&[0], 0, total, 0b10));
+
+        assert!(matches!(
+            decode_multichannel_stream(&stream).unwrap_err(),
+            Error::MultichannelTooManyChannels(n) if n > cap
+        ));
+        assert!(matches!(
+            multichannel_layout(&stream).unwrap_err(),
+            Error::MultichannelTooManyChannels(n) if n > cap
+        ));
+    }
+
+    #[test]
     fn multichannel_layout_agrees_with_decode_channels() {
         // The header-only layout's channel count matches the decoded one.
         let pcm: Vec<i32> = (0..18).collect(); // 6 channels × 3 frames
