@@ -17,6 +17,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 378 — **multichannel CRC-muted decode**.
+  `decode_multichannel_stream_muted` is the multichannel twin of
+  `decode_stream_muted`: each member block is gated by its own §5 running
+  CRC and, on a mismatch, that member's channels are muted (zeroed) while
+  the set's other members still contribute — so the interleaved frame width
+  is unchanged and only the corrupt member's channel slots go to zero.
+  Returns `(DecodedStream, all_crc_ok)`. Backed by the new member-level
+  `WavPackBlock::decode_member_samples_muted`. Exported:
+  `decode_multichannel_stream_muted`,
+  `WavPackBlock::decode_member_samples_muted`.
+
 - Round 378 — **multichannel stream encode**. `encode_multichannel_stream`
   is the bit-exact inverse of `decode_multichannel_stream`: it takes an
   interleaved multichannel PCM buffer plus a channel count and emits a

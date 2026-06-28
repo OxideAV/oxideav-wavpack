@@ -991,6 +991,27 @@ impl<'a> WavPackBlock<'a> {
         Ok(pcm)
     }
 
+    /// Decode a multichannel-set member's PCM with the spec §5.6 CRC
+    /// *mute gate* applied — the member twin of
+    /// [`Self::decode_samples_muted`].
+    ///
+    /// Each member block carries its own §5 running CRC over its own
+    /// channels; this folds that CRC over the member's reconstructed
+    /// pre-shift PCM and, on a mismatch with the stored header CRC word,
+    /// zeros the returned buffer (the spec's "mute the corrupt block"
+    /// behaviour). Returns `(pcm, crc_ok)` exactly as
+    /// [`Self::decode_samples_muted`] does. Round 378.
+    pub fn decode_member_samples_muted(&self) -> Result<(Vec<i32>, bool)> {
+        let mut pcm = self.decode_member_preshift()?;
+        let crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        if crc_ok {
+            crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
+        } else {
+            pcm.iter_mut().for_each(|s| *s = 0);
+        }
+        Ok((pcm, crc_ok))
+    }
+
     /// Decode this block's PCM ([`Self::decode_samples`]) and verify the
     /// running §5 block CRC against the stored header CRC word
     /// ([`Self::crc`]).
@@ -2096,6 +2117,41 @@ pub struct DecodedStream {
 /// this function reports the **first** set's count as the stream
 /// `channels` and concatenates every set's interleaved frames. Round 378.
 pub fn decode_multichannel_stream(bytes: &[u8]) -> Result<DecodedStream> {
+    let (stream, _all_crc_ok) = decode_multichannel_inner(bytes, false)?;
+    Ok(stream)
+}
+
+/// Decode a multichannel WavPack byte buffer with the spec §5.6 per-member
+/// CRC *mute gate* applied — the multichannel twin of
+/// [`decode_stream_muted`].
+///
+/// Identical to [`decode_multichannel_stream`] except each member block is
+/// decoded through [`WavPackBlock::decode_member_samples_muted`]: a member
+/// whose recomputed §5 running CRC does not match its stored header CRC
+/// word contributes a run of zeros (its channels muted) instead of its
+/// samples — exactly what a conformant decoder emits for a corrupt block.
+/// The set's other (uncorrupted) members still contribute their channels,
+/// so the interleaved frame width is unchanged; only the muted member's
+/// channel slots are zero.
+///
+/// Returns `(stream, all_crc_ok)`: `all_crc_ok` is `true` only when every
+/// decoded member's CRC matched. The grouping-shape refusals
+/// ([`Error::MultichannelSetMalformed`] /
+/// [`Error::MultichannelSampleCountMismatch`] /
+/// [`Error::MultichannelTooManyChannels`]) and parse / structural errors
+/// still propagate — a CRC mismatch is the defined mute behaviour, not an
+/// error. Round 378.
+pub fn decode_multichannel_stream_muted(bytes: &[u8]) -> Result<(DecodedStream, bool)> {
+    decode_multichannel_inner(bytes, true)
+}
+
+/// Shared grouping-walk core for [`decode_multichannel_stream`] (plain,
+/// `muted == false`) and [`decode_multichannel_stream_muted`]
+/// (`muted == true`). Walks the wiki bits-11..=12 member sets, decodes
+/// each member's channels, and interleaves each closed set's channels into
+/// frames. Returns the assembled stream plus whether every member's §5 CRC
+/// matched (always `true` in the non-muted mode, which does not fold CRCs).
+fn decode_multichannel_inner(bytes: &[u8], muted: bool) -> Result<(DecodedStream, bool)> {
     // Per-set accumulator: the decoded per-member channel buffers of the
     // currently-open set, plus the set's agreed frame count.
     //
@@ -2104,6 +2160,7 @@ pub fn decode_multichannel_stream(bytes: &[u8]) -> Result<DecodedStream> {
     // `[ch0[f], ch1[f], …, chN[f]]` across the members in wire order.
     let mut out: Vec<i32> = Vec::new();
     let mut stream_channels: Option<usize> = None;
+    let mut all_crc_ok = true;
 
     // The channels of the currently-open set, each as a flat per-channel
     // buffer of `frame_count` samples. `None` => no set is open.
@@ -2149,7 +2206,13 @@ pub fn decode_multichannel_stream(bytes: &[u8]) -> Result<DecodedStream> {
         // accepted, not refused), then split the interleaved buffer into
         // per-channel flat buffers and append them to the open set.
         let member_channels = block.member_channel_count();
-        let pcm = block.decode_member_samples()?;
+        let pcm = if muted {
+            let (pcm, crc_ok) = block.decode_member_samples_muted()?;
+            all_crc_ok &= crc_ok;
+            pcm
+        } else {
+            block.decode_member_samples()?
+        };
         let set = open_channels
             .as_mut()
             .expect("a set is open here (opened above or pre-existing)");
@@ -2208,11 +2271,14 @@ pub fn decode_multichannel_stream(bytes: &[u8]) -> Result<DecodedStream> {
         return Err(Error::MultichannelSetMalformed);
     }
 
-    Ok(DecodedStream {
-        samples: out,
-        // An empty stream (no audio blocks) reports 0 channels.
-        channels: stream_channels.unwrap_or(0),
-    })
+    Ok((
+        DecodedStream {
+            samples: out,
+            // An empty stream (no audio blocks) reports 0 channels.
+            channels: stream_channels.unwrap_or(0),
+        },
+        all_crc_ok,
+    ))
 }
 
 #[cfg(test)]
@@ -6327,6 +6393,61 @@ mod tests {
         let decoded = decode_multichannel_stream(&[]).unwrap();
         assert_eq!(decoded.channels, 0);
         assert!(decoded.samples.is_empty());
+    }
+
+    /// Corrupt a block's stored §5 CRC word (bytes 28..32) so the muted
+    /// decode path mutes it.
+    fn corrupt_crc(block: &mut [u8]) {
+        block[28..32].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn multichannel_muted_all_crc_ok_when_intact() {
+        // Every member's CRC is valid → muted decode agrees with the plain
+        // decode and reports all_crc_ok.
+        let total = 2;
+        let mut stream = mono_member(&[10, 11], 0, total, 0b01);
+        stream.extend(mono_member(&[20, 21], 0, total, 0b00));
+        stream.extend(mono_member(&[30, 31], 0, total, 0b10));
+
+        let (decoded, all_ok) = decode_multichannel_stream_muted(&stream).unwrap();
+        assert!(all_ok);
+        assert_eq!(decoded.channels, 3);
+        assert_eq!(
+            decoded.samples,
+            decode_multichannel_stream(&stream).unwrap().samples
+        );
+        assert_eq!(decoded.samples, vec![10, 20, 30, 11, 21, 31]);
+    }
+
+    #[test]
+    fn multichannel_muted_zeros_only_the_corrupt_member() {
+        // Corrupt the middle (continuation) member's CRC: its channel is
+        // muted to zeros, the other two channels survive, and all_crc_ok
+        // is false.
+        let total = 2;
+        let mut stream = mono_member(&[10, 11], 0, total, 0b01);
+        let mut mid = mono_member(&[20, 21], 0, total, 0b00);
+        corrupt_crc(&mut mid);
+        stream.extend(mid);
+        stream.extend(mono_member(&[30, 31], 0, total, 0b10));
+
+        let (decoded, all_ok) = decode_multichannel_stream_muted(&stream).unwrap();
+        assert!(!all_ok);
+        assert_eq!(decoded.channels, 3);
+        // Middle channel zeroed; outer two intact.
+        assert_eq!(decoded.samples, vec![10, 0, 30, 11, 0, 31]);
+    }
+
+    #[test]
+    fn decode_member_samples_muted_mutes_on_bad_crc() {
+        let pcm = [5, -3, 8, 1];
+        let mut block = mono_member(&pcm, 0, 4, 0b01);
+        corrupt_crc(&mut block);
+        let (parsed, _) = parse_block(&block).unwrap();
+        let (muted, crc_ok) = parsed.decode_member_samples_muted().unwrap();
+        assert!(!crc_ok);
+        assert_eq!(muted, vec![0, 0, 0, 0]);
     }
 
     #[test]
