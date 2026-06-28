@@ -17,6 +17,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 378 — **multichannel layout introspection**. `multichannel_layout`
+  reports a stream's per-frame channel count and member-set count by
+  walking block headers (and the per-block mono/stereo flag) only — no
+  entropy decode — returning a `MultichannelLayout { channels, sets }`. It
+  enforces the same wiki bits-11..=12 grouping rules
+  `decode_multichannel_stream` does, so a stream that passes layout is
+  structurally decodable, and its `channels` agrees with the decoded
+  count. Lets a caller size buffers and route channels before paying for a
+  full decode. Exported: `multichannel_layout`, `MultichannelLayout`.
+
 - Round 378 — **multichannel CRC-muted decode**.
   `decode_multichannel_stream_muted` is the multichannel twin of
   `decode_stream_muted`: each member block is gated by its own §5 running

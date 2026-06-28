@@ -1494,6 +1494,104 @@ pub fn audio_block_count(bytes: &[u8]) -> Result<usize> {
     Ok(count)
 }
 
+/// Header-only shape of a multichannel WavPack stream: the per-frame
+/// channel count and the number of member-block sets, computed by walking
+/// block **headers** only (no entropy decode).
+///
+/// [`multichannel_layout`] returns this so a caller can size buffers and
+/// route channels before paying for a full
+/// [`decode_multichannel_stream`]. Round 378.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultichannelLayout {
+    /// Per-frame channel count — the summed member channel counts of one
+    /// set (every well-formed set carries the same width). `0` for an
+    /// audio-free stream.
+    pub channels: usize,
+    /// Number of complete member-block sets in the stream (one per frame
+    /// range). `0` for an audio-free stream.
+    pub sets: usize,
+}
+
+/// Compute the [`MultichannelLayout`] of a WavPack byte buffer by walking
+/// the block headers (and the per-block mono/stereo flag) only — no
+/// entropy decode, no per-sample loop.
+///
+/// Applies the same wiki bits-11..=12 grouping rules
+/// [`decode_multichannel_stream`] enforces: a first-marker opens a set, a
+/// final-marker closes it, every member of a set must agree on
+/// `block_samples`, and every set must carry the same channel width.
+/// Metadata-only blocks are skipped. The same malformed-grouping refusals
+/// ([`Error::MultichannelSetMalformed`] /
+/// [`Error::MultichannelSampleCountMismatch`] /
+/// [`Error::MultichannelTooManyChannels`]) fire here too, so a stream that
+/// passes `multichannel_layout` is structurally decodable. A plain mono /
+/// stereo file reports `channels == 1 / 2` with `sets ==
+/// audio_block_count`. Round 378.
+pub fn multichannel_layout(bytes: &[u8]) -> Result<MultichannelLayout> {
+    let mut stream_channels: Option<usize> = None;
+    let mut sets = 0usize;
+    // Channels accumulated in the currently-open set, and its agreed frame
+    // count. `open` tracks whether a set is currently open.
+    let mut open = false;
+    let mut open_chan = 0usize;
+    let mut open_frames: u32 = 0;
+
+    for parsed in iter_blocks(bytes) {
+        let block = parsed?;
+        if !block.header.is_audio_block() {
+            continue;
+        }
+        let flags = &block.header.flags;
+        let is_first = flags.is_first_block();
+        let is_final = flags.is_final_block();
+        let block_samples = block.header.block_samples;
+
+        if is_first {
+            if open {
+                return Err(Error::MultichannelSetMalformed);
+            }
+            open = true;
+            open_chan = 0;
+            open_frames = block_samples;
+        } else if !open {
+            return Err(Error::MultichannelSetMalformed);
+        }
+
+        if block_samples != open_frames {
+            return Err(Error::MultichannelSampleCountMismatch {
+                expected: open_frames,
+                found: block_samples,
+            });
+        }
+
+        open_chan += block.member_channel_count();
+        if open_chan > MAX_MULTICHANNEL_CHANNELS {
+            return Err(Error::MultichannelTooManyChannels(open_chan));
+        }
+
+        if is_final {
+            match stream_channels {
+                None => stream_channels = Some(open_chan),
+                Some(prev) if prev != open_chan => {
+                    return Err(Error::MultichannelSetMalformed);
+                }
+                Some(_) => {}
+            }
+            sets += 1;
+            open = false;
+        }
+    }
+
+    if open {
+        return Err(Error::MultichannelSetMalformed);
+    }
+
+    Ok(MultichannelLayout {
+        channels: stream_channels.unwrap_or(0),
+        sets,
+    })
+}
+
 /// Count the blocks in `bytes` whose `block_samples == 0` — i.e. the
 /// metadata-only blocks the wiki "Block structure" listing allows.
 ///
@@ -6448,6 +6546,83 @@ mod tests {
         let (muted, crc_ok) = parsed.decode_member_samples_muted().unwrap();
         assert!(!crc_ok);
         assert_eq!(muted, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn multichannel_layout_reports_channels_and_sets() {
+        // Two 3-channel sets.
+        let total = 4;
+        let mut stream = mono_member(&[1, 2], 0, total, 0b01);
+        stream.extend(mono_member(&[3, 4], 0, total, 0b00));
+        stream.extend(mono_member(&[5, 6], 0, total, 0b10));
+        stream.extend(mono_member(&[7, 8], 2, total, 0b01));
+        stream.extend(mono_member(&[9, 10], 2, total, 0b00));
+        stream.extend(mono_member(&[11, 12], 2, total, 0b10));
+
+        let layout = multichannel_layout(&stream).unwrap();
+        assert_eq!(layout.channels, 3);
+        assert_eq!(layout.sets, 2);
+    }
+
+    #[test]
+    fn multichannel_layout_counts_stereo_members() {
+        // 4 channels via two stereo members.
+        let total = 2;
+        let mut stream = stereo_member(&[1, 2, 3, 4], 0, total, 0b01);
+        stream.extend(stereo_member(&[5, 6, 7, 8], 0, total, 0b10));
+        let layout = multichannel_layout(&stream).unwrap();
+        assert_eq!(layout.channels, 4);
+        assert_eq!(layout.sets, 1);
+    }
+
+    #[test]
+    fn multichannel_layout_plain_mono_is_one_channel_per_set() {
+        let pcm = [3, -2, 5];
+        let stream = crate::encode::encode_block_mono(&pcm, 2, 0, 3).unwrap();
+        let layout = multichannel_layout(&stream).unwrap();
+        assert_eq!(layout.channels, 1);
+        assert_eq!(layout.sets, 1);
+    }
+
+    #[test]
+    fn multichannel_layout_empty_stream_is_zero() {
+        let layout = multichannel_layout(&[]).unwrap();
+        assert_eq!(layout.channels, 0);
+        assert_eq!(layout.sets, 0);
+    }
+
+    #[test]
+    fn multichannel_layout_refuses_malformed_grouping() {
+        // Stray final marker.
+        let stream = mono_member(&[1, 2], 0, 2, 0b10);
+        assert!(matches!(
+            multichannel_layout(&stream).unwrap_err(),
+            Error::MultichannelSetMalformed
+        ));
+    }
+
+    #[test]
+    fn multichannel_layout_refuses_member_count_mismatch() {
+        let mut stream = mono_member(&[1, 2, 3], 0, 3, 0b01);
+        stream.extend(mono_member(&[4, 5], 0, 2, 0b10));
+        assert!(matches!(
+            multichannel_layout(&stream).unwrap_err(),
+            Error::MultichannelSampleCountMismatch {
+                expected: 3,
+                found: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn multichannel_layout_agrees_with_decode_channels() {
+        // The header-only layout's channel count matches the decoded one.
+        let pcm: Vec<i32> = (0..18).collect(); // 6 channels × 3 frames
+        let stream = crate::encode::encode_multichannel_stream(&pcm, 6, 0, 2).unwrap();
+        let layout = multichannel_layout(&stream).unwrap();
+        let decoded = decode_multichannel_stream(&stream).unwrap();
+        assert_eq!(layout.channels, decoded.channels);
+        assert_eq!(layout.channels, 6);
     }
 
     #[test]
