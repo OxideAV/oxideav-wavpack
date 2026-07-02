@@ -47,7 +47,10 @@
 //! them and their wire layout is a documented spec gap.
 
 use crate::block_header::{MAGIC, MIN_CK_SIZE};
-use crate::decorrelation::{recorrelate_mono, recorrelate_stereo};
+use crate::decorrelation::{
+    quantize_weight, recorrelate_mono, recorrelate_stereo, serialize_mono_passes,
+    serialize_stereo_passes, DecorrPass, MAX_TERM,
+};
 use crate::error::{Error, Result};
 use crate::metadata::{SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE};
 use crate::samples::{encode_packed_samples_mono, encode_packed_samples_stereo, AdaptiveMedians};
@@ -806,6 +809,218 @@ pub fn encode_block_stereo_with_decorr(
         block_samples,
         flags_raw,
         crc,
+    )
+}
+
+/// Decorrelation strength profile for the self-deriving (`*_auto`)
+/// encoders — how many prediction passes the encoder derives and runs.
+///
+/// The term lists are **this encoder's own choices** among the spec §2
+/// valid set (`1..8`, `17`, `18`, and the stereo cross terms): any
+/// ordered valid list is a conformant block, because the decoder
+/// reconstructs whatever pass list the `0x02`/`0x03`/`0x04` metadata
+/// describes. More passes model more structure (usually smaller blocks)
+/// at more encode/decode arithmetic per sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecorrProfile {
+    /// Two extrapolate passes — cheapest derivation, catches the
+    /// dominant smooth/linear structure.
+    Fast,
+    /// Five passes mixing extrapolators and short fixed lags (plus a
+    /// zero-delay cross pass on stereo).
+    Normal,
+    /// Eight passes over a wider lag spread (plus a mutual cross pass on
+    /// stereo) — the deepest derivation this encoder offers.
+    High,
+}
+
+impl DecorrProfile {
+    /// The application-ordered `(term, delta)` list for a mono (or
+    /// false-stereo / per-channel) derivation.
+    fn mono_terms(self) -> &'static [(i8, i32)] {
+        match self {
+            DecorrProfile::Fast => &[(18, 2), (17, 2)],
+            DecorrProfile::Normal => &[(18, 2), (18, 2), (2, 2), (17, 2), (3, 2)],
+            DecorrProfile::High => &[
+                (18, 2),
+                (18, 2),
+                (18, 2),
+                (1, 2),
+                (2, 2),
+                (3, 2),
+                (5, 2),
+                (17, 2),
+            ],
+        }
+    }
+
+    /// The application-ordered `(term, delta)` list for a stereo
+    /// derivation: the per-channel list plus a trailing zero-delay cross
+    /// pass (spec §3.3) on the deeper profiles.
+    fn stereo_terms(self) -> &'static [(i8, i32)] {
+        match self {
+            DecorrProfile::Fast => &[(18, 2), (17, 2)],
+            DecorrProfile::Normal => &[(18, 2), (18, 2), (2, 2), (17, 2), (3, 2), (-1, 2)],
+            DecorrProfile::High => &[
+                (18, 2),
+                (18, 2),
+                (18, 2),
+                (1, 2),
+                (2, 2),
+                (3, 2),
+                (5, 2),
+                (17, 2),
+                (-3, 2),
+            ],
+        }
+    }
+}
+
+/// Build a zero-state (zero weights, zero seeds) pass list from a
+/// `(term, delta)` spec. `stereo` seeds both channel histories.
+fn zero_state_passes(spec: &[(i8, i32)], stereo: bool) -> Result<Vec<DecorrPass>> {
+    let zeros = [0i32; MAX_TERM as usize];
+    spec.iter()
+        .map(|&(term, delta)| {
+            DecorrPass::new(term, delta, 0, 0, &zeros, if stereo { &zeros } else { &[] })
+        })
+        .collect()
+}
+
+/// Derive a serializable, application-ordered decorrelation pass list
+/// for a **mono** PCM buffer by training the spec §3.4 weight
+/// adaptation over the block.
+///
+/// The derivation is a two-step bootstrap:
+///
+/// 1. **Training pass** — run the forward prediction loop
+///    ([`recorrelate_mono`]) over a scratch copy of the block with
+///    zero-state passes (zero weights, zero seeds). The §3.4 `±delta`
+///    adaptation walks each pass's weight toward the block's actual
+///    inter-sample correlation.
+/// 2. **Quantize + rebuild** — quantize each trained weight to its
+///    `0x03` stored-byte value ([`quantize_weight`]) and rebuild fresh
+///    zero-seed passes carrying those starting weights.
+///
+/// The returned list is serializable by construction
+/// ([`serialize_mono_passes`] cannot refuse it) and ready for
+/// [`encode_block_mono_with_decorr`] — the decoder reconstructs the
+/// identical starting state from the metadata, so the round trip stays
+/// bit-exact regardless of how well the training matched the signal.
+pub fn derive_mono_passes(pcm: &[i32], profile: DecorrProfile) -> Result<Vec<DecorrPass>> {
+    let spec = profile.mono_terms();
+    let mut training = zero_state_passes(spec, false)?;
+    let mut scratch = pcm.to_vec();
+    recorrelate_mono(&mut training, &mut scratch)?;
+    let zeros = [0i32; MAX_TERM as usize];
+    spec.iter()
+        .zip(training.iter())
+        .map(|(&(term, delta), trained)| {
+            DecorrPass::new(
+                term,
+                delta,
+                quantize_weight(trained.weight_a),
+                0,
+                &zeros,
+                &[],
+            )
+        })
+        .collect()
+}
+
+/// Derive a serializable decorrelation pass list for an **interleaved
+/// stereo** buffer — the two-channel twin of [`derive_mono_passes`]
+/// (training via [`recorrelate_stereo`], both channels' weights
+/// quantized, cross passes included per the profile).
+///
+/// `pcm` is the buffer the block will actually entropy-code: for a
+/// joint (mid/side) block, pass the buffer *after* the forward joint
+/// transform, so the training sees the same values the real prediction
+/// loop will.
+pub fn derive_stereo_passes(pcm: &[i32], profile: DecorrProfile) -> Result<Vec<DecorrPass>> {
+    let spec = profile.stereo_terms();
+    let mut training = zero_state_passes(spec, true)?;
+    let mut scratch = pcm.to_vec();
+    recorrelate_stereo(&mut training, &mut scratch)?;
+    let zeros = [0i32; MAX_TERM as usize];
+    spec.iter()
+        .zip(training.iter())
+        .map(|(&(term, delta), trained)| {
+            DecorrPass::new(
+                term,
+                delta,
+                quantize_weight(trained.weight_a),
+                quantize_weight(trained.weight_b),
+                &zeros,
+                &zeros,
+            )
+        })
+        .collect()
+}
+
+/// Encode a mono PCM buffer into one complete `wvpk` block with a
+/// **self-derived** decorrelation pass list — the first entry point
+/// that performs real prediction-based compression without the caller
+/// authoring any metadata.
+///
+/// Derives the pass list from the PCM ([`derive_mono_passes`] — a
+/// training pass over the block, trained weights quantized to their
+/// stored-byte values), serializes it to the raw `0x02`/`0x03`/`0x04`
+/// payloads ([`serialize_mono_passes`]), and encodes through the
+/// verbatim-payload path ([`encode_block_mono_with_decorr`]), so the
+/// lossless guarantee is inherited unchanged:
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_mono_auto(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let passes = derive_mono_passes(pcm, profile)?;
+    let (terms, weights, samples) = serialize_mono_passes(&passes)?;
+    encode_block_mono_with_decorr(
+        pcm,
+        &terms,
+        &weights,
+        &samples,
+        bytes_per_sample,
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode an interleaved stereo PCM buffer into one complete `wvpk`
+/// block with a self-derived decorrelation pass list — the stereo twin
+/// of [`encode_block_mono_auto`] (plain, independent-channel stereo;
+/// the deeper profiles add a zero-delay cross pass).
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_stereo_auto(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let passes = derive_stereo_passes(pcm, profile)?;
+    let (terms, weights, samples) = serialize_stereo_passes(&passes)?;
+    encode_block_stereo_with_decorr(
+        pcm,
+        &terms,
+        &weights,
+        &samples,
+        bytes_per_sample,
+        block_index,
+        total_samples,
     )
 }
 
@@ -1590,5 +1805,170 @@ mod tests {
         let decoded = decode_multichannel_stream(&out).unwrap();
         assert_eq!(decoded.channels, 4);
         assert_eq!(decoded.samples, pcm);
+    }
+
+    // ---- self-deriving (auto) decorrelation encode (round 383) ----
+
+    /// A smooth mono signal (ramp plus a small wiggle) the extrapolate
+    /// terms model well.
+    fn smooth_mono(len: usize) -> Vec<i32> {
+        (0..len)
+            .map(|i| {
+                let i = i as i32;
+                i * 13 - 1500 + ((i % 7) - 3)
+            })
+            .collect()
+    }
+
+    /// A correlated stereo buffer: right channel tracks left with a small
+    /// offset, both smooth.
+    fn smooth_stereo(pairs: usize) -> Vec<i32> {
+        let mut pcm = Vec::with_capacity(pairs * 2);
+        for i in 0..pairs {
+            let i = i as i32;
+            let l = i * 9 - 1000 + ((i % 5) - 2);
+            pcm.push(l);
+            pcm.push(l + 37 + ((i % 3) - 1));
+        }
+        pcm
+    }
+
+    /// Every profile's mono auto encode is bit-exactly lossless.
+    #[test]
+    fn mono_auto_round_trips_all_profiles() {
+        let pcm = smooth_mono(400);
+        for profile in [
+            DecorrProfile::Fast,
+            DecorrProfile::Normal,
+            DecorrProfile::High,
+        ] {
+            let block = encode_block_mono_auto(&pcm, profile, 2, 0, pcm.len() as u32).unwrap();
+            assert_eq!(
+                decode_stream(&block).unwrap(),
+                pcm,
+                "profile {profile:?} must round-trip"
+            );
+            let (_, all_ok) = crate::block::decode_stream_muted(&block).unwrap();
+            assert!(all_ok, "profile {profile:?} must pass its CRC gate");
+        }
+    }
+
+    /// Every profile's stereo auto encode is bit-exactly lossless
+    /// (including the cross-term passes on Normal / High).
+    #[test]
+    fn stereo_auto_round_trips_all_profiles() {
+        let pcm = smooth_stereo(300);
+        for profile in [
+            DecorrProfile::Fast,
+            DecorrProfile::Normal,
+            DecorrProfile::High,
+        ] {
+            let block =
+                encode_block_stereo_auto(&pcm, profile, 2, 0, (pcm.len() / 2) as u32).unwrap();
+            assert_eq!(
+                decode_stream(&block).unwrap(),
+                pcm,
+                "profile {profile:?} must round-trip"
+            );
+        }
+    }
+
+    /// Auto encode also round-trips pseudo-random (uncorrelated) input —
+    /// the derivation may not help there, but it must never hurt
+    /// correctness.
+    #[test]
+    fn auto_round_trips_pseudo_random_input() {
+        let mut pcm = Vec::with_capacity(600);
+        let mut state: u32 = 0xC0FF_EE01;
+        for _ in 0..600 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pcm.push((state >> 16) as i16 as i32);
+        }
+        let mono = encode_block_mono_auto(&pcm, DecorrProfile::Normal, 2, 0, 600).unwrap();
+        assert_eq!(decode_stream(&mono).unwrap(), pcm);
+        let stereo = encode_block_stereo_auto(&pcm, DecorrProfile::High, 2, 0, 300).unwrap();
+        assert_eq!(decode_stream(&stereo).unwrap(), pcm);
+    }
+
+    /// The headline compression claim: on a smooth signal the derived
+    /// decorrelation produces a smaller block than the raw path.
+    #[test]
+    fn auto_beats_raw_on_smooth_signal() {
+        let pcm = smooth_mono(1000);
+        let raw = encode_block_mono(&pcm, 2, 0, 1000).unwrap();
+        let auto = encode_block_mono_auto(&pcm, DecorrProfile::Normal, 2, 0, 1000).unwrap();
+        assert!(
+            auto.len() < raw.len(),
+            "decorrelated block ({}) must be smaller than raw ({}) on a smooth signal",
+            auto.len(),
+            raw.len()
+        );
+
+        let stereo = smooth_stereo(500);
+        let raw_s = encode_block_stereo(&stereo, 2, 0, 500).unwrap();
+        let auto_s = encode_block_stereo_auto(&stereo, DecorrProfile::Normal, 2, 0, 500).unwrap();
+        assert!(
+            auto_s.len() < raw_s.len(),
+            "stereo decorrelated block ({}) must be smaller than raw ({})",
+            auto_s.len(),
+            raw_s.len()
+        );
+    }
+
+    /// The training pass actually moves the weights: a linear ramp drives
+    /// the leading extrapolate pass's weight well away from zero, and
+    /// every derived weight is exactly its own quantization (serializable
+    /// by construction).
+    #[test]
+    fn derived_passes_are_trained_and_quantized() {
+        let pcm: Vec<i32> = (0..500).map(|i| i * 11 - 2700).collect();
+        let passes = derive_mono_passes(&pcm, DecorrProfile::Fast).unwrap();
+        assert_eq!(passes.len(), 2);
+        assert!(
+            passes[0].weight_a > 256,
+            "ramp training must push the extrapolate weight up (got {})",
+            passes[0].weight_a
+        );
+        for p in &passes {
+            assert_eq!(
+                quantize_weight(p.weight_a),
+                p.weight_a,
+                "derived weight must be storable verbatim"
+            );
+        }
+        // And the serializer accepts the list without refusal.
+        assert!(serialize_mono_passes(&passes).is_ok());
+    }
+
+    /// Stereo derivation trains both channels' weights independently and
+    /// keeps the profile's cross pass serializable.
+    #[test]
+    fn derived_stereo_passes_cover_both_channels() {
+        let pcm = smooth_stereo(400);
+        let passes = derive_stereo_passes(&pcm, DecorrProfile::Normal).unwrap();
+        assert_eq!(passes.len(), 6);
+        assert!(passes.iter().any(|p| p.term < 0), "cross pass present");
+        for p in &passes {
+            assert_eq!(quantize_weight(p.weight_a), p.weight_a);
+            assert_eq!(quantize_weight(p.weight_b), p.weight_b);
+        }
+        assert!(serialize_stereo_passes(&passes).is_ok());
+    }
+
+    /// The auto encoders share the plain encoders' refusal arms.
+    #[test]
+    fn auto_refusal_arms() {
+        assert!(matches!(
+            encode_block_mono_auto(&[], DecorrProfile::Fast, 2, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_auto(&[], DecorrProfile::Fast, 2, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_auto(&[1, 2, 3], DecorrProfile::Fast, 2, 0, 1),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
     }
 }

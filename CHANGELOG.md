@@ -17,6 +17,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 — **self-deriving decorrelation encoder** (`*_auto`). The
+  first entry points that perform real prediction-based compression
+  without the caller authoring any metadata: `encode_block_mono_auto` /
+  `encode_block_stereo_auto` take only PCM and a `DecorrProfile`
+  (`Fast` = 2 extrapolate passes, `Normal` = 5 mixed passes + a stereo
+  zero-delay cross pass, `High` = 8 passes over a wider lag spread + a
+  mutual cross pass — this encoder's own choices among the spec §2
+  valid term set). The derivation (`derive_mono_passes` /
+  `derive_stereo_passes`) is a two-step bootstrap: a zero-state
+  **training pass** runs the §3 forward prediction loop over a scratch
+  copy so the §3.4 `±delta` adaptation walks each weight toward the
+  block's actual correlation, then the trained weights are quantized to
+  their `0x03` stored-byte values and fresh zero-seed passes are
+  rebuilt — serializable by construction, so the auto path composes
+  `derive → serialize → encode_block_*_with_decorr` and inherits the
+  bit-exact lossless guarantee (`decode_stream(&out)? == pcm`)
+  regardless of how well the training matched the signal. On a smooth
+  test signal the Normal-profile block is pinned smaller than the raw
+  (no-decorrelation) block for both mono and stereo. 7 new tests (862
+  total): all-profile mono + stereo round-trips (with CRC gate),
+  pseudo-random-input safety, the compression assertions, trained-and-
+  quantized weight checks (ramp drives the extrapolate weight up;
+  every derived weight is its own quantization), stereo both-channel /
+  cross-pass coverage, and the shared refusal arms. Exported:
+  `encode_block_mono_auto`, `encode_block_stereo_auto`,
+  `derive_mono_passes`, `derive_stereo_passes`, `DecorrProfile`.
+
 - Round 383 — **forward decorrelation-metadata serializers** (the exact
   inverses of the round-339/348 assemblers). `serialize_mono_passes` /
   `serialize_stereo_passes` turn an application-ordered `DecorrPass` list
