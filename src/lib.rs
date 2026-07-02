@@ -856,9 +856,10 @@ pub use crate::decorrelation::{
     WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
 };
 pub use crate::encode::{
-    derive_mono_passes, derive_stereo_passes, encode_block_mono, encode_block_mono_auto,
-    encode_block_mono_shifted, encode_block_mono_with_decorr, encode_block_stereo,
-    encode_block_stereo_auto, encode_block_stereo_joint, encode_block_stereo_joint_auto,
+    derive_mono_passes, derive_stereo_passes, detect_left_shift, encode_block_mono,
+    encode_block_mono_auto, encode_block_mono_best, encode_block_mono_shifted,
+    encode_block_mono_with_decorr, encode_block_stereo, encode_block_stereo_auto,
+    encode_block_stereo_best, encode_block_stereo_joint, encode_block_stereo_joint_auto,
     encode_block_stereo_joint_with_decorr, encode_block_stereo_shifted,
     encode_block_stereo_with_decorr, encode_multichannel_stream, encode_stream_mono,
     encode_stream_stereo, DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,

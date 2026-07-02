@@ -17,6 +17,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 — **left-shift auto-detection + best-of block mode
+  selection**. `detect_left_shift` reports the sub-byte-depth shift a
+  PCM buffer announces itself with (the common low-zero-bit count across
+  all samples, capped at the 5-bit flag field; `0` for all-zero or
+  full-depth audio) — so 12-/20-bit-in-container material no longer
+  needs the caller to know its own scaling. `encode_block_mono_best` /
+  `encode_block_stereo_best` then search this encoder's whole mode grid
+  at the detected shift — mono: {raw, derived decorrelation}; stereo:
+  {plain, joint mid/side} × {raw, derived decorrelation} — with each
+  decorrelated candidate trained over the exact domain its prediction
+  loop runs in (narrow, or narrow + joint), keeping the smallest
+  output. Every candidate decodes back to the input bit-exactly, so the
+  selection is size-only, never correctness. Pinned: best never loses
+  to any public single-mode encoder; the shift-aware best beats the
+  unshifted auto encoder on 12-bit-style material; a shifted
+  identical-channel buffer combines all three features (joint + decorr
+  + shift flag) in one block and passes the CRC gate. 6 new tests (873
+  total). Exported: `detect_left_shift`, `encode_block_mono_best`,
+  `encode_block_stereo_best`.
+
 - Round 383 — **joint (mid/side) stereo + decorrelation combined
   encode** and the single-body encoder core. Previously joint stereo
   and decorrelation were mutually exclusive encode paths; the new

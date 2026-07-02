@@ -979,6 +979,153 @@ pub fn encode_block_stereo_joint_auto(
     )
 }
 
+/// Detect the sub-byte-depth left-shift of a PCM buffer: the number of
+/// low zero bits **every** sample shares (capped at the 5-bit wiki
+/// flag-field maximum of 31), i.e. the largest `s` for which the buffer
+/// is genuine `2^s`-scaled audio the shifted encoders can narrow
+/// losslessly. Returns `0` for an all-zero buffer (nothing to gain — the
+/// zero-run fast path already collapses it) and for ordinary full-depth
+/// audio.
+///
+/// This is how 12-/20-/24-bit-in-32-bit-container material announces
+/// itself: e.g. 12-bit samples scaled `<< 4` into a 16-bit container
+/// detect as `4`.
+pub fn detect_left_shift(pcm: &[i32]) -> u8 {
+    let mut common = 31u32;
+    let mut any_nonzero = false;
+    for &s in pcm {
+        if s != 0 {
+            any_nonzero = true;
+            common = common.min(s.trailing_zeros());
+            if common == 0 {
+                return 0;
+            }
+        }
+    }
+    if any_nonzero {
+        common as u8
+    } else {
+        0
+    }
+}
+
+/// Encode a mono PCM buffer into the **smallest** block this encoder can
+/// produce: auto-detects the sub-byte-depth left-shift
+/// ([`detect_left_shift`]), derives a decorrelation pass list over the
+/// narrowed domain, and keeps whichever of the raw / decorrelated
+/// candidates is smaller. Every candidate decodes back to `pcm`
+/// bit-exactly, so the choice is purely a size decision:
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_mono_best(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let left_shift = detect_left_shift(pcm);
+    let mut narrow = pcm.to_vec();
+    if left_shift > 0 {
+        narrow_left_shift(&mut narrow, left_shift)?;
+    }
+
+    let raw = encode_block_core(
+        pcm,
+        BlockConfig {
+            left_shift,
+            ..raw_config(true, bytes_per_sample)
+        },
+        block_index,
+        total_samples,
+    )?;
+
+    // Decorrelated candidate, trained over the narrow domain the real
+    // prediction loop sees.
+    let passes = derive_mono_passes(&narrow, profile)?;
+    let (terms, weights, samples) = serialize_mono_passes(&passes)?;
+    let decorr = encode_block_core(
+        pcm,
+        BlockConfig {
+            left_shift,
+            decorr: Some((&terms, &weights, &samples)),
+            ..raw_config(true, bytes_per_sample)
+        },
+        block_index,
+        total_samples,
+    )?;
+
+    Ok(if decorr.len() < raw.len() {
+        decorr
+    } else {
+        raw
+    })
+}
+
+/// Encode an interleaved stereo PCM buffer into the **smallest** block
+/// this encoder can produce, searching the mode grid: {plain, joint
+/// mid/side} × {raw, derived decorrelation}, all at the auto-detected
+/// left-shift. Each decorrelated candidate trains over the exact domain
+/// its prediction loop will run in (narrow, or narrow + joint). Every
+/// candidate decodes back to `pcm` bit-exactly:
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_stereo_best(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let left_shift = detect_left_shift(pcm);
+    let mut narrow = pcm.to_vec();
+    if left_shift > 0 {
+        narrow_left_shift(&mut narrow, left_shift)?;
+    }
+    let mut joint_narrow = narrow.clone();
+    for pair in joint_narrow.chunks_exact_mut(2) {
+        let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
+        pair[0] = mid;
+        pair[1] = side;
+    }
+
+    let mut best: Option<Vec<u8>> = None;
+    for joint in [false, true] {
+        let domain = if joint { &joint_narrow } else { &narrow };
+        let derived = derive_stereo_passes(domain, profile)?;
+        let (terms, weights, samples) = serialize_stereo_passes(&derived)?;
+        for decorr in [None, Some((&terms[..], &weights[..], &samples[..]))] {
+            let candidate = encode_block_core(
+                pcm,
+                BlockConfig {
+                    joint,
+                    left_shift,
+                    decorr,
+                    ..raw_config(false, bytes_per_sample)
+                },
+                block_index,
+                total_samples,
+            )?;
+            let improves = match &best {
+                None => true,
+                Some(b) => candidate.len() < b.len(),
+            };
+            if improves {
+                best = Some(candidate);
+            }
+        }
+    }
+    // The loop always ran at least one candidate.
+    Ok(best.expect("mode grid produced no candidate"))
+}
+
 /// Default per-block sample count the stream encoders split a long PCM
 /// buffer into. A whole `.wv` file is a chain of `wvpk` blocks — the
 /// walker ([`crate::block::iter_decoded_blocks`]) concatenates their PCM
@@ -2019,6 +2166,122 @@ mod tests {
         ));
         assert!(matches!(
             encode_block_stereo_joint_auto(&[1, 2, 3], DecorrProfile::Fast, 2, 0, 1),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
+    }
+
+    // ---- left-shift detection + best-of mode selection (round 383) ----
+
+    /// `detect_left_shift` reports the common low-zero-bit count, with
+    /// the documented zero-buffer and full-depth-audio arms.
+    #[test]
+    fn detect_left_shift_arms() {
+        assert_eq!(detect_left_shift(&[]), 0);
+        assert_eq!(detect_left_shift(&[0, 0, 0]), 0);
+        assert_eq!(detect_left_shift(&[1, 2, 3]), 0);
+        // 12-bit audio scaled << 4.
+        assert_eq!(detect_left_shift(&[16, -32, 4096, 0]), 4);
+        // The minimum across samples wins.
+        assert_eq!(detect_left_shift(&[64, 128, 8]), 3);
+        // Cap at 31 (i32::MIN alone has 31 trailing zeros).
+        assert_eq!(detect_left_shift(&[i32::MIN]), 31);
+    }
+
+    /// The best mono encoder auto-detects a 12-bit-style shift: the
+    /// output carries the flag, round-trips, and beats the plain auto
+    /// encoder that codes the wide container values.
+    #[test]
+    fn mono_best_detects_shift_and_beats_unshifted_auto() {
+        let pcm: Vec<i32> = smooth_mono(600).iter().map(|&v| v << 4).collect();
+        let best = encode_block_mono_best(&pcm, DecorrProfile::Normal, 2, 0, 600).unwrap();
+        let (hdr, _) = parse_block_header(&best).unwrap();
+        assert_eq!(hdr.flags.left_shift, 4, "detected shift stored in flags");
+        assert_eq!(decode_stream(&best).unwrap(), pcm);
+
+        let auto = encode_block_mono_auto(&pcm, DecorrProfile::Normal, 2, 0, 600).unwrap();
+        assert!(
+            best.len() < auto.len(),
+            "shift-aware best ({}) must beat unshifted auto ({})",
+            best.len(),
+            auto.len()
+        );
+    }
+
+    /// The best encoders never lose to any public single-mode candidate.
+    #[test]
+    fn best_is_no_larger_than_any_single_mode() {
+        let mono = smooth_mono(500);
+        let best = encode_block_mono_best(&mono, DecorrProfile::Normal, 2, 0, 500).unwrap();
+        let raw = encode_block_mono(&mono, 2, 0, 500).unwrap();
+        let auto = encode_block_mono_auto(&mono, DecorrProfile::Normal, 2, 0, 500).unwrap();
+        assert!(best.len() <= raw.len() && best.len() <= auto.len());
+        assert_eq!(decode_stream(&best).unwrap(), mono);
+
+        let stereo = smooth_stereo(400);
+        let best = encode_block_stereo_best(&stereo, DecorrProfile::Normal, 2, 0, 400).unwrap();
+        for candidate in [
+            encode_block_stereo(&stereo, 2, 0, 400).unwrap(),
+            encode_block_stereo_auto(&stereo, DecorrProfile::Normal, 2, 0, 400).unwrap(),
+            encode_block_stereo_joint(&stereo, 2, 0, 400).unwrap(),
+            encode_block_stereo_joint_auto(&stereo, DecorrProfile::Normal, 2, 0, 400).unwrap(),
+        ] {
+            assert!(
+                best.len() <= candidate.len(),
+                "best ({}) lost to a single-mode candidate ({})",
+                best.len(),
+                candidate.len()
+            );
+        }
+        assert_eq!(decode_stream(&best).unwrap(), stereo);
+    }
+
+    /// Stereo best on shifted identical channels combines all three
+    /// features (joint + decorr + shift) and still round-trips.
+    #[test]
+    fn stereo_best_combines_shift_joint_decorr() {
+        let mut pcm = Vec::with_capacity(500);
+        for i in 0..250 {
+            let v = (i * 5 - 600 + ((i % 6) - 3)) << 3;
+            pcm.push(v);
+            pcm.push(v);
+        }
+        let best = encode_block_stereo_best(&pcm, DecorrProfile::Normal, 2, 0, 250).unwrap();
+        let (hdr, _) = parse_block_header(&best).unwrap();
+        assert_eq!(hdr.flags.left_shift, 3, "detected shift stored");
+        assert_eq!(decode_stream(&best).unwrap(), pcm);
+        let (_, all_ok) = crate::block::decode_stream_muted(&best).unwrap();
+        assert!(all_ok);
+    }
+
+    /// Best on pseudo-random data still round-trips (raw candidate may
+    /// win — the choice is size-only, never correctness).
+    #[test]
+    fn best_round_trips_pseudo_random() {
+        let mut pcm = Vec::with_capacity(400);
+        let mut state: u32 = 0xFEED_5EED;
+        for _ in 0..400 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pcm.push((state >> 16) as i16 as i32);
+        }
+        let mono = encode_block_mono_best(&pcm, DecorrProfile::High, 2, 0, 400).unwrap();
+        assert_eq!(decode_stream(&mono).unwrap(), pcm);
+        let stereo = encode_block_stereo_best(&pcm, DecorrProfile::High, 2, 0, 200).unwrap();
+        assert_eq!(decode_stream(&stereo).unwrap(), pcm);
+    }
+
+    /// The best encoders share the standard refusal arms.
+    #[test]
+    fn best_refusal_arms() {
+        assert!(matches!(
+            encode_block_mono_best(&[], DecorrProfile::Fast, 2, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_best(&[], DecorrProfile::Fast, 2, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_best(&[1, 2, 3], DecorrProfile::Fast, 2, 0, 1),
             Err(Error::EncodeStereoOddLength(3))
         ));
     }
