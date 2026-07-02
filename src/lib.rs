@@ -845,13 +845,15 @@ pub use crate::crc::{
 };
 pub use crate::decorrelation::{
     apply_weight, assemble_mono_passes, assemble_stereo_passes, decode_term_byte, decorrelate_mono,
-    decorrelate_stereo, decorrelation_sample_count, expand_samples, expand_terms, expand_weights,
-    is_cross_term, is_valid_term, partition_decorrelation_samples, recorrelate_mono,
-    recorrelate_stereo, update_weight, update_weight_clip, weights_per_term, DecorrPass,
-    DecorrelationSamples, DecorrelationTerms, DecorrelationWeights, TermKind,
-    MAX_DECORRELATION_SAMPLES_PER_TERM, MAX_DOCUMENTED_TERM, MAX_NTERMS, MAX_TERM,
-    SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES, TERM_BYTE_BIAS, TERM_DELTA_BITS, TERM_DELTA_MASK,
-    TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, WEIGHT_CLIP, WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
+    decorrelate_stereo, decorrelation_sample_count, encode_term_byte, expand_samples, expand_terms,
+    expand_weights, is_cross_term, is_valid_term, pack_sample_word, pack_weight_byte,
+    partition_decorrelation_samples, quantize_seed_sample, quantize_weight, recorrelate_mono,
+    recorrelate_stereo, serialize_mono_passes, serialize_stereo_passes, update_weight,
+    update_weight_clip, weights_per_term, DecorrPass, DecorrelationSamples, DecorrelationTerms,
+    DecorrelationWeights, TermKind, MAX_DECORRELATION_SAMPLES_PER_TERM, MAX_DOCUMENTED_TERM,
+    MAX_NTERMS, MAX_TERM, SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES, TERM_BYTE_BIAS,
+    TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, WEIGHT_CLIP,
+    WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
 };
 pub use crate::encode::{
     encode_block_mono, encode_block_mono_shifted, encode_block_mono_with_decorr,

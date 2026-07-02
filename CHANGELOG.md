@@ -17,6 +17,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 — **forward decorrelation-metadata serializers** (the exact
+  inverses of the round-339/348 assemblers). `serialize_mono_passes` /
+  `serialize_stereo_passes` turn an application-ordered `DecorrPass` list
+  into the three raw `0x02` (terms) / `0x03` (weights) / `0x04` (seed
+  samples) payload byte vectors, applying the spec §3.7 reverse-storage
+  convention (wire stores the encoder's last-applied pass first), the
+  §2.1 `+5`-biased term byte with the 3-bit delta field
+  (`encode_term_byte`, the exact inverse of `decode_term_byte`), one /
+  two weight bytes per pass, and the per-term per-channel seed
+  partition: `assemble_*_passes(&serialize_*_passes(passes)?)? ==
+  passes`, bit-exact. The on-wire stores are lossy log-packs, so the
+  supporting quantizers are public: `pack_weight_byte` /
+  `quantize_weight` (nearest-value inverse of the §3.6 weight expansion,
+  pinned as a true nearest quantizer against exhaustive search and
+  byte-exact round-trip over all 256 stored bytes) and
+  `pack_sample_word` / `quantize_seed_sample` (canonical
+  minimal-exponent inverse of the wiki 16-bit exponent/mantissa
+  log-word). Passes carrying state the wire cannot reproduce are refused
+  with the new typed errors `EncodeWeightNotRepresentable` /
+  `EncodeSeedNotRepresentable` / `EncodeDeltaOutOfRange` (plus the
+  assembler's existing cross-on-mono / over-long gates), so a serialized
+  block always decodes back to the identical pass state. 14 new tests
+  (855 total): exhaustive weight-byte round-trip + nearest-quantizer
+  sweep, seed-word canonical/truncation arms, term-byte inverse across
+  every valid `(term, delta)`, serialize→assemble identities (mono +
+  stereo with cross terms), assemble→serialize byte identity on
+  canonical payloads, every refusal arm, and a serialized-pass-list
+  recorrelate→decorrelate round trip. Exported: `serialize_mono_passes`,
+  `serialize_stereo_passes`, `encode_term_byte`, `pack_weight_byte`,
+  `quantize_weight`, `pack_sample_word`, `quantize_seed_sample`.
+
 - Round 378 — **multichannel layout introspection**. `multichannel_layout`
   reports a stream's per-frame channel count and member-set count by
   walking block headers (and the per-block mono/stereo flag) only — no

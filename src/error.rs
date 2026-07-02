@@ -299,6 +299,28 @@ pub enum Error {
     /// `2^left_shift` (its low bits zero) or the encode would not be
     /// lossless. The offending sample value is carried for diagnostics.
     EncodeLeftShiftLosesData(i32),
+    /// A decorrelation-pass serializer was given a working weight that no
+    /// `0x03` stored byte expands back to. The §3.6 weight store is one
+    /// signed byte per pass per channel expanded through the documented
+    /// log-pack (`byte * 8`, plus `(n + 64) >> 7` when positive), so only
+    /// 256 working values are representable; an encoder must quantize its
+    /// working weight (see [`crate::quantize_weight`]) before serializing
+    /// so the decoder reconstructs the identical starting state. Carries
+    /// the unrepresentable weight.
+    EncodeWeightNotRepresentable(i32),
+    /// A decorrelation-pass serializer was given a seed-history sample
+    /// that no `0x04` stored 16-bit log-word expands back to. The §3.6
+    /// seed store is a signed-log2 word (8-bit signed mantissa, shifted
+    /// exponent), so a seed with more than 8 significant bits must be
+    /// quantized (see [`crate::quantize_seed_sample`]) before serializing.
+    /// Carries the unrepresentable seed value.
+    EncodeSeedNotRepresentable(i32),
+    /// A decorrelation-pass serializer was given a per-pass `delta`
+    /// outside the 3-bit on-wire field. The `0x02` term byte stores the
+    /// weight-adaptation step in its top 3 bits (spec §2.1,
+    /// `delta = (byte >> 5) & 0x7`), so only `0..=7` is representable.
+    /// Carries the out-of-range delta.
+    EncodeDeltaOutOfRange(i32),
     /// A multichannel set was malformed: a member block carried the wiki
     /// bit-12 "final block of set" marker without any preceding bit-11
     /// "first block of set" marker having opened a set (or the stream
@@ -461,6 +483,18 @@ impl core::fmt::Display for Error {
             Error::EncodeLeftShiftLosesData(v) => write!(
                 f,
                 "oxideav-wavpack: encode_block_*_shifted: sample {v} has non-zero low bits that left_shift would drop (input must be a multiple of 2^left_shift)"
+            ),
+            Error::EncodeWeightNotRepresentable(w) => write!(
+                f,
+                "oxideav-wavpack: serialize: working weight {w} is not a 0x03 stored-byte expansion (quantize via quantize_weight first)"
+            ),
+            Error::EncodeSeedNotRepresentable(v) => write!(
+                f,
+                "oxideav-wavpack: serialize: seed sample {v} is not a 0x04 log-word expansion (quantize via quantize_seed_sample first)"
+            ),
+            Error::EncodeDeltaOutOfRange(d) => write!(
+                f,
+                "oxideav-wavpack: serialize: pass delta {d} does not fit the 3-bit 0x02 term-byte field (0..=7)"
             ),
             Error::MultichannelSetMalformed => f.write_str(
                 "oxideav-wavpack: malformed multichannel set (stray final-block marker or unterminated set; wiki flag bits 11..=12)",

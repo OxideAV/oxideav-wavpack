@@ -1474,6 +1474,223 @@ pub fn assemble_stereo_passes(
     Ok(passes)
 }
 
+/// Pack a working decorrelation weight into its `0x03` stored byte —
+/// the nearest-value inverse of the spec §3.6 weight expansion
+/// (`n = byte * 8; if (n > 0) n += (n + 64) >> 7`, the `restore_weight`
+/// rule whose two endpoints are `+127 → +1024` and `-128 → -1024`).
+///
+/// The expansion is strictly monotonic across the 256 stored bytes (each
+/// byte step moves the working value by 8 or 9), so the inverse is found
+/// with a small search window around the linear `weight / 8` estimate.
+/// When `weight` falls between two representable values the packer
+/// returns the numerically smaller byte among the nearest (deterministic
+/// tie-break); out-of-range inputs clamp to the `±1024` endpoints.
+///
+/// The exact-representability predicate an encoder needs before
+/// serializing is `quantize_weight(w) == w` (see [`quantize_weight`]).
+pub fn pack_weight_byte(weight: i32) -> u8 {
+    let estimate = (weight >> 3).clamp(i32::from(i8::MIN), i32::from(i8::MAX)) as i8;
+    // The positive-branch correction `(n + 64) >> 7` is at most 8 across
+    // the byte range, i.e. within one byte step of the `w / 8` estimate;
+    // a ±4 window is comfortably wider than the worst-case offset.
+    let lo = estimate.saturating_sub(4);
+    let hi = estimate.saturating_add(4);
+    let mut best = lo;
+    let mut best_dist = (i64::from(expand_weight_byte(lo as u8)) - i64::from(weight)).abs();
+    let mut b = lo;
+    while b < hi {
+        b += 1;
+        let dist = (i64::from(expand_weight_byte(b as u8)) - i64::from(weight)).abs();
+        if dist < best_dist {
+            best = b;
+            best_dist = dist;
+        }
+    }
+    best as u8
+}
+
+/// Quantize a working decorrelation weight to the nearest value the
+/// `0x03` stored byte can represent: `expand ∘ pack`.
+///
+/// An encoder that derives a working weight (e.g. by training the §3.4
+/// adaptation over the block) must start its *real* forward pass from
+/// the quantized value — the decoder reconstructs its starting weight
+/// from the stored byte, so only a quantized weight keeps the two
+/// directions' pass state byte-identical. Idempotent:
+/// `quantize_weight(quantize_weight(w)) == quantize_weight(w)`.
+pub fn quantize_weight(weight: i32) -> i32 {
+    expand_weight_byte(pack_weight_byte(weight))
+}
+
+/// Pack a seed-history sample into its canonical `0x04` on-wire 16-bit
+/// log-word `[mantissa, exponent]` — the nearest-value inverse of the
+/// wiki exponent/mantissa expansion ([`expand_samples`]): a signed 8-bit
+/// mantissa shifted left by `exponent - 9`.
+///
+/// The canonical form uses the smallest exponent whose arithmetic
+/// right-shift fits the mantissa in `i8`, so any value with at most 8
+/// significant bits round-trips exactly (including every `-128..=127`
+/// verbatim at exponent `9`, and any such value scaled by a power of
+/// two). Wider values quantize by dropping low bits (arithmetic-shift
+/// truncation, toward negative infinity) — the exactness predicate is
+/// `quantize_seed_sample(v) == v` (see [`quantize_seed_sample`]).
+pub fn pack_sample_word(value: i32) -> [u8; 2] {
+    if value == 0 {
+        return [0, SAMPLE_EXPONENT_BIAS as u8];
+    }
+    let mut shift = 0u32;
+    while !(i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&(value >> shift)) {
+        shift += 1;
+    }
+    let mantissa = (value >> shift) as i8 as u8;
+    [mantissa, SAMPLE_EXPONENT_BIAS as u8 + shift as u8]
+}
+
+/// Quantize a seed-history sample to the nearest value the `0x04`
+/// log-word can represent: `expand ∘ pack`. Values with at most 8
+/// significant bits are returned verbatim; wider values lose their low
+/// bits (truncation toward negative infinity). Idempotent, like
+/// [`quantize_weight`] — an encoder priming pass history from real PCM
+/// must prime with the quantized values so the decoder's seed expansion
+/// reconstructs the identical history.
+pub fn quantize_seed_sample(value: i32) -> i32 {
+    let [mantissa, exponent] = pack_sample_word(value);
+    expand_sample_word(mantissa, exponent)
+}
+
+/// Pack a `(term, delta)` pair into its `0x02` on-wire term byte — the
+/// exact inverse of [`decode_term_byte`]. Per spec §2.1 the low 5 bits
+/// carry the `+5`-biased term and the top 3 bits carry the per-pass
+/// weight-adaptation `delta`.
+///
+/// Returns [`Error::InvalidDecorrelationTerm`] for a term outside the
+/// spec valid set `{1..8, 17, 18, -1, -2, -3}` and
+/// [`Error::EncodeDeltaOutOfRange`] for a delta outside the 3-bit field.
+pub fn encode_term_byte(term: i8, delta: i32) -> Result<u8> {
+    if !is_valid_term(term) {
+        return Err(Error::InvalidDecorrelationTerm(term));
+    }
+    if !(0..=i32::from(TERM_DELTA_MASK)).contains(&delta) {
+        return Err(Error::EncodeDeltaOutOfRange(delta));
+    }
+    let biased = ((term + TERM_BYTE_BIAS) as u8) & TERM_PREDICTOR_MASK;
+    Ok(biased | ((delta as u8) << TERM_PREDICTOR_BITS))
+}
+
+/// Pack a weight for serialization, refusing a value the stored byte
+/// cannot reproduce exactly.
+fn pack_weight_exact(weight: i32) -> Result<u8> {
+    let byte = pack_weight_byte(weight);
+    if expand_weight_byte(byte) != weight {
+        return Err(Error::EncodeWeightNotRepresentable(weight));
+    }
+    Ok(byte)
+}
+
+/// Pack a seed for serialization, refusing a value the log-word cannot
+/// reproduce exactly.
+fn pack_seed_exact(value: i32) -> Result<[u8; 2]> {
+    let word = pack_sample_word(value);
+    if expand_sample_word(word[0], word[1]) != value {
+        return Err(Error::EncodeSeedNotRepresentable(value));
+    }
+    Ok(word)
+}
+
+/// Read a pass's per-channel seed-history samples back out of its ring,
+/// newest-first — the exact inverse of the [`DecorrPass::new`] /
+/// `seed_history` placement (fixed-lag rings reverse into slots
+/// `0..t-1`; `17`/`18` occupy slots `0`/`1` in order; cross terms slot
+/// `0`).
+fn extract_seeds(term: i8, ring: &[i32; MAX_TERM as usize]) -> Vec<i32> {
+    let n = seed_count(term);
+    if (1..=MAX_TERM).contains(&term) {
+        (0..n).map(|i| ring[n - 1 - i]).collect()
+    } else {
+        ring[..n].to_vec()
+    }
+}
+
+/// Serialize an application-ordered **mono** [`DecorrPass`] list into the
+/// three raw decorrelation metadata payloads — `0x02` terms, `0x03`
+/// weights, `0x04` seed samples — the exact forward inverse of
+/// [`assemble_mono_passes`]:
+/// `assemble_mono_passes(&t, &w, &s)? == passes` for the returned
+/// `(t, w, s)`.
+///
+/// The caller's list is in *application* order (the order
+/// [`decorrelate_mono`] / [`recorrelate_mono`] consume); per spec §3.7
+/// the wire stores the passes in the reverse (encoder's last-applied
+/// pass first), so the serializer walks the list back-to-front. Each
+/// pass contributes one `0x02` term byte ([`encode_term_byte`]), one
+/// `0x03` weight byte, and `seed_count(term)` `0x04` log-words from its
+/// (initial) channel-A history.
+///
+/// The passes must carry **serializable state**: every weight must be a
+/// stored-byte expansion ([`Error::EncodeWeightNotRepresentable`]
+/// otherwise — quantize via [`quantize_weight`]) and every seed a
+/// log-word expansion ([`Error::EncodeSeedNotRepresentable`] — quantize
+/// via [`quantize_seed_sample`]); the delta must fit the 3-bit field
+/// ([`Error::EncodeDeltaOutOfRange`]). Cross terms are rejected for mono
+/// ([`Error::CrossTermOnMono`]) and an over-long list trips
+/// [`Error::TooManyDecorrelationPasses`], matching the assembler's
+/// gates. Serialize a pass list *before* running it — the loops mutate
+/// weights and history in place.
+pub fn serialize_mono_passes(passes: &[DecorrPass]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    if passes.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(passes.len()));
+    }
+    for pass in passes {
+        if is_cross_term(pass.term) {
+            return Err(Error::CrossTermOnMono(pass.term));
+        }
+    }
+    let mut terms = Vec::with_capacity(passes.len());
+    let mut weights = Vec::with_capacity(passes.len());
+    let mut samples = Vec::new();
+    // Wire order is the reverse of application order (§3.7).
+    for pass in passes.iter().rev() {
+        terms.push(encode_term_byte(pass.term, pass.delta)?);
+        weights.push(pack_weight_exact(pass.weight_a)?);
+        for seed in extract_seeds(pass.term, &pass.history_a) {
+            samples.extend_from_slice(&pack_seed_exact(seed)?);
+        }
+    }
+    Ok((terms, weights, samples))
+}
+
+/// Serialize an application-ordered **stereo** [`DecorrPass`] list into
+/// the three raw decorrelation metadata payloads — the exact forward
+/// inverse of [`assemble_stereo_passes`]:
+/// `assemble_stereo_passes(&t, &w, &s)? == passes`.
+///
+/// The stereo wire layout (spec §3.6): per pass, **two** weight bytes
+/// (channel A then channel B) and `2 * seed_count(term)` seed log-words
+/// (channel A's seeds then channel B's). Cross terms (`-1`/`-2`/`-3`)
+/// are valid here. All the [`serialize_mono_passes`] representability
+/// gates apply to both channels' state.
+pub fn serialize_stereo_passes(passes: &[DecorrPass]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    if passes.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(passes.len()));
+    }
+    let mut terms = Vec::with_capacity(passes.len());
+    let mut weights = Vec::with_capacity(passes.len() * 2);
+    let mut samples = Vec::new();
+    // Wire order is the reverse of application order (§3.7).
+    for pass in passes.iter().rev() {
+        terms.push(encode_term_byte(pass.term, pass.delta)?);
+        weights.push(pack_weight_exact(pass.weight_a)?);
+        weights.push(pack_weight_exact(pass.weight_b)?);
+        for seed in extract_seeds(pass.term, &pass.history_a) {
+            samples.extend_from_slice(&pack_seed_exact(seed)?);
+        }
+        for seed in extract_seeds(pass.term, &pass.history_b) {
+            samples.extend_from_slice(&pack_seed_exact(seed)?);
+        }
+    }
+    Ok((terms, weights, samples))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3059,5 +3276,266 @@ mod tests {
             assemble_stereo_passes(&[], &[5, 6], &[]),
             Err(Error::DecorrelationTermsMissing)
         );
+    }
+
+    // ---- forward serializers (round 383) ----
+
+    /// The §3.6 weight expansion is injective, so packing an expanded
+    /// byte must return the byte for every one of the 256 stored values.
+    #[test]
+    fn pack_weight_byte_round_trips_every_stored_byte() {
+        for byte in 0..=255u8 {
+            let expanded = expand_weight_byte(byte);
+            assert_eq!(
+                pack_weight_byte(expanded),
+                byte,
+                "byte {byte} (weight {expanded}) must round-trip"
+            );
+        }
+    }
+
+    /// The packer is a true nearest-value quantizer: across the whole
+    /// working range no stored byte is closer than the one it picks.
+    #[test]
+    fn pack_weight_byte_is_nearest_across_working_range() {
+        for w in -1100..=1100 {
+            let picked = pack_weight_byte(w);
+            let picked_dist = (i64::from(expand_weight_byte(picked)) - i64::from(w)).abs();
+            for candidate in 0..=255u8 {
+                let dist = (i64::from(expand_weight_byte(candidate)) - i64::from(w)).abs();
+                assert!(
+                    picked_dist <= dist,
+                    "weight {w}: picked byte {picked} (dist {picked_dist}) beaten by {candidate} (dist {dist})"
+                );
+            }
+        }
+    }
+
+    /// Quantization is idempotent and clamps the out-of-range extremes to
+    /// the documented `±1024` endpoints.
+    #[test]
+    fn quantize_weight_idempotent_and_clamped() {
+        for w in [-5000, -1024, -1000, -17, 0, 1, 8, 500, 1000, 1024, 5000] {
+            let q = quantize_weight(w);
+            assert_eq!(quantize_weight(q), q, "idempotence at {w}");
+        }
+        assert_eq!(quantize_weight(9999), 1024);
+        assert_eq!(quantize_weight(-9999), -1024);
+        assert_eq!(quantize_weight(1024), 1024);
+        assert_eq!(quantize_weight(-1024), -1024);
+        assert_eq!(quantize_weight(0), 0);
+    }
+
+    /// Every signed-8-bit value packs verbatim at the bias exponent, and
+    /// power-of-two multiples pack exactly through larger exponents.
+    #[test]
+    fn pack_sample_word_exact_for_representable_values() {
+        for v in -128..=127i32 {
+            let [m, e] = pack_sample_word(v);
+            assert_eq!(expand_sample_word(m, e), v, "verbatim at {v}");
+            if v != 0 {
+                assert_eq!(e, SAMPLE_EXPONENT_BIAS as u8, "minimal exponent at {v}");
+            }
+        }
+        for shift in 1..=20u32 {
+            for base in [-128i32, -77, -1, 1, 77, 127] {
+                let v = base << shift;
+                let [m, e] = pack_sample_word(v);
+                assert_eq!(expand_sample_word(m, e), v, "shifted {base} << {shift}");
+            }
+        }
+        // The i32 extremes are exactly representable (−128 << 24, etc.).
+        let [m, e] = pack_sample_word(i32::MIN);
+        assert_eq!(expand_sample_word(m, e), i32::MIN);
+    }
+
+    /// Quantization truncates low bits toward negative infinity and is
+    /// idempotent; values within 8 significant bits are untouched.
+    #[test]
+    fn quantize_seed_sample_truncates_and_is_idempotent() {
+        assert_eq!(quantize_seed_sample(0), 0);
+        assert_eq!(quantize_seed_sample(127), 127);
+        assert_eq!(quantize_seed_sample(-128), -128);
+        // 301 needs 9 significant bits → the low bit is dropped.
+        assert_eq!(quantize_seed_sample(301), 300);
+        // -301 >> 1 = -151 still exceeds the i8 mantissa, so the canonical
+        // form shifts by 2: (-301 >> 2) << 2 = -76 << 2 = -304.
+        assert_eq!(quantize_seed_sample(-301), -304);
+        for v in [-100_000, -301, -129, 129, 301, 100_000, i32::MAX] {
+            let q = quantize_seed_sample(v);
+            assert!(q <= v, "truncation toward -inf at {v}");
+            assert_eq!(quantize_seed_sample(q), q, "idempotence at {v}");
+        }
+    }
+
+    /// `encode_term_byte` is the exact inverse of `decode_term_byte`
+    /// across every valid `(term, delta)` pair, and rejects the
+    /// out-of-set / out-of-field inputs.
+    #[test]
+    fn encode_term_byte_inverts_decode_term_byte() {
+        let valid_terms: [i8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 17, 18, -1, -2, -3];
+        for &t in &valid_terms {
+            for d in 0..=7i32 {
+                let byte = encode_term_byte(t, d).unwrap();
+                assert_eq!(decode_term_byte(byte), (t, d), "term {t} delta {d}");
+            }
+        }
+        assert_eq!(
+            encode_term_byte(0, 0),
+            Err(Error::InvalidDecorrelationTerm(0))
+        );
+        assert_eq!(
+            encode_term_byte(9, 0),
+            Err(Error::InvalidDecorrelationTerm(9))
+        );
+        assert_eq!(encode_term_byte(1, 8), Err(Error::EncodeDeltaOutOfRange(8)));
+        assert_eq!(
+            encode_term_byte(1, -1),
+            Err(Error::EncodeDeltaOutOfRange(-1))
+        );
+    }
+
+    /// serialize → assemble is the identity on a multi-term mono pass
+    /// list carrying quantized weights and seeds (fixed-lag, extrapolate).
+    #[test]
+    fn serialize_mono_round_trips_through_assembler() {
+        let passes = vec![
+            DecorrPass::new(18, 2, quantize_weight(500), 0, &[10, -20], &[]).unwrap(),
+            DecorrPass::new(3, 1, quantize_weight(-300), 0, &[7, -8, 9], &[]).unwrap(),
+            DecorrPass::new(17, 5, 0, 0, &[64 << 3, -128], &[]).unwrap(),
+        ];
+        let (t, w, s) = serialize_mono_passes(&passes).unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(w.len(), 3);
+        // 2 + 3 + 2 seeds, two bytes each.
+        assert_eq!(s.len(), 7 * 2);
+        let rebuilt = assemble_mono_passes(&t, &w, &s).unwrap();
+        assert_eq!(rebuilt, passes);
+    }
+
+    /// serialize → assemble is the identity on a stereo pass list with a
+    /// cross term and distinct per-channel weights / seeds.
+    #[test]
+    fn serialize_stereo_round_trips_through_assembler() {
+        let passes = vec![
+            DecorrPass::new(
+                -1,
+                3,
+                quantize_weight(200),
+                quantize_weight(-200),
+                &[5],
+                &[-6],
+            )
+            .unwrap(),
+            DecorrPass::new(
+                2,
+                2,
+                quantize_weight(999),
+                quantize_weight(1),
+                &[1, 2],
+                &[3, 4],
+            )
+            .unwrap(),
+            DecorrPass::new(18, 4, 0, quantize_weight(-1024), &[100, -100], &[50, -50]).unwrap(),
+        ];
+        let (t, w, s) = serialize_stereo_passes(&passes).unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(w.len(), 6);
+        // (1 + 2 + 2) seeds per channel, two channels, two bytes each.
+        assert_eq!(s.len(), 5 * 2 * 2);
+        let rebuilt = assemble_stereo_passes(&t, &w, &s).unwrap();
+        assert_eq!(rebuilt, passes);
+    }
+
+    /// The other direction: assemble → serialize reproduces the exact
+    /// payload bytes when the seeds are in canonical (minimal-exponent)
+    /// form — pinning the wire order (reverse of application order).
+    #[test]
+    fn assemble_then_serialize_reproduces_canonical_payloads() {
+        let terms = vec![term_byte(2, 1), term_byte(17, 3)];
+        let weights = vec![10u8, 0x80u8]; // +80, -1024 after expansion
+        let mut samples = Vec::new();
+        // term 2 seeds (canonical: mantissa, exponent 9).
+        samples.extend_from_slice(&seed_word(3));
+        samples.extend_from_slice(&seed_word(-4));
+        // term 17 seeds.
+        samples.extend_from_slice(&seed_word(100));
+        samples.extend_from_slice(&seed_word(-100));
+        let passes = assemble_mono_passes(&terms, &weights, &samples).unwrap();
+        let (t2, w2, s2) = serialize_mono_passes(&passes).unwrap();
+        assert_eq!(t2, terms);
+        assert_eq!(w2, weights);
+        assert_eq!(s2, samples);
+    }
+
+    /// Serializer refusal arms: unrepresentable weight, unrepresentable
+    /// seed, out-of-range delta, cross term on mono, over-long list.
+    #[test]
+    fn serialize_refusal_arms() {
+        // Weight 5 is not a stored-byte expansion (steps are 8 or 9).
+        let p = DecorrPass::new(1, 0, 5, 0, &[0], &[]).unwrap();
+        assert_eq!(
+            serialize_mono_passes(&[p]),
+            Err(Error::EncodeWeightNotRepresentable(5))
+        );
+        // Seed 301 needs 9 significant bits.
+        let p = DecorrPass::new(1, 0, 0, 0, &[301], &[]).unwrap();
+        assert_eq!(
+            serialize_mono_passes(&[p]),
+            Err(Error::EncodeSeedNotRepresentable(301))
+        );
+        // Delta 9 does not fit the 3-bit field.
+        let p = DecorrPass::new(1, 9, 0, 0, &[0], &[]).unwrap();
+        assert_eq!(
+            serialize_mono_passes(&[p]),
+            Err(Error::EncodeDeltaOutOfRange(9))
+        );
+        // Cross term on the mono serializer.
+        let p = DecorrPass::new(-2, 0, 0, 0, &[0], &[0]).unwrap();
+        assert_eq!(serialize_mono_passes(&[p]), Err(Error::CrossTermOnMono(-2)));
+        // Over-long list (17 passes).
+        let long: Vec<DecorrPass> = (0..17)
+            .map(|_| DecorrPass::new(1, 0, 0, 0, &[0], &[]).unwrap())
+            .collect();
+        assert_eq!(
+            serialize_mono_passes(&long),
+            Err(Error::TooManyDecorrelationPasses(17))
+        );
+        assert_eq!(
+            serialize_stereo_passes(&long),
+            Err(Error::TooManyDecorrelationPasses(17))
+        );
+    }
+
+    /// Empty pass lists serialize to three empty payloads and assemble
+    /// back to the empty list.
+    #[test]
+    fn serialize_empty_pass_list_is_three_empty_payloads() {
+        let (t, w, s) = serialize_mono_passes(&[]).unwrap();
+        assert!(t.is_empty() && w.is_empty() && s.is_empty());
+        let (t, w, s) = serialize_stereo_passes(&[]).unwrap();
+        assert!(t.is_empty() && w.is_empty() && s.is_empty());
+    }
+
+    /// A serialized pass list drives the full forward/inverse loop pair:
+    /// recorrelate with the assembled passes, decorrelate with a freshly
+    /// re-assembled copy, recovering the original buffer.
+    #[test]
+    fn serialized_passes_drive_recorrelate_decorrelate_round_trip() {
+        let passes = vec![
+            DecorrPass::new(18, 2, quantize_weight(700), 0, &[12, -13], &[]).unwrap(),
+            DecorrPass::new(2, 1, quantize_weight(-150), 0, &[40, -40], &[]).unwrap(),
+        ];
+        let (t, w, s) = serialize_mono_passes(&passes).unwrap();
+
+        let original: Vec<i32> = (0..64).map(|i| (i * 37 % 200) - 100).collect();
+        let mut buffer = original.clone();
+        let mut forward = assemble_mono_passes(&t, &w, &s).unwrap();
+        recorrelate_mono(&mut forward, &mut buffer).unwrap();
+        assert_ne!(buffer, original, "residuals differ from PCM");
+
+        let mut inverse = assemble_mono_passes(&t, &w, &s).unwrap();
+        decorrelate_mono(&mut inverse, &mut buffer).unwrap();
+        assert_eq!(buffer, original);
     }
 }
