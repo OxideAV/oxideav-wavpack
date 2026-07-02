@@ -17,6 +17,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 — **joint (mid/side) stereo + decorrelation combined
+  encode** and the single-body encoder core. Previously joint stereo
+  and decorrelation were mutually exclusive encode paths; the new
+  `encode_block_stereo_joint_with_decorr` (payload-driven) and
+  `encode_block_stereo_joint_auto` (self-derived) combine them,
+  mirroring the decoder's stage order — the §5 CRC folds over the true
+  L/R, the forward §5.4 mid/side transform runs next, and the §3
+  forward prediction loop runs over the *joint-transformed* buffer (the
+  decoder decorrelates first, then undoes joint). The joint auto path
+  trains its pass list over a joint-transformed scratch copy so the
+  derivation sees the same domain the real loop will. Internally every
+  public block encoder now delegates to one `encode_block_core` +
+  `BlockConfig` body (mono/joint/left-shift/decorr/marker as orthogonal
+  axes), replacing five hand-expanded stage pipelines — byte-identical
+  output, pinned by the entire existing encode suite passing unchanged.
+  On identical channels the joint auto block is pinned strictly smaller
+  than the plain auto block (the mid channel collapses to the zero-run
+  fast path). 5 new tests (867 total): combined-feature round-trip with
+  flag + sub-block-chain checks, all-profile joint-auto round-trips,
+  the joint-beats-plain compression pin, pseudo-random safety, and the
+  refusal arms. Exported: `encode_block_stereo_joint_with_decorr`,
+  `encode_block_stereo_joint_auto`.
+
 - Round 383 — **self-deriving decorrelation encoder** (`*_auto`). The
   first entry points that perform real prediction-based compression
   without the caller authoring any metadata: `encode_block_mono_auto` /

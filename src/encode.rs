@@ -251,6 +251,198 @@ fn forward_joint_stereo(left: i32, right: i32) -> (i32, i32) {
     (mid, side)
 }
 
+/// Shape / feature selection for one block encode, consumed by
+/// [`encode_block_core`]. Every public block encoder is a thin wrapper
+/// choosing a combination; the core runs the stages in the exact inverse
+/// of the decoder's documented order (entropy → decorrelate → joint undo
+/// → CRC → final shift), i.e. narrow → CRC → joint forward → recorrelate
+/// → entropy.
+struct BlockConfig<'a> {
+    /// Mono / false-stereo shape (bit 2) vs interleaved stereo.
+    mono: bool,
+    /// Joint (mid/side) stereo (bit 4); stereo only.
+    joint: bool,
+    /// Wiki flag-bits-13..=17 sub-byte-depth shift (`0` = whole-byte).
+    left_shift: u8,
+    /// Raw `0x02`/`0x03`/`0x04` decorrelation payloads to emit verbatim
+    /// and drive the §3 forward prediction loop with; `None` = raw path.
+    decorr: Option<(&'a [u8], &'a [u8], &'a [u8])>,
+    /// Header bits 0..=1 width hint (1..=4).
+    bytes_per_sample: u8,
+    /// Wiki bits-11..=12 multichannel grouping marker (`0b11` standalone).
+    marker: u32,
+}
+
+/// Assemble one complete `wvpk` block from a container-scaled PCM buffer
+/// and a [`BlockConfig`] — the single body every public block encoder
+/// delegates to.
+///
+/// Stage order (each the forward inverse of the decoder's documented
+/// stage, in reverse):
+///
+/// 1. **Narrow** (`left_shift > 0`): right-shift each sample (inverse of
+///    the §1 pipeline final [`crate::fixup::apply_left_shift_buffer`]),
+///    refusing non-zero dropped bits.
+/// 2. **CRC**: fold the spec §5 running CRC over the narrow true
+///    (pre-joint) samples — the exact buffer the decoder folds.
+/// 3. **Joint forward** (`joint`): the §5.4 inverse per pair.
+/// 4. **Recorrelate** (`decorr`): assemble the pass list from the raw
+///    payloads and run the §3 forward prediction loop into residuals.
+/// 5. **Entropy**: the §4.2 writer, framed as the `0x05` + (`0x02` /
+///    `0x03` / `0x04`) + `0x0A` metadata chain behind the 32-byte fixed
+///    header.
+fn encode_block_core(
+    pcm: &[i32],
+    config: BlockConfig<'_>,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if !config.mono && pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+
+    // Stage 1: narrow container-scaled samples for a sub-byte-depth
+    // block; the identity when left_shift == 0.
+    let mut work = pcm.to_vec();
+    if config.left_shift > 0 {
+        narrow_left_shift(&mut work, config.left_shift)?;
+    }
+
+    // Stage 2: the §5 running CRC over the narrow true samples (the
+    // decoder undoes joint stereo before its CRC step, and folds the
+    // pre-shift buffer).
+    let crc = if config.mono {
+        crate::crc::crc_mono(&work)
+    } else {
+        crate::crc::crc_stereo_interleaved(&work)
+    };
+
+    // Stage 3: forward mid/side ahead of prediction, mirroring the
+    // decoder's decorrelate-then-joint-undo order.
+    if config.joint {
+        for pair in work.chunks_exact_mut(2) {
+            let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
+            pair[0] = mid;
+            pair[1] = side;
+        }
+    }
+
+    // Stage 4: §3 forward prediction into residuals (validating the
+    // payloads exactly as the decoder's assembler will).
+    if let Some((terms, weights, samples)) = config.decorr {
+        if config.mono {
+            let mut passes = crate::decorrelation::assemble_mono_passes(terms, weights, samples)?;
+            recorrelate_mono(&mut passes, &mut work)?;
+        } else {
+            let mut passes = crate::decorrelation::assemble_stereo_passes(terms, weights, samples)?;
+            recorrelate_stereo(&mut passes, &mut work)?;
+        }
+    }
+
+    // Flag word: width bits, grouping marker, then the shape bits.
+    let mut flags_raw = with_marker(base_flags(config.bytes_per_sample), config.marker);
+    if config.mono {
+        flags_raw |= 1 << 2;
+    }
+    if config.joint {
+        flags_raw |= crate::crc::JOINT_STEREO_FLAG;
+    }
+    if config.left_shift > 0 {
+        flags_raw = with_left_shift(flags_raw, config.left_shift);
+    }
+
+    let mut metadata = Vec::new();
+
+    // 0x05 entropy info. Mono: a single zero-seed set. Stereo: two sets,
+    // the right one carrying a minimal non-zero seed ([0, 0, 1]) because
+    // the decoder distinguishes a stereo entropy payload from a mono one
+    // by content (an all-zero right set reads as mono and is refused on
+    // the stereo path); the encode medians are seeded from the exact
+    // same sets so the round trip stays bit-exact whatever the seed.
+    let left_seed = [0, 0, 0];
+    let right_seed = [0, 0, 1];
+    let entropy_payload = if config.mono {
+        pack_entropy_info(&[left_seed])
+    } else {
+        pack_entropy_info(&[left_seed, right_seed])
+    };
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::EntropyInfo.as_id_byte(),
+        &entropy_payload,
+    )?;
+
+    // The three decorrelation sub-blocks, verbatim, in wire order.
+    if let Some((terms, weights, samples)) = config.decorr {
+        append_sub_block(
+            &mut metadata,
+            SubBlockId::DecorrelationTerms.as_id_byte(),
+            terms,
+        )?;
+        append_sub_block(
+            &mut metadata,
+            SubBlockId::DecorrelationWeights.as_id_byte(),
+            weights,
+        )?;
+        append_sub_block(
+            &mut metadata,
+            SubBlockId::DecorrelationSamples.as_id_byte(),
+            samples,
+        )?;
+    }
+
+    // Stage 5: the §4.2 entropy writer over the residuals.
+    let packed = if config.mono {
+        let mut medians = AdaptiveMedians::new([0, 0, 0]);
+        encode_packed_samples_mono(&work, &mut medians)?
+    } else {
+        let mut medians = [
+            AdaptiveMedians::from_seed_values(left_seed)
+                .ok_or(Error::InvalidEntropyInfoForStereo)?,
+            AdaptiveMedians::from_seed_values(right_seed)
+                .ok_or(Error::InvalidEntropyInfoForStereo)?,
+        ];
+        encode_packed_samples_stereo(&work, &mut medians)?
+    };
+    append_sub_block(
+        &mut metadata,
+        SubBlockId::PackedSamples.as_id_byte(),
+        &packed,
+    )?;
+
+    let per_channel = if config.mono {
+        pcm.len()
+    } else {
+        pcm.len() / 2
+    };
+    let block_samples =
+        u32::try_from(per_channel).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    build_block(
+        metadata,
+        block_index,
+        total_samples,
+        block_samples,
+        flags_raw,
+        crc,
+    )
+}
+
+/// The default standalone [`BlockConfig`]: raw (no decorrelation),
+/// whole-byte, non-joint, standalone marker.
+fn raw_config(mono: bool, bytes_per_sample: u8) -> BlockConfig<'static> {
+    BlockConfig {
+        mono,
+        joint: false,
+        left_shift: 0,
+        decorr: None,
+        bytes_per_sample,
+        marker: 0b11,
+    }
+}
+
 /// Encode a mono (single-channel) PCM buffer into one complete `wvpk`
 /// block via the raw (no-decorrelation) lossless path — the entropy
 /// stream carries the PCM verbatim and the decoder's no-decorrelation
@@ -295,46 +487,11 @@ fn encode_block_mono_marker(
     total_samples: u32,
     marker: u32,
 ) -> Result<Vec<u8>> {
-    if pcm.is_empty() {
-        return Err(Error::EncodeEmptyAudio);
-    }
-
-    // The spec §5 CRC is folded over the decoded PCM — i.e. the input
-    // samples themselves (the raw path carries them verbatim).
-    let crc = crate::crc::crc_mono(pcm);
-
-    let residuals = pcm.to_vec();
-    // Bit 2 (mono) per the wiki "Flags meaning", with the chosen grouping
-    // marker replacing the default standalone bits.
-    let flags_raw = with_marker(base_flags(bytes_per_sample), marker) | (1 << 2);
-    let mut metadata = Vec::new();
-
-    // 0x05 entropy info: a single zero-seed median set.
-    let entropy_payload = pack_entropy_info(&[[0, 0, 0]]);
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::EntropyInfo.as_id_byte(),
-        &entropy_payload,
-    )?;
-
-    let mut medians = AdaptiveMedians::new([0, 0, 0]);
-    let packed = encode_packed_samples_mono(&residuals, &mut medians)?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::PackedSamples.as_id_byte(),
-        &packed,
-    )?;
-
-    let block_samples =
-        u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
-    build_block(
-        metadata,
-        block_index,
-        total_samples,
-        block_samples,
-        flags_raw,
-        crc,
-    )
+    let config = BlockConfig {
+        marker,
+        ..raw_config(true, bytes_per_sample)
+    };
+    encode_block_core(pcm, config, block_index, total_samples)
 }
 
 /// Right-shift a container-scaled PCM buffer by `left_shift` in place,
@@ -389,47 +546,14 @@ pub fn encode_block_mono_shifted(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
-    if pcm.is_empty() {
-        return Err(Error::EncodeEmptyAudio);
-    }
     if left_shift == 0 {
         return Err(Error::EncodeLeftShiftZero);
     }
-
-    // Narrow the container-scaled PCM to the values the decoder
-    // reconstructs *before* its final left-shift; the §5 CRC folds these.
-    let mut narrow = pcm.to_vec();
-    narrow_left_shift(&mut narrow, left_shift)?;
-    let crc = crate::crc::crc_mono(&narrow);
-
-    let flags_raw = with_left_shift(base_flags(bytes_per_sample) | (1 << 2), left_shift);
-    let mut metadata = Vec::new();
-
-    let entropy_payload = pack_entropy_info(&[[0, 0, 0]]);
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::EntropyInfo.as_id_byte(),
-        &entropy_payload,
-    )?;
-
-    let mut medians = AdaptiveMedians::new([0, 0, 0]);
-    let packed = encode_packed_samples_mono(&narrow, &mut medians)?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::PackedSamples.as_id_byte(),
-        &packed,
-    )?;
-
-    let block_samples =
-        u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
-    build_block(
-        metadata,
-        block_index,
-        total_samples,
-        block_samples,
-        flags_raw,
-        crc,
-    )
+    let config = BlockConfig {
+        left_shift,
+        ..raw_config(true, bytes_per_sample)
+    };
+    encode_block_core(pcm, config, block_index, total_samples)
 }
 
 /// Encode an interleaved stereo PCM buffer at a sub-byte bit-depth into
@@ -443,53 +567,14 @@ pub fn encode_block_stereo_shifted(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
-    if pcm.is_empty() {
-        return Err(Error::EncodeEmptyAudio);
-    }
-    if pcm.len() % 2 != 0 {
-        return Err(Error::EncodeStereoOddLength(pcm.len()));
-    }
     if left_shift == 0 {
         return Err(Error::EncodeLeftShiftZero);
     }
-
-    let mut narrow = pcm.to_vec();
-    narrow_left_shift(&mut narrow, left_shift)?;
-    let crc = crate::crc::crc_stereo_interleaved(&narrow);
-
-    let flags_raw = with_left_shift(base_flags(bytes_per_sample), left_shift);
-    let mut metadata = Vec::new();
-
-    let left_seed = [0, 0, 0];
-    let right_seed = [0, 0, 1];
-    let entropy_payload = pack_entropy_info(&[left_seed, right_seed]);
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::EntropyInfo.as_id_byte(),
-        &entropy_payload,
-    )?;
-
-    let mut medians = [
-        AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-        AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-    ];
-    let packed = encode_packed_samples_stereo(&narrow, &mut medians)?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::PackedSamples.as_id_byte(),
-        &packed,
-    )?;
-
-    let block_samples =
-        u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
-    build_block(
-        metadata,
-        block_index,
-        total_samples,
-        block_samples,
-        flags_raw,
-        crc,
-    )
+    let config = BlockConfig {
+        left_shift,
+        ..raw_config(false, bytes_per_sample)
+    };
+    encode_block_core(pcm, config, block_index, total_samples)
 }
 
 /// Encode a mono PCM buffer into one complete `wvpk` block that carries a
@@ -525,61 +610,11 @@ pub fn encode_block_mono_with_decorr(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
-    if pcm.is_empty() {
-        return Err(Error::EncodeEmptyAudio);
-    }
-    let crc = crate::crc::crc_mono(pcm);
-
-    // Validate the payloads + build the application-ordered passes, then
-    // run the forward prediction loop into the residual buffer.
-    let mut passes = crate::decorrelation::assemble_mono_passes(terms, weights, samples)?;
-    let mut residuals = pcm.to_vec();
-    recorrelate_mono(&mut passes, &mut residuals)?;
-
-    let flags_raw = base_flags(bytes_per_sample) | (1 << 2);
-    let mut metadata = Vec::new();
-
-    let entropy_payload = pack_entropy_info(&[[0, 0, 0]]);
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::EntropyInfo.as_id_byte(),
-        &entropy_payload,
-    )?;
-    // The three decorrelation sub-blocks, verbatim, in wire order.
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::DecorrelationTerms.as_id_byte(),
-        terms,
-    )?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::DecorrelationWeights.as_id_byte(),
-        weights,
-    )?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::DecorrelationSamples.as_id_byte(),
-        samples,
-    )?;
-
-    let mut medians = AdaptiveMedians::new([0, 0, 0]);
-    let packed = encode_packed_samples_mono(&residuals, &mut medians)?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::PackedSamples.as_id_byte(),
-        &packed,
-    )?;
-
-    let block_samples =
-        u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
-    build_block(
-        metadata,
-        block_index,
-        total_samples,
-        block_samples,
-        flags_raw,
-        crc,
-    )
+    let config = BlockConfig {
+        decorr: Some((terms, weights, samples)),
+        ..raw_config(true, bytes_per_sample)
+    };
+    encode_block_core(pcm, config, block_index, total_samples)
 }
 
 /// Encode an interleaved (`[L0, R0, L1, R1, …]`) stereo PCM buffer into
@@ -598,59 +633,11 @@ pub fn encode_block_stereo(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
-    if pcm.is_empty() {
-        return Err(Error::EncodeEmptyAudio);
-    }
-    if pcm.len() % 2 != 0 {
-        return Err(Error::EncodeStereoOddLength(pcm.len()));
-    }
-
-    let crc = crate::crc::crc_stereo_interleaved(pcm);
-
-    let residuals = pcm.to_vec();
-    let flags_raw = base_flags(bytes_per_sample); // mono bit clear
-
-    let mut metadata = Vec::new();
-
-    // 0x05 entropy info: two median seed sets (left, right). The decoder
-    // distinguishes a *stereo* entropy payload from a mono one by content
-    // (`EntropyInfo::is_mono()` — right set all-zero reads as mono), not
-    // by the 12-byte length, and refuses an all-zero right set on the
-    // stereo path ([`Error::InvalidEntropyInfoForStereo`]). So the right
-    // set carries a minimal non-zero seed (`[0, 0, 1]`) to mark the
-    // payload stereo; the encode medians are seeded from the exact same
-    // sets so the round trip stays bit-exact whatever the seed value.
-    let left_seed = [0, 0, 0];
-    let right_seed = [0, 0, 1];
-    let entropy_payload = pack_entropy_info(&[left_seed, right_seed]);
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::EntropyInfo.as_id_byte(),
-        &entropy_payload,
-    )?;
-
-    // Seed the encode medians from the same sets written to 0x05 so the
-    // encoder and decoder share an identical median start.
-    let mut medians = [
-        AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-        AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-    ];
-    let packed = encode_packed_samples_stereo(&residuals, &mut medians)?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::PackedSamples.as_id_byte(),
-        &packed,
-    )?;
-
-    let block_samples =
-        u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
-    build_block(
-        metadata,
+    encode_block_core(
+        pcm,
+        raw_config(false, bytes_per_sample),
         block_index,
         total_samples,
-        block_samples,
-        flags_raw,
-        crc,
     )
 }
 
@@ -674,61 +661,11 @@ pub fn encode_block_stereo_joint(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
-    if pcm.is_empty() {
-        return Err(Error::EncodeEmptyAudio);
-    }
-    if pcm.len() % 2 != 0 {
-        return Err(Error::EncodeStereoOddLength(pcm.len()));
-    }
-
-    // The §5 CRC is folded over the *true* L/R PCM (the decoder undoes
-    // joint stereo before the CRC step), so it is the same as the plain
-    // stereo CRC over the input.
-    let crc = crate::crc::crc_stereo_interleaved(pcm);
-
-    // Forward mid/side transform into the residual buffer the entropy
-    // stream carries.
-    let mut residuals = pcm.to_vec();
-    for pair in residuals.chunks_exact_mut(2) {
-        let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
-        pair[0] = mid;
-        pair[1] = side;
-    }
-
-    // base flags + joint-stereo bit 4.
-    let flags_raw = base_flags(bytes_per_sample) | crate::crc::JOINT_STEREO_FLAG;
-    let mut metadata = Vec::new();
-
-    let left_seed = [0, 0, 0];
-    let right_seed = [0, 0, 1];
-    let entropy_payload = pack_entropy_info(&[left_seed, right_seed]);
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::EntropyInfo.as_id_byte(),
-        &entropy_payload,
-    )?;
-
-    let mut medians = [
-        AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-        AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-    ];
-    let packed = encode_packed_samples_stereo(&residuals, &mut medians)?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::PackedSamples.as_id_byte(),
-        &packed,
-    )?;
-
-    let block_samples =
-        u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
-    build_block(
-        metadata,
-        block_index,
-        total_samples,
-        block_samples,
-        flags_raw,
-        crc,
-    )
+    let config = BlockConfig {
+        joint: true,
+        ..raw_config(false, bytes_per_sample)
+    };
+    encode_block_core(pcm, config, block_index, total_samples)
 }
 
 /// Encode an interleaved stereo PCM buffer into one complete `wvpk` block
@@ -750,66 +687,41 @@ pub fn encode_block_stereo_with_decorr(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
-    if pcm.is_empty() {
-        return Err(Error::EncodeEmptyAudio);
-    }
-    if pcm.len() % 2 != 0 {
-        return Err(Error::EncodeStereoOddLength(pcm.len()));
-    }
-    let crc = crate::crc::crc_stereo_interleaved(pcm);
+    let config = BlockConfig {
+        decorr: Some((terms, weights, samples)),
+        ..raw_config(false, bytes_per_sample)
+    };
+    encode_block_core(pcm, config, block_index, total_samples)
+}
 
-    let mut passes = crate::decorrelation::assemble_stereo_passes(terms, weights, samples)?;
-    let mut residuals = pcm.to_vec();
-    recorrelate_stereo(&mut passes, &mut residuals)?;
-
-    let flags_raw = base_flags(bytes_per_sample);
-    let mut metadata = Vec::new();
-
-    let left_seed = [0, 0, 0];
-    let right_seed = [0, 0, 1];
-    let entropy_payload = pack_entropy_info(&[left_seed, right_seed]);
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::EntropyInfo.as_id_byte(),
-        &entropy_payload,
-    )?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::DecorrelationTerms.as_id_byte(),
-        terms,
-    )?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::DecorrelationWeights.as_id_byte(),
-        weights,
-    )?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::DecorrelationSamples.as_id_byte(),
-        samples,
-    )?;
-
-    let mut medians = [
-        AdaptiveMedians::from_seed_values(left_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-        AdaptiveMedians::from_seed_values(right_seed).ok_or(Error::InvalidEntropyInfoForStereo)?,
-    ];
-    let packed = encode_packed_samples_stereo(&residuals, &mut medians)?;
-    append_sub_block(
-        &mut metadata,
-        SubBlockId::PackedSamples.as_id_byte(),
-        &packed,
-    )?;
-
-    let block_samples =
-        u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
-    build_block(
-        metadata,
-        block_index,
-        total_samples,
-        block_samples,
-        flags_raw,
-        crc,
-    )
+/// Encode an interleaved stereo PCM buffer into one complete **joint
+/// (mid/side) stereo** `wvpk` block carrying a decorrelation pass list
+/// described by its raw `0x02`/`0x03`/`0x04` metadata payloads — the
+/// combination of [`encode_block_stereo_joint`] and
+/// [`encode_block_stereo_with_decorr`].
+///
+/// Mirroring the decoder's stage order (entropy → decorrelate → joint
+/// undo → CRC), the encoder folds the §5 CRC over the true L/R, applies
+/// the forward mid/side transform, and *then* runs the §3 forward
+/// prediction loop over the mid/side buffer — so the decorrelation
+/// payloads describe passes over the joint-transformed domain. The
+/// three sub-blocks are emitted verbatim, so the round trip is
+/// bit-exact: `decode_stream(&out)? == pcm`.
+pub fn encode_block_stereo_joint_with_decorr(
+    pcm: &[i32],
+    terms: &[u8],
+    weights: &[u8],
+    samples: &[u8],
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    let config = BlockConfig {
+        joint: true,
+        decorr: Some((terms, weights, samples)),
+        ..raw_config(false, bytes_per_sample)
+    };
+    encode_block_core(pcm, config, block_index, total_samples)
 }
 
 /// Decorrelation strength profile for the self-deriving (`*_auto`)
@@ -1014,6 +926,49 @@ pub fn encode_block_stereo_auto(
     let passes = derive_stereo_passes(pcm, profile)?;
     let (terms, weights, samples) = serialize_stereo_passes(&passes)?;
     encode_block_stereo_with_decorr(
+        pcm,
+        &terms,
+        &weights,
+        &samples,
+        bytes_per_sample,
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode an interleaved stereo PCM buffer into one complete **joint
+/// (mid/side) stereo** `wvpk` block with a self-derived decorrelation
+/// pass list — the compression-favouring stereo auto path.
+///
+/// The prediction loop runs over the joint-transformed (mid/side)
+/// buffer, so the derivation trains over the same domain: the forward
+/// §5.4 transform is applied to a scratch copy first, the pass list is
+/// derived from that ([`derive_stereo_passes`]), and the block is
+/// assembled through [`encode_block_stereo_joint_with_decorr`].
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_stereo_joint_auto(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    // Train over the joint (mid/side) domain the real loop will see.
+    let mut joint = pcm.to_vec();
+    for pair in joint.chunks_exact_mut(2) {
+        let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
+        pair[0] = mid;
+        pair[1] = side;
+    }
+    let passes = derive_stereo_passes(&joint, profile)?;
+    let (terms, weights, samples) = serialize_stereo_passes(&passes)?;
+    encode_block_stereo_joint_with_decorr(
         pcm,
         &terms,
         &weights,
@@ -1953,6 +1908,119 @@ mod tests {
             assert_eq!(quantize_weight(p.weight_b), p.weight_b);
         }
         assert!(serialize_stereo_passes(&passes).is_ok());
+    }
+
+    /// Joint + decorrelation combined: the block carries the joint flag
+    /// AND the three decorrelation sub-blocks, and round-trips exactly.
+    #[test]
+    fn joint_with_decorr_round_trips_with_both_features() {
+        let pcm = smooth_stereo(300);
+        // Derive over the joint domain by hand, mirroring the auto path.
+        let mut joint = pcm.clone();
+        for pair in joint.chunks_exact_mut(2) {
+            let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
+            pair[0] = mid;
+            pair[1] = side;
+        }
+        let passes = derive_stereo_passes(&joint, DecorrProfile::Normal).unwrap();
+        let (t, w, s) = serialize_stereo_passes(&passes).unwrap();
+        let block =
+            encode_block_stereo_joint_with_decorr(&pcm, &t, &w, &s, 2, 0, (pcm.len() / 2) as u32)
+                .unwrap();
+
+        let (hdr, _) = parse_block_header(&block).unwrap();
+        assert!(hdr.flags.joint_stereo, "joint flag set");
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+        let (_, all_ok) = crate::block::decode_stream_muted(&block).unwrap();
+        assert!(all_ok, "CRC folds over true L/R");
+
+        // The metadata chain carries 0x05, 0x02, 0x03, 0x04, 0x0A in order.
+        let (_hdr, payload) = parse_block_header(&block).unwrap();
+        let ids: Vec<SubBlockId> = {
+            let mut rest = payload;
+            let mut out = Vec::new();
+            while !rest.is_empty() {
+                let (sb, tail) = parse_metadata_sub_block(rest).unwrap();
+                out.push(sb.id);
+                rest = tail;
+            }
+            out
+        };
+        assert_eq!(
+            ids,
+            vec![
+                SubBlockId::EntropyInfo,
+                SubBlockId::DecorrelationTerms,
+                SubBlockId::DecorrelationWeights,
+                SubBlockId::DecorrelationSamples,
+                SubBlockId::PackedSamples,
+            ]
+        );
+    }
+
+    /// The joint auto encoder round-trips on every profile.
+    #[test]
+    fn joint_auto_round_trips_all_profiles() {
+        let pcm = smooth_stereo(250);
+        for profile in [
+            DecorrProfile::Fast,
+            DecorrProfile::Normal,
+            DecorrProfile::High,
+        ] {
+            let block = encode_block_stereo_joint_auto(&pcm, profile, 2, 0, 250).unwrap();
+            assert_eq!(
+                decode_stream(&block).unwrap(),
+                pcm,
+                "profile {profile:?} must round-trip"
+            );
+        }
+    }
+
+    /// On identical channels the mid channel is all-zero after the joint
+    /// transform, so the joint auto block must beat the plain auto block.
+    #[test]
+    fn joint_auto_beats_plain_auto_on_identical_channels() {
+        let mut pcm = Vec::with_capacity(600);
+        for i in 0..300 {
+            let v = i * 6 - 900 + ((i % 4) - 2);
+            pcm.push(v);
+            pcm.push(v);
+        }
+        let plain = encode_block_stereo_auto(&pcm, DecorrProfile::Normal, 2, 0, 300).unwrap();
+        let joint = encode_block_stereo_joint_auto(&pcm, DecorrProfile::Normal, 2, 0, 300).unwrap();
+        assert!(
+            joint.len() < plain.len(),
+            "joint auto ({}) must beat plain auto ({}) on identical channels",
+            joint.len(),
+            plain.len()
+        );
+        assert_eq!(decode_stream(&joint).unwrap(), pcm);
+    }
+
+    /// The joint auto encoder round-trips pseudo-random input too.
+    #[test]
+    fn joint_auto_round_trips_pseudo_random() {
+        let mut pcm = Vec::with_capacity(500);
+        let mut state: u32 = 0x1357_9BDF;
+        for _ in 0..500 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            pcm.push((state >> 15) as i16 as i32);
+        }
+        let block = encode_block_stereo_joint_auto(&pcm, DecorrProfile::High, 2, 0, 250).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+    }
+
+    /// Joint refusal arms carry over to the combined paths.
+    #[test]
+    fn joint_combined_refusal_arms() {
+        assert!(matches!(
+            encode_block_stereo_joint_with_decorr(&[], &[], &[], &[], 2, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_joint_auto(&[1, 2, 3], DecorrProfile::Fast, 2, 0, 1),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
     }
 
     /// The auto encoders share the plain encoders' refusal arms.
