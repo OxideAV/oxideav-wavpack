@@ -747,6 +747,24 @@ pub enum DecorrProfile {
 }
 
 impl DecorrProfile {
+    /// The nested effort ladder up to and including this profile — the
+    /// candidate set the `*_best` mode search walks. The profiles are
+    /// ordered by derivation cost (`Fast ⊂ Normal ⊂ High` as search
+    /// sets), and which term stack yields the smallest block is
+    /// signal-dependent, so a deeper ceiling always *tries* the cheaper
+    /// stacks too and can only match or beat them.
+    pub fn search_set(self) -> &'static [DecorrProfile] {
+        match self {
+            DecorrProfile::Fast => &[DecorrProfile::Fast],
+            DecorrProfile::Normal => &[DecorrProfile::Fast, DecorrProfile::Normal],
+            DecorrProfile::High => &[
+                DecorrProfile::Fast,
+                DecorrProfile::Normal,
+                DecorrProfile::High,
+            ],
+        }
+    }
+
     /// The application-ordered `(term, delta)` list for a mono (or
     /// false-stereo / per-channel) derivation.
     fn mono_terms(self) -> &'static [(i8, i32)] {
@@ -1009,13 +1027,30 @@ pub fn detect_left_shift(pcm: &[i32]) -> u8 {
     }
 }
 
+/// Keep `candidate` when it is strictly smaller than the current best
+/// (or when there is no best yet).
+fn keep_smaller(best: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
+    let improves = match best {
+        None => true,
+        Some(b) => candidate.len() < b.len(),
+    };
+    if improves {
+        *best = Some(candidate);
+    }
+}
+
 /// Encode a mono PCM buffer into the **smallest** block this encoder can
 /// produce: auto-detects the sub-byte-depth left-shift
-/// ([`detect_left_shift`]), derives a decorrelation pass list over the
-/// narrowed domain, and keeps whichever of the raw / decorrelated
-/// candidates is smaller. Every candidate decodes back to `pcm`
-/// bit-exactly, so the choice is purely a size decision:
-/// `decode_stream(&out)? == pcm`.
+/// ([`detect_left_shift`]) and searches the raw candidate plus one
+/// derived-decorrelation candidate per profile in the search set.
+///
+/// `profile` is the **search ceiling**, not a single choice: the
+/// profiles form a nested effort ladder ([`DecorrProfile::search_set`]),
+/// so `High` tries the `Fast` and `Normal` derivations too and keeps the
+/// smallest output — which term stack wins is signal-dependent, and
+/// trying the cheaper stacks is nearly free next to the entropy coding.
+/// Every candidate decodes back to `pcm` bit-exactly, so the choice is
+/// purely a size decision: `decode_stream(&out)? == pcm`.
 pub fn encode_block_mono_best(
     pcm: &[i32],
     profile: DecorrProfile,
@@ -1032,44 +1067,51 @@ pub fn encode_block_mono_best(
         narrow_left_shift(&mut narrow, left_shift)?;
     }
 
-    let raw = encode_block_core(
-        pcm,
-        BlockConfig {
-            left_shift,
-            ..raw_config(true, bytes_per_sample)
-        },
-        block_index,
-        total_samples,
-    )?;
+    let mut best: Option<Vec<u8>> = None;
+    keep_smaller(
+        &mut best,
+        encode_block_core(
+            pcm,
+            BlockConfig {
+                left_shift,
+                ..raw_config(true, bytes_per_sample)
+            },
+            block_index,
+            total_samples,
+        )?,
+    );
 
-    // Decorrelated candidate, trained over the narrow domain the real
-    // prediction loop sees.
-    let passes = derive_mono_passes(&narrow, profile)?;
-    let (terms, weights, samples) = serialize_mono_passes(&passes)?;
-    let decorr = encode_block_core(
-        pcm,
-        BlockConfig {
-            left_shift,
-            decorr: Some((&terms, &weights, &samples)),
-            ..raw_config(true, bytes_per_sample)
-        },
-        block_index,
-        total_samples,
-    )?;
-
-    Ok(if decorr.len() < raw.len() {
-        decorr
-    } else {
-        raw
-    })
+    // One decorrelated candidate per profile in the search set, each
+    // trained over the narrow domain the real prediction loop sees.
+    for &p in profile.search_set() {
+        let passes = derive_mono_passes(&narrow, p)?;
+        let (terms, weights, samples) = serialize_mono_passes(&passes)?;
+        keep_smaller(
+            &mut best,
+            encode_block_core(
+                pcm,
+                BlockConfig {
+                    left_shift,
+                    decorr: Some((&terms, &weights, &samples)),
+                    ..raw_config(true, bytes_per_sample)
+                },
+                block_index,
+                total_samples,
+            )?,
+        );
+    }
+    // At least the raw candidate was pushed.
+    Ok(best.expect("mode search produced no candidate"))
 }
 
 /// Encode an interleaved stereo PCM buffer into the **smallest** block
 /// this encoder can produce, searching the mode grid: {plain, joint
-/// mid/side} × {raw, derived decorrelation}, all at the auto-detected
-/// left-shift. Each decorrelated candidate trains over the exact domain
-/// its prediction loop will run in (narrow, or narrow + joint). Every
-/// candidate decodes back to `pcm` bit-exactly:
+/// mid/side} × ({raw} ∪ {derived decorrelation per profile in the
+/// search set}), all at the auto-detected left-shift. Like
+/// [`encode_block_mono_best`], `profile` is the search **ceiling**
+/// ([`DecorrProfile::search_set`]). Each decorrelated candidate trains
+/// over the exact domain its prediction loop will run in (narrow, or
+/// narrow + joint). Every candidate decodes back to `pcm` bit-exactly:
 /// `decode_stream(&out)? == pcm`.
 pub fn encode_block_stereo_best(
     pcm: &[i32],
@@ -1099,31 +1141,40 @@ pub fn encode_block_stereo_best(
     let mut best: Option<Vec<u8>> = None;
     for joint in [false, true] {
         let domain = if joint { &joint_narrow } else { &narrow };
-        let derived = derive_stereo_passes(domain, profile)?;
-        let (terms, weights, samples) = serialize_stereo_passes(&derived)?;
-        for decorr in [None, Some((&terms[..], &weights[..], &samples[..]))] {
-            let candidate = encode_block_core(
+        keep_smaller(
+            &mut best,
+            encode_block_core(
                 pcm,
                 BlockConfig {
                     joint,
                     left_shift,
-                    decorr,
                     ..raw_config(false, bytes_per_sample)
                 },
                 block_index,
                 total_samples,
-            )?;
-            let improves = match &best {
-                None => true,
-                Some(b) => candidate.len() < b.len(),
-            };
-            if improves {
-                best = Some(candidate);
-            }
+            )?,
+        );
+        for &p in profile.search_set() {
+            let derived = derive_stereo_passes(domain, p)?;
+            let (terms, weights, samples) = serialize_stereo_passes(&derived)?;
+            keep_smaller(
+                &mut best,
+                encode_block_core(
+                    pcm,
+                    BlockConfig {
+                        joint,
+                        left_shift,
+                        decorr: Some((&terms[..], &weights[..], &samples[..])),
+                        ..raw_config(false, bytes_per_sample)
+                    },
+                    block_index,
+                    total_samples,
+                )?,
+            );
         }
     }
-    // The loop always ran at least one candidate.
-    Ok(best.expect("mode grid produced no candidate"))
+    // At least the two raw candidates were pushed.
+    Ok(best.expect("mode search produced no candidate"))
 }
 
 /// Default per-block sample count the stream encoders split a long PCM
@@ -2439,6 +2490,67 @@ mod tests {
             encode_stream_stereo_best(&[1, 2, 3], 0, 2, DecorrProfile::Fast),
             Err(Error::EncodeStereoOddLength(3))
         ));
+    }
+
+    /// The search sets nest: Fast ⊂ Normal ⊂ High.
+    #[test]
+    fn profile_search_sets_nest() {
+        assert_eq!(DecorrProfile::Fast.search_set(), &[DecorrProfile::Fast]);
+        assert_eq!(
+            DecorrProfile::Normal.search_set(),
+            &[DecorrProfile::Fast, DecorrProfile::Normal]
+        );
+        assert_eq!(
+            DecorrProfile::High.search_set(),
+            &[
+                DecorrProfile::Fast,
+                DecorrProfile::Normal,
+                DecorrProfile::High
+            ]
+        );
+    }
+
+    /// A deeper search ceiling can only match or beat a shallower one —
+    /// the candidate sets nest, so the minimum is monotone.
+    #[test]
+    fn best_is_monotone_in_the_search_ceiling() {
+        let mono = smooth_mono(700);
+        let fast = encode_block_mono_best(&mono, DecorrProfile::Fast, 2, 0, 700).unwrap();
+        let normal = encode_block_mono_best(&mono, DecorrProfile::Normal, 2, 0, 700).unwrap();
+        let high = encode_block_mono_best(&mono, DecorrProfile::High, 2, 0, 700).unwrap();
+        assert!(normal.len() <= fast.len());
+        assert!(high.len() <= normal.len());
+        for out in [fast, normal, high] {
+            assert_eq!(decode_stream(&out).unwrap(), mono);
+        }
+
+        let stereo = smooth_stereo(350);
+        let fast = encode_block_stereo_best(&stereo, DecorrProfile::Fast, 2, 0, 350).unwrap();
+        let high = encode_block_stereo_best(&stereo, DecorrProfile::High, 2, 0, 350).unwrap();
+        assert!(high.len() <= fast.len());
+        assert_eq!(decode_stream(&high).unwrap(), stereo);
+    }
+
+    /// The ceiling search also dominates every single-profile auto
+    /// encoder inside the ceiling.
+    #[test]
+    fn best_dominates_all_autos_in_ceiling() {
+        let mono = smooth_mono(600);
+        let best = encode_block_mono_best(&mono, DecorrProfile::High, 2, 0, 600).unwrap();
+        for p in [
+            DecorrProfile::Fast,
+            DecorrProfile::Normal,
+            DecorrProfile::High,
+        ] {
+            let auto = encode_block_mono_auto(&mono, p, 2, 0, 600).unwrap();
+            assert!(
+                best.len() <= auto.len(),
+                "best-High ({}) lost to auto-{p:?} ({})",
+                best.len(),
+                auto.len()
+            );
+        }
+        assert_eq!(decode_stream(&best).unwrap(), mono);
     }
 
     /// The best encoders share the standard refusal arms.

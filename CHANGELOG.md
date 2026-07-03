@@ -17,6 +17,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 — **profile-ceiling mode search in the best encoders**.
+  `DecorrProfile::search_set` names the nested effort ladder
+  (`Fast ⊂ Normal ⊂ High` as candidate sets), and the `*_best` encoders
+  now treat their `profile` argument as a search **ceiling**: one
+  derived-decorrelation candidate per profile in the set is tried (per
+  joint arm on stereo), alongside the raw candidate(s). Which term
+  stack yields the smallest block is signal-dependent — on the
+  measurement signal the 2-pass Fast stack beats the 5-pass Normal
+  stack — so a deeper ceiling always tries the cheaper stacks too and
+  the minimum is monotone in the ceiling. Re-measured stream-best
+  ratios at the High ceiling: mono ~51% of raw-stream bytes (42% of
+  16-bit PCM), correlated stereo ~36% of raw (30% of PCM, down from 46%
+  of raw with the single-profile search), 12-bit-in-16 material ~26% of
+  raw (down from 30%). 3 new tests (881 total): the nesting pin, minimum
+  monotonicity in the ceiling (mono + stereo), and best-dominates-every-
+  auto-in-ceiling. Exported: `DecorrProfile::search_set`.
+
 - Round 383 — **stream-level best encode**. `encode_stream_mono_best` /
   `encode_stream_stereo_best` lift the per-block best-of search to the
   whole-file surface: each chunk gets its own left-shift detection, its
