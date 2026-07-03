@@ -17,6 +17,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 386 — **`.wvc` correction-file pairing plumbing
+  (`pair_correction_stream` / `correction_coverage` /
+  `WavPackBlock::expects_correction`)**. Stream-level alignment of a
+  main `.wv` buffer with its companion `.wvc` buffer: audio blocks are
+  paired by the wiki "offset in samples for current block" header
+  word, with per-pair agreement enforced on `block_samples`
+  (`Error::CorrectionSampleCountMismatch`) and the mono flag
+  (`Error::CorrectionShapeMismatch`); orphaned
+  (`Error::CorrectionIndexMismatch`) and surplus
+  (`Error::CorrectionBlockSurplus`) correction blocks are typed
+  refusals, partial coverage pairs `None`, and metadata-only blocks on
+  either side are skipped. `expects_correction` classifies which
+  blocks *want* a twin (wiki bit-3 hybrid flag) so lossless-path
+  callers can validate and size correction coverage before any hybrid
+  decode exists — consuming the paired `0x0B` words stays gated on
+  `UnsupportedBlockFeature::Hybrid`.
+
 - Round 386 — **union "smallest" encoders (`encode_block_*_smallest` +
   `encode_stream_*_smallest`)**. One call races the two search
   families this crate now has — the Extra-ceiling profile grid

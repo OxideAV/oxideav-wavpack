@@ -347,6 +347,42 @@ pub enum Error {
     /// is refused before it sizes the interleave buffer. Carries the
     /// channel count reached.
     MultichannelTooManyChannels(usize),
+    /// A `.wvc` correction-file audio block could not be aligned with a
+    /// `.wv` main-file audio block: walking both audio-block chains in
+    /// order, a correction block's wiki "offset in samples for current
+    /// block" header word was **behind** the next main block's — i.e.
+    /// the correction file carries a block the main file never had (or
+    /// the chains are out of order). Carries `(main, correction)` block
+    /// indices at the point of divergence.
+    CorrectionIndexMismatch {
+        /// `block_index` of the next unpaired main audio block.
+        main: u32,
+        /// `block_index` of the orphaned correction audio block.
+        correction: u32,
+    },
+    /// An index-aligned `.wv`/`.wvc` audio-block pair disagreed on
+    /// `block_samples` (the wiki "samples in this block" header word).
+    /// A correction stream corrects the main stream sample-for-sample
+    /// (spec §4.1: two residuals per sample position), so both sides of
+    /// a pair must cover the identical range. Carries
+    /// `(main, correction)` sample counts.
+    CorrectionSampleCountMismatch {
+        /// `block_samples` of the main block.
+        main: u32,
+        /// `block_samples` of the correction block.
+        correction: u32,
+    },
+    /// An index-aligned `.wv`/`.wvc` audio-block pair disagreed on
+    /// channel shape (the wiki bit-2 mono flag). The correction words
+    /// pair one-to-one with the main stream's channel samples, so a
+    /// shape flip mid-pairing is structural corruption. Carries the
+    /// pair's shared `block_index`.
+    CorrectionShapeMismatch(u32),
+    /// The `.wvc` buffer carried audio blocks beyond the last `.wv`
+    /// audio block — corrections for samples the main file does not
+    /// have. Carries the first surplus correction block's
+    /// `block_index`.
+    CorrectionBlockSurplus(u32),
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -506,6 +542,22 @@ impl core::fmt::Display for Error {
             Error::MultichannelTooManyChannels(n) => write!(
                 f,
                 "oxideav-wavpack: multichannel set channel count {n} exceeds the supported maximum"
+            ),
+            Error::CorrectionIndexMismatch { main, correction } => write!(
+                f,
+                "oxideav-wavpack: correction-file block_index {correction} has no main-file twin (next main audio block is at {main})"
+            ),
+            Error::CorrectionSampleCountMismatch { main, correction } => write!(
+                f,
+                "oxideav-wavpack: correction-file block disagrees on block_samples (main {main}, correction {correction})"
+            ),
+            Error::CorrectionShapeMismatch(idx) => write!(
+                f,
+                "oxideav-wavpack: correction-file block at block_index {idx} disagrees on the mono flag"
+            ),
+            Error::CorrectionBlockSurplus(idx) => write!(
+                f,
+                "oxideav-wavpack: correction file carries audio blocks past the end of the main file (first surplus at block_index {idx})"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

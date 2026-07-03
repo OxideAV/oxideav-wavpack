@@ -456,6 +456,19 @@ impl<'a> WavPackBlock<'a> {
         self.has_packed_correction_data() || self.has_noise_shaping_profile()
     }
 
+    /// `true` when this block **wants** a `.wvc` correction twin to
+    /// reconstruct losslessly: the wiki bit-3 hybrid flag is set, so the
+    /// main `0x0A` stream alone is lossy and only pairing it with the
+    /// companion correction words (spec §4.1 — two residuals per sample
+    /// position) recovers the exact original. A pure-lossless block
+    /// (`hybrid` clear) reports `false`: a paired correction block would
+    /// be redundant for it. Pairs with
+    /// [`crate::block::pair_correction_stream`] to classify coverage on
+    /// a two-file decode. Round 386.
+    pub fn expects_correction(&self) -> bool {
+        self.header.flags.hybrid
+    }
+
     /// Which decorrelation-spec §4.1 correction-fold placement this block's
     /// flag word selects ([`crate::CorrectionFold`]).
     ///
@@ -1949,6 +1962,103 @@ pub fn total_correction_payload_bytes(bytes: &[u8]) -> Result<u64> {
         }
     }
     Ok(sum)
+}
+
+/// Pair the audio blocks of a main `.wv` byte buffer with the audio
+/// blocks of its companion `.wvc` correction-file buffer — the
+/// stream-level plumbing that aligns the two files a hybrid encode
+/// splits its output across (spec §4.1: the `0x0B` correction stream is
+/// "normally in the companion `.wvc` file").
+///
+/// Both buffers are walked as ordinary `wvpk` block chains (a `.wvc`
+/// file uses the identical container per the wiki "Block structure"
+/// section — only the sub-block inventory differs). Audio blocks
+/// (`block_samples > 0`) are aligned **by the wiki "offset in samples
+/// for current block" header word**, in order:
+///
+/// - a main block whose `block_index` the correction chain does not
+///   carry pairs with `None` (a correction file may cover only part of
+///   the stream — pure-lossless blocks need no correction);
+/// - an aligned pair must agree on `block_samples`
+///   ([`Error::CorrectionSampleCountMismatch`]) and on the mono flag
+///   ([`Error::CorrectionShapeMismatch`]) — the correction words pair
+///   one-to-one with the main stream's channel samples;
+/// - a correction audio block whose `block_index` is behind the next
+///   main block is an orphan ([`Error::CorrectionIndexMismatch`]);
+/// - correction audio blocks past the last main block are surplus
+///   ([`Error::CorrectionBlockSurplus`]).
+///
+/// Metadata-only blocks (`block_samples == 0`) on either side are
+/// skipped — they never carry sample words to pair. Parse errors from
+/// either chain surface verbatim. Note this is **structural** pairing
+/// only: consuming a pair's `0x0B` words in a hybrid decode stays
+/// gated on the hybrid entropy derivation (the
+/// [`crate::UnsupportedBlockFeature::Hybrid`] refusal), so today's
+/// callers use this to locate / validate / size correction coverage
+/// on the lossless path.
+pub fn pair_correction_stream<'a, 'b>(
+    main: &'a [u8],
+    correction: &'b [u8],
+) -> Result<Vec<(WavPackBlock<'a>, Option<WavPackBlock<'b>>)>> {
+    let mut pairs: Vec<(WavPackBlock<'a>, Option<WavPackBlock<'b>>)> = Vec::new();
+    let mut wvc = iter_audio_blocks(correction);
+    let mut pending: Option<WavPackBlock<'b>> = None;
+    for block in iter_audio_blocks(main) {
+        let block = block?;
+        // Fetch the next unconsumed correction audio block (if any).
+        if pending.is_none() {
+            pending = match wvc.next() {
+                Some(Ok(c)) => Some(c),
+                Some(Err(e)) => return Err(e),
+                None => None,
+            };
+        }
+        let paired = match pending.as_ref() {
+            Some(c) if c.block_index() == block.block_index() => {
+                if c.block_samples() != block.block_samples() {
+                    return Err(Error::CorrectionSampleCountMismatch {
+                        main: block.block_samples(),
+                        correction: c.block_samples(),
+                    });
+                }
+                if c.flags().mono != block.flags().mono {
+                    return Err(Error::CorrectionShapeMismatch(block.block_index()));
+                }
+                pending.take()
+            }
+            Some(c) if c.block_index() < block.block_index() => {
+                return Err(Error::CorrectionIndexMismatch {
+                    main: block.block_index(),
+                    correction: c.block_index(),
+                });
+            }
+            // Correction chain is ahead (or exhausted): this main block
+            // has no correction twin.
+            _ => None,
+        };
+        pairs.push((block, paired));
+    }
+    // Anything left on the correction side has no main twin.
+    if let Some(c) = pending {
+        return Err(Error::CorrectionBlockSurplus(c.block_index()));
+    }
+    match wvc.next() {
+        Some(Ok(c)) => Err(Error::CorrectionBlockSurplus(c.block_index())),
+        Some(Err(e)) => Err(e),
+        None => Ok(pairs),
+    }
+}
+
+/// Count how many of a main `.wv` buffer's audio blocks have an
+/// index-aligned correction twin in the companion `.wvc` buffer — the
+/// coverage summary of [`pair_correction_stream`]. Returns
+/// `(paired, total_main_audio_blocks)`; a full hybrid-lossless file
+/// reports `paired == total`.
+pub fn correction_coverage(main: &[u8], correction: &[u8]) -> Result<(usize, usize)> {
+    let pairs = pair_correction_stream(main, correction)?;
+    let total = pairs.len();
+    let paired = pairs.iter().filter(|(_, c)| c.is_some()).count();
+    Ok((paired, total))
 }
 
 /// Lazy iterator over the PCM samples produced by every audio block in a
@@ -5775,6 +5885,161 @@ mod tests {
         assert!(!block.is_audio_block());
         assert!(block.has_packed_correction_data());
         assert!(block.has_correction_stream_data());
+    }
+
+    /// Synthesise a pairing-test block: audio header with the supplied
+    /// index/samples/extra-flags, plus (for the `.wvc` side) a `0x0B`
+    /// stub payload so the block looks correction-bearing.
+    fn synth_pairing_block(index: u32, samples: u32, extra_flags: u32, wvc: bool) -> Vec<u8> {
+        let mut payload = Vec::new();
+        if wvc {
+            append_packed_correction_data(&mut payload, &[0xAB, 0xCD]);
+        } else {
+            append_entropy_info_mono_zero(&mut payload);
+            append_packed_samples(&mut payload, &[0x00, 0x00]);
+        }
+        let mut buf = synthesise_block(samples, flags_with(extra_flags), &payload);
+        buf[16..20].copy_from_slice(&index.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn pair_correction_stream_full_coverage() {
+        let mono = 1u32 << 2;
+        let mut main = synth_pairing_block(0, 100, mono, false);
+        main.extend_from_slice(&synth_pairing_block(100, 50, mono, false));
+        let mut wvc = synth_pairing_block(0, 100, mono, true);
+        wvc.extend_from_slice(&synth_pairing_block(100, 50, mono, true));
+
+        let pairs = pair_correction_stream(&main, &wvc).expect("pairing");
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|(_, c)| c.is_some()));
+        assert_eq!(pairs[1].1.as_ref().unwrap().block_index(), 100);
+        assert_eq!(correction_coverage(&main, &wvc).unwrap(), (2, 2));
+    }
+
+    #[test]
+    fn pair_correction_stream_partial_coverage_pairs_none() {
+        let mono = 1u32 << 2;
+        let mut main = synth_pairing_block(0, 100, mono, false);
+        main.extend_from_slice(&synth_pairing_block(100, 50, mono, false));
+        // Correction file only covers the second block.
+        let wvc = synth_pairing_block(100, 50, mono, true);
+
+        let pairs = pair_correction_stream(&main, &wvc).expect("pairing");
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs[0].1.is_none());
+        assert!(pairs[1].1.is_some());
+        assert_eq!(correction_coverage(&main, &wvc).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn pair_correction_stream_empty_wvc_pairs_all_none() {
+        let mono = 1u32 << 2;
+        let mut main = synth_pairing_block(0, 100, mono, false);
+        main.extend_from_slice(&synth_pairing_block(100, 50, mono, false));
+        assert_eq!(correction_coverage(&main, &[]).unwrap(), (0, 2));
+        // And a real lossless encode pairs cleanly with no wvc at all.
+        let pcm: Vec<i32> = (0..300).map(|i| i * 7 % 101 - 50).collect();
+        let stream = crate::encode::encode_stream_mono(&pcm, 100, 2).unwrap();
+        let (paired, total) = correction_coverage(&stream, &[]).unwrap();
+        assert_eq!(paired, 0);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn pair_correction_stream_orphan_behind_is_index_mismatch() {
+        let mono = 1u32 << 2;
+        // Main starts at 100; correction claims a block at 0.
+        let main = synth_pairing_block(100, 50, mono, false);
+        let wvc = synth_pairing_block(0, 100, mono, true);
+        assert_eq!(
+            pair_correction_stream(&main, &wvc).expect_err("orphan"),
+            Error::CorrectionIndexMismatch {
+                main: 100,
+                correction: 0
+            }
+        );
+    }
+
+    #[test]
+    fn pair_correction_stream_sample_count_mismatch() {
+        let mono = 1u32 << 2;
+        let main = synth_pairing_block(0, 100, mono, false);
+        let wvc = synth_pairing_block(0, 64, mono, true);
+        assert_eq!(
+            pair_correction_stream(&main, &wvc).expect_err("count"),
+            Error::CorrectionSampleCountMismatch {
+                main: 100,
+                correction: 64
+            }
+        );
+    }
+
+    #[test]
+    fn pair_correction_stream_shape_mismatch() {
+        let main = synth_pairing_block(0, 100, 1u32 << 2, false); // mono
+        let wvc = synth_pairing_block(0, 100, 0, true); // stereo
+        assert_eq!(
+            pair_correction_stream(&main, &wvc).expect_err("shape"),
+            Error::CorrectionShapeMismatch(0)
+        );
+    }
+
+    #[test]
+    fn pair_correction_stream_surplus_wvc_blocks() {
+        let mono = 1u32 << 2;
+        let main = synth_pairing_block(0, 100, mono, false);
+        let mut wvc = synth_pairing_block(0, 100, mono, true);
+        wvc.extend_from_slice(&synth_pairing_block(100, 50, mono, true));
+        assert_eq!(
+            pair_correction_stream(&main, &wvc).expect_err("surplus"),
+            Error::CorrectionBlockSurplus(100)
+        );
+        // Entirely main-less correction blocks are surplus too.
+        assert_eq!(
+            pair_correction_stream(&[], &synth_pairing_block(0, 10, mono, true))
+                .expect_err("no main"),
+            Error::CorrectionBlockSurplus(0)
+        );
+    }
+
+    #[test]
+    fn pair_correction_stream_skips_metadata_only_blocks() {
+        let mono = 1u32 << 2;
+        // A metadata-only (block_samples == 0) block sits between the
+        // audio blocks on both sides; pairing must ignore it.
+        let mut main = synth_pairing_block(0, 100, mono, false);
+        main.extend_from_slice(&synthesise_block(0, flags_with(0), &[]));
+        main.extend_from_slice(&synth_pairing_block(100, 50, mono, false));
+        let mut wvc = synthesise_block(0, flags_with(0), &[]);
+        wvc.extend_from_slice(&synth_pairing_block(0, 100, mono, true));
+        wvc.extend_from_slice(&synth_pairing_block(100, 50, mono, true));
+        assert_eq!(correction_coverage(&main, &wvc).unwrap(), (2, 2));
+    }
+
+    #[test]
+    fn pair_correction_stream_propagates_parse_errors_from_both_sides() {
+        let mono = 1u32 << 2;
+        let good = synth_pairing_block(0, 100, mono, false);
+        let mut bad_main = good.clone();
+        bad_main.extend_from_slice(&[0u8; 3]);
+        assert!(pair_correction_stream(&bad_main, &[]).is_err());
+
+        let mut bad_wvc = synth_pairing_block(0, 100, mono, true);
+        bad_wvc.extend_from_slice(&[0u8; 3]);
+        assert!(pair_correction_stream(&good, &bad_wvc).is_err());
+    }
+
+    #[test]
+    fn expects_correction_reads_the_hybrid_flag() {
+        let hybrid = synth_pairing_block(0, 100, (1 << 2) | (1 << 3), false);
+        let (block, _) = parse_block(&hybrid).expect("parse");
+        assert!(block.expects_correction());
+
+        let lossless = synth_pairing_block(0, 100, 1 << 2, false);
+        let (block, _) = parse_block(&lossless).expect("parse");
+        assert!(!block.expects_correction());
     }
 
     #[test]

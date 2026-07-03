@@ -824,14 +824,15 @@ mod packed_samples;
 mod samples;
 
 pub use crate::block::{
-    audio_block_count, block_count, correction_block_count, decode_multichannel_stream,
-    decode_multichannel_stream_muted, decode_stream, decode_stream_muted, decoded_sample_count,
-    first_audio_block, first_correction_block, iter_audio_blocks, iter_blocks,
-    iter_correction_blocks, iter_decoded_blocks, metadata_block_count, multichannel_layout,
-    parse_block, parse_blocks, stream_total_samples, total_audio_samples, total_block_samples,
-    total_correction_payload_bytes, AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream,
-    MultichannelLayout, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
-    MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
+    audio_block_count, block_count, correction_block_count, correction_coverage,
+    decode_multichannel_stream, decode_multichannel_stream_muted, decode_stream,
+    decode_stream_muted, decoded_sample_count, first_audio_block, first_correction_block,
+    iter_audio_blocks, iter_blocks, iter_correction_blocks, iter_decoded_blocks,
+    metadata_block_count, multichannel_layout, pair_correction_stream, parse_block, parse_blocks,
+    stream_total_samples, total_audio_samples, total_block_samples, total_correction_payload_bytes,
+    AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream, MultichannelLayout,
+    StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock, MAX_DECODE_SAMPLES_PER_BLOCK,
+    MAX_MULTICHANNEL_CHANNELS,
 };
 pub use crate::block_header::{
     parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
