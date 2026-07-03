@@ -18,6 +18,19 @@
 //! escape, phase-in mantissa, and adaptive medians) for every audio
 //! block in the input, concatenating the per-block PCM. The return
 //! value is intentionally discarded.
+//!
+//! **RSS sizing note:** decompression amplification is *inherent* to
+//! the format — a ~50-byte block whose `0x0A` stream is a spec §4.2
+//! step-1 zero-run legitimately decodes to up to
+//! `MAX_DECODE_SAMPLES_PER_BLOCK` (`1 << 26`) zero samples (256 MiB of
+//! `i32`s), because silence compresses enormously; the eager
+//! `decode_stream` then concatenates per-block output across the
+//! chain. That per-block ceiling is the documented anti-amplification
+//! bound (see the round-296 hardening notes), not a leak, so campaigns
+//! must run with an `-rss_limit_mb` sized for a few such expansions
+//! (e.g. `-rss_limit_mb=8192`) or libFuzzer reports a spurious OOM
+//! against its default 2 GiB limit. Callers needing hard memory bounds
+//! use the lazy per-block iterator instead of the eager composer.
 
 use libfuzzer_sys::fuzz_target;
 

@@ -17,6 +17,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 — **encoder round-trip fuzz target + corpus seeds from the
+  new block shapes**. New `fuzz/fuzz_targets/encode_roundtrip.rs`
+  carries a *round-trip oracle* (strictly stronger than the decode
+  targets' panic-freedom contract): fuzz bytes become a control header
+  (mono/stereo shape, search-ceiling profile, synthetic left-shift
+  scale) plus an `i32` PCM buffer, encoded through the `*_best` mode
+  search and asserted `decode_stream(&encoded)? == pcm` bit-exactly
+  plus the §5.6 CRC gate — any divergence in derive → serialize →
+  recorrelate → entropy → decode fails the run. A ~1.8M-exec campaign
+  is clean. Two new named decode-corpus seeds cover the round-383
+  block shapes (shifted+decorrelated mono; joint+decorrelated stereo).
+  A campaign with those seeds also surfaced that the eager
+  `decode_stream`'s *inherent* format amplification (a ~50-byte
+  zero-run block legitimately decodes to up to `1 << 26` zero samples —
+  silence compresses enormously; verified: a 50-byte encoded block of
+  `2^24` zeros decodes to 64 MiB) trips libFuzzer's default 2 GiB RSS
+  accounting; the decode target now documents the required
+  `-rss_limit_mb` sizing and points hard-memory-bound callers at the
+  lazy per-block iterator. A re-run at the documented limit is clean
+  (0 oom/timeout/crash).
+
 - Round 383 — **profile-ceiling mode search in the best encoders**.
   `DecorrProfile::search_set` names the nested effort ladder
   (`Fast ⊂ Normal ⊂ High` as candidate sets), and the `*_best` encoders
