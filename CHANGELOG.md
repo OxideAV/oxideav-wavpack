@@ -33,6 +33,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 386 — **introspection-surface fuzz target + round-386 corpus
+  seeds + four clean campaigns**. New
+  `fuzz/fuzz_targets/introspection_surface.rs` drives arbitrary bytes
+  through every non-decoding stream walker (block/audio/metadata/
+  correction counts, sample-count walkers, layout, first-block peeks,
+  correction-payload sizing) plus the new `.wvc` pairing walker at a
+  fuzz-chosen split, asserting the cross-walker invariants (audio +
+  metadata partition the chain; correction-bearing ⊆ all;
+  per-channel-sum ≤ PCM-value-count ≤ ×2; paired ≤ total). Six new
+  corpus seeds cover the round-386 encode shapes (Extra 16-pass block,
+  searched stereo block, 3-block smallest stream, three pairing
+  splits). Campaigns this round: introspection 15.7M execs,
+  decode_stream 710k (post-fix), multichannel 2.07M,
+  encode_roundtrip 658k — all clean at the documented
+  `-rss_limit_mb` sizing.
+
 - Round 386 — **`.wvc` correction-file pairing plumbing
   (`pair_correction_stream` / `correction_coverage` /
   `WavPackBlock::expects_correction`)**. Stream-level alignment of a

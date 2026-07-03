@@ -54,3 +54,9 @@ name = "encode_roundtrip"
 path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "introspection_surface"
+path = "fuzz_targets/introspection_surface.rs"
+test = false
+doc = false
