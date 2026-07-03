@@ -176,15 +176,39 @@ Working surface:
   over the joint-transformed domain, matching the decoder's
   decorrelate-then-joint-undo order). `detect_left_shift` +
   `encode_block_mono_best` / `encode_block_stereo_best` search the
-  whole mode grid — {plain, joint} × ({raw} ∪ {derived decorrelation
-  per profile in the `DecorrProfile::search_set` effort ladder}) at the
-  auto-detected sub-byte-depth shift — keeping the smallest output
-  (every candidate decodes back bit-exactly, so selection is
-  size-only); `encode_stream_mono_best` / `encode_stream_stereo_best`
-  lift the search per-block across a whole file. Measured on a
-  synthetic musical signal at the `High` ceiling: mono ~51% of the
-  raw-stream bytes, correlated stereo ~36%, 12-bit-in-16-container
-  material ~26%.
+  whole mode grid — {plain, joint} × ({raw} ∪ {single-sweep,
+  twice-iterated derived decorrelation per profile in the
+  `DecorrProfile::search_set` effort ladder}) at the auto-detected
+  sub-byte-depth shift — keeping the smallest output (every candidate
+  decodes back bit-exactly, so selection is size-only);
+  `encode_stream_mono_best` / `encode_stream_stereo_best` lift the
+  search per-block across a whole file. The effort ladder now tops out
+  at `DecorrProfile::Extra` — the spec §2.1 `MAX_NTERMS` (16-pass)
+  ceiling — and `derive_*_passes_iterated` refines the stored starting
+  weights over multiple `quantize ∘ train` sweeps.
+* **Greedy term search + union "smallest" encoders** —
+  `derive_*_passes_searched` picks each pass's term greedily from the
+  full spec §2 valid set (`1..8`, `17`, `18`, cross terms on stereo)
+  by measuring which candidate most reduces a residual magnitude-bits
+  cost proxy, stopping when nothing strictly improves;
+  `encode_block_*_searched` races the searched stack against raw.
+  `encode_block_*_smallest` / `encode_stream_*_smallest` take the
+  union of both search families (Extra-ceiling grid ∪ greedy search)
+  and keep the smaller block per window. Measured on 22 050-sample
+  synthetic signals (16-bit source): music-like mono 50.8% of the PCM
+  bytes (the greedy search beats the `High` profile grid by ~10%),
+  ramp-plus-noise mono 27.4% (`Extra` beats `High` by ~6.6%),
+  correlated stereo 20.8% — the union wins every case by construction.
+* **`.wvc` correction-file pairing plumbing** —
+  `pair_correction_stream` aligns a main `.wv` buffer's audio blocks
+  with its companion `.wvc` buffer's by the `block_index` header word
+  (per-pair agreement on `block_samples` and the mono flag enforced;
+  orphan / surplus / mismatched correction blocks are typed refusals;
+  partial coverage pairs `None`), `correction_coverage` summarises
+  `(paired, total)`, and `WavPackBlock::expects_correction` classifies
+  which blocks *want* a twin (wiki bit-3 hybrid flag). Structural
+  plumbing for the two-file lossless path — consuming the paired
+  `0x0B` words stays gated on the hybrid entropy docs gap below.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -246,6 +270,12 @@ if block.is_audio_block() {
 // bit-exactly lossless):
 use oxideav_wavpack::{encode_stream_stereo_best, DecorrProfile};
 let wv = encode_stream_stereo_best(&pcm, 0, 2, DecorrProfile::High)?;
+assert_eq!(decode_stream(&wv)?, pcm);
+
+// Or the union of every search family this crate has (Extra-ceiling
+// profile grid ∪ greedy term search), smallest block per window:
+use oxideav_wavpack::encode_stream_stereo_smallest;
+let wv = encode_stream_stereo_smallest(&pcm, 0, 2)?;
 assert_eq!(decode_stream(&wv)?, pcm);
 ```
 
@@ -322,9 +352,17 @@ clean-room decorrelation/CRC trace
 source, archived prior history, or online resources were consulted at
 any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
 and `decode_multichannel_stream` (plus its CRC-muted and `multichannel_layout`
-twins) entry points and carries an `encode_roundtrip` **round-trip
+twins) entry points, carries an `encode_roundtrip` **round-trip
 oracle** target (fuzz bytes → PCM + mode-grid control → `*_best` encode
-→ assert bit-exact decode + CRC gate); 881 unit tests synthesise
+→ assert bit-exact decode + CRC gate; the control byte now sweeps all
+four profiles), and an `introspection_surface` target asserting the
+cross-walker invariants over every non-decoding stream walker plus the
+`.wvc` pairing walker at a fuzz-chosen split. A round-386 campaign
+found (and the fix pinned) an adversarial-history overflow in the
+term-17/18 extrapolator predictors — all twelve predictor sites are
+now 32-bit wrapping, matching the wrapping reconstruction adds around
+them, with the minimized input kept as a corpus regression seed;
+908 unit tests synthesise
 minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
