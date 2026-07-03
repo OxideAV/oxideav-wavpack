@@ -994,6 +994,125 @@ pub fn derive_stereo_passes_iterated(
     derive_stereo_passes_for_spec(pcm, profile.stereo_terms(), iterations)
 }
 
+/// The `delta` (weight step, spec §2.1 top-3-bits field) every
+/// greedy-search candidate pass uses.
+const GREEDY_DELTA: i32 = 2;
+
+/// The per-channel term candidates the greedy search draws from — the
+/// full spec §2 non-cross valid set: every fixed lag plus both
+/// extrapolators.
+const GREEDY_CHANNEL_TERMS: &[i8] = &[1, 2, 3, 4, 5, 6, 7, 8, 17, 18];
+
+/// The cross-term candidates added on stereo (spec §3.3).
+const GREEDY_CROSS_TERMS: &[i8] = &[-1, -2, -3];
+
+/// Magnitude-bits cost proxy the greedy search minimizes: the summed
+/// bit length of every residual's absolute value. The entropy coder's
+/// per-word cost grows with the residual's magnitude bits (the §4.2
+/// interval ladder walks median multiples), so shrinking this sum is a
+/// faithful, cheap stand-in for shrinking the coded block without
+/// running the full entropy coder per candidate.
+fn residual_cost(buffer: &[i32]) -> u64 {
+    buffer
+        .iter()
+        .map(|&v| u64::from(32 - v.unsigned_abs().leading_zeros()))
+        .sum()
+}
+
+/// Greedy core shared by the mono/stereo searched derivations: pick up
+/// to `cap` terms, each the candidate that most reduces the residual
+/// cost of the current domain, stopping early when no candidate
+/// strictly improves. Returns the picked `(term, delta)` list in
+/// pick order (= encode-application order, first-applied first).
+fn greedy_pick_terms(
+    domain: &mut Vec<i32>,
+    candidates: &[i8],
+    cap: usize,
+    stereo: bool,
+) -> Result<Vec<(i8, i32)>> {
+    let zeros = [0i32; MAX_TERM as usize];
+    let mut cost = residual_cost(domain);
+    let mut picked: Vec<(i8, i32)> = Vec::new();
+    while picked.len() < cap {
+        let mut winner: Option<(i8, Vec<i32>, u64)> = None;
+        for &term in candidates {
+            let mut pass = DecorrPass::new(
+                term,
+                GREEDY_DELTA,
+                0,
+                0,
+                &zeros,
+                if stereo { &zeros[..] } else { &[] },
+            )?;
+            let mut scratch = domain.clone();
+            let single = std::slice::from_mut(&mut pass);
+            if stereo {
+                recorrelate_stereo(single, &mut scratch)?;
+            } else {
+                recorrelate_mono(single, &mut scratch)?;
+            }
+            let c = residual_cost(&scratch);
+            if c < winner.as_ref().map_or(cost, |w| w.2) {
+                winner = Some((term, scratch, c));
+            }
+        }
+        let Some((term, next, c)) = winner else {
+            break;
+        };
+        picked.push((term, GREEDY_DELTA));
+        *domain = next;
+        cost = c;
+    }
+    Ok(picked)
+}
+
+/// Derive a **searched** decorrelation pass list for a mono PCM buffer:
+/// instead of a fixed [`DecorrProfile`] term stack, each pass's term is
+/// chosen greedily from the full spec §2 valid set by measuring which
+/// candidate most reduces the residual magnitude-bits cost of the
+/// buffer the previous picks produced.
+///
+/// The search stops as soon as no candidate strictly improves the
+/// domain (so trailing dead passes are never emitted) or at
+/// `max_passes` (clamped to the spec §2.1 `MAX_NTERMS` = 16 cap). The
+/// picked stack is then re-trained from the original PCM with two
+/// iterated sweeps ([`derive_mono_passes_iterated`] semantics), so the
+/// stored starting weights match the exact composition the decoder
+/// will run. An empty result (nothing improved — e.g. constant zero
+/// input) is valid: it means "encode raw".
+///
+/// Like every derivation in this module the result is the encoder's own
+/// choice among conformant pass lists — any ordered valid list decodes
+/// per the `0x02`/`0x03`/`0x04` metadata, and the round trip stays
+/// bit-exact regardless of how well the search matched the signal.
+pub fn derive_mono_passes_searched(pcm: &[i32], max_passes: usize) -> Result<Vec<DecorrPass>> {
+    let cap = max_passes.min(crate::decorrelation::MAX_NTERMS);
+    let mut domain = pcm.to_vec();
+    let picked = greedy_pick_terms(&mut domain, GREEDY_CHANNEL_TERMS, cap, false)?;
+    // The forward recorrelation walks the application-ordered list
+    // back-to-front, so the first-picked (first-applied) term sits last.
+    let spec: Vec<(i8, i32)> = picked.into_iter().rev().collect();
+    derive_mono_passes_for_spec(pcm, &spec, 2)
+}
+
+/// Derive a **searched** decorrelation pass list for an interleaved
+/// stereo buffer — the two-channel twin of
+/// [`derive_mono_passes_searched`], with the spec §3.3 cross terms
+/// (`-1`/`-2`/`-3`) added to the candidate set. `pcm` is the buffer the
+/// block will actually entropy-code (post-joint for a mid/side block).
+pub fn derive_stereo_passes_searched(pcm: &[i32], max_passes: usize) -> Result<Vec<DecorrPass>> {
+    let cap = max_passes.min(crate::decorrelation::MAX_NTERMS);
+    let candidates: Vec<i8> = GREEDY_CHANNEL_TERMS
+        .iter()
+        .chain(GREEDY_CROSS_TERMS.iter())
+        .copied()
+        .collect();
+    let mut domain = pcm.to_vec();
+    let picked = greedy_pick_terms(&mut domain, &candidates, cap, true)?;
+    let spec: Vec<(i8, i32)> = picked.into_iter().rev().collect();
+    derive_stereo_passes_for_spec(pcm, &spec, 2)
+}
+
 /// Encode a mono PCM buffer into one complete `wvpk` block with a
 /// **self-derived** decorrelation pass list — the first entry point
 /// that performs real prediction-based compression without the caller
@@ -1289,6 +1408,131 @@ pub fn encode_block_stereo_best(
     }
     // At least the two raw candidates were pushed.
     Ok(best.expect("mode search produced no candidate"))
+}
+
+/// Encode a mono PCM buffer through the **greedy term search**
+/// ([`derive_mono_passes_searched`]): the searched-stack candidate is
+/// raced against the raw (no-decorrelation) candidate at the
+/// auto-detected left-shift, and the smaller block wins — so the
+/// searched encode never loses to raw even on signals where no term
+/// helps. Every candidate decodes back to `pcm` bit-exactly:
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_mono_searched(
+    pcm: &[i32],
+    max_passes: usize,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let left_shift = detect_left_shift(pcm);
+    let mut narrow = pcm.to_vec();
+    if left_shift > 0 {
+        narrow_left_shift(&mut narrow, left_shift)?;
+    }
+
+    let mut best: Option<Vec<u8>> = None;
+    keep_smaller(
+        &mut best,
+        encode_block_core(
+            pcm,
+            BlockConfig {
+                left_shift,
+                ..raw_config(true, bytes_per_sample)
+            },
+            block_index,
+            total_samples,
+        )?,
+    );
+    let passes = derive_mono_passes_searched(&narrow, max_passes)?;
+    if !passes.is_empty() {
+        let (terms, weights, samples) = serialize_mono_passes(&passes)?;
+        keep_smaller(
+            &mut best,
+            encode_block_core(
+                pcm,
+                BlockConfig {
+                    left_shift,
+                    decorr: Some((&terms, &weights, &samples)),
+                    ..raw_config(true, bytes_per_sample)
+                },
+                block_index,
+                total_samples,
+            )?,
+        );
+    }
+    Ok(best.expect("searched encode produced no candidate"))
+}
+
+/// Encode an interleaved stereo PCM buffer through the **greedy term
+/// search** — the two-channel twin of [`encode_block_mono_searched`],
+/// racing {plain, joint mid/side} × {raw, searched stack} and keeping
+/// the smallest block. The searched derivation runs once per joint
+/// mode over the exact domain that mode entropy-codes. Every candidate
+/// decodes back to `pcm` bit-exactly.
+pub fn encode_block_stereo_searched(
+    pcm: &[i32],
+    max_passes: usize,
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let left_shift = detect_left_shift(pcm);
+    let mut narrow = pcm.to_vec();
+    if left_shift > 0 {
+        narrow_left_shift(&mut narrow, left_shift)?;
+    }
+    let mut joint_narrow = narrow.clone();
+    for pair in joint_narrow.chunks_exact_mut(2) {
+        let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
+        pair[0] = mid;
+        pair[1] = side;
+    }
+
+    let mut best: Option<Vec<u8>> = None;
+    for joint in [false, true] {
+        let domain = if joint { &joint_narrow } else { &narrow };
+        keep_smaller(
+            &mut best,
+            encode_block_core(
+                pcm,
+                BlockConfig {
+                    joint,
+                    left_shift,
+                    ..raw_config(false, bytes_per_sample)
+                },
+                block_index,
+                total_samples,
+            )?,
+        );
+        let passes = derive_stereo_passes_searched(domain, max_passes)?;
+        if !passes.is_empty() {
+            let (terms, weights, samples) = serialize_stereo_passes(&passes)?;
+            keep_smaller(
+                &mut best,
+                encode_block_core(
+                    pcm,
+                    BlockConfig {
+                        joint,
+                        left_shift,
+                        decorr: Some((&terms[..], &weights[..], &samples[..])),
+                        ..raw_config(false, bytes_per_sample)
+                    },
+                    block_index,
+                    total_samples,
+                )?,
+            );
+        }
+    }
+    Ok(best.expect("searched encode produced no candidate"))
 }
 
 /// Default per-block sample count the stream encoders split a long PCM
@@ -2737,6 +2981,97 @@ mod tests {
         let (terms_one, _, _) = serialize_mono_passes(&one).unwrap();
         let (terms_three, _, _) = serialize_mono_passes(&three).unwrap();
         assert_eq!(terms_one, terms_three);
+    }
+
+    /// The greedy search respects the `MAX_NTERMS` clamp and any smaller
+    /// caller cap, only ever emits serializable spec-valid terms, and
+    /// stops early rather than padding with dead passes.
+    #[test]
+    fn searched_derivation_respects_caps_and_stays_valid() {
+        let mono = smooth_mono(400);
+        for cap in [1usize, 3, 16, 64] {
+            let passes = derive_mono_passes_searched(&mono, cap).unwrap();
+            assert!(passes.len() <= cap.min(crate::decorrelation::MAX_NTERMS));
+            serialize_mono_passes(&passes).unwrap();
+        }
+        let stereo = smooth_stereo(200);
+        let passes = derive_stereo_passes_searched(&stereo, 64).unwrap();
+        assert!(passes.len() <= crate::decorrelation::MAX_NTERMS);
+        serialize_stereo_passes(&passes).unwrap();
+    }
+
+    /// On a signal no term can improve (constant zero), the search picks
+    /// nothing and the searched encoders fall back to the raw candidate.
+    #[test]
+    fn searched_derivation_picks_nothing_on_zeros() {
+        let zeros = vec![0i32; 128];
+        assert!(derive_mono_passes_searched(&zeros, 16).unwrap().is_empty());
+        let out = encode_block_mono_searched(&zeros, 16, 2, 0, 128).unwrap();
+        assert_eq!(decode_stream(&out).unwrap(), zeros);
+    }
+
+    /// Searched encodes round-trip bit-exactly in every channel shape
+    /// and never lose to the raw encoder (the raw candidate is in the
+    /// race).
+    #[test]
+    fn searched_encode_round_trips_and_beats_raw() {
+        let mono = smooth_mono(600);
+        let searched = encode_block_mono_searched(&mono, 16, 2, 0, 600).unwrap();
+        let raw = encode_block_mono(&mono, 2, 0, 600).unwrap();
+        assert!(searched.len() <= raw.len());
+        assert_eq!(decode_stream(&searched).unwrap(), mono);
+
+        let stereo = smooth_stereo(300);
+        let searched = encode_block_stereo_searched(&stereo, 16, 2, 0, 300).unwrap();
+        let raw = encode_block_stereo(&stereo, 2, 0, 300).unwrap();
+        assert!(searched.len() <= raw.len());
+        assert_eq!(decode_stream(&searched).unwrap(), stereo);
+    }
+
+    /// The searched mode compresses a correlated signal — it actually
+    /// picks passes and lands strictly below raw, not just at parity.
+    #[test]
+    fn searched_encode_compresses_correlated_signal() {
+        let mono = smooth_mono(800);
+        let passes = derive_mono_passes_searched(&mono, 16).unwrap();
+        assert!(!passes.is_empty(), "smooth signal must pick terms");
+        let searched = encode_block_mono_searched(&mono, 16, 2, 0, 800).unwrap();
+        let raw = encode_block_mono(&mono, 2, 0, 800).unwrap();
+        assert!(
+            searched.len() < raw.len(),
+            "searched ({}) must beat raw ({}) on a smooth signal",
+            searched.len(),
+            raw.len()
+        );
+    }
+
+    /// Searched encodes preserve the sub-byte-depth left-shift arm and
+    /// the shared refusal arms.
+    #[test]
+    fn searched_encode_shift_and_refusals() {
+        let mono: Vec<i32> = smooth_mono(300).iter().map(|s| s << 3).collect();
+        let out = encode_block_mono_searched(&mono, 16, 2, 0, 300).unwrap();
+        assert_eq!(decode_stream(&out).unwrap(), mono);
+
+        assert!(matches!(
+            encode_block_mono_searched(&[], 16, 2, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_searched(&[1, 2, 3], 16, 2, 0, 1),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
+    }
+
+    /// The residual-cost proxy orders buffers by magnitude bits.
+    #[test]
+    fn residual_cost_orders_by_magnitude_bits() {
+        assert_eq!(residual_cost(&[0, 0, 0]), 0);
+        assert_eq!(residual_cost(&[1, -1]), 2); // |−1| = 1 → 1 bit each
+        assert_eq!(residual_cost(&[3]), 2);
+        assert_eq!(residual_cost(&[4]), 3);
+        assert_eq!(residual_cost(&[i32::MIN]), 32);
+        assert!(residual_cost(&[100, 100]) < residual_cost(&[10_000, 10_000]));
     }
 
     /// A deeper search ceiling can only match or beat a shallower one —

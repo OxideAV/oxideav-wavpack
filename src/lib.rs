@@ -856,15 +856,16 @@ pub use crate::decorrelation::{
     WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
 };
 pub use crate::encode::{
-    derive_mono_passes, derive_mono_passes_iterated, derive_stereo_passes,
-    derive_stereo_passes_iterated, detect_left_shift, encode_block_mono, encode_block_mono_auto,
-    encode_block_mono_best, encode_block_mono_shifted, encode_block_mono_with_decorr,
+    derive_mono_passes, derive_mono_passes_iterated, derive_mono_passes_searched,
+    derive_stereo_passes, derive_stereo_passes_iterated, derive_stereo_passes_searched,
+    detect_left_shift, encode_block_mono, encode_block_mono_auto, encode_block_mono_best,
+    encode_block_mono_searched, encode_block_mono_shifted, encode_block_mono_with_decorr,
     encode_block_stereo, encode_block_stereo_auto, encode_block_stereo_best,
     encode_block_stereo_joint, encode_block_stereo_joint_auto,
-    encode_block_stereo_joint_with_decorr, encode_block_stereo_shifted,
-    encode_block_stereo_with_decorr, encode_multichannel_stream, encode_stream_mono,
-    encode_stream_mono_best, encode_stream_stereo, encode_stream_stereo_best, DecorrProfile,
-    DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
+    encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
+    encode_block_stereo_shifted, encode_block_stereo_with_decorr, encode_multichannel_stream,
+    encode_stream_mono, encode_stream_mono_best, encode_stream_stereo, encode_stream_stereo_best,
+    DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
 };
 pub use crate::entropy::{
     expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,

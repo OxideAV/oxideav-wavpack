@@ -17,6 +17,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 386 — **greedy term-search encoder mode
+  (`derive_*_passes_searched` + `encode_block_*_searched`)**. Instead
+  of a fixed profile stack, each pass's term is picked greedily from
+  the full spec §2 valid set (`1..8`, `17`, `18`, plus the §3.3 cross
+  terms on stereo) by measuring which candidate most reduces a
+  residual magnitude-bits cost proxy over the domain the previous
+  picks produced; the search stops early when nothing strictly
+  improves (so dead passes are never emitted) and clamps at the
+  `MAX_NTERMS` = 16 cap. The picked stack is re-trained with two
+  iterated sweeps so the stored starting weights match the exact
+  composition the decoder runs. The block entry points race the
+  searched stack against the raw candidate ({plain, joint} × {raw,
+  searched} on stereo) at the auto-detected left-shift, so a searched
+  encode never loses to raw; an empty pick list (e.g. constant zero
+  input) falls back to raw cleanly.
+
 - Round 386 — **iterated weight training
   (`derive_mono_passes_iterated` / `derive_stereo_passes_iterated`)**.
   Each extra sweep re-trains the §3.4 adaptation starting from the
