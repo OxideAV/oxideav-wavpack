@@ -903,8 +903,15 @@ pub fn decorrelate_mono(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result
         for slot in buffer.iter_mut() {
             let residual = *slot;
             let pred = match pass.term {
-                17 => 2 * pass.history_a[0] - pass.history_a[1],
-                18 => (3 * pass.history_a[0] - pass.history_a[1]) >> 1,
+                17 => pass.history_a[0]
+                    .wrapping_mul(2)
+                    .wrapping_sub(pass.history_a[1]),
+                18 => {
+                    pass.history_a[0]
+                        .wrapping_mul(3)
+                        .wrapping_sub(pass.history_a[1])
+                        >> 1
+                }
                 // Fixed lag: read the current ring slot `m`. A value
                 // written here `t` iterations ago (to `(m'+t)&7`) is read
                 // again when `m` catches up, giving `s[n-t]` (§3.2 step 1
@@ -992,8 +999,12 @@ pub fn decorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
                 }
                 // Per-channel two-sample extrapolators (§3.2).
                 17 => {
-                    let pa = 2 * pass.history_a[0] - pass.history_a[1];
-                    let pb = 2 * pass.history_b[0] - pass.history_b[1];
+                    let pa = pass.history_a[0]
+                        .wrapping_mul(2)
+                        .wrapping_sub(pass.history_a[1]);
+                    let pb = pass.history_b[0]
+                        .wrapping_mul(2)
+                        .wrapping_sub(pass.history_b[1]);
                     let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
                     let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
                     pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
@@ -1006,8 +1017,14 @@ pub fn decorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
                     pass.history_b[0] = b;
                 }
                 18 => {
-                    let pa = (3 * pass.history_a[0] - pass.history_a[1]) >> 1;
-                    let pb = (3 * pass.history_b[0] - pass.history_b[1]) >> 1;
+                    let pa = pass.history_a[0]
+                        .wrapping_mul(3)
+                        .wrapping_sub(pass.history_a[1])
+                        >> 1;
+                    let pb = pass.history_b[0]
+                        .wrapping_mul(3)
+                        .wrapping_sub(pass.history_b[1])
+                        >> 1;
                     let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
                     let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
                     pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
@@ -1086,8 +1103,15 @@ pub fn recorrelate_mono(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result
         for slot in buffer.iter_mut() {
             let sample = *slot;
             let pred = match pass.term {
-                17 => 2 * pass.history_a[0] - pass.history_a[1],
-                18 => (3 * pass.history_a[0] - pass.history_a[1]) >> 1,
+                17 => pass.history_a[0]
+                    .wrapping_mul(2)
+                    .wrapping_sub(pass.history_a[1]),
+                18 => {
+                    pass.history_a[0]
+                        .wrapping_mul(3)
+                        .wrapping_sub(pass.history_a[1])
+                        >> 1
+                }
                 _ => pass.history_a[m & (MAX_TERM as usize - 1)],
             };
             // Inverse of `s[n] = apply_weight(w, pred) + residual`.
@@ -1176,8 +1200,12 @@ pub fn recorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
                     pass.history_b[0] = sb;
                 }
                 17 => {
-                    let pa = 2 * pass.history_a[0] - pass.history_a[1];
-                    let pb = 2 * pass.history_b[0] - pass.history_b[1];
+                    let pa = pass.history_a[0]
+                        .wrapping_mul(2)
+                        .wrapping_sub(pass.history_a[1]);
+                    let pb = pass.history_b[0]
+                        .wrapping_mul(2)
+                        .wrapping_sub(pass.history_b[1]);
                     let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
                     let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
                     pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
@@ -1190,8 +1218,14 @@ pub fn recorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
                     pass.history_b[0] = sb;
                 }
                 18 => {
-                    let pa = (3 * pass.history_a[0] - pass.history_a[1]) >> 1;
-                    let pb = (3 * pass.history_b[0] - pass.history_b[1]) >> 1;
+                    let pa = pass.history_a[0]
+                        .wrapping_mul(3)
+                        .wrapping_sub(pass.history_a[1])
+                        >> 1;
+                    let pb = pass.history_b[0]
+                        .wrapping_mul(3)
+                        .wrapping_sub(pass.history_b[1])
+                        >> 1;
                     let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
                     let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
                     pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
@@ -3537,5 +3571,34 @@ mod tests {
         let mut inverse = assemble_mono_passes(&t, &w, &s).unwrap();
         decorrelate_mono(&mut inverse, &mut buffer).unwrap();
         assert_eq!(buffer, original);
+    }
+
+    /// Fuzz regression (round 386): adversarial metadata can seed a
+    /// term-17/18 pass with near-`i32`-extreme history, so the §3.2
+    /// extrapolator predictors (`2*a0 - a1`, `(3*a0 - a1) >> 1`) must
+    /// use 32-bit wrapping arithmetic like every other reconstruction
+    /// step — the pre-fix build tripped a debug multiply overflow.
+    /// Both directions use the identical wrapping forms, so the
+    /// forward/inverse identity must survive the extremes.
+    #[test]
+    fn extrapolator_predictors_wrap_on_extreme_history() {
+        let seeds = [i32::MIN, i32::MAX];
+        for term in [17i8, 18] {
+            // Mono, both directions, round trip through the wrap.
+            let mut inv = DecorrPass::new(term, 2, 1024, 0, &seeds, &[]).unwrap();
+            let mut buf = [7i32, -3, 0, 11];
+            decorrelate_mono(std::slice::from_mut(&mut inv), &mut buf).unwrap();
+            let mut fwd = DecorrPass::new(term, 2, 1024, 0, &seeds, &[]).unwrap();
+            recorrelate_mono(std::slice::from_mut(&mut fwd), &mut buf).unwrap();
+            assert_eq!(buf, [7, -3, 0, 11]);
+
+            // Stereo twin (independent per-channel histories).
+            let mut inv = DecorrPass::new(term, 2, 1024, -1024, &seeds, &seeds).unwrap();
+            let mut buf = [5i32, -9, 2, 4];
+            decorrelate_stereo(std::slice::from_mut(&mut inv), &mut buf).unwrap();
+            let mut fwd = DecorrPass::new(term, 2, 1024, -1024, &seeds, &seeds).unwrap();
+            recorrelate_stereo(std::slice::from_mut(&mut fwd), &mut buf).unwrap();
+            assert_eq!(buf, [5, -9, 2, 4]);
+        }
     }
 }

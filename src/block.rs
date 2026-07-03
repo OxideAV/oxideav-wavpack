@@ -6031,6 +6031,20 @@ mod tests {
         assert!(pair_correction_stream(&good, &bad_wvc).is_err());
     }
 
+    /// Fuzz regression (round 386): this minimized adversarial stream
+    /// seeds a term-17/18 decorrelation pass with extreme history so
+    /// the §3.2 extrapolator predictor overflows a non-wrapping i32
+    /// multiply. The decode must return (Ok or a typed Err) without
+    /// panicking; the input stays in the fuzz corpus as
+    /// `regression_extrapolator_overflow.bin`.
+    #[test]
+    fn decode_survives_adversarial_extrapolator_history() {
+        let bytes =
+            include_bytes!("../fuzz/corpus/decode_stream/regression_extrapolator_overflow.bin");
+        let _ = decode_stream(bytes);
+        let _ = decode_stream_muted(bytes);
+    }
+
     #[test]
     fn expects_correction_reads_the_hybrid_flag() {
         let hybrid = synth_pairing_block(0, 100, (1 << 2) | (1 << 3), false);

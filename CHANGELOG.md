@@ -15,6 +15,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   verbatim-payload path); the staged `Error::NotImplemented` decorr branch
   is gone.
 
+### Fixed
+
+- Round 386 — **adversarial-history extrapolator overflow (fuzz
+  finding)**. A malformed stream can seed a term-17/18 decorrelation
+  pass with near-`i32`-extreme `0x04` history samples, making the
+  spec §3.2 extrapolator predictors (`2*a0 - a1`, `(3*a0 - a1) >> 1`)
+  overflow a non-wrapping multiply (debug-build panic). All twelve
+  predictor sites across `decorrelate_mono` / `decorrelate_stereo` /
+  `recorrelate_mono` / `recorrelate_stereo` now use 32-bit wrapping
+  arithmetic, matching the wrapping reconstruction adds that already
+  surrounded them — both directions use identical forms, so the
+  forward/inverse identity is unchanged (asserted at the extremes in
+  both channel shapes). The minimized input is pinned as corpus seed
+  `regression_extrapolator_overflow.bin` + an `include_bytes!`
+  regression test through `decode_stream` / `decode_stream_muted`.
+
 ### Added
 
 - Round 386 — **`.wvc` correction-file pairing plumbing
