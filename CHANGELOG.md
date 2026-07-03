@@ -17,6 +17,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 386 — **iterated weight training
+  (`derive_mono_passes_iterated` / `derive_stereo_passes_iterated`)**.
+  Each extra sweep re-trains the §3.4 adaptation starting from the
+  previous sweep's quantized `0x03` weights, walking the stored
+  starting weights toward the block's own `quantize ∘ train` fixpoint
+  so the early samples are predicted well immediately instead of
+  adapting from zero. One sweep reproduces the round-383 derivation
+  exactly (asserted); the term/delta stack is sweep-invariant — only
+  the starting weights refine. The `*_best` mode searches now push a
+  twice-iterated candidate per profile alongside the single-sweep one,
+  so a best encode can only get smaller.
+
 - Round 386 — **`DecorrProfile::Extra` — the spec §2.1 `MAX_NTERMS`
   (16-pass) derivation ceiling**. The new profile derives sixteen
   decorrelation passes (every fixed lag `1..8`, repeated extrapolators,

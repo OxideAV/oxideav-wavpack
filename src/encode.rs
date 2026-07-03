@@ -853,17 +853,6 @@ impl DecorrProfile {
     }
 }
 
-/// Build a zero-state (zero weights, zero seeds) pass list from a
-/// `(term, delta)` spec. `stereo` seeds both channel histories.
-fn zero_state_passes(spec: &[(i8, i32)], stereo: bool) -> Result<Vec<DecorrPass>> {
-    let zeros = [0i32; MAX_TERM as usize];
-    spec.iter()
-        .map(|&(term, delta)| {
-            DecorrPass::new(term, delta, 0, 0, &zeros, if stereo { &zeros } else { &[] })
-        })
-        .collect()
-}
-
 /// Derive a serializable, application-ordered decorrelation pass list
 /// for a **mono** PCM buffer by training the spec §3.4 weight
 /// adaptation over the block.
@@ -885,24 +874,66 @@ fn zero_state_passes(spec: &[(i8, i32)], stereo: bool) -> Result<Vec<DecorrPass>
 /// identical starting state from the metadata, so the round trip stays
 /// bit-exact regardless of how well the training matched the signal.
 pub fn derive_mono_passes(pcm: &[i32], profile: DecorrProfile) -> Result<Vec<DecorrPass>> {
-    let spec = profile.mono_terms();
-    let mut training = zero_state_passes(spec, false)?;
-    let mut scratch = pcm.to_vec();
-    recorrelate_mono(&mut training, &mut scratch)?;
+    derive_mono_passes_for_spec(pcm, profile.mono_terms(), 1)
+}
+
+/// Spec-driven core of the mono derivation: train an arbitrary
+/// application-ordered `(term, delta)` list over the block for
+/// `iterations` sweeps and return zero-seed passes carrying the final
+/// quantized starting weights.
+///
+/// One sweep is the round-383 bootstrap (train from the current
+/// starting weights via [`recorrelate_mono`], quantize the trained end
+/// weights into the next starting weights). Additional sweeps re-train
+/// from the previous sweep's quantized result: the §3.4 adaptation then
+/// starts near the block's own correlation instead of at zero, so the
+/// early samples of the block are predicted well immediately. The
+/// sequence converges toward a per-block fixpoint of
+/// `quantize ∘ train`; `iterations == 1` reproduces the round-383
+/// behaviour exactly. `iterations` is clamped to at least one sweep.
+fn derive_mono_passes_for_spec(
+    pcm: &[i32],
+    spec: &[(i8, i32)],
+    iterations: u32,
+) -> Result<Vec<DecorrPass>> {
     let zeros = [0i32; MAX_TERM as usize];
+    let mut weights = vec![0i32; spec.len()];
+    for _ in 0..iterations.max(1) {
+        let mut training: Vec<DecorrPass> = spec
+            .iter()
+            .zip(weights.iter())
+            .map(|(&(term, delta), &w)| DecorrPass::new(term, delta, w, 0, &zeros, &[]))
+            .collect::<Result<_>>()?;
+        let mut scratch = pcm.to_vec();
+        recorrelate_mono(&mut training, &mut scratch)?;
+        for (w, trained) in weights.iter_mut().zip(training.iter()) {
+            *w = quantize_weight(trained.weight_a);
+        }
+    }
     spec.iter()
-        .zip(training.iter())
-        .map(|(&(term, delta), trained)| {
-            DecorrPass::new(
-                term,
-                delta,
-                quantize_weight(trained.weight_a),
-                0,
-                &zeros,
-                &[],
-            )
-        })
+        .zip(weights.iter())
+        .map(|(&(term, delta), &w)| DecorrPass::new(term, delta, w, 0, &zeros, &[]))
         .collect()
+}
+
+/// Derive a mono pass list with **iterated** weight training — the
+/// multi-sweep refinement of [`derive_mono_passes`].
+///
+/// Each sweep re-trains the §3.4 adaptation starting from the previous
+/// sweep's quantized weights, walking the stored starting weights
+/// toward the block's own `quantize ∘ train` fixpoint (see
+/// [`derive_mono_passes_for_spec`]'s sweep semantics). One iteration is
+/// exactly [`derive_mono_passes`]; two is usually where most of the
+/// refinement lands, since the stored `0x03` byte only resolves the
+/// weight to steps of 8. The result is serializable by construction and
+/// round-trips bit-exactly regardless of the iteration count — the
+/// decoder rebuilds whatever starting weights the metadata stores.
+pub fn derive_mono_passes_iterated(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    iterations: u32,
+) -> Result<Vec<DecorrPass>> {
+    derive_mono_passes_for_spec(pcm, profile.mono_terms(), iterations)
 }
 
 /// Derive a serializable decorrelation pass list for an **interleaved
@@ -915,24 +946,52 @@ pub fn derive_mono_passes(pcm: &[i32], profile: DecorrProfile) -> Result<Vec<Dec
 /// transform, so the training sees the same values the real prediction
 /// loop will.
 pub fn derive_stereo_passes(pcm: &[i32], profile: DecorrProfile) -> Result<Vec<DecorrPass>> {
-    let spec = profile.stereo_terms();
-    let mut training = zero_state_passes(spec, true)?;
-    let mut scratch = pcm.to_vec();
-    recorrelate_stereo(&mut training, &mut scratch)?;
+    derive_stereo_passes_for_spec(pcm, profile.stereo_terms(), 1)
+}
+
+/// Spec-driven core of the stereo derivation — the two-channel twin of
+/// [`derive_mono_passes_for_spec`]: `iterations` training sweeps over
+/// the interleaved buffer, both channels' weights quantized between
+/// sweeps, zero-seed passes carrying the final starting weights.
+fn derive_stereo_passes_for_spec(
+    pcm: &[i32],
+    spec: &[(i8, i32)],
+    iterations: u32,
+) -> Result<Vec<DecorrPass>> {
     let zeros = [0i32; MAX_TERM as usize];
-    spec.iter()
-        .zip(training.iter())
-        .map(|(&(term, delta), trained)| {
-            DecorrPass::new(
-                term,
-                delta,
+    let mut weights = vec![(0i32, 0i32); spec.len()];
+    for _ in 0..iterations.max(1) {
+        let mut training: Vec<DecorrPass> = spec
+            .iter()
+            .zip(weights.iter())
+            .map(|(&(term, delta), &(wa, wb))| DecorrPass::new(term, delta, wa, wb, &zeros, &zeros))
+            .collect::<Result<_>>()?;
+        let mut scratch = pcm.to_vec();
+        recorrelate_stereo(&mut training, &mut scratch)?;
+        for (w, trained) in weights.iter_mut().zip(training.iter()) {
+            *w = (
                 quantize_weight(trained.weight_a),
                 quantize_weight(trained.weight_b),
-                &zeros,
-                &zeros,
-            )
-        })
+            );
+        }
+    }
+    spec.iter()
+        .zip(weights.iter())
+        .map(|(&(term, delta), &(wa, wb))| DecorrPass::new(term, delta, wa, wb, &zeros, &zeros))
         .collect()
+}
+
+/// Derive a stereo pass list with **iterated** weight training — the
+/// two-channel twin of [`derive_mono_passes_iterated`] (training via
+/// [`recorrelate_stereo`], both channels refined per sweep, cross
+/// passes included per the profile). One iteration is exactly
+/// [`derive_stereo_passes`].
+pub fn derive_stereo_passes_iterated(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    iterations: u32,
+) -> Result<Vec<DecorrPass>> {
+    derive_stereo_passes_for_spec(pcm, profile.stereo_terms(), iterations)
 }
 
 /// Encode a mono PCM buffer into one complete `wvpk` block with a
@@ -1088,8 +1147,10 @@ fn keep_smaller(best: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
 
 /// Encode a mono PCM buffer into the **smallest** block this encoder can
 /// produce: auto-detects the sub-byte-depth left-shift
-/// ([`detect_left_shift`]) and searches the raw candidate plus one
-/// derived-decorrelation candidate per profile in the search set.
+/// ([`detect_left_shift`]) and searches the raw candidate plus a
+/// single-sweep and a twice-iterated derived-decorrelation candidate
+/// per profile in the search set
+/// ([`derive_mono_passes_iterated`]).
 ///
 /// `profile` is the **search ceiling**, not a single choice: the
 /// profiles form a nested effort ladder ([`DecorrProfile::search_set`]),
@@ -1128,24 +1189,27 @@ pub fn encode_block_mono_best(
         )?,
     );
 
-    // One decorrelated candidate per profile in the search set, each
-    // trained over the narrow domain the real prediction loop sees.
+    // Two decorrelated candidates per profile in the search set — the
+    // single-sweep and the twice-iterated derivation — each trained
+    // over the narrow domain the real prediction loop sees.
     for &p in profile.search_set() {
-        let passes = derive_mono_passes(&narrow, p)?;
-        let (terms, weights, samples) = serialize_mono_passes(&passes)?;
-        keep_smaller(
-            &mut best,
-            encode_block_core(
-                pcm,
-                BlockConfig {
-                    left_shift,
-                    decorr: Some((&terms, &weights, &samples)),
-                    ..raw_config(true, bytes_per_sample)
-                },
-                block_index,
-                total_samples,
-            )?,
-        );
+        for iterations in [1u32, 2] {
+            let passes = derive_mono_passes_iterated(&narrow, p, iterations)?;
+            let (terms, weights, samples) = serialize_mono_passes(&passes)?;
+            keep_smaller(
+                &mut best,
+                encode_block_core(
+                    pcm,
+                    BlockConfig {
+                        left_shift,
+                        decorr: Some((&terms, &weights, &samples)),
+                        ..raw_config(true, bytes_per_sample)
+                    },
+                    block_index,
+                    total_samples,
+                )?,
+            );
+        }
     }
     // At least the raw candidate was pushed.
     Ok(best.expect("mode search produced no candidate"))
@@ -1153,8 +1217,9 @@ pub fn encode_block_mono_best(
 
 /// Encode an interleaved stereo PCM buffer into the **smallest** block
 /// this encoder can produce, searching the mode grid: {plain, joint
-/// mid/side} × ({raw} ∪ {derived decorrelation per profile in the
-/// search set}), all at the auto-detected left-shift. Like
+/// mid/side} × ({raw} ∪ {single-sweep, twice-iterated derived
+/// decorrelation per profile in the search set}), all at the
+/// auto-detected left-shift. Like
 /// [`encode_block_mono_best`], `profile` is the search **ceiling**
 /// ([`DecorrProfile::search_set`]). Each decorrelated candidate trains
 /// over the exact domain its prediction loop will run in (narrow, or
@@ -1202,22 +1267,24 @@ pub fn encode_block_stereo_best(
             )?,
         );
         for &p in profile.search_set() {
-            let derived = derive_stereo_passes(domain, p)?;
-            let (terms, weights, samples) = serialize_stereo_passes(&derived)?;
-            keep_smaller(
-                &mut best,
-                encode_block_core(
-                    pcm,
-                    BlockConfig {
-                        joint,
-                        left_shift,
-                        decorr: Some((&terms[..], &weights[..], &samples[..])),
-                        ..raw_config(false, bytes_per_sample)
-                    },
-                    block_index,
-                    total_samples,
-                )?,
-            );
+            for iterations in [1u32, 2] {
+                let derived = derive_stereo_passes_iterated(domain, p, iterations)?;
+                let (terms, weights, samples) = serialize_stereo_passes(&derived)?;
+                keep_smaller(
+                    &mut best,
+                    encode_block_core(
+                        pcm,
+                        BlockConfig {
+                            joint,
+                            left_shift,
+                            decorr: Some((&terms[..], &weights[..], &samples[..])),
+                            ..raw_config(false, bytes_per_sample)
+                        },
+                        block_index,
+                        total_samples,
+                    )?,
+                );
+            }
         }
     }
     // At least the two raw candidates were pushed.
@@ -2613,6 +2680,63 @@ mod tests {
         let extra = encode_block_stereo_best(&stereo, DecorrProfile::Extra, 2, 0, 350).unwrap();
         assert!(extra.len() <= high.len());
         assert_eq!(decode_stream(&extra).unwrap(), stereo);
+    }
+
+    /// One training sweep of the iterated derivation is exactly the
+    /// single-sweep derivation — same terms, weights, and seeds.
+    #[test]
+    fn iterated_once_matches_single_sweep_derivation() {
+        let mono = smooth_mono(400);
+        assert_eq!(
+            derive_mono_passes_iterated(&mono, DecorrProfile::High, 1).unwrap(),
+            derive_mono_passes(&mono, DecorrProfile::High).unwrap()
+        );
+        // Zero iterations clamp to one sweep rather than skipping training.
+        assert_eq!(
+            derive_mono_passes_iterated(&mono, DecorrProfile::Normal, 0).unwrap(),
+            derive_mono_passes(&mono, DecorrProfile::Normal).unwrap()
+        );
+
+        let stereo = smooth_stereo(200);
+        assert_eq!(
+            derive_stereo_passes_iterated(&stereo, DecorrProfile::High, 1).unwrap(),
+            derive_stereo_passes(&stereo, DecorrProfile::High).unwrap()
+        );
+    }
+
+    /// Iterated-training pass lists stay serializable and bit-exact
+    /// through the verbatim-payload encoders at any iteration count.
+    #[test]
+    fn iterated_derivation_round_trips_bit_exact() {
+        let mono = smooth_mono(500);
+        for iterations in [2u32, 3, 5] {
+            let passes =
+                derive_mono_passes_iterated(&mono, DecorrProfile::High, iterations).unwrap();
+            let (terms, weights, samples) = serialize_mono_passes(&passes).unwrap();
+            let block = encode_block_mono_with_decorr(&mono, &terms, &weights, &samples, 2, 0, 500)
+                .unwrap();
+            assert_eq!(decode_stream(&block).unwrap(), mono);
+        }
+
+        let stereo = smooth_stereo(250);
+        let passes = derive_stereo_passes_iterated(&stereo, DecorrProfile::Extra, 3).unwrap();
+        let (terms, weights, samples) = serialize_stereo_passes(&passes).unwrap();
+        let block = encode_block_stereo_with_decorr(&stereo, &terms, &weights, &samples, 2, 0, 250)
+            .unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), stereo);
+    }
+
+    /// Extra sweeps refine only the starting weights — the term/delta
+    /// stack (and thus the `0x02` payload) is sweep-invariant.
+    #[test]
+    fn iterated_derivation_keeps_the_term_stack() {
+        let mono = smooth_mono(300);
+        let one = derive_mono_passes_iterated(&mono, DecorrProfile::Normal, 1).unwrap();
+        let three = derive_mono_passes_iterated(&mono, DecorrProfile::Normal, 3).unwrap();
+        assert_eq!(one.len(), three.len());
+        let (terms_one, _, _) = serialize_mono_passes(&one).unwrap();
+        let (terms_three, _, _) = serialize_mono_passes(&three).unwrap();
+        assert_eq!(terms_one, terms_three);
     }
 
     /// A deeper search ceiling can only match or beat a shallower one —
