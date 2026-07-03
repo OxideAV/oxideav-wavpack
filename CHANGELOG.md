@@ -17,6 +17,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 386 — **`DecorrProfile::Extra` — the spec §2.1 `MAX_NTERMS`
+  (16-pass) derivation ceiling**. The new profile derives sixteen
+  decorrelation passes (every fixed lag `1..8`, repeated extrapolators,
+  plus `-1`/`-3` cross passes on stereo) — the deepest pass list a
+  conformant block can carry, since the `0x02` reader caps the count
+  at 16. `search_set()` nests it above `High`, so an `Extra` ceiling
+  in the `*_best` encoders tries all four stacks and keeps the
+  smallest block; the encoder round-trip fuzz target's control byte
+  now maps its fourth profile value onto it.
+
 - Round 383 — **encoder round-trip fuzz target + corpus seeds from the
   new block shapes**. New `fuzz/fuzz_targets/encode_roundtrip.rs`
   carries a *round-trip oracle* (strictly stronger than the decode

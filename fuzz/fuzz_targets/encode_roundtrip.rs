@@ -34,7 +34,8 @@ fuzz_target!(|data: &[u8]| {
     let profile = match (control >> 1) & 0x03 {
         0 => DecorrProfile::Fast,
         1 => DecorrProfile::Normal,
-        _ => DecorrProfile::High,
+        2 => DecorrProfile::High,
+        _ => DecorrProfile::Extra,
     };
     // A 0..=3 bit scale so some inputs detect a non-zero left shift.
     let scale = (control >> 3) & 0x03;

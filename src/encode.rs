@@ -742,8 +742,13 @@ pub enum DecorrProfile {
     /// zero-delay cross pass on stereo).
     Normal,
     /// Eight passes over a wider lag spread (plus a mutual cross pass on
-    /// stereo) — the deepest derivation this encoder offers.
+    /// stereo).
     High,
+    /// Sixteen passes — the spec §2.1 `MAX_NTERMS` ceiling, covering
+    /// every fixed lag `1..8`, both extrapolators repeatedly, and (on
+    /// stereo) two cross passes. The deepest derivation this encoder
+    /// offers: the pass count cannot legally grow past this.
+    Extra,
 }
 
 impl DecorrProfile {
@@ -761,6 +766,12 @@ impl DecorrProfile {
                 DecorrProfile::Fast,
                 DecorrProfile::Normal,
                 DecorrProfile::High,
+            ],
+            DecorrProfile::Extra => &[
+                DecorrProfile::Fast,
+                DecorrProfile::Normal,
+                DecorrProfile::High,
+                DecorrProfile::Extra,
             ],
         }
     }
@@ -781,6 +792,24 @@ impl DecorrProfile {
                 (5, 2),
                 (17, 2),
             ],
+            DecorrProfile::Extra => &[
+                (18, 2),
+                (18, 2),
+                (18, 2),
+                (18, 2),
+                (1, 2),
+                (2, 2),
+                (3, 2),
+                (4, 2),
+                (5, 2),
+                (6, 2),
+                (7, 2),
+                (8, 2),
+                (17, 2),
+                (17, 2),
+                (2, 2),
+                (3, 2),
+            ],
         }
     }
 
@@ -800,6 +829,24 @@ impl DecorrProfile {
                 (3, 2),
                 (5, 2),
                 (17, 2),
+                (-3, 2),
+            ],
+            DecorrProfile::Extra => &[
+                (18, 2),
+                (18, 2),
+                (18, 2),
+                (1, 2),
+                (2, 2),
+                (3, 2),
+                (4, 2),
+                (5, 2),
+                (6, 2),
+                (7, 2),
+                (8, 2),
+                (17, 2),
+                (17, 2),
+                (2, 2),
+                (-1, 2),
                 (-3, 2),
             ],
         }
@@ -2492,7 +2539,7 @@ mod tests {
         ));
     }
 
-    /// The search sets nest: Fast ⊂ Normal ⊂ High.
+    /// The search sets nest: Fast ⊂ Normal ⊂ High ⊂ Extra.
     #[test]
     fn profile_search_sets_nest() {
         assert_eq!(DecorrProfile::Fast.search_set(), &[DecorrProfile::Fast]);
@@ -2508,6 +2555,64 @@ mod tests {
                 DecorrProfile::High
             ]
         );
+        assert_eq!(
+            DecorrProfile::Extra.search_set(),
+            &[
+                DecorrProfile::Fast,
+                DecorrProfile::Normal,
+                DecorrProfile::High,
+                DecorrProfile::Extra
+            ]
+        );
+    }
+
+    /// The Extra profile sits exactly at the spec §2.1 `MAX_NTERMS`
+    /// pass-count ceiling in both channel shapes, and every derived pass
+    /// list serializes (i.e. every term is in the spec §2 valid set).
+    #[test]
+    fn extra_profile_is_the_max_nterms_ceiling() {
+        let mono = smooth_mono(400);
+        let passes = derive_mono_passes(&mono, DecorrProfile::Extra).unwrap();
+        assert_eq!(passes.len(), crate::decorrelation::MAX_NTERMS);
+        serialize_mono_passes(&passes).unwrap();
+
+        let stereo = smooth_stereo(200);
+        let passes = derive_stereo_passes(&stereo, DecorrProfile::Extra).unwrap();
+        assert_eq!(passes.len(), crate::decorrelation::MAX_NTERMS);
+        serialize_stereo_passes(&passes).unwrap();
+    }
+
+    /// Extra-profile auto encodes stay bit-exact through the full block
+    /// decoder in every channel shape.
+    #[test]
+    fn extra_profile_auto_round_trips_bit_exact() {
+        let mono = smooth_mono(500);
+        let block = encode_block_mono_auto(&mono, DecorrProfile::Extra, 2, 0, 500).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), mono);
+
+        let stereo = smooth_stereo(250);
+        let plain = encode_block_stereo_auto(&stereo, DecorrProfile::Extra, 2, 0, 250).unwrap();
+        assert_eq!(decode_stream(&plain).unwrap(), stereo);
+        let joint =
+            encode_block_stereo_joint_auto(&stereo, DecorrProfile::Extra, 2, 0, 250).unwrap();
+        assert_eq!(decode_stream(&joint).unwrap(), stereo);
+    }
+
+    /// An Extra search ceiling can only match or beat High — its
+    /// candidate set is a strict superset — and still decodes bit-exact.
+    #[test]
+    fn extra_ceiling_dominates_high() {
+        let mono = smooth_mono(700);
+        let high = encode_block_mono_best(&mono, DecorrProfile::High, 2, 0, 700).unwrap();
+        let extra = encode_block_mono_best(&mono, DecorrProfile::Extra, 2, 0, 700).unwrap();
+        assert!(extra.len() <= high.len());
+        assert_eq!(decode_stream(&extra).unwrap(), mono);
+
+        let stereo = smooth_stereo(350);
+        let high = encode_block_stereo_best(&stereo, DecorrProfile::High, 2, 0, 350).unwrap();
+        let extra = encode_block_stereo_best(&stereo, DecorrProfile::Extra, 2, 0, 350).unwrap();
+        assert!(extra.len() <= high.len());
+        assert_eq!(decode_stream(&extra).unwrap(), stereo);
     }
 
     /// A deeper search ceiling can only match or beat a shallower one —
