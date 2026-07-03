@@ -1535,6 +1535,73 @@ pub fn encode_block_stereo_searched(
     Ok(best.expect("searched encode produced no candidate"))
 }
 
+/// Encode a mono PCM buffer into the smallest block **any** encoder in
+/// this crate can currently produce: the union of the full
+/// profile-ceiling mode search ([`encode_block_mono_best`] at
+/// [`DecorrProfile::Extra`] — raw + eight derived-stack candidates)
+/// and the greedy term search ([`encode_block_mono_searched`] at the
+/// `MAX_NTERMS` cap). The two searches explore different stack spaces
+/// (fixed curated profiles vs. signal-driven term picks), so their
+/// union can only match or beat either alone. Bit-exact:
+/// `decode_stream(&out)? == pcm`.
+pub fn encode_block_mono_smallest(
+    pcm: &[i32],
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    let best = encode_block_mono_best(
+        pcm,
+        DecorrProfile::Extra,
+        bytes_per_sample,
+        block_index,
+        total_samples,
+    )?;
+    let searched = encode_block_mono_searched(
+        pcm,
+        crate::decorrelation::MAX_NTERMS,
+        bytes_per_sample,
+        block_index,
+        total_samples,
+    )?;
+    Ok(if searched.len() < best.len() {
+        searched
+    } else {
+        best
+    })
+}
+
+/// Encode an interleaved stereo PCM buffer into the smallest block any
+/// encoder in this crate can currently produce — the stereo twin of
+/// [`encode_block_mono_smallest`] (profile-ceiling grid ∪ greedy term
+/// search, both already racing plain vs. joint mid/side internally).
+pub fn encode_block_stereo_smallest(
+    pcm: &[i32],
+    bytes_per_sample: u8,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    let best = encode_block_stereo_best(
+        pcm,
+        DecorrProfile::Extra,
+        bytes_per_sample,
+        block_index,
+        total_samples,
+    )?;
+    let searched = encode_block_stereo_searched(
+        pcm,
+        crate::decorrelation::MAX_NTERMS,
+        bytes_per_sample,
+        block_index,
+        total_samples,
+    )?;
+    Ok(if searched.len() < best.len() {
+        searched
+    } else {
+        best
+    })
+}
+
 /// Default per-block sample count the stream encoders split a long PCM
 /// buffer into. A whole `.wv` file is a chain of `wvpk` blocks — the
 /// walker ([`crate::block::iter_decoded_blocks`]) concatenates their PCM
@@ -1677,6 +1744,66 @@ pub fn encode_stream_stereo_best(
     let mut index: u32 = 0;
     for window in pcm.chunks(pairs * 2) {
         let block = encode_block_stereo_best(window, profile, bytes_per_sample, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add((window.len() / 2) as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
+/// Encode a mono PCM buffer into the smallest multi-block `.wv` stream
+/// this crate can currently produce: every block goes through the
+/// union search ([`encode_block_mono_smallest`] — profile-ceiling grid
+/// ∪ greedy term search), each window winning independently.
+/// `block_samples` of `0` is [`DEFAULT_BLOCK_SAMPLES`]; an empty `pcm`
+/// yields an empty stream. Bit-exact:
+/// `decode_stream(&encode_stream_mono_smallest(pcm, …)?)? == pcm`.
+pub fn encode_stream_mono_smallest(
+    pcm: &[i32],
+    block_samples: usize,
+    bytes_per_sample: u8,
+) -> Result<Vec<u8>> {
+    let chunk = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(chunk) {
+        let block = encode_block_mono_smallest(window, bytes_per_sample, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add(window.len() as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
+/// Encode an interleaved stereo PCM buffer into the smallest
+/// multi-block `.wv` stream this crate can currently produce — the
+/// stereo twin of [`encode_stream_mono_smallest`], one union search
+/// ([`encode_block_stereo_smallest`]) per window.
+pub fn encode_stream_stereo_smallest(
+    pcm: &[i32],
+    block_samples: usize,
+    bytes_per_sample: u8,
+) -> Result<Vec<u8>> {
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let pairs = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(pairs * 2) {
+        let block = encode_block_stereo_smallest(window, bytes_per_sample, index, total)?;
         out.extend_from_slice(&block);
         index = index
             .checked_add((window.len() / 2) as u32)
@@ -3061,6 +3188,66 @@ mod tests {
             encode_block_stereo_searched(&[1, 2, 3], 16, 2, 0, 1),
             Err(Error::EncodeStereoOddLength(3))
         ));
+    }
+
+    /// The union search can only match or beat both of its members and
+    /// stays bit-exact in every channel shape.
+    #[test]
+    fn smallest_union_dominates_both_searches() {
+        let mono = smooth_mono(700);
+        let best = encode_block_mono_best(&mono, DecorrProfile::Extra, 2, 0, 700).unwrap();
+        let searched = encode_block_mono_searched(&mono, 16, 2, 0, 700).unwrap();
+        let smallest = encode_block_mono_smallest(&mono, 2, 0, 700).unwrap();
+        assert!(smallest.len() <= best.len());
+        assert!(smallest.len() <= searched.len());
+        assert_eq!(decode_stream(&smallest).unwrap(), mono);
+
+        let stereo = smooth_stereo(350);
+        let best = encode_block_stereo_best(&stereo, DecorrProfile::Extra, 2, 0, 350).unwrap();
+        let searched = encode_block_stereo_searched(&stereo, 16, 2, 0, 350).unwrap();
+        let smallest = encode_block_stereo_smallest(&stereo, 2, 0, 350).unwrap();
+        assert!(smallest.len() <= best.len());
+        assert!(smallest.len() <= searched.len());
+        assert_eq!(decode_stream(&smallest).unwrap(), stereo);
+    }
+
+    /// Stream-level smallest: multi-block chains round-trip bit-exactly,
+    /// honour the zero-means-default chunking rule, and inherit the
+    /// refusal arms.
+    #[test]
+    fn stream_smallest_round_trips_multi_block() {
+        let mono = smooth_mono(700);
+        let stream = encode_stream_mono_smallest(&mono, 256, 2).unwrap();
+        assert!(crate::block::block_count(&stream).unwrap() > 1);
+        assert_eq!(decode_stream(&stream).unwrap(), mono);
+
+        let stereo = smooth_stereo(300);
+        let stream = encode_stream_stereo_smallest(&stereo, 128, 2).unwrap();
+        assert!(crate::block::block_count(&stream).unwrap() > 1);
+        assert_eq!(decode_stream(&stream).unwrap(), stereo);
+
+        // Zero chunk = DEFAULT_BLOCK_SAMPLES (single block here).
+        let one = encode_stream_mono_smallest(&mono, 0, 2).unwrap();
+        assert_eq!(crate::block::block_count(&one).unwrap(), 1);
+        assert_eq!(decode_stream(&one).unwrap(), mono);
+
+        // Empty PCM = empty stream; odd stereo refuses.
+        assert!(encode_stream_mono_smallest(&[], 0, 2).unwrap().is_empty());
+        assert!(matches!(
+            encode_stream_stereo_smallest(&[1, 2, 3], 0, 2),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
+    }
+
+    /// A stream-level smallest encode is never larger than the
+    /// stream-level Extra-ceiling best encode.
+    #[test]
+    fn stream_smallest_dominates_stream_best() {
+        let mono = smooth_mono(600);
+        let best = encode_stream_mono_best(&mono, 200, 2, DecorrProfile::Extra).unwrap();
+        let smallest = encode_stream_mono_smallest(&mono, 200, 2).unwrap();
+        assert!(smallest.len() <= best.len());
+        assert_eq!(decode_stream(&smallest).unwrap(), mono);
     }
 
     /// The residual-cost proxy orders buffers by magnitude bits.

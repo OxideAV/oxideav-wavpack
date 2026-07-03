@@ -17,6 +17,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 386 — **union "smallest" encoders (`encode_block_*_smallest` +
+  `encode_stream_*_smallest`)**. One call races the two search
+  families this crate now has — the Extra-ceiling profile grid
+  (raw + eight curated derived stacks, ×2 joint modes on stereo) and
+  the greedy term search at the 16-pass cap — and keeps the smaller
+  block; the stream twins run the union per window. The two families
+  explore different stack spaces (curated profiles vs. signal-driven
+  picks), so the union dominates both by construction (asserted at
+  block and stream level).
+
 - Round 386 — **greedy term-search encoder mode
   (`derive_*_passes_searched` + `encode_block_*_searched`)**. Instead
   of a fixed profile stack, each pass's term is picked greedily from
