@@ -153,6 +153,38 @@ Working surface:
   channel-count blowup) is refused with the typed errors
   `MultichannelSetMalformed` / `MultichannelSampleCountMismatch` /
   `MultichannelTooManyChannels`.
+* **Self-deriving compression encoder (auto / best)** — the encoder
+  performs real prediction-based compression without the caller
+  authoring any metadata. `serialize_mono_passes` /
+  `serialize_stereo_passes` are the exact forward inverses of the
+  assemblers (`assemble_*(serialize_*(passes)) == passes`, applying the
+  §3.7 reverse-storage convention, the §2.1 `+5`-biased term byte via
+  `encode_term_byte`, and the per-term per-channel seed partition),
+  backed by public quantizers for the lossy on-wire log-packs
+  (`pack_weight_byte` / `quantize_weight`, pinned as a true
+  nearest-value inverse of the §3.6 weight expansion;
+  `pack_sample_word` / `quantize_seed_sample` for the 16-bit
+  exponent/mantissa seed words). `derive_mono_passes` /
+  `derive_stereo_passes` bootstrap a pass list from the PCM itself — a
+  zero-state training pass lets the §3.4 `±delta` adaptation walk each
+  weight toward the block's actual correlation, then the trained
+  weights are quantized to stored-byte values — and the
+  `encode_block_*_auto` entry points compose derive → serialize →
+  verbatim-payload encode, inheriting the bit-exact lossless guarantee.
+  `encode_block_stereo_joint_with_decorr` / `encode_block_stereo_joint_auto`
+  combine joint (mid/side) coding with decorrelation (prediction runs
+  over the joint-transformed domain, matching the decoder's
+  decorrelate-then-joint-undo order). `detect_left_shift` +
+  `encode_block_mono_best` / `encode_block_stereo_best` search the
+  whole mode grid — {plain, joint} × ({raw} ∪ {derived decorrelation
+  per profile in the `DecorrProfile::search_set` effort ladder}) at the
+  auto-detected sub-byte-depth shift — keeping the smallest output
+  (every candidate decodes back bit-exactly, so selection is
+  size-only); `encode_stream_mono_best` / `encode_stream_stereo_best`
+  lift the search per-block across a whole file. Measured on a
+  synthetic musical signal at the `High` ceiling: mono ~51% of the
+  raw-stream bytes, correlated stereo ~36%, 12-bit-in-16-container
+  material ~26%.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -208,6 +240,13 @@ if block.is_audio_block() {
     let samples = block.decode_samples()?;        // mono / stereo lossless
     let (samples, crc_ok) = block.decode_samples_muted()?; // CRC-gated
 }
+
+// Encode: the smallest stream this encoder can produce (self-derived
+// decorrelation, joint-stereo decision, left-shift detection, all
+// bit-exactly lossless):
+use oxideav_wavpack::{encode_stream_stereo_best, DecorrProfile};
+let wv = encode_stream_stereo_best(&pcm, 0, 2, DecorrProfile::High)?;
+assert_eq!(decode_stream(&wv)?, pcm);
 ```
 
 ## Not yet supported
@@ -268,10 +307,8 @@ main stream cannot be decoded from raw `.wv` bytes, so the *end-to-end*
 hybrid decode from a bitstream stays refused — but a caller holding both
 residual buffers can now recover lossless PCM via the block-level fold.
 
-A full `.wv` block *writer* (header + sub-block framing around the entropy
-encoder) is not yet assembled. The crate is not yet wired into the
-`oxideav-core` framework registry — there is no `Decoder` / `Encoder`
-trait impl or `register` entry point.
+The crate is not yet wired into the `oxideav-core` framework registry —
+there is no `Decoder` / `Encoder` trait impl or `register` entry point.
 
 ## Provenance
 
@@ -285,7 +322,10 @@ clean-room decorrelation/CRC trace
 source, archived prior history, or online resources were consulted at
 any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
 and `decode_multichannel_stream` (plus its CRC-muted and `multichannel_layout`
-twins) entry points; 841 unit tests synthesise minimal valid headers /
+twins) entry points and carries an `encode_roundtrip` **round-trip
+oracle** target (fuzz bytes → PCM + mode-grid control → `*_best` encode
+→ assert bit-exact decode + CRC gate); 881 unit tests synthesise
+minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
 mono / stereo CRC vectors, pin the §3 decorrelation weight
@@ -302,7 +342,13 @@ pre-shift CRC ordering, and pin the §4.1 hybrid correction-fold
 `split_correction` / `CorrectionFold` + the block-level
 `fold_hybrid_correction` / `split_hybrid_correction`) as the exact
 fold-∘-split lossless-recovery inverse across the post-decorrelation
-placement, with the `CROSS_DECORR` / noise-shaped placements refused.
+placement, with the `CROSS_DECORR` / noise-shaped placements refused,
+and pin the forward decorrelation-metadata serializers
+(`serialize_mono_passes` / `serialize_stereo_passes` as
+assemble-inverses; the weight quantizer against exhaustive
+stored-byte search) plus the self-deriving auto / best encoders'
+lossless round-trips, mode-search dominance, and search-ceiling
+monotonicity.
 
 ## License
 
