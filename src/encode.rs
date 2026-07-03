@@ -1206,6 +1206,76 @@ pub fn encode_stream_stereo(
     Ok(out)
 }
 
+/// Encode a mono PCM buffer into a multi-block `.wv` byte stream where
+/// **every block is the smallest this encoder can produce** — the
+/// stream-level lift of [`encode_block_mono_best`]. Each chunk gets its
+/// own left-shift detection, its own trained decorrelation pass list,
+/// and its own raw-vs-decorrelated size decision, so a file whose
+/// character changes over time (smooth passages, noisy passages,
+/// silence) picks the best mode per block independently.
+///
+/// The chunking / header contract matches [`encode_stream_mono`]
+/// (`block_samples` of `0` = [`DEFAULT_BLOCK_SAMPLES`]; running
+/// `block_index`; file-global `total_samples`), and the stream decodes
+/// back exactly: `decode_stream(&out)? == pcm`.
+pub fn encode_stream_mono_best(
+    pcm: &[i32],
+    block_samples: usize,
+    bytes_per_sample: u8,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    let chunk = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(chunk) {
+        let block = encode_block_mono_best(window, profile, bytes_per_sample, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add(window.len() as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
+/// Encode an interleaved stereo PCM buffer into a multi-block `.wv`
+/// byte stream where every block is the smallest this encoder can
+/// produce — the stream-level lift of [`encode_block_stereo_best`]
+/// (per-block mode grid: {plain, joint} × {raw, derived decorrelation}
+/// at the per-block detected left-shift). The chunking / header
+/// contract matches [`encode_stream_stereo`].
+/// `decode_stream(&out)? == pcm` exactly.
+pub fn encode_stream_stereo_best(
+    pcm: &[i32],
+    block_samples: usize,
+    bytes_per_sample: u8,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let pairs = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(pairs * 2) {
+        let block = encode_block_stereo_best(window, profile, bytes_per_sample, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add((window.len() / 2) as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
 /// Encode an interleaved multichannel PCM buffer into a `.wv` byte stream
 /// that [`crate::block::decode_multichannel_stream`] decodes back exactly.
 ///
@@ -2267,6 +2337,108 @@ mod tests {
         assert_eq!(decode_stream(&mono).unwrap(), pcm);
         let stereo = encode_block_stereo_best(&pcm, DecorrProfile::High, 2, 0, 200).unwrap();
         assert_eq!(decode_stream(&stereo).unwrap(), pcm);
+    }
+
+    // ---- stream-level best encode (round 383) ----
+
+    /// A long smooth mono buffer through the best stream encoder:
+    /// multi-block, bit-exact, and measurably smaller than the raw
+    /// stream encoder.
+    #[test]
+    fn stream_mono_best_round_trips_and_compresses() {
+        let pcm = smooth_mono(2000);
+        let best = encode_stream_mono_best(&pcm, 250, 2, DecorrProfile::Normal).unwrap();
+        assert_eq!(decode_stream(&best).unwrap(), pcm);
+        assert!(crate::block::audio_block_count(&best).unwrap() > 1);
+
+        let raw = encode_stream_mono(&pcm, 250, 2).unwrap();
+        assert!(
+            best.len() < raw.len(),
+            "best stream ({}) must beat raw stream ({}) on smooth audio",
+            best.len(),
+            raw.len()
+        );
+        let (_, all_ok) = crate::block::decode_stream_muted(&best).unwrap();
+        assert!(all_ok, "every block passes its CRC gate");
+    }
+
+    /// The stereo best stream encoder round-trips a correlated signal
+    /// across blocks and beats the raw stream.
+    #[test]
+    fn stream_stereo_best_round_trips_and_compresses() {
+        let pcm = smooth_stereo(1200);
+        let best = encode_stream_stereo_best(&pcm, 200, 2, DecorrProfile::Normal).unwrap();
+        assert_eq!(decode_stream(&best).unwrap(), pcm);
+        assert!(crate::block::audio_block_count(&best).unwrap() > 1);
+
+        let raw = encode_stream_stereo(&pcm, 200, 2).unwrap();
+        assert!(
+            best.len() < raw.len(),
+            "best stream ({}) must beat raw stream ({})",
+            best.len(),
+            raw.len()
+        );
+    }
+
+    /// Per-block independence: a stream whose first half is identical
+    /// channels and second half uncorrelated noise still round-trips,
+    /// with block headers reflecting per-block mode choices (at least
+    /// one joint block in the correlated half is expected but not
+    /// mandated — the pinned contract is exact decode + block count).
+    #[test]
+    fn stream_stereo_best_mixed_material_round_trips() {
+        let mut pcm = Vec::with_capacity(1200);
+        for i in 0..300 {
+            let v = i * 4 - 600;
+            pcm.push(v);
+            pcm.push(v);
+        }
+        let mut state: u32 = 0xABCD_EF01;
+        for _ in 0..300 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pcm.push((state >> 16) as i16 as i32);
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pcm.push((state >> 16) as i16 as i32);
+        }
+        let best = encode_stream_stereo_best(&pcm, 150, 2, DecorrProfile::Normal).unwrap();
+        assert_eq!(decode_stream(&best).unwrap(), pcm);
+        assert_eq!(crate::block::audio_block_count(&best).unwrap(), 4);
+    }
+
+    /// Stream-best headers carry the same block_index / total_samples
+    /// contract as the plain stream encoders.
+    #[test]
+    fn stream_best_header_contract() {
+        let pcm = smooth_mono(55);
+        let stream = encode_stream_mono_best(&pcm, 20, 2, DecorrProfile::Fast).unwrap();
+        let mut payload = stream.as_slice();
+        let mut expected_index = 0u32;
+        let mut seen = 0;
+        while !payload.is_empty() {
+            let (hdr, _) = parse_block_header(payload).unwrap();
+            assert_eq!(hdr.block_index, expected_index);
+            assert_eq!(hdr.total_samples, 55);
+            expected_index += hdr.block_samples;
+            payload = &payload[8 + hdr.ck_size as usize..];
+            seen += 1;
+        }
+        assert_eq!(seen, 3); // 20 + 20 + 15
+        assert_eq!(expected_index, 55);
+    }
+
+    /// Empty inputs yield empty streams; odd stereo is refused.
+    #[test]
+    fn stream_best_edge_arms() {
+        assert!(encode_stream_mono_best(&[], 0, 2, DecorrProfile::Fast)
+            .unwrap()
+            .is_empty());
+        assert!(encode_stream_stereo_best(&[], 0, 2, DecorrProfile::Fast)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            encode_stream_stereo_best(&[1, 2, 3], 0, 2, DecorrProfile::Fast),
+            Err(Error::EncodeStereoOddLength(3))
+        ));
     }
 
     /// The best encoders share the standard refusal arms.

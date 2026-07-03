@@ -17,6 +17,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 — **stream-level best encode**. `encode_stream_mono_best` /
+  `encode_stream_stereo_best` lift the per-block best-of search to the
+  whole-file surface: each chunk gets its own left-shift detection, its
+  own trained decorrelation pass list, and its own mode-grid size
+  decision (stereo: {plain, joint} × {raw, decorr}), so a file whose
+  character changes over time picks the best mode per block
+  independently. Chunking / header contract matches the raw stream
+  encoders (`DEFAULT_BLOCK_SAMPLES` fallback, running `block_index`,
+  file-global total); `decode_stream(&out)? == pcm` exactly. Measured
+  on a synthetic musical signal (44100 samples, triangle mix + small
+  noise): the best stream is ~51% of the raw-stream bytes for mono
+  (Fast profile), ~46% for correlated stereo, and ~30% for
+  12-bit-in-16-container material — ~47% of the raw 16-bit PCM byte
+  count. 5 new tests (878 total): mono + stereo multi-block round-trip
+  + smaller-than-raw pins with the CRC gate, mixed-material per-block
+  independence, the block_index/total header contract, and the
+  empty/odd edge arms. Exported: `encode_stream_mono_best`,
+  `encode_stream_stereo_best`.
+
 - Round 383 — **left-shift auto-detection + best-of block mode
   selection**. `detect_left_shift` reports the sub-byte-depth shift a
   PCM buffer announces itself with (the common low-zero-bit count across
