@@ -31,6 +31,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `regression_extrapolator_overflow.bin` + an `include_bytes!`
   regression test through `decode_stream` / `decode_stream_muted`.
 
+### Fixed
+
+- Round 393 — **reference-decoder conformance (wvunpack black-box
+  cross-validation)**. A 13/13 fixture battery against `wvunpack` 5.9
+  (opaque binary; no reference source consulted) now decodes every
+  encoder output shape bit-exactly. Wire fixes: canonical all-zero
+  log-word (`0x0000`) for zero medians/seeds (the stereo `0x05` is
+  now all-zero, stereo-ness gated by its 12-byte length instead of
+  the old `[0,0,1]` content marker); no run-length field after a
+  completed zero-run (`DecodeState::run_break`, both directions);
+  **stream-level** stereo holding state
+  (`StereoDecodeState::{left_run,right_run}` merged into a single
+  shared `run`, encoder carry-lookahead retargeted to the next stream
+  sample); `max_magnitude` flag emission (bits 18..=22 — empirically
+  required, not just a hint: reference decoders need ≥
+  `bit_length(ones_count − 3)`); first-member `0x0D`
+  `[channel_count, speaker_mask]` emission on multichannel sets.
+  Decode-side: wiki bit 28 (robust, "okay to ignore") and bit 5
+  `CROSS_DECORR` on lossless blocks are now ignored instead of
+  refused — reference encoders set both on ordinary files; the
+  `UnsupportedBlockFeature` variants remain for API stability. The
+  staged §5 CRC formulas and §4.2/§3 arithmetic were positively
+  confirmed against reference-encoded probe files. Remaining docs
+  gap (precise): the `wp_log2`/`wp_exp2s` log-pack algorithm + table
+  — foreign files' non-zero median/seed words cannot be expanded from
+  the staged docs, so arbitrary-file decode stays blocked while
+  zero-seed streams are fully bidirectional. Post-change campaigns:
+  encode_roundtrip 715k / seek_surface 227k / decode_stream 1.27M
+  execs, clean; two curated new-wire corpus seeds added.
+
 ### Added
 
 - Round 393 — **`oxideav-core` registry wiring (dual API) + streaming

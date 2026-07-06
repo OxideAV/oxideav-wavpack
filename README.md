@@ -223,6 +223,25 @@ Working surface:
   decoding whole sets, caching the most recent one per decode mode
   (cross-mode reuse only when the CRC verdict was clean), and
   restoring the cursor on a failed read (all-or-nothing).
+* **Reference-decoder conformance (black-box cross-validated)** — the
+  encoder's output is **byte-conformant with real WavPack decoders**:
+  a round-393 cross-validation battery against `wvunpack` 5.9 (used
+  strictly as an opaque binary; no reference source consulted)
+  decodes every supported shape **bit-exactly** with zero
+  CRC / missing-data reports — mono + stereo × raw / `*_best` /
+  `*_smallest` / joint / 12-bit shifted / 24-bit / sparse zero-run /
+  full-scale extremes, plus 4- and 6-channel member-set grouping
+  (13/13 fixtures). The staged §5 CRC formulas, §4.2 Rice ladder and
+  §3 decorrelation arithmetic were positively confirmed against
+  reference-encoded probe files along the way. Getting there fixed
+  four wire divergences the staged docs under-specified (canonical
+  all-zero log-word for zero medians/seeds; no run-length field after
+  a completed zero-run; **stream-level** — not per-channel — stereo
+  holding state; the required `max_magnitude` and first-member `0x0D`
+  fields) and two over-strict decode refusals (wiki bit 28 "robust,
+  okay to ignore" and bit 5 `CROSS_DECORR` on lossless blocks, whose
+  only documented consumer is the hybrid §4.1 fold — reference
+  encoders set both on ordinary files).
 * **Framework registry wiring (dual API)** — `register` installs the
   codec into an `oxideav_core::RuntimeContext` (`CodecInfo`:
   decode + encode, lossless, SW priority, the staged-wiki `WVPK`
@@ -385,6 +404,22 @@ main stream cannot be decoded from raw `.wv` bytes, so the *end-to-end*
 hybrid decode from a bitstream stays refused — but a caller holding both
 residual buffers can now recover lossless PCM via the block-level fold.
 
+**Decoding arbitrary reference-encoded files** stays blocked on one
+precise docs gap: the `wp_log2` / `wp_exp2s` **log-packed 16-bit
+encoding** used by the `0x05` entropy medians and `0x04` decorrelation
+seeds. The staged spec names `wp_exp2s` (§3.6, entropy §1) but never
+transcribes the algorithm or its fractional lookup table, and the
+wiki's linear "lower 8 bits are mantiss, high 8 bits are exponent-9"
+reading demonstrably diverges from reference-encoded files for
+non-zero values (cross-validation showed reference words like `0x0711`
+expanding to values the linear reading cannot produce; only the
+all-zero word agrees). Every reference encoder writes non-zero medians
+on real content, so end-to-end decode of foreign files mis-seeds —
+while this crate's own zero-seed streams are fully bidirectional
+(decoded by reference tools bit-exactly, and vice versa for the
+zero-seed subset). The needed transcription: `wp_exp2s` /
+`wp_log2` exact integer algorithm + table.
+
 **Seeking is frame-addressed, not time-addressed**: the wiki documents
 the flags bits 23..=26 sampling-rate *index* (and the `15 =
 unknown/custom` sentinel pointing at sub-block `0x27`), but the staged
@@ -426,7 +461,7 @@ found (and the fix pinned) an adversarial-history overflow in the
 term-17/18 extrapolator predictors — all twelve predictor sites are
 now 32-bit wrapping, matching the wrapping reconstruction adds around
 them, with the minimized input kept as a corpus regression seed;
-961 unit tests synthesise
+964 unit tests synthesise
 minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
