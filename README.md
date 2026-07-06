@@ -223,6 +223,21 @@ Working surface:
   decoding whole sets, caching the most recent one per decode mode
   (cross-mode reuse only when the CRC verdict was clean), and
   restoring the cursor on a failed read (all-or-nothing).
+* **Framework registry wiring (dual API)** — `register` installs the
+  codec into an `oxideav_core::RuntimeContext` (`CodecInfo`:
+  decode + encode, lossless, SW priority, the staged-wiki `WVPK`
+  FourCC tag) behind the `oxideav_core::register!` entry point, and
+  the direct factories are exposed per the workspace convention as
+  `decoder::make_decoder` / `encoder::make_encoder`. The packet
+  contract is "complete `wvpk` blocks per packet": `WavPackDecoder`
+  turns each packet into one `AudioFrame` via
+  `decode_multichannel_stream` (bytes packed at the stream's container
+  width — S8/S16/S24/S32 interleaved, values verbatim), and
+  `WavPackEncoder` emits one packet per input frame with a **running
+  `block_index`** (mono / stereo through the `encode_block_*_best`
+  mode search; wider layouts through the mono-member grouping via the
+  new offset-aware `encode_multichannel_stream_at`), so concatenated
+  packet payloads form one contiguous, seekable `.wv` chain.
 * **`.wvc` correction-file pairing plumbing** —
   `pair_correction_stream` aligns a main `.wv` buffer's audio blocks
   with its companion `.wvc` buffer's by the `block_index` header word
@@ -377,8 +392,12 @@ docs carry **no table mapping index values `0..=14` to Hz** — so the
 seek layer cannot convert seconds to frames (a docs gap; the frame
 domain itself is fully documented and implemented).
 
-The crate is not yet wired into the `oxideav-core` framework registry —
-there is no `Decoder` / `Encoder` trait impl or `register` entry point.
+The crate **is** wired into the `oxideav-core` framework registry (see
+the working-surface bullet): `Decoder` / `Encoder` trait impls, the
+`register` entry point, and the direct `decoder::make_decoder` /
+`encoder::make_encoder` factory endpoints. Time-addressed seeking and a
+registry-reported sample rate remain limited by the sampling-rate-index
+docs gap above (the decoder echoes the caller-supplied rate only).
 
 ## Provenance
 
@@ -407,7 +426,7 @@ found (and the fix pinned) an adversarial-history overflow in the
 term-17/18 extrapolator predictors — all twelve predictor sites are
 now 32-bit wrapping, matching the wrapping reconstruction adds around
 them, with the minimized input kept as a corpus regression seed;
-949 unit tests synthesise
+961 unit tests synthesise
 minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked

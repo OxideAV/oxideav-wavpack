@@ -33,6 +33,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 393 — **`oxideav-core` registry wiring (dual API) + streaming
+  multichannel encoder**. New `registry` module: `WavPackDecoder`
+  (one `AudioFrame` per packet of complete `wvpk` blocks via
+  `decode_multichannel_stream`, output bytes packed at the stream's
+  container width — S8/S16/S24/S32 interleaved, values verbatim —
+  NeedMore/Eof discipline, `reset` re-arms) and `WavPackEncoder`
+  (interleaved signed PCM in, one packet per frame out with a running
+  `block_index`, so concatenated packet payloads form one contiguous
+  **seekable** `.wv` chain; mono / stereo use the
+  `encode_block_*_best` mode search at `DecorrProfile::Normal`, wider
+  layouts the mono-member grouping; float / planar / ragged-frame
+  refusals). `register` installs the `CodecInfo` (decode + encode,
+  lossless, staged-wiki `WVPK` FourCC tag) behind
+  `oxideav_core::register!`, and the direct factories are exposed as
+  `decoder::make_decoder` / `encoder::make_encoder` per the workspace
+  dual-API convention. Enabler:
+  **`encode_multichannel_stream_at`** — the offset-aware
+  generalization of `encode_multichannel_stream` (now its `0/frames`
+  delegate), taking a first-block frame offset and a caller-supplied
+  `total_samples` word (`TOTAL_SAMPLES_UNKNOWN` for streaming
+  producers) so incremental chunks concatenate contiguously. 12 new
+  tests (registry encoder→decoder loops at 16/24-bit, cross-packet
+  seekability, metadata-only packets, refusal arms) + 3 for the
+  offset-aware encoder (byte-equality at zero offset, seekable
+  two-chunk streaming vs. non-offset control, u32 overflow refusal).
+
 - Round 393 — **seeking / block-index subsystem
   (`StreamIndex` / `decode_range` / `StreamReader`)**. Sample-accurate
   random access built on the wiki "Block structure" header fields
