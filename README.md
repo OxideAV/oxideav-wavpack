@@ -201,6 +201,28 @@ Working surface:
   bytes (the greedy search beats the `High` profile grid by ~10%),
   ramp-plus-noise mono 27.4% (`Extra` beats `High` by ~6.6%),
   correlated stereo 20.8% — the union wins every case by construction.
+* **Seeking / block index** — sample-accurate random access from the
+  wiki "Block structure" header fields alone. `StreamIndex::scan` is a
+  header-only O(blocks) pass (no metadata parse, no audio decode)
+  mapping every block's byte span and sample range (`IndexEntry`) and
+  grouping audio blocks into decodable member sets (`SetEntry`) under
+  the same wiki bits-11..=12 rules — and the same typed refusals —
+  `decode_multichannel_stream` applies, so every stream the decoder
+  accepts can be indexed. On a *seekable* index (sets forming one
+  contiguous ascending frame chain; gaps / overlaps / regressions are
+  reported by `is_seekable` and refused by the seek layer as
+  `StreamNotSeekable`), `locate_frame` / `set_for_frame` binary-search
+  the absolute frame domain and `set_byte_span` sizes ranged
+  partial-file reads. `decode_range` / `decode_range_muted` decode an
+  arbitrary frame window touching only the sets it overlaps —
+  bit-exactly the same window sliced from the whole-stream decode, for
+  mono / stereo / joint / left-shifted / multichannel shapes, with the
+  muted twin applying the spec §5.6 per-member CRC gate window-scoped.
+  `StreamReader` is the playback-shaped cursor over the same machinery
+  (`seek` / `read_frames(_muted)` / `position` / `frames_remaining`),
+  decoding whole sets, caching the most recent one per decode mode
+  (cross-mode reuse only when the CRC verdict was clean), and
+  restoring the cursor on a failed read (all-or-nothing).
 * **`.wvc` correction-file pairing plumbing** —
   `pair_correction_stream` aligns a main `.wv` buffer's audio blocks
   with its companion `.wvc` buffer's by the `block_index` header word
@@ -279,6 +301,15 @@ assert_eq!(decode_stream(&wv)?, pcm);
 use oxideav_wavpack::encode_stream_stereo_smallest;
 let wv = encode_stream_stereo_smallest(&pcm, 0, 2)?;
 assert_eq!(decode_stream(&wv)?, pcm);
+
+// Seek: index the stream once (header-only), then decode windows —
+// or drive the playback-shaped cursor:
+use oxideav_wavpack::{decode_range, StreamIndex, StreamReader};
+let index = StreamIndex::scan(&wv)?;
+let window = decode_range(&wv, &index, 44100, 1024)?; // frames 44100..45124
+let mut reader = StreamReader::new(&wv)?;
+reader.seek(44100)?;
+let frames = reader.read_frames(1024)?; // == window
 ```
 
 ## Not yet supported
@@ -339,6 +370,13 @@ main stream cannot be decoded from raw `.wv` bytes, so the *end-to-end*
 hybrid decode from a bitstream stays refused — but a caller holding both
 residual buffers can now recover lossless PCM via the block-level fold.
 
+**Seeking is frame-addressed, not time-addressed**: the wiki documents
+the flags bits 23..=26 sampling-rate *index* (and the `15 =
+unknown/custom` sentinel pointing at sub-block `0x27`), but the staged
+docs carry **no table mapping index values `0..=14` to Hz** — so the
+seek layer cannot convert seconds to frames (a docs gap; the frame
+domain itself is fully documented and implemented).
+
 The crate is not yet wired into the `oxideav-core` framework registry —
 there is no `Decoder` / `Encoder` trait impl or `register` entry point.
 
@@ -357,14 +395,19 @@ and `decode_multichannel_stream` (plus its CRC-muted and `multichannel_layout`
 twins) entry points, carries an `encode_roundtrip` **round-trip
 oracle** target (fuzz bytes → PCM + mode-grid control → `*_best` encode
 → assert bit-exact decode + CRC gate; the control byte now sweeps all
-four profiles), and an `introspection_surface` target asserting the
+four profiles), an `introspection_surface` target asserting the
 cross-walker invariants over every non-decoding stream walker plus the
-`.wvc` pairing walker at a fuzz-chosen split. A round-386 campaign
+`.wvc` pairing walker at a fuzz-chosen split, and a round-393
+`seek_surface` **differential** target (scan never stricter than the
+decoder; index tiling / set / locate invariants; full-span +
+fuzz-chosen-window `decode_range` and chunked `StreamReader` walks
+bit-equal to the whole-stream decode, muted PCM + verdict parity
+included). A round-386 campaign
 found (and the fix pinned) an adversarial-history overflow in the
 term-17/18 extrapolator predictors — all twelve predictor sites are
 now 32-bit wrapping, matching the wrapping reconstruction adds around
 them, with the minimized input kept as a corpus regression seed;
-908 unit tests synthesise
+949 unit tests synthesise
 minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked

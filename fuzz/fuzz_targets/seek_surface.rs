@@ -84,7 +84,11 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(set.channels, index.channels(), "uniform channel width");
         sum_frames += u64::from(set.frames);
     }
-    assert_eq!(index.frame_count(), sum_frames, "frame_count is the set sum");
+    assert_eq!(
+        index.frame_count(),
+        sum_frames,
+        "frame_count is the set sum"
+    );
 
     // locate_frame agrees with the set table on a seekable index.
     if index.is_seekable() {
@@ -139,8 +143,7 @@ fuzz_target!(|data: &[u8]| {
     // the span touches every member).
     let (full_muted, ok) =
         decode_range_muted(bytes, &index, first, total).expect("full-span muted");
-    let (stream_muted, stream_ok) =
-        decode_multichannel_stream_muted(bytes).expect("stream muted");
+    let (stream_muted, stream_ok) = decode_multichannel_stream_muted(bytes).expect("stream muted");
     assert_eq!(full_muted, stream_muted.samples, "muted PCM parity");
     assert_eq!(ok, stream_ok, "muted verdict parity");
 

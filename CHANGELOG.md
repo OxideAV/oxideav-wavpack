@@ -33,6 +33,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 393 — **seeking / block-index subsystem
+  (`StreamIndex` / `decode_range` / `StreamReader`)**. Sample-accurate
+  random access built on the wiki "Block structure" header fields
+  alone:
+
+  - **`StreamIndex::scan`** — a header-only O(blocks) pass mapping
+    every block's byte span (`IndexEntry`: offset, `8 + ck_size`
+    length, `block_index`, `block_samples`, decoded flags) and
+    grouping audio blocks into member sets (`SetEntry`) under the
+    same wiki bits-11..=12 rules — and the same typed refusals —
+    `decode_multichannel_stream` applies, so every stream the decoder
+    accepts can be indexed without decoding a sample. Introspection:
+    block/audio/set counts, per-frame `channels`,
+    `first_frame`/`end_frame`/`frame_count`, `is_seekable`
+    (contiguous ascending set chain), `locate_frame`/`set_for_frame`
+    binary search in the absolute frame domain, and `set_byte_span`
+    for ranged partial-file IO.
+  - **`decode_range` / `decode_range_muted`** — decode an arbitrary
+    absolute frame window, touching only the sets it overlaps; the
+    output is bit-exactly the same window sliced from the
+    whole-stream decode (asserted for mono / stereo / joint /
+    left-shifted / multichannel shapes and swept window boundaries).
+    The muted twin applies the spec §5.6 per-member CRC gate with a
+    window-scoped `all_crc_ok`. New typed refusals:
+    `Error::StreamNotSeekable` (gapped / overlapping / regressing
+    frame chains) and `Error::SeekOutOfRange` (with the covered
+    `[first_frame, end_frame)` carried).
+  - **`StreamReader`** — a playback-shaped cursor (`seek` /
+    `read_frames` / `read_frames_muted` / `position` /
+    `frames_remaining` / `is_at_end`) that decodes whole sets and
+    caches the most recent one with its decode mode, so sequential
+    small reads decode each set once, seek-back within the cached set
+    is free, and a plain buffer never serves a muted read (nor a
+    corrupt muted buffer a plain one — cross-mode reuse only when the
+    CRC verdict was clean, where the two modes are bit-identical by
+    construction). Failed reads are all-or-nothing: no frames
+    returned, cursor restored.
+  - **`seek_surface` fuzz target + five corpus seeds** — differential
+    campaign asserting scan-never-stricter-than-decode, buffer
+    tiling, set/locate invariants, walker agreement, and full-span +
+    fuzz-chosen-window + chunked-reader equality against the
+    whole-stream decoders (incl. muted PCM + verdict parity).
+    793,827 execs / 7 min at `-rss_limit_mb=4096`, clean.
+
+  41 new unit tests across the four milestones.
+
 - Round 386 — **introspection-surface fuzz target + round-386 corpus
   seeds + four clean campaigns**. New
   `fuzz/fuzz_targets/introspection_surface.rs` drives arbitrary bytes
