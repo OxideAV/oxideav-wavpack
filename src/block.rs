@@ -49,9 +49,7 @@ use crate::metadata::{
     SubBlockId,
 };
 use crate::packed_samples::PackedSamples;
-use crate::samples::{
-    decode_packed_samples_mono_from_entropy, decode_packed_samples_stereo_from_entropy,
-};
+use crate::samples::decode_packed_samples_mono_from_entropy;
 
 /// Anti-amplification ceiling on the per-block decoded sample count.
 ///
@@ -137,8 +135,14 @@ pub enum UnsupportedBlockFeature {
     /// block; the composer honours that ban.
     LowLatencyBlock,
     /// Wiki bit 28 ("robust block (experimental, okay to ignore)") is
-    /// set. The composer is conservative and refuses experimental
-    /// blocks; the per-sample primitives themselves stay callable.
+    /// set.
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** — the wiki
+    /// marks the bit "okay to ignore if encountered", and a round-393
+    /// black-box cross-validation (wvunpack as opaque binary) showed
+    /// reference-encoded files set it on every block, so the earlier
+    /// conservative refusal rejected every real file. Retained as a
+    /// public variant for API stability.
     RobustBlock,
     /// Wiki bit 4 ("joint stereo coding scheme") is set on a stereo
     /// block: the two decoded channels are a mid/side (sum / difference)
@@ -711,10 +715,9 @@ impl<'a> WavPackBlock<'a> {
     ///   loop is per-block and cannot stitch grouped blocks.
     /// * [`UnsupportedBlockFeature::LowLatencyBlock`] — wiki bit 31
     ///   "low-latency block (experimental, do not decode if encountered)"
-    ///   set; the wiki explicitly bars decode.
-    /// * [`UnsupportedBlockFeature::RobustBlock`] — wiki bit 28
-    ///   "robust block (experimental, okay to ignore)" set; the
-    ///   composer is conservative about experimental gating.
+    ///   set; the wiki explicitly bars decode. (Bit 28 "robust block"
+    ///   is *ignored* per its wiki "okay to ignore" labelling — see
+    ///   [`UnsupportedBlockFeature::RobustBlock`].)
     /// * [`UnsupportedBlockFeature::CrossChannelDecorrelation`] — wiki
     ///   bit 5 (`CROSS_DECORR`) set on a non-hybrid stereo block; the
     ///   decorrelation-spec doc §4.1 documents this flag only in the
@@ -839,11 +842,13 @@ impl<'a> WavPackBlock<'a> {
                 UnsupportedBlockFeature::Int32Mode,
             ));
         }
-        if flags.robust_block {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::RobustBlock,
-            ));
-        }
+        // Wiki bit 28 "robust block (experimental, okay to ignore if
+        // encountered)" is exactly that — ignorable. Real-world
+        // encoders set it routinely, and a round-393 black-box
+        // cross-validation (wvunpack as opaque binary) showed
+        // reference-encoded files carry it on every block, so refusing
+        // it rejected every real file. Only bit 31 (below) carries the
+        // wiki's "do not decode" instruction.
         if flags.low_latency_block {
             return Err(Error::UnsupportedBlockFeature(
                 UnsupportedBlockFeature::LowLatencyBlock,
@@ -870,22 +875,23 @@ impl<'a> WavPackBlock<'a> {
         // are not a correctness hazard for the mono path. Guard on
         // `is_block_data_mono()` so the mono / false-stereo loop is not
         // needlessly refused.
-        if !flags.is_block_data_mono() {
-            // Wiki bit 5 (`CROSS_DECORR` 0x20): the staged
-            // decorrelation-spec doc §4.1 documents this flag ONLY in the
-            // hybrid-stereo context (zero-delay correction folding before
-            // the decorrelation passes). Hybrid is refused above, so a
-            // non-hybrid stereo block carrying this flag has no documented
-            // main-stream meaning — refuse rather than emit wrong samples.
-            // (The lossless inter-channel predictors are the negative
-            // `0x02` decorr *terms* `-1`/`-2`/`-3`, which ARE decoded by
-            // the stereo path below.)
-            if flags.cross_channel_decorrelation {
-                return Err(Error::UnsupportedBlockFeature(
-                    UnsupportedBlockFeature::CrossChannelDecorrelation,
-                ));
-            }
-        }
+        // Wiki bit 5 (`CROSS_DECORR` 0x20) is *ignored* on a lossless
+        // block: the staged decorrelation-spec doc documents the flag's
+        // only consumer in the hybrid correction-fold placement (§4.1 —
+        // "the correction is folded in *before* the decorrelation
+        // passes" when set), and the §1 lossless per-block decode order
+        // (entropy → decorr passes → joint undo → CRC → shift) has no
+        // step that consults it. Hybrid blocks are refused above, so
+        // every block reaching this point decodes identically with the
+        // bit set or clear. A round-393 black-box cross-validation
+        // (wvunpack as an opaque binary) confirmed reference encoders
+        // set the bit on plain lossless stereo files — the earlier
+        // conservative refusal rejected every real stereo file. (The
+        // lossless inter-channel predictors are the negative `0x02`
+        // decorr *terms* `-1`/`-2`/`-3`, which ARE decoded by the
+        // stereo path below;
+        // `UnsupportedBlockFeature::CrossChannelDecorrelation` is no
+        // longer raised here.)
 
         // Structural sub-block lookup. Both must be present for the
         // per-sample loop to have inputs.
@@ -927,8 +933,28 @@ impl<'a> WavPackBlock<'a> {
             }
             Ok(residuals)
         } else {
+            // Stereo-ness is decided by the block FLAGS plus the 0x05
+            // payload length (wiki: one 6-byte set for mono, two sets =
+            // 12 bytes for stereo) — NOT by the expanded content. An
+            // all-zero right median set is a legitimate stereo payload
+            // (fresh seeds), indistinguishable from a mono payload only
+            // if the on-wire length is ignored; the reference encoder's
+            // zero-seed form and this crate's own encoder both emit it.
+            // The content-heuristic `decode_packed_samples_stereo_from_entropy`
+            // wrapper (which refuses an all-zero right set) stays for
+            // API compatibility; this flags-gated path checks the wire
+            // length instead. Round 393.
+            if entropy_sub.payload.len() != crate::entropy::STEREO_PAYLOAD_BYTES {
+                return Err(Error::InvalidEntropyInfoForStereo);
+            }
+            let mut medians = [
+                crate::samples::AdaptiveMedians::from_seed_values(entropy.medians_left)
+                    .ok_or(Error::InvalidEntropyInfoForStereo)?,
+                crate::samples::AdaptiveMedians::from_seed_values(entropy.medians_right)
+                    .ok_or(Error::InvalidEntropyInfoForStereo)?,
+            ];
             let mut residuals =
-                decode_packed_samples_stereo_from_entropy(&packed, &entropy, count)?;
+                crate::samples::decode_packed_samples_stereo(&packed, &mut medians, count)?;
             if has_decorr {
                 // Stereo residuals arrive interleaved [L0, R0, L1, R1, …].
                 // Assemble the §3.7 application-ordered stereo pass list
@@ -994,7 +1020,7 @@ impl<'a> WavPackBlock<'a> {
     /// [`decode_multichannel_stream`]; this method is the per-member leg.
     ///
     /// All other refusals ([`UnsupportedBlockFeature::Hybrid`],
-    /// `FloatData`, `Int32Mode`, `LowLatencyBlock`, `RobustBlock`,
+    /// `FloatData`, `Int32Mode`, `LowLatencyBlock`,
     /// `CrossChannelDecorrelation`) and structural errors still fire — a
     /// member exercising those is no more decodable than a standalone
     /// block that does. Round 378.
@@ -3382,16 +3408,21 @@ mod tests {
     }
 
     #[test]
-    fn decode_samples_rejects_robust_experimental_block() {
+    fn decode_samples_ignores_robust_experimental_bit() {
+        // Wiki bit 28 is "robust block (experimental, okay to ignore if
+        // encountered)" — the decode must proceed as if it were clear
+        // (round-393 wvunpack cross-validation: reference encoders set
+        // it on every block).
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
-        let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 28)), &payload);
-        let (block, _) = parse_block(&bytes).expect("parse block");
-        let err = block.decode_samples().expect_err("must refuse robust");
+        let plain = synthesise_block(1, flags_with(1 << 2), &payload);
+        let robust = synthesise_block(1, flags_with((1 << 2) | (1 << 28)), &payload);
+        let (plain_block, _) = parse_block(&plain).expect("parse block");
+        let (robust_block, _) = parse_block(&robust).expect("parse block");
         assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::RobustBlock)
+            robust_block.decode_samples().expect("robust decodes"),
+            plain_block.decode_samples().expect("plain decodes"),
         );
     }
 
@@ -3454,26 +3485,26 @@ mod tests {
     }
 
     #[test]
-    fn decode_samples_rejects_cross_channel_decorrelation_block() {
+    fn decode_samples_ignores_cross_decorr_bit_on_lossless_stereo() {
         // Bit 5 (`CROSS_DECORR`) set on a non-hybrid stereo block. The
-        // staged decorrelation doc §4.1 documents this flag only in the
-        // hybrid-stereo correction-folding context; on a lossless
-        // main-stream block it has no documented meaning, so the composer
-        // refuses with a typed feature tag instead of returning wrong
-        // samples.
+        // staged decorrelation doc's only consumer of this flag is the
+        // hybrid correction-fold placement (§4.1); the §1 lossless
+        // decode order never consults it, and reference encoders set it
+        // on plain lossless stereo files (round-393 wvunpack black-box
+        // cross-validation) — so the lossless path decodes as if the
+        // bit were clear.
         let mut payload = Vec::new();
         append_entropy_info_stereo_minimal(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
-        let bytes = synthesise_block(1, flags_with(1 << 5), &payload);
-        let (block, _) = parse_block(&bytes).expect("parse block");
-        assert!(!block.header.flags.mono);
-        assert!(block.header.flags.cross_channel_decorrelation);
-        let err = block
-            .decode_samples()
-            .expect_err("must refuse cross-channel decorrelation");
+        let plain = synthesise_block(1, flags_with(0), &payload);
+        let crossed = synthesise_block(1, flags_with(1 << 5), &payload);
+        let (plain_block, _) = parse_block(&plain).expect("parse block");
+        let (crossed_block, _) = parse_block(&crossed).expect("parse block");
+        assert!(!crossed_block.header.flags.mono);
+        assert!(crossed_block.header.flags.cross_channel_decorrelation);
         assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::CrossChannelDecorrelation)
+            crossed_block.decode_samples().expect("crossed decodes"),
+            plain_block.decode_samples().expect("plain decodes"),
         );
     }
 

@@ -1570,7 +1570,15 @@ pub fn quantize_weight(weight: i32) -> i32 {
 /// `quantize_seed_sample(v) == v` (see [`quantize_seed_sample`]).
 pub fn pack_sample_word(value: i32) -> [u8; 2] {
     if value == 0 {
-        return [0, SAMPLE_EXPONENT_BIAS as u8];
+        // Canonical zero is the all-zero word `0x0000` (mantissa 0,
+        // exponent 0 → right-shift to 0), NOT `[0, 9]` (mantissa 0 at
+        // the unshifted exponent). Both expand to 0 under the wiki
+        // reading, but a round-393 black-box cross-validation
+        // (wvunpack as an opaque binary) showed reference decoders
+        // mute blocks whose zero seeds are written in the `[0, 9]`
+        // form while accepting the all-zero word — so the all-zero
+        // word is the interoperable canonical zero.
+        return [0, 0];
     }
     let mut shift = 0u32;
     while !(i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&(value >> shift)) {

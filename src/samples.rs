@@ -1662,16 +1662,33 @@ pub struct DecodeState {
     /// run-length and zeroed the medians. Tests assert this to confirm
     /// the path actually ran rather than the loop bypassing it.
     pub ever_took_zero_run: bool,
+    /// `true` while a just-completed non-zero zero-run suppresses the
+    /// step-1 probe for the **immediately following** sample word.
+    ///
+    /// A non-zero run is maximal from the reader's point of view — the
+    /// sample after it is coded as a regular word with **no** new
+    /// run-length field in between. (Round 393: pinned by black-box
+    /// cross-validation with wvunpack as an opaque binary —
+    /// reference-encoded streams place the next word's unary prefix
+    /// directly after a run's last bit, and reference decoders mis-read
+    /// a stream that inserts a zero-length "no run" marker there. The
+    /// spec §4.2 step 1 "may carry an explicit zero-run" wording left
+    /// this boundary ambiguous.) Set when a non-zero run is taken;
+    /// survives the pending-drain calls; cleared by the first regular
+    /// word after the run.
+    pub run_break: bool,
 }
 
 impl DecodeState {
     /// Fresh decode state for the first sample of a block: no holding
-    /// bits, no zero-run debt, no zero-run-fast-path-seen flag.
+    /// bits, no zero-run debt, no zero-run-fast-path-seen flag, no
+    /// run-boundary suppression.
     pub const fn new() -> Self {
         Self {
             run: RunState::new(),
             zero_run_pending: 0,
             ever_took_zero_run: false,
+            run_break: false,
         }
     }
 
@@ -2047,6 +2064,13 @@ fn try_zero_run_path(
     medians: &mut AdaptiveMedians,
     state: &mut DecodeState,
 ) -> Result<Option<i32>> {
+    // Run-boundary suppression: the word immediately after a completed
+    // non-zero run is a regular word with NO new run-length field (see
+    // [`DecodeState::run_break`]). Consume the flag and skip the probe.
+    if state.run_break {
+        state.run_break = false;
+        return Ok(None);
+    }
     // Spec §4.2 step 1 eligibility gate, via the public predicate: raw
     // median[0] <= 1 AND no holding-bit pending. For mono "both
     // channels" reduces to the one channel.
@@ -2070,6 +2094,8 @@ fn try_zero_run_path(
     // to zero and emits a `0` sample." Mono: the one channel.
     medians.values = [0, 0, 0];
     state.ever_took_zero_run = true;
+    // The word after the run carries no new run-length field.
+    state.run_break = true;
     // run_length samples total are zero; we are emitting the first
     // here, so owe run_length - 1 more on subsequent calls.
     state.zero_run_pending = run_length - 1;
@@ -2238,14 +2264,20 @@ fn prealloc_floor(count: usize, payload_len: usize) -> usize {
 /// current cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StereoDecodeState {
-    /// Per-channel holding state for the **left** channel (even sample
-    /// indices). Matches spec §4.2 step 4 semantics applied to the
-    /// left-channel median set.
-    pub left_run: RunState,
-    /// Per-channel holding state for the **right** channel (odd sample
-    /// indices). Matches spec §4.2 step 4 semantics applied to the
-    /// right-channel median set.
-    pub right_run: RunState,
+    /// **Shared** stream-level holding state for both channels.
+    ///
+    /// Spec §2 scopes only the *medians* per channel ("sample index
+    /// parity selects the channel's median set"); the §4.2 step 4
+    /// holding registers are stream-level — one word's low prefix bit
+    /// pre-encodes the **next stream word's** mode even when that word
+    /// belongs to the other channel. (Round 393: pinned by black-box
+    /// cross-validation with wvunpack as an opaque binary — a stereo
+    /// stream encoded with per-channel holding state is mis-read by
+    /// reference decoders whenever both channels of a frame carry
+    /// non-zero samples, while the shared-state encoding verifies
+    /// losslessly. The wiki pseudocode's single `last_zero`/`last_one`
+    /// globals say the same thing.)
+    pub run: RunState,
     /// Remaining stream-level samples owed by an in-flight zero-run from
     /// spec §4.2 step 1 — when non-zero, the next stereo decode call
     /// short-circuits to a `0` sample (no bits read), toggles
@@ -2256,6 +2288,11 @@ pub struct StereoDecodeState {
     /// to confirm the path actually ran rather than the loop bypassing
     /// it.
     pub ever_took_zero_run: bool,
+    /// `true` while a just-completed non-zero zero-run suppresses the
+    /// step-1 probe for the **immediately following** sample word —
+    /// the stereo twin of [`DecodeState::run_break`] (see there for the
+    /// round-393 black-box grounding).
+    pub run_break: bool,
     /// Channel index of the **next** sample to emit (`0` = left, `1` =
     /// right). Starts at `0`; toggles on every successful emit.
     pub next_channel: u8,
@@ -2264,13 +2301,14 @@ pub struct StereoDecodeState {
 impl StereoDecodeState {
     /// Fresh stereo decode state for the first sample of a block: both
     /// channels' holding bits clear, no zero-run debt, no
-    /// zero-run-fast-path-seen flag, next sample = left.
+    /// zero-run-fast-path-seen flag, no run-boundary suppression, next
+    /// sample = left.
     pub const fn new() -> Self {
         Self {
-            left_run: RunState::new(),
-            right_run: RunState::new(),
+            run: RunState::new(),
             zero_run_pending: 0,
             ever_took_zero_run: false,
+            run_break: false,
             next_channel: 0,
         }
     }
@@ -2293,10 +2331,8 @@ impl StereoDecodeState {
     pub fn zero_run_eligible(&self, medians: &[AdaptiveMedians; 2]) -> bool {
         medians[0].values[0] <= 1
             && medians[1].values[0] <= 1
-            && !self.left_run.last_one
-            && !self.left_run.last_zero
-            && !self.right_run.last_one
-            && !self.right_run.last_zero
+            && !self.run.last_one
+            && !self.run.last_zero
     }
 }
 
@@ -2317,6 +2353,12 @@ fn try_zero_run_path_stereo(
     medians: &mut [AdaptiveMedians; 2],
     state: &mut StereoDecodeState,
 ) -> Result<Option<i32>> {
+    // Run-boundary suppression — the stereo twin of the mono gate; see
+    // [`DecodeState::run_break`].
+    if state.run_break {
+        state.run_break = false;
+        return Ok(None);
+    }
     // Spec §4.2 step 1 eligibility gate for stereo, via the public
     // predicate: BOTH channels' raw median[0] must satisfy <= 1, AND
     // neither channel's holding state may be pending.
@@ -2341,6 +2383,8 @@ fn try_zero_run_path_stereo(
     medians[0].values = [0, 0, 0];
     medians[1].values = [0, 0, 0];
     state.ever_took_zero_run = true;
+    // The word after the run carries no new run-length field.
+    state.run_break = true;
     state.zero_run_pending = run_length - 1;
     Ok(Some(0))
 }
@@ -2386,12 +2430,9 @@ pub fn decode_sample_stateful_stereo(
     // operates on the chosen channel only.
     let ch = state.next_channel as usize;
     debug_assert!(ch < 2, "next_channel must be 0 or 1");
-    let ch_state = if ch == 0 {
-        &mut state.left_run
-    } else {
-        &mut state.right_run
-    };
-    let ones_count = read_folded_ones_count(reader, ch_state)?;
+    // The holding state is SHARED across channels (see
+    // [`StereoDecodeState::run`]); only the medians are per-channel.
+    let ones_count = read_folded_ones_count(reader, &mut state.run)?;
 
     // 5. Form the interval from the per-channel PRE-adaptation medians,
     // via the round-255 typed surface.
@@ -2519,23 +2560,29 @@ fn finish_even(writer: BitWriter) -> Vec<u8> {
 /// decoder's spec §4.2 steps 2-8 tail, shared by the mono and stereo
 /// packed encoders.
 ///
-/// `next_value` is the **same channel's** next sample, used for the
+/// `next_value` is the **next stream word's** sample, used for the
 /// step-4 carry decision: the emitted raw prefix's low bit pre-encodes
 /// the next word's mode (clear → that word's `ones_count` is `0` and
 /// it reads no prefix bits; set → its folded count gains `+1`). The
-/// choice is forced — clear is only decodable when the next magnitude
-/// lands in zone 0 under the post-adapt medians, set only when it does
-/// not — except for the final word, where clear is chosen (one wire
-/// bit shorter). No zero-run word can interpose between this word and
-/// the same channel's next (the holding bit this word leaves pending
-/// blocks the §4.2 step 1 gate until that word consumes it), so the
-/// lookahead target is exact.
+/// holding state is stream-level (see [`StereoDecodeState::run`]), so
+/// on stereo the next word belongs to the **other** channel:
+/// `next_channel_medians` carries that channel's medians (a copy —
+/// this word's adaptation does not touch them), while `None` means the
+/// next word is the same channel and the zone-0 test uses this word's
+/// post-adapt medians. The choice is forced — clear is only decodable
+/// when the next magnitude lands in zone 0 under the next word's
+/// medians, set only when it does not — except for the final word,
+/// where clear is chosen (one wire bit shorter). No zero-run word can
+/// interpose between this word and the next (the holding bit this
+/// word leaves pending blocks the §4.2 step 1 gate until that word
+/// consumes it), so the lookahead target is exact.
 fn encode_one_word(
     writer: &mut BitWriter,
     medians: &mut AdaptiveMedians,
     run: &mut RunState,
     value: i32,
     next_value: Option<i32>,
+    next_channel_medians: Option<AdaptiveMedians>,
 ) -> Result<()> {
     let (magnitude, _) = split_sign(value);
     let ones_count = if run.last_zero {
@@ -2549,8 +2596,18 @@ fn encode_one_word(
         let hold_one = match next_value {
             None => false,
             Some(next) => {
-                let mut after = *medians;
-                after.adapt(Zone::from_ones_count(zone));
+                // The next word's zone-0 test runs against ITS channel's
+                // medians: this word's post-adapt state when the next
+                // word is the same channel, the other channel's
+                // (untouched) medians otherwise.
+                let after = match next_channel_medians {
+                    Some(other) => other,
+                    None => {
+                        let mut own = *medians;
+                        own.adapt(Zone::from_ones_count(zone));
+                        own
+                    }
+                };
                 let (next_mag, _) = split_sign(next);
                 next_mag >= after.get_med(0)
             }
@@ -2621,13 +2678,18 @@ pub fn encode_packed_samples_mono(
     let mut state = DecodeState::new();
     let mut i = 0usize;
     while i < values.len() {
-        if state.zero_run_eligible(medians) {
+        if state.run_break {
+            // The word immediately after a completed run carries no
+            // run-length field (see [`DecodeState::run_break`]).
+            state.run_break = false;
+        } else if state.zero_run_eligible(medians) {
             let zeros = values[i..].iter().take_while(|&&v| v == 0).count();
             let run = u32::try_from(zeros).unwrap_or(u32::MAX);
             emit_zero_run_length(&mut writer, run);
             if run > 0 {
                 medians.values = [0, 0, 0];
                 state.ever_took_zero_run = true;
+                state.run_break = true;
                 i += run as usize;
                 continue;
             }
@@ -2635,7 +2697,7 @@ pub fn encode_packed_samples_mono(
             // through to the regular word for this same sample.
         }
         let next = values.get(i + 1).copied();
-        encode_one_word(&mut writer, medians, &mut state.run, values[i], next)?;
+        encode_one_word(&mut writer, medians, &mut state.run, values[i], next, None)?;
         i += 1;
     }
     Ok(finish_even(writer))
@@ -2667,7 +2729,11 @@ pub fn encode_packed_samples_stereo(
     let mut state = StereoDecodeState::new();
     let mut i = 0usize;
     while i < values.len() {
-        if state.zero_run_eligible(medians) {
+        if state.run_break {
+            // The word immediately after a completed run carries no
+            // run-length field (see [`DecodeState::run_break`]).
+            state.run_break = false;
+        } else if state.zero_run_eligible(medians) {
             let zeros = values[i..].iter().take_while(|&&v| v == 0).count();
             let run = u32::try_from(zeros).unwrap_or(u32::MAX);
             emit_zero_run_length(&mut writer, run);
@@ -2675,18 +2741,25 @@ pub fn encode_packed_samples_stereo(
                 medians[0].values = [0, 0, 0];
                 medians[1].values = [0, 0, 0];
                 state.ever_took_zero_run = true;
+                state.run_break = true;
                 i += run as usize;
                 continue;
             }
         }
         let ch = i & 1;
-        let next = values.get(i + 2).copied();
-        let run_state = if ch == 0 {
-            &mut state.left_run
-        } else {
-            &mut state.right_run
-        };
-        encode_one_word(&mut writer, &mut medians[ch], run_state, values[i], next)?;
+        // Holding is stream-level: the carry lookahead targets the next
+        // STREAM sample (the other channel), whose medians this word's
+        // adaptation does not touch.
+        let next = values.get(i + 1).copied();
+        let other = medians[ch ^ 1];
+        encode_one_word(
+            &mut writer,
+            &mut medians[ch],
+            &mut state.run,
+            values[i],
+            next,
+            Some(other),
+        )?;
         i += 1;
     }
     Ok(finish_even(writer))
@@ -4625,8 +4698,7 @@ mod tests {
         assert_eq!(s.zero_run_pending, 0);
         assert_eq!(s.next_channel, 0);
         assert!(!s.ever_took_zero_run);
-        assert_eq!(s.left_run, RunState::new());
-        assert_eq!(s.right_run, RunState::new());
+        assert_eq!(s.run, RunState::new());
     }
 
     #[test]
@@ -4733,21 +4805,15 @@ mod tests {
     }
 
     #[test]
-    fn stereo_per_channel_holding_state_independent() {
-        // After encoding a sample on the LEFT channel that sets
-        // last_zero (even raw → zone 0), the RIGHT channel's state
-        // must remain untouched, and the next RIGHT-channel decode
-        // must read its own prefix as if it were the first sample on
-        // that channel.
+    fn stereo_holding_state_is_shared_across_channels() {
+        // The §4.2 step 4 holding registers are STREAM-level (see
+        // [`StereoDecodeState::run`]): a left-channel word's low
+        // prefix bit pre-encodes the RIGHT channel's next word, and
+        // vice versa, while each word's interval still reads its own
+        // channel's medians. Round-trip a mixed sequence exercising
+        // zone-0 short-circuits and +1 carries across the channel
+        // boundary in both directions.
         let seeds = [[256u32, 256, 256], [8192u32, 8192, 8192]];
-        // Left frame 0: 0 (zone 0, sets left_run.last_zero=true).
-        // Right frame 0: 600 (zone 1 on right with get_med=513, sets
-        // right_run.last_one=true since odd raw=1).
-        // Left frame 1: 0 (left_run.last_zero short-circuit → zone 0
-        // with NO unary read).
-        // Right frame 1: 700 (zone 1 again; right_run carries
-        // last_one from frame 0 with no short-circuit, so it reads
-        // normally).
         let interleaved = vec![0i32, 600, 0, 700];
         let n = stereo_round_trip(seeds, &interleaved);
         assert_eq!(n, 4);
@@ -6354,14 +6420,12 @@ mod tests {
         // Either channel's median[0] over the threshold blocks the path.
         assert!(!state.zero_run_eligible(&[high, low]));
         assert!(!state.zero_run_eligible(&[low, high]));
-        // Any of the four holding bits blocks the path.
-        for setter in 0..4 {
+        // Either shared holding bit blocks the path.
+        for setter in 0..2 {
             let mut s = StereoDecodeState::new();
             match setter {
-                0 => s.left_run.last_one = true,
-                1 => s.left_run.last_zero = true,
-                2 => s.right_run.last_one = true,
-                _ => s.right_run.last_zero = true,
+                0 => s.run.last_one = true,
+                _ => s.run.last_zero = true,
             }
             assert!(!s.zero_run_eligible(&[low, low]), "setter {setter}");
         }
@@ -6884,21 +6948,20 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rereads_run_length_after_drain() {
-        // After a non-zero run drains, the medians are still zero and
-        // the holding state clean, so the NEXT word starts with another
-        // explicit run-length field — here the zero-length marker, then
-        // a regular word. Wire: run 2 ("10" → count 1? no: count=2 needs
-        // "110" + 1 mantissa bit) — use run length 2: unary count 2
-        // ("110") + mantissa bit 0 → (1 << 1) | 0 = 2. Then marker "0",
-        // then word for 5: zone_for_magnitude(5) with all-zero medians
-        // (get_med = 1) = 2 + (5 - 2) / 1 = 5 → raw 10 (last word, even)
-        // → unary "11111111110", then degenerate interval (no
-        // mantissa), then sign "0".
+    fn decoder_reads_word_directly_after_run_drain() {
+        // After a non-zero run drains, the NEXT word follows directly —
+        // there is NO new run-length field between a completed run and
+        // the following word (round 393, pinned by black-box
+        // cross-validation against reference-encoded streams; see
+        // [`DecodeState::run_break`]). Wire: run length 2 (unary count
+        // 2 = "110" + 1 mantissa bit 0 → (1 << 1) | 0 = 2), then the
+        // word for 5 immediately: zone_for_magnitude(5) with all-zero
+        // medians (get_med = 1) = 2 + (5 - 2) / 1 = 5 → raw 10 (last
+        // word, even) → unary "11111111110", then degenerate interval
+        // (no mantissa), then sign "0".
         let mut bits = String::new();
         bits.push_str("110"); // run-length count = 2
         bits.push('0'); // mantissa bit → run length 2
-        bits.push('0'); // next word: zero-length-run marker
         bits.push_str("11111111110"); // raw prefix unary 10 → zone 5
         bits.push('0'); // sign clear
         let bytes = bits_to_bytes(&bits);

@@ -133,10 +133,19 @@ fn append_sub_block(out: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<()> {
 /// `mantissa << (exponent - 9)` (signed mantissa). For a value in the
 /// signed-8-bit range we can store it verbatim with exponent byte `9`
 /// (shift 0), so the round trip is exact. This encoder only ever needs
-/// the zero seed (`[0, 0, 0]`), which packs to `[0x00, 0x09]`, but the
+/// the zero seed (`[0, 0, 0]`), which packs to the canonical all-zero
+/// word `[0x00, 0x00]` (see the round-393 interop note inside), but the
 /// small-value path is kept so future seeds in `-128..=127` round-trip.
 fn pack_median_word(value: i32) -> Option<[u8; MEDIAN_WORD_BYTES]> {
-    if (i8::MIN as i32..=i8::MAX as i32).contains(&value) {
+    if value == 0 {
+        // Canonical zero is the all-zero word — see the round-393
+        // interop note on [`crate::pack_sample_word`]: both `[0, 0]`
+        // and `[0, 9]` expand to 0 under the wiki reading, but
+        // black-box cross-validation (wvunpack as an opaque binary)
+        // showed reference decoders only read the all-zero word as a
+        // zero median.
+        Some([0, 0])
+    } else if (i8::MIN as i32..=i8::MAX as i32).contains(&value) {
         Some([(value as i8) as u8, EXPONENT_BIAS_BYTE])
     } else {
         None
@@ -271,6 +280,15 @@ struct BlockConfig<'a> {
     bytes_per_sample: u8,
     /// Wiki bits-11..=12 multichannel grouping marker (`0b11` standalone).
     marker: u32,
+    /// `0x0D` multichannel-information payload (`[channel_count,
+    /// speaker_mask]`) to emit after the `0x05` entropy info — set on
+    /// the FIRST member of a multichannel set. `None` for standalone
+    /// blocks and continuation / final members. (Round 393: black-box
+    /// cross-validation showed reference decoders refuse a member set
+    /// whose first member lacks the `0x0D` sub-block; the observed
+    /// layout is one channel-count byte followed by the Microsoft
+    /// speaker-mask byte the wiki names, `0` = unassigned.)
+    multichannel_info: Option<[u8; 2]>,
 }
 
 /// Assemble one complete `wvpk` block from a container-scaled PCM buffer
@@ -320,6 +338,12 @@ fn encode_block_core(
         crate::crc::crc_stereo_interleaved(&work)
     };
 
+    // Magnitude of the narrow true samples (the wiki bits-18..=22
+    // "maximum magnitude of decoded data"). Captured before the joint /
+    // prediction transforms; the residual domain is folded in below so
+    // the field covers everything the entropy reader will walk.
+    let mut max_magnitude = magnitude_bits(&work);
+
     // Stage 3: forward mid/side ahead of prediction, mirroring the
     // decoder's decorrelate-then-joint-undo order.
     if config.joint {
@@ -353,17 +377,34 @@ fn encode_block_core(
     if config.left_shift > 0 {
         flags_raw = with_left_shift(flags_raw, config.left_shift);
     }
+    // Wiki bits 18..=22 "maximum magnitude of decoded data". The wiki
+    // frames it as an optimisation hint, but the round-393 black-box
+    // cross-validation (wvunpack as an opaque binary) showed reference
+    // decoders REQUIRE it: with the field left at 0, any block whose
+    // sample words reach a unary zone selector past ~3 is reported as
+    // "missing data or crc errors" and muted (empirically the field
+    // must be at least `bit_length(ones_count - 3)` for the largest
+    // word). The bit-length of the largest sign-folded magnitude across
+    // both the true-sample and residual domains always satisfies that
+    // bound (a magnitude-`m` word's zone selector never exceeds `m`
+    // when every working median is at its floor), and matches the
+    // reference's own zero-for-silence behaviour.
+    max_magnitude = max_magnitude.max(magnitude_bits(&work));
+    flags_raw |= (max_magnitude.min(0x1f)) << 18;
 
     let mut metadata = Vec::new();
 
-    // 0x05 entropy info. Mono: a single zero-seed set. Stereo: two sets,
-    // the right one carrying a minimal non-zero seed ([0, 0, 1]) because
-    // the decoder distinguishes a stereo entropy payload from a mono one
-    // by content (an all-zero right set reads as mono and is refused on
-    // the stereo path); the encode medians are seeded from the exact
-    // same sets so the round trip stays bit-exact whatever the seed.
+    // 0x05 entropy info: zero seeds for every channel (fresh adaptive
+    // state), packed in the canonical all-zero word form. Stereo-ness
+    // is carried by the payload LENGTH (two 6-byte sets = 12 bytes) —
+    // the decoder's block path gates on the wire length, so an
+    // all-zero right set is a legitimate stereo payload. (Until round
+    // 393 the right set carried a [0, 0, 1] marker seed to satisfy the
+    // old content-based stereo heuristic; the wvunpack black-box
+    // cross-validation showed reference decoders expand that non-zero
+    // log-word differently, so the marker is gone.)
     let left_seed = [0, 0, 0];
-    let right_seed = [0, 0, 1];
+    let right_seed = [0, 0, 0];
     let entropy_payload = if config.mono {
         pack_entropy_info(&[left_seed])
     } else {
@@ -374,6 +415,16 @@ fn encode_block_core(
         SubBlockId::EntropyInfo.as_id_byte(),
         &entropy_payload,
     )?;
+
+    // 0x0D multichannel information on a set's first member (see
+    // [`BlockConfig::multichannel_info`]).
+    if let Some(info) = config.multichannel_info {
+        append_sub_block(
+            &mut metadata,
+            SubBlockId::MultichannelInfo.as_id_byte(),
+            &info,
+        )?;
+    }
 
     // The three decorrelation sub-blocks, verbatim, in wire order.
     if let Some((terms, weights, samples)) = config.decorr {
@@ -440,6 +491,7 @@ fn raw_config(mono: bool, bytes_per_sample: u8) -> BlockConfig<'static> {
         decorr: None,
         bytes_per_sample,
         marker: 0b11,
+        multichannel_info: None,
     }
 }
 
@@ -467,7 +519,14 @@ pub fn encode_block_mono(
     // The standalone marker (0b11) is the default — a self-contained
     // single-block file. Multichannel members reuse the body below with a
     // grouping marker via `encode_block_mono_marker`.
-    encode_block_mono_marker(pcm, bytes_per_sample, block_index, total_samples, 0b11)
+    encode_block_mono_marker(
+        pcm,
+        bytes_per_sample,
+        block_index,
+        total_samples,
+        0b11,
+        None,
+    )
 }
 
 /// Encode a mono PCM buffer into one `wvpk` block carrying the supplied
@@ -486,9 +545,11 @@ fn encode_block_mono_marker(
     block_index: u32,
     total_samples: u32,
     marker: u32,
+    multichannel_info: Option<[u8; 2]>,
 ) -> Result<Vec<u8>> {
     let config = BlockConfig {
         marker,
+        multichannel_info,
         ..raw_config(true, bytes_per_sample)
     };
     encode_block_core(pcm, config, block_index, total_samples)
@@ -518,6 +579,24 @@ fn narrow_left_shift(buffer: &mut [i32], left_shift: u8) -> Result<()> {
 /// Set the wiki flag-bits-13..=17 `left_shift` field in a flag word.
 fn with_left_shift(flags_raw: u32, left_shift: u8) -> u32 {
     flags_raw | ((u32::from(left_shift) & 0b1_1111) << 13)
+}
+
+/// Bit-length of the largest sign-folded magnitude in `values` — the
+/// value the encoder stores in the wiki bits-18..=22 `max_magnitude`
+/// field. The fold matches the spec §4.2 step 7 sign convention: a
+/// negative sample's coded magnitude is its bitwise complement
+/// (`-v - 1`), so `-1` folds to `0` and `i32::MIN` to `2^31 - 1`.
+/// All-zero (silence) input yields `0`, matching the reference
+/// encoder's observed zero-for-silence field.
+fn magnitude_bits(values: &[i32]) -> u32 {
+    values
+        .iter()
+        .map(|&v| {
+            let folded = if v < 0 { !v as u32 } else { v as u32 };
+            32 - folded.leading_zeros()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Encode a mono PCM buffer at a **sub-byte bit-depth** (e.g. 12-bit,
@@ -1924,12 +2003,23 @@ pub fn encode_multichannel_stream_at(
             } else {
                 0b00 // continuation
             };
+            // The set's first member carries the 0x0D multichannel
+            // information ([count, mask]) reference decoders require
+            // (see BlockConfig::multichannel_info). The speaker mask is
+            // 0 = unassigned — this API has no layout knowledge. A
+            // width past 255 cannot be expressed in the observed
+            // one-byte count; MAX_MULTICHANNEL_CHANNELS-wide grouping
+            // still encodes/decodes in-crate, without the sub-block.
+            let mc_info = (ch == 0 && channels > 1)
+                .then(|| u8::try_from(channels).ok().map(|c| [c, 0u8]))
+                .flatten();
             let block = encode_block_mono_marker(
                 &channel_pcm,
                 bytes_per_sample,
                 block_index,
                 total,
                 marker,
+                mc_info,
             )?;
             out.extend_from_slice(&block);
         }
@@ -2452,6 +2542,72 @@ mod tests {
     }
 
     // ---- Multichannel stream encode round-trips (round 378) ------------
+
+    #[test]
+    fn encoder_sets_max_magnitude_flag_bits() {
+        // Wiki bits 18..=22: bit-length of the largest sign-folded
+        // magnitude (round-393 wvunpack cross-validation showed
+        // reference decoders require it — see encode_block_core).
+        use crate::block::parse_block;
+        // Silence → 0 (matches the reference encoder's observed field).
+        let wv = encode_block_mono(&[0; 8], 2, 0, 8).unwrap();
+        let (b, _) = parse_block(&wv).unwrap();
+        assert_eq!(b.flags().max_magnitude, 0);
+        // Magnitude 4 → 3 bits; -1 folds to 0 and adds nothing.
+        let wv = encode_block_mono(&[4, -1], 2, 0, 2).unwrap();
+        let (b, _) = parse_block(&wv).unwrap();
+        assert_eq!(b.flags().max_magnitude, 3);
+        // Full-scale 16-bit: -32768 folds to 32767 → 15 bits.
+        let wv = encode_block_mono(&[-32768], 2, 0, 1).unwrap();
+        let (b, _) = parse_block(&wv).unwrap();
+        assert_eq!(b.flags().max_magnitude, 15);
+        // Stereo joint: the mid/side residual domain is covered too
+        // (mid = L - R can exceed either input's magnitude).
+        let wv = encode_block_stereo_joint(&[20000, -20000], 2, 0, 1).unwrap();
+        let (b, _) = parse_block(&wv).unwrap();
+        assert!(b.flags().max_magnitude >= 15, "{}", b.flags().max_magnitude);
+    }
+
+    #[test]
+    fn multichannel_first_member_carries_0x0d_info() {
+        // Round 393: reference decoders refuse a member set whose first
+        // member lacks the 0x0D multichannel-information sub-block
+        // ([count, mask], mask 0 = unassigned). Only the first member
+        // of each set carries it.
+        use crate::block::parse_blocks;
+        let pcm: Vec<i32> = (0..4 * 6).map(|i| i as i32).collect();
+        let wv = encode_multichannel_stream(&pcm, 4, 3, 2).unwrap();
+        let blocks = parse_blocks(&wv).unwrap();
+        assert_eq!(blocks.len(), 8); // 2 sets × 4 members
+        for (i, b) in blocks.iter().enumerate() {
+            let info = b.find_multichannel_info_sub_block();
+            if i % 4 == 0 {
+                let payload = info.expect("first member carries 0x0D").payload;
+                assert_eq!(payload, &[4u8, 0u8]);
+            } else {
+                assert!(info.is_none(), "member {i} must not carry 0x0D");
+            }
+        }
+        // A plain (single-channel) stream never carries it.
+        let mono = encode_multichannel_stream(&pcm[..6], 1, 3, 2).unwrap();
+        for b in parse_blocks(&mono).unwrap() {
+            assert!(b.find_multichannel_info_sub_block().is_none());
+        }
+    }
+
+    #[test]
+    fn encoder_stereo_entropy_info_is_all_zero_canonical() {
+        // Round 393: both channels' median seeds are the canonical
+        // all-zero log word (0x0000); stereo-ness is the 12-byte
+        // payload length, not a content marker.
+        use crate::block::parse_block;
+        let wv = encode_block_stereo(&[5, -3, 2, 2], 2, 0, 2).unwrap();
+        let (b, _) = parse_block(&wv).unwrap();
+        let sub = b.find_entropy_info_sub_block().expect("0x05 present");
+        assert_eq!(sub.payload, &[0u8; 12]);
+        // And the block still decodes as stereo.
+        assert_eq!(b.decode_samples().unwrap(), vec![5, -3, 2, 2]);
+    }
 
     #[test]
     fn multichannel_three_channel_round_trips() {
