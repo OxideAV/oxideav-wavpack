@@ -2575,7 +2575,7 @@ mod tests {
         // ([count, mask], mask 0 = unassigned). Only the first member
         // of each set carries it.
         use crate::block::parse_blocks;
-        let pcm: Vec<i32> = (0..4 * 6).map(|i| i as i32).collect();
+        let pcm: Vec<i32> = (0..4 * 6).collect();
         let wv = encode_multichannel_stream(&pcm, 4, 3, 2).unwrap();
         let blocks = parse_blocks(&wv).unwrap();
         assert_eq!(blocks.len(), 8); // 2 sets × 4 members
