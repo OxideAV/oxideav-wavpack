@@ -60,3 +60,9 @@ name = "introspection_surface"
 path = "fuzz_targets/introspection_surface.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "seek_surface"
+path = "fuzz_targets/seek_surface.rs"
+test = false
+doc = false
