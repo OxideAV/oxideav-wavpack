@@ -821,8 +821,28 @@ mod hybrid;
 mod metadata;
 mod overflow_bits;
 mod packed_samples;
+mod registry;
 mod samples;
 mod seek;
+
+/// Direct decoder factory endpoint (the workspace's historical
+/// `<crate>::decoder::make_decoder` convention), alongside the
+/// registry path installed by [`register`].
+pub mod decoder {
+    pub use crate::registry::{make_decoder, WavPackDecoder};
+}
+
+/// Direct encoder factory endpoint (the workspace's historical
+/// `<crate>::encoder::make_encoder` convention), alongside the
+/// registry path installed by [`register`].
+pub mod encoder {
+    pub use crate::registry::{make_encoder, WavPackEncoder};
+}
+
+pub use crate::registry::{register, CODEC_ID};
+
+// Canonical sibling entry point for `oxideav_meta::register_all`.
+oxideav_core::register!("wavpack", register);
 
 pub use crate::block::{
     audio_block_count, block_count, correction_block_count, correction_coverage,
@@ -866,9 +886,10 @@ pub use crate::encode::{
     encode_block_stereo_best, encode_block_stereo_joint, encode_block_stereo_joint_auto,
     encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
     encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
-    encode_multichannel_stream, encode_stream_mono, encode_stream_mono_best,
-    encode_stream_mono_smallest, encode_stream_stereo, encode_stream_stereo_best,
-    encode_stream_stereo_smallest, DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
+    encode_multichannel_stream, encode_multichannel_stream_at, encode_stream_mono,
+    encode_stream_mono_best, encode_stream_mono_smallest, encode_stream_stereo,
+    encode_stream_stereo_best, encode_stream_stereo_smallest, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
+    ENCODE_VERSION,
 };
 pub use crate::entropy::{
     expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,

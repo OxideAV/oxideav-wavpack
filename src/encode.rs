@@ -1844,6 +1844,38 @@ pub fn encode_multichannel_stream(
     block_samples: usize,
     bytes_per_sample: u8,
 ) -> Result<Vec<u8>> {
+    // channels == 0 falls through as 0 frames; the refusal fires in
+    // the `_at` body.
+    let frames = pcm.len().checked_div(channels).unwrap_or(0);
+    let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    encode_multichannel_stream_at(pcm, channels, block_samples, bytes_per_sample, 0, total)
+}
+
+/// The offset-aware generalization of [`encode_multichannel_stream`]:
+/// emit the member sets starting at the absolute frame index
+/// `first_block_index` and carrying the caller-supplied file-global
+/// `total_samples` header word instead of deriving both from this one
+/// buffer.
+///
+/// This is the streaming form: an encoder that receives PCM
+/// incrementally calls this once per input chunk with a running frame
+/// offset, and the concatenated outputs form a single contiguous
+/// (seekable — see [`crate::StreamIndex::is_seekable`]) `.wv` chain
+/// whose whole-file decode equals the concatenated inputs. A producer
+/// that does not know the final length passes
+/// [`crate::TOTAL_SAMPLES_UNKNOWN`] (the wiki "may be 0xFFFFFFFF if
+/// unknown" sentinel) as `total_samples`.
+///
+/// `encode_multichannel_stream(pcm, …)` is exactly
+/// `encode_multichannel_stream_at(pcm, …, 0, frames)`. Round 393.
+pub fn encode_multichannel_stream_at(
+    pcm: &[i32],
+    channels: usize,
+    block_samples: usize,
+    bytes_per_sample: u8,
+    first_block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
     if channels == 0 || channels > crate::block::MAX_MULTICHANNEL_CHANNELS {
         return Err(Error::MultichannelTooManyChannels(channels));
     }
@@ -1855,7 +1887,7 @@ pub fn encode_multichannel_stream(
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let frames = pcm.len() / channels;
-    let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let total = total_samples;
     let chunk_frames = if block_samples == 0 {
         DEFAULT_BLOCK_SAMPLES
     } else {
@@ -1867,8 +1899,10 @@ pub fn encode_multichannel_stream(
     while frame_start < frames {
         let frame_end = (frame_start + chunk_frames).min(frames);
         let set_frames = frame_end - frame_start;
-        let block_index =
-            u32::try_from(frame_start).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+        let block_index = u32::try_from(frame_start)
+            .ok()
+            .and_then(|fs| first_block_index.checked_add(fs))
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
 
         // De-interleave this frame range into one mono buffer per channel
         // and emit each as a member block with the right grouping marker.
@@ -2478,6 +2512,70 @@ mod tests {
         // A single-channel set is a standalone block — also decodes via the
         // plain stream walker.
         assert_eq!(decode_stream(&out).unwrap(), pcm);
+    }
+
+    #[test]
+    fn multichannel_at_zero_offset_equals_plain_encoder() {
+        let mut pcm = Vec::new();
+        for f in 0..5i32 {
+            for ch in 0..3i32 {
+                pcm.push(f * 10 + ch);
+            }
+        }
+        let plain = encode_multichannel_stream(&pcm, 3, 2, 2).unwrap();
+        let at = encode_multichannel_stream_at(&pcm, 3, 2, 2, 0, 5).unwrap();
+        assert_eq!(plain, at);
+    }
+
+    #[test]
+    fn multichannel_at_streaming_chunks_concatenate_seekably() {
+        use crate::block::decode_multichannel_stream;
+        use crate::block_header::TOTAL_SAMPLES_UNKNOWN;
+        use crate::seek::StreamIndex;
+        // Feed the same 4-channel signal as two incremental chunks with
+        // a running frame offset; the concatenated chain must decode as
+        // one stream AND form a contiguous, seekable frame chain.
+        let channels = 4usize;
+        let frames = 10usize;
+        let pcm: Vec<i32> = (0..frames * channels)
+            .map(|i| (i as i32 * 13) % 200 - 100)
+            .collect();
+        let split = 6 * channels; // first 6 frames, then 4
+        let mut wv =
+            encode_multichannel_stream_at(&pcm[..split], channels, 3, 2, 0, TOTAL_SAMPLES_UNKNOWN)
+                .unwrap();
+        wv.extend_from_slice(
+            &encode_multichannel_stream_at(&pcm[split..], channels, 3, 2, 6, TOTAL_SAMPLES_UNKNOWN)
+                .unwrap(),
+        );
+        let decoded = decode_multichannel_stream(&wv).unwrap();
+        assert_eq!(decoded.channels, channels);
+        assert_eq!(decoded.samples, pcm);
+        let index = StreamIndex::scan(&wv).unwrap();
+        assert!(
+            index.is_seekable(),
+            "running offsets make the chain contiguous"
+        );
+        assert_eq!(index.frame_count(), frames as u64);
+        // Without the offset the second chunk restarts at 0 — decodable
+        // but NOT seekable.
+        let mut flat =
+            encode_multichannel_stream_at(&pcm[..split], channels, 3, 2, 0, TOTAL_SAMPLES_UNKNOWN)
+                .unwrap();
+        flat.extend_from_slice(
+            &encode_multichannel_stream_at(&pcm[split..], channels, 3, 2, 0, TOTAL_SAMPLES_UNKNOWN)
+                .unwrap(),
+        );
+        assert!(!StreamIndex::scan(&flat).unwrap().is_seekable());
+    }
+
+    #[test]
+    fn multichannel_at_index_overflow_is_refused() {
+        let pcm: Vec<i32> = vec![1, 2, 3, 4];
+        assert!(matches!(
+            encode_multichannel_stream_at(&pcm, 2, 1, 2, u32::MAX, u32::MAX),
+            Err(Error::EncodeBlockTooLarge(_))
+        ));
     }
 
     #[test]
