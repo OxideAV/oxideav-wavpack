@@ -383,6 +383,28 @@ pub enum Error {
     /// have. Carries the first surplus correction block's
     /// `block_index`.
     CorrectionBlockSurplus(u32),
+    /// A random-access operation ([`crate::decode_range`] /
+    /// [`crate::StreamReader`]) addressed frames on an index whose
+    /// member sets do not form one contiguous ascending frame chain
+    /// (gaps, overlaps, or regressions in the wiki "offset in samples
+    /// for current block" header words). Without that property a frame
+    /// number does not map to a unique set, so seeking is refused;
+    /// whole-stream decoding ([`crate::decode_stream`] /
+    /// [`crate::decode_multichannel_stream`]) still works on such
+    /// streams.
+    StreamNotSeekable,
+    /// A random-access frame window fell outside the indexed stream's
+    /// `[first_frame, end_frame)` coverage. `requested` is the
+    /// offending absolute frame index (the window start when it
+    /// precedes coverage, the window end when it overruns it).
+    SeekOutOfRange {
+        /// The out-of-coverage absolute frame index.
+        requested: u64,
+        /// First covered absolute frame index.
+        first_frame: u64,
+        /// One past the last covered absolute frame index.
+        end_frame: u64,
+    },
     /// Reserved placeholder for API surface not yet wired by the
     /// clean-room rebuild rounds.
     NotImplemented,
@@ -558,6 +580,17 @@ impl core::fmt::Display for Error {
             Error::CorrectionBlockSurplus(idx) => write!(
                 f,
                 "oxideav-wavpack: correction file carries audio blocks past the end of the main file (first surplus at block_index {idx})"
+            ),
+            Error::StreamNotSeekable => f.write_str(
+                "oxideav-wavpack: stream is not seekable (member sets do not form a contiguous ascending frame chain)",
+            ),
+            Error::SeekOutOfRange {
+                requested,
+                first_frame,
+                end_frame,
+            } => write!(
+                f,
+                "oxideav-wavpack: frame {requested} is outside the indexed coverage [{first_frame}, {end_frame})"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-wavpack: clean-room rebuild in progress — see crates/oxideav-wavpack/README.md",

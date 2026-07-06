@@ -395,6 +395,181 @@ impl StreamIndex {
     }
 }
 
+/// Decode one member set into its interleaved PCM frames.
+///
+/// `bytes` must be the same buffer `index` was scanned from — each
+/// member block is re-parsed at its recorded byte span and decoded via
+/// [`crate::WavPackBlock::decode_member_samples`] (or the CRC-muted
+/// twin when `muted`), then the members' channels are interleaved per
+/// frame in wire order, exactly as
+/// [`crate::decode_multichannel_stream`] interleaves the same set.
+/// Returns `(pcm, all_crc_ok)`; `all_crc_ok` is only meaningful in
+/// muted mode (`true` otherwise).
+///
+/// A buffer that no longer matches the index (shorter, or reshaped
+/// blocks) surfaces as [`Error::Truncated`] / parse errors / the
+/// grouping refusals — never as an out-of-bounds access.
+fn decode_set(
+    bytes: &[u8],
+    index: &StreamIndex,
+    set: &SetEntry,
+    muted: bool,
+) -> Result<(Vec<i32>, bool)> {
+    let mut channels: Vec<Vec<i32>> = Vec::with_capacity(set.channels);
+    let mut all_crc_ok = true;
+    for &member_idx in set.member_entries() {
+        let entry = &index.entries()[member_idx];
+        let slice = bytes.get(entry.byte_range()).ok_or(Error::Truncated)?;
+        let (block, _tail) = crate::block::parse_block(slice)?;
+        // Consistency guards against a caller passing a different
+        // buffer than the one scanned: the re-parsed shape must match
+        // the indexed shape.
+        if block.header().block_samples != set.frames {
+            return Err(Error::MultichannelSampleCountMismatch {
+                expected: set.frames,
+                found: block.header().block_samples,
+            });
+        }
+        let member_channels = if block.flags().is_block_data_mono() {
+            1
+        } else {
+            2
+        };
+        if member_channels != entry.member_channels() {
+            return Err(Error::MultichannelSetMalformed);
+        }
+        let pcm = if muted {
+            let (pcm, crc_ok) = block.decode_member_samples_muted()?;
+            all_crc_ok &= crc_ok;
+            pcm
+        } else {
+            block.decode_member_samples()?
+        };
+        if member_channels == 1 {
+            channels.push(pcm);
+        } else {
+            let frames = pcm.len() / 2;
+            let mut left = Vec::with_capacity(frames);
+            let mut right = Vec::with_capacity(frames);
+            for pair in pcm.chunks_exact(2) {
+                left.push(pair[0]);
+                right.push(pair[1]);
+            }
+            channels.push(left);
+            channels.push(right);
+        }
+    }
+    let frames = set.frames as usize;
+    let mut out = Vec::with_capacity(frames * set.channels);
+    for f in 0..frames {
+        for ch in &channels {
+            out.push(ch[f]);
+        }
+    }
+    Ok((out, all_crc_ok))
+}
+
+/// Shared range-decode core for [`decode_range`] (`muted == false`)
+/// and [`decode_range_muted`].
+fn decode_range_inner(
+    bytes: &[u8],
+    index: &StreamIndex,
+    start_frame: u64,
+    frames: u64,
+    muted: bool,
+) -> Result<(Vec<i32>, bool)> {
+    if !index.is_seekable() {
+        return Err(Error::StreamNotSeekable);
+    }
+    if frames == 0 {
+        return Ok((Vec::new(), true));
+    }
+    let end_frame = start_frame
+        .checked_add(frames)
+        .ok_or(Error::SeekOutOfRange {
+            requested: u64::MAX,
+            first_frame: index.first_frame(),
+            end_frame: index.end_frame(),
+        })?;
+    if start_frame < index.first_frame() || end_frame > index.end_frame() {
+        return Err(Error::SeekOutOfRange {
+            requested: if start_frame < index.first_frame() {
+                start_frame
+            } else {
+                end_frame
+            },
+            first_frame: index.first_frame(),
+            end_frame: index.end_frame(),
+        });
+    }
+    let mut set_idx = index
+        .locate_frame(start_frame)
+        .expect("in-range frame on a seekable index locates a set");
+    let channels = index.channels();
+    let mut out: Vec<i32> = Vec::with_capacity(usize::try_from(frames).unwrap_or(0) * channels);
+    let mut all_crc_ok = true;
+    let mut cursor = start_frame;
+    while cursor < end_frame {
+        let set = &index.sets()[set_idx];
+        let (pcm, crc_ok) = decode_set(bytes, index, set, muted)?;
+        all_crc_ok &= crc_ok;
+        // Overlap of [cursor, end_frame) with this set, in set-local
+        // frame offsets.
+        let from = (cursor - u64::from(set.first_frame)) as usize;
+        let upto = (end_frame.min(set.end_frame()) - u64::from(set.first_frame)) as usize;
+        out.extend_from_slice(&pcm[from * channels..upto * channels]);
+        cursor = set.end_frame().min(end_frame);
+        set_idx += 1;
+    }
+    Ok((out, all_crc_ok))
+}
+
+/// Decode an arbitrary frame window `[start_frame, start_frame +
+/// frames)` from an indexed WavPack stream, touching only the member
+/// sets the window overlaps.
+///
+/// `bytes` must be the buffer `index` was scanned from ([`StreamIndex::scan`]).
+/// Frame indices are **absolute** (the wiki `block_index` domain — for
+/// a normal file the first frame is `0`; see
+/// [`StreamIndex::first_frame`]). The result is interleaved PCM,
+/// `frames * index.channels()` values, bit-exactly equal to the same
+/// window sliced out of the whole-stream
+/// [`crate::decode_multichannel_stream`] output (which for plain mono /
+/// stereo files equals [`crate::decode_stream`]).
+///
+/// Refusals: [`Error::StreamNotSeekable`] when the index's sets do not
+/// form a contiguous frame chain, [`Error::SeekOutOfRange`] when the
+/// window falls outside `[first_frame, end_frame)`. Per-set parse /
+/// decode errors propagate verbatim. `frames == 0` yields an empty
+/// buffer.
+pub fn decode_range(
+    bytes: &[u8],
+    index: &StreamIndex,
+    start_frame: u64,
+    frames: u64,
+) -> Result<Vec<i32>> {
+    decode_range_inner(bytes, index, start_frame, frames, false).map(|(pcm, _)| pcm)
+}
+
+/// The spec §5.6 CRC-mute twin of [`decode_range`]: every member block
+/// the window touches is decoded through the per-member CRC gate
+/// ([`crate::WavPackBlock::decode_member_samples_muted`]), so a member
+/// whose stored CRC mismatches contributes zeros in its channel slots
+/// instead of failing the decode.
+///
+/// Returns `(pcm, all_crc_ok)` where `all_crc_ok` covers **only the
+/// member blocks the window touched** — a corrupt block outside the
+/// window is not decoded and therefore not reported. A zero-length
+/// window reports `true`.
+pub fn decode_range_muted(
+    bytes: &[u8],
+    index: &StreamIndex,
+    start_frame: u64,
+    frames: u64,
+) -> Result<(Vec<i32>, bool)> {
+    decode_range_inner(bytes, index, start_frame, frames, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,6 +902,197 @@ mod tests {
         assert_eq!(sub.set_count(), 1);
         assert_eq!(sub.sets()[0].frames, index.sets()[1].frames);
         assert_eq!(sub.channels(), 4);
+    }
+
+    #[test]
+    fn decode_range_full_span_equals_decode_stream_mono() {
+        let pcm = mono_pcm(700);
+        let wv = encode_stream_mono(&pcm, 256, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let ranged = decode_range(&wv, &index, 0, 700).expect("range");
+        assert_eq!(ranged, crate::block::decode_stream(&wv).expect("full"));
+        assert_eq!(ranged, pcm);
+    }
+
+    #[test]
+    fn decode_range_every_window_equals_full_decode_slice_mono() {
+        let pcm = mono_pcm(300);
+        let wv = encode_stream_mono(&pcm, 128, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let full = crate::block::decode_stream(&wv).expect("full");
+        // Sweep window starts and lengths across all block boundaries.
+        for start in (0..300).step_by(37) {
+            for len in [1usize, 7, 128, 129, 300 - start] {
+                let len = len.min(300 - start);
+                let ranged = decode_range(&wv, &index, start as u64, len as u64).expect("range");
+                assert_eq!(ranged, full[start..start + len], "start={start} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_range_windows_equal_full_decode_slice_stereo() {
+        let pcm: Vec<i32> = (0..600).map(|i| (i * 13) % 800 - 400).collect();
+        let wv = encode_stream_stereo(&pcm, 100, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let full = crate::block::decode_stream(&wv).expect("full");
+        assert_eq!(index.channels(), 2);
+        for (start, len) in [(0u64, 300u64), (50, 100), (99, 2), (100, 100), (250, 50)] {
+            let ranged = decode_range(&wv, &index, start, len).expect("range");
+            let s = start as usize * 2;
+            let e = s + len as usize * 2;
+            assert_eq!(ranged, full[s..e], "start={start} len={len}");
+        }
+    }
+
+    #[test]
+    fn decode_range_windows_equal_full_decode_slice_multichannel() {
+        let channels = 5usize;
+        let frames = 250usize;
+        let pcm: Vec<i32> = (0..frames * channels)
+            .map(|i| (i as i32 * 11) % 600 - 300)
+            .collect();
+        let wv = encode_multichannel_stream(&pcm, channels, 100, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let full = crate::block::decode_multichannel_stream(&wv).expect("full");
+        assert_eq!(full.channels, channels);
+        assert_eq!(index.channels(), channels);
+        for (start, len) in [
+            (0u64, 250u64),
+            (0, 1),
+            (99, 2),
+            (100, 150),
+            (249, 1),
+            (60, 130),
+        ] {
+            let ranged = decode_range(&wv, &index, start, len).expect("range");
+            let s = start as usize * channels;
+            let e = s + len as usize * channels;
+            assert_eq!(ranged, full.samples[s..e], "start={start} len={len}");
+        }
+    }
+
+    #[test]
+    fn decode_range_zero_frames_is_empty() {
+        let pcm = mono_pcm(100);
+        let wv = encode_stream_mono(&pcm, 0, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        assert_eq!(
+            decode_range(&wv, &index, 0, 0).expect("range"),
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            decode_range(&wv, &index, 100, 0).expect("range"),
+            Vec::<i32>::new()
+        );
+        let (pcm0, ok) = decode_range_muted(&wv, &index, 50, 0).expect("range");
+        assert!(pcm0.is_empty());
+        assert!(ok);
+    }
+
+    #[test]
+    fn decode_range_refuses_out_of_coverage_windows() {
+        let pcm = mono_pcm(100);
+        let wv = encode_stream_mono(&pcm, 0, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        assert!(matches!(
+            decode_range(&wv, &index, 0, 101),
+            Err(Error::SeekOutOfRange {
+                requested: 101,
+                first_frame: 0,
+                end_frame: 100
+            })
+        ));
+        assert!(matches!(
+            decode_range(&wv, &index, 100, 1),
+            Err(Error::SeekOutOfRange { .. })
+        ));
+        // Overflowing start + frames must not wrap.
+        assert!(matches!(
+            decode_range(&wv, &index, u64::MAX, 2),
+            Err(Error::SeekOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_range_refuses_non_seekable_index() {
+        let mut wv = raw_block(0, 64, MONO | STANDALONE);
+        wv.extend_from_slice(&raw_block(100, 64, MONO | STANDALONE));
+        let index = StreamIndex::scan(&wv).expect("scan");
+        assert!(matches!(
+            decode_range(&wv, &index, 0, 1),
+            Err(Error::StreamNotSeekable)
+        ));
+        assert!(matches!(
+            decode_range_muted(&wv, &index, 0, 1),
+            Err(Error::StreamNotSeekable)
+        ));
+    }
+
+    #[test]
+    fn decode_range_muted_matches_decode_stream_muted_on_corruption() {
+        let pcm = mono_pcm(384);
+        let mut wv = encode_stream_mono(&pcm, 128, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        // Corrupt the stored CRC of the middle block (header offset 28).
+        let mid = index.entries()[1].byte_offset;
+        wv[mid + 28] ^= 0xff;
+        let (full, full_ok) = crate::block::decode_stream_muted(&wv).expect("full muted");
+        assert!(!full_ok);
+        let (ranged, ok) = decode_range_muted(&wv, &index, 0, 384).expect("range muted");
+        assert!(!ok);
+        assert_eq!(ranged, full);
+        // The muted block's frames are zeros; its neighbours survive.
+        assert_eq!(&ranged[128..256], &[0i32; 128]);
+        assert_eq!(&ranged[..128], &pcm[..128]);
+        // A window that avoids the corrupt block reports all-ok.
+        let (clean, ok) = decode_range_muted(&wv, &index, 256, 128).expect("range muted");
+        assert!(ok);
+        assert_eq!(clean, pcm[256..384]);
+        // A window touching only the corrupt block reports the mute.
+        let (muted, ok) = decode_range_muted(&wv, &index, 200, 10).expect("range muted");
+        assert!(!ok);
+        assert_eq!(muted, [0i32; 10]);
+        // The plain (non-muted) range decoder still decodes — CRC is
+        // not consulted outside the muted path.
+        let plain = decode_range(&wv, &index, 128, 128).expect("plain");
+        assert_eq!(plain, pcm[128..256]);
+    }
+
+    #[test]
+    fn decode_range_on_shifted_and_joint_blocks() {
+        // Joint stereo single block.
+        let pcm: Vec<i32> = (0..256).map(|i| ((i * 31) % 700) - 350).collect();
+        let wv = encode_block_stereo_joint(&pcm, 2, 0, 128).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let full = crate::block::decode_stream(&wv).expect("full");
+        let ranged = decode_range(&wv, &index, 40, 50).expect("range");
+        assert_eq!(ranged, full[80..180]);
+        // Left-shifted (12-bit) mono block.
+        let pcm12: Vec<i32> = (0..100).map(|i| ((i * 37) % 2000 - 1000) * 16).collect();
+        let wv = crate::encode::encode_block_mono_shifted(&pcm12, 4, 2, 0, 100).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let ranged = decode_range(&wv, &index, 25, 50).expect("range");
+        assert_eq!(ranged, pcm12[25..75]);
+    }
+
+    #[test]
+    fn decode_range_truncated_buffer_after_scan_is_typed() {
+        // Scan a full buffer, then hand the range decoder a shorter
+        // one — the recorded byte spans no longer fit.
+        let pcm = mono_pcm(200);
+        let wv = encode_stream_mono(&pcm, 100, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let short = &wv[..wv.len() - 4];
+        assert!(matches!(
+            decode_range(short, &index, 150, 10),
+            Err(Error::Truncated)
+        ));
+        // Windows inside the intact prefix still decode.
+        assert_eq!(
+            decode_range(short, &index, 0, 100).expect("range"),
+            pcm[..100]
+        );
     }
 
     #[test]

@@ -892,7 +892,7 @@ pub use crate::metadata::{
 };
 pub use crate::overflow_bits::{expand_packed_overflow_bits, PackedOverflowBits};
 pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples, PackedSamples};
-pub use crate::seek::{IndexEntry, SetEntry, StreamIndex};
+pub use crate::seek::{decode_range, decode_range_muted, IndexEntry, SetEntry, StreamIndex};
 
 pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
