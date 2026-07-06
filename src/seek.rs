@@ -570,6 +570,205 @@ pub fn decode_range_muted(
     decode_range_inner(bytes, index, start_frame, frames, true)
 }
 
+/// A seekable decoding cursor over an indexed WavPack stream.
+///
+/// Wraps a byte buffer plus its [`StreamIndex`] and exposes the
+/// classic reader trio — [`StreamReader::seek`],
+/// [`StreamReader::read_frames`], [`StreamReader::position`] — in the
+/// absolute frame domain (see [`StreamIndex::first_frame`]; `0` for a
+/// normal file). Reads decode whole member sets and cache the most
+/// recently decoded one, so sequential small reads inside one set (the
+/// common playback pattern) decode each set exactly once, and a
+/// seek-back within the cached set costs nothing.
+///
+/// Construction refuses a non-seekable stream
+/// ([`Error::StreamNotSeekable`]) — whole-stream decoding via
+/// [`crate::decode_stream`] / [`crate::decode_multichannel_stream`]
+/// remains available for those. An empty (no-audio) stream is
+/// trivially seekable: `seek(0)` succeeds and reads return no frames.
+#[derive(Debug, Clone)]
+pub struct StreamReader<'a> {
+    bytes: &'a [u8],
+    index: StreamIndex,
+    /// Absolute frame index of the next frame a read will return.
+    position: u64,
+    /// Most recently decoded set.
+    cache: Option<CachedSet>,
+}
+
+/// The [`StreamReader`] set cache: one decoded set plus the mode it
+/// was decoded in, so a cached buffer never leaks across plain / muted
+/// reads with different contents (the mute gate zeros a
+/// CRC-mismatching member, so the two modes agree only when every
+/// member's CRC matched).
+#[derive(Debug, Clone)]
+struct CachedSet {
+    set_idx: usize,
+    pcm: Vec<i32>,
+    /// `true` when [`CachedSet::pcm`] came from a CRC-gated (muted)
+    /// decode.
+    muted: bool,
+    /// Whether every member's CRC matched — only meaningful when
+    /// [`CachedSet::muted`] is set.
+    crc_ok: bool,
+}
+
+impl<'a> StreamReader<'a> {
+    /// Scan `bytes` ([`StreamIndex::scan`]) and open a cursor
+    /// positioned at the stream's first frame.
+    ///
+    /// Scan refusals propagate verbatim; a stream whose sets do not
+    /// form a contiguous ascending frame chain raises
+    /// [`Error::StreamNotSeekable`].
+    pub fn new(bytes: &'a [u8]) -> Result<Self> {
+        Self::with_index(bytes, StreamIndex::scan(bytes)?)
+    }
+
+    /// Open a cursor over an already-scanned index. `bytes` must be
+    /// the buffer `index` was scanned from.
+    pub fn with_index(bytes: &'a [u8], index: StreamIndex) -> Result<Self> {
+        if !index.is_seekable() {
+            return Err(Error::StreamNotSeekable);
+        }
+        let position = index.first_frame();
+        Ok(Self {
+            bytes,
+            index,
+            position,
+            cache: None,
+        })
+    }
+
+    /// The underlying index (byte spans, sets, frame ranges).
+    pub fn index(&self) -> &StreamIndex {
+        &self.index
+    }
+
+    /// Per-frame channel count of every read (`0` for a no-audio
+    /// stream).
+    pub fn channels(&self) -> usize {
+        self.index.channels()
+    }
+
+    /// Absolute frame index of the next frame a read will return.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Number of frames between the cursor and the end of the stream.
+    pub fn frames_remaining(&self) -> u64 {
+        self.index.end_frame() - self.position
+    }
+
+    /// `true` when the cursor is at the end of the stream (a read
+    /// returns no frames).
+    pub fn is_at_end(&self) -> bool {
+        self.position == self.index.end_frame()
+    }
+
+    /// Move the cursor to the absolute frame index `frame`.
+    ///
+    /// Any position in `[first_frame, end_frame]` is accepted —
+    /// seeking **to** the end is a valid cursor state from which reads
+    /// return no frames. Outside that range the seek is refused with
+    /// [`Error::SeekOutOfRange`] and the cursor is unchanged. Seeking
+    /// never decodes; the set cache is kept (a seek back into the
+    /// cached set stays free).
+    pub fn seek(&mut self, frame: u64) -> Result<()> {
+        if frame < self.index.first_frame() || frame > self.index.end_frame() {
+            return Err(Error::SeekOutOfRange {
+                requested: frame,
+                first_frame: self.index.first_frame(),
+                end_frame: self.index.end_frame(),
+            });
+        }
+        self.position = frame;
+        Ok(())
+    }
+
+    /// Decode and return up to `max_frames` interleaved frames from
+    /// the cursor, advancing it by the frames returned.
+    ///
+    /// Returns `max_frames * channels` PCM values, or fewer when the
+    /// stream ends first (an empty buffer at end-of-stream). A failed
+    /// read returns no frames and leaves the cursor **unchanged**, so
+    /// a caller that repairs the buffer (or narrows the request to the
+    /// intact region) retries from the same position.
+    pub fn read_frames(&mut self, max_frames: usize) -> Result<Vec<i32>> {
+        self.read_frames_inner(max_frames, false)
+            .map(|(pcm, _)| pcm)
+    }
+
+    /// The spec §5.6 CRC-mute twin of [`StreamReader::read_frames`]:
+    /// member blocks are decoded through the per-member CRC gate, a
+    /// mismatching member contributes zeros in its channel slots, and
+    /// the returned flag is `true` only when every member decoded for
+    /// **this read** matched. (A set decoded from the cache reports
+    /// the CRC state observed when it was decoded.)
+    pub fn read_frames_muted(&mut self, max_frames: usize) -> Result<(Vec<i32>, bool)> {
+        self.read_frames_inner(max_frames, true)
+    }
+
+    fn read_frames_inner(&mut self, max_frames: usize, muted: bool) -> Result<(Vec<i32>, bool)> {
+        // All-or-nothing cursor contract: a failed read restores the
+        // starting position so no frames are silently skipped.
+        let start_position = self.position;
+        self.read_frames_advance(max_frames, muted)
+            .inspect_err(|_| self.position = start_position)
+    }
+
+    fn read_frames_advance(&mut self, max_frames: usize, muted: bool) -> Result<(Vec<i32>, bool)> {
+        let channels = self.channels();
+        let mut out: Vec<i32> = Vec::new();
+        let mut all_crc_ok = true;
+        let mut remaining = max_frames as u64;
+        while remaining > 0 && self.position < self.index.end_frame() {
+            let set_idx = self
+                .index
+                .locate_frame(self.position)
+                .expect("cursor inside coverage on a seekable index");
+            // A cached set is reusable when it was decoded in the same
+            // mode; across modes only a muted-and-CRC-clean buffer is
+            // byte-identical to the plain decode (the mute gate only
+            // changes the output by zeroing a mismatching member).
+            let reusable = match &self.cache {
+                Some(c) if c.set_idx == set_idx => {
+                    if c.muted == muted {
+                        true
+                    } else {
+                        // Cross-mode: muted-clean == plain; a plain
+                        // cache never serves a muted read (no CRC
+                        // verdict was recorded).
+                        c.muted && c.crc_ok
+                    }
+                }
+                _ => false,
+            };
+            if !reusable {
+                let (pcm, crc_ok) =
+                    decode_set(self.bytes, &self.index, &self.index.sets()[set_idx], muted)?;
+                self.cache = Some(CachedSet {
+                    set_idx,
+                    pcm,
+                    muted,
+                    crc_ok,
+                });
+            }
+            let cached = self.cache.as_ref().expect("cache populated above");
+            if muted {
+                all_crc_ok &= cached.crc_ok;
+            }
+            let set = &self.index.sets()[set_idx];
+            let from = (self.position - u64::from(set.first_frame)) as usize;
+            let want = remaining.min(set.end_frame() - self.position) as usize;
+            out.extend_from_slice(&cached.pcm[from * channels..(from + want) * channels]);
+            self.position += want as u64;
+            remaining -= want as u64;
+        }
+        Ok((out, all_crc_ok))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1292,204 @@ mod tests {
             decode_range(short, &index, 0, 100).expect("range"),
             pcm[..100]
         );
+    }
+
+    #[test]
+    fn reader_sequential_chunked_reads_equal_full_decode() {
+        let pcm = mono_pcm(700);
+        let wv = encode_stream_mono(&pcm, 256, 2).expect("encode");
+        let full = crate::block::decode_stream(&wv).expect("full");
+        // Chunk sizes that straddle set boundaries in different ways.
+        for chunk in [1usize, 7, 100, 256, 257, 1000] {
+            let mut reader = StreamReader::new(&wv).expect("reader");
+            assert_eq!(reader.channels(), 1);
+            assert_eq!(reader.position(), 0);
+            let mut got: Vec<i32> = Vec::new();
+            loop {
+                let frames = reader.read_frames(chunk).expect("read");
+                if frames.is_empty() {
+                    break;
+                }
+                got.extend_from_slice(&frames);
+            }
+            assert_eq!(got, full, "chunk={chunk}");
+            assert!(reader.is_at_end());
+            assert_eq!(reader.frames_remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn reader_seek_and_read_equal_range_decode() {
+        let channels = 3usize;
+        let frames = 250usize;
+        let pcm: Vec<i32> = (0..frames * channels)
+            .map(|i| (i as i32 * 17) % 900 - 450)
+            .collect();
+        let wv = encode_multichannel_stream(&pcm, channels, 100, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let mut reader = StreamReader::new(&wv).expect("reader");
+        assert_eq!(reader.channels(), 3);
+        for (start, len) in [(200u64, 50usize), (0, 10), (99, 3), (120, 130), (249, 1)] {
+            reader.seek(start).expect("seek");
+            assert_eq!(reader.position(), start);
+            let got = reader.read_frames(len).expect("read");
+            let want = decode_range(&wv, &index, start, len as u64).expect("range");
+            assert_eq!(got, want, "start={start} len={len}");
+            assert_eq!(reader.position(), start + len as u64);
+        }
+    }
+
+    #[test]
+    fn reader_seek_back_within_cached_set_rereads_identically() {
+        let pcm = mono_pcm(300);
+        let wv = encode_stream_mono(&pcm, 300, 2).expect("encode");
+        let mut reader = StreamReader::new(&wv).expect("reader");
+        let first = reader.read_frames(200).expect("read");
+        reader.seek(50).expect("seek back");
+        let again = reader.read_frames(150).expect("re-read");
+        assert_eq!(again, first[50..200]);
+    }
+
+    #[test]
+    fn reader_seek_bounds() {
+        let pcm = mono_pcm(100);
+        let wv = encode_stream_mono(&pcm, 0, 2).expect("encode");
+        let mut reader = StreamReader::new(&wv).expect("reader");
+        // Seeking to the end is a valid cursor state...
+        reader.seek(100).expect("seek to end");
+        assert!(reader.is_at_end());
+        assert_eq!(
+            reader.read_frames(10).expect("read at end"),
+            Vec::<i32>::new()
+        );
+        // ...one past is not.
+        assert!(matches!(
+            reader.seek(101),
+            Err(Error::SeekOutOfRange {
+                requested: 101,
+                first_frame: 0,
+                end_frame: 100
+            })
+        ));
+        // The failed seek left the cursor unchanged.
+        assert_eq!(reader.position(), 100);
+        reader.seek(0).expect("rewind");
+        assert_eq!(reader.read_frames(100).expect("read"), pcm);
+    }
+
+    #[test]
+    fn reader_refuses_non_seekable_stream() {
+        let mut wv = raw_block(0, 64, MONO | STANDALONE);
+        wv.extend_from_slice(&raw_block(100, 64, MONO | STANDALONE));
+        assert!(matches!(
+            StreamReader::new(&wv),
+            Err(Error::StreamNotSeekable)
+        ));
+        // with_index refuses the same way.
+        let index = StreamIndex::scan(&wv).expect("scan");
+        assert!(matches!(
+            StreamReader::with_index(&wv, index),
+            Err(Error::StreamNotSeekable)
+        ));
+    }
+
+    #[test]
+    fn reader_on_empty_stream() {
+        let mut reader = StreamReader::new(&[]).expect("reader");
+        assert_eq!(reader.channels(), 0);
+        assert!(reader.is_at_end());
+        assert_eq!(reader.read_frames(16).expect("read"), Vec::<i32>::new());
+        reader.seek(0).expect("seek 0");
+        assert!(matches!(reader.seek(1), Err(Error::SeekOutOfRange { .. })));
+        // Metadata-only stream behaves the same.
+        let wv = raw_block(0, 0, STANDALONE);
+        let reader = StreamReader::new(&wv).expect("reader");
+        assert!(reader.is_at_end());
+    }
+
+    #[test]
+    fn reader_starts_at_nonzero_first_frame() {
+        let mut wv = raw_block(1000, 64, MONO | STANDALONE);
+        wv.extend_from_slice(&raw_block(1064, 64, MONO | STANDALONE));
+        // Raw header-only blocks have no audio payload to decode, so
+        // only check the cursor geometry.
+        let reader = StreamReader::new(&wv).expect("reader");
+        assert_eq!(reader.position(), 1000);
+        assert_eq!(reader.frames_remaining(), 128);
+        let mut reader = reader;
+        assert!(matches!(
+            reader.seek(999),
+            Err(Error::SeekOutOfRange { .. })
+        ));
+        reader.seek(1128).expect("seek to end");
+    }
+
+    #[test]
+    fn reader_muted_reads_gate_and_cache_correctly() {
+        let pcm = mono_pcm(384);
+        let mut wv = encode_stream_mono(&pcm, 128, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        // Corrupt the middle block's stored CRC.
+        let mid = index.entries()[1].byte_offset;
+        wv[mid + 28] ^= 0xff;
+
+        let mut reader = StreamReader::new(&wv).expect("reader");
+        // Clean first set.
+        let (a, ok) = reader.read_frames_muted(128).expect("read");
+        assert!(ok);
+        assert_eq!(a, pcm[..128]);
+        // Corrupt second set mutes.
+        let (b, ok) = reader.read_frames_muted(128).expect("read");
+        assert!(!ok);
+        assert_eq!(b, [0i32; 128]);
+        // Seek back inside the (cached, muted) corrupt set: the CRC
+        // verdict is re-reported, not lost with the cache hit.
+        reader.seek(130).expect("seek");
+        let (c, ok) = reader.read_frames_muted(10).expect("read");
+        assert!(!ok);
+        assert_eq!(c, [0i32; 10]);
+        // A plain read over the same corrupt set must NOT be served
+        // from the muted cache (the plain decode still yields the
+        // block's decoded samples — CRC is not consulted).
+        reader.seek(128).expect("seek");
+        let plain = reader.read_frames(128).expect("plain read");
+        assert_eq!(plain, pcm[128..256]);
+        // And a muted read after the plain one re-decodes rather than
+        // serving the plain cache.
+        reader.seek(128).expect("seek");
+        let (again, ok) = reader.read_frames_muted(128).expect("read");
+        assert!(!ok);
+        assert_eq!(again, [0i32; 128]);
+        // Cross-mode cache reuse on a CLEAN set is allowed: a muted
+        // read of set 3 then a plain re-read of the same frames.
+        reader.seek(256).expect("seek");
+        let (clean, ok) = reader.read_frames_muted(128).expect("read");
+        assert!(ok);
+        assert_eq!(clean, pcm[256..384]);
+        reader.seek(256).expect("seek");
+        assert_eq!(reader.read_frames(128).expect("read"), pcm[256..384]);
+    }
+
+    #[test]
+    fn reader_failed_read_resumes_at_first_unconsumed_frame() {
+        // Two blocks; truncate the buffer inside the second so its
+        // decode fails, then verify the cursor lands at the set
+        // boundary and the intact prefix was consumable.
+        let pcm = mono_pcm(200);
+        let wv = encode_stream_mono(&pcm, 100, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+        let short = &wv[..wv.len() - 4];
+        let mut reader =
+            StreamReader::with_index(short, index).expect("reader over truncated buffer");
+        // Read across both sets: fails on the second.
+        assert!(reader.read_frames(150).is_err());
+        // Nothing was returned; cursor did not advance past the first
+        // set — retry semantics from frame 0.
+        assert_eq!(reader.position(), 0);
+        // Reading only the intact set succeeds.
+        let got = reader.read_frames(100).expect("read intact set");
+        assert_eq!(got, pcm[..100]);
+        assert_eq!(reader.position(), 100);
     }
 
     #[test]
