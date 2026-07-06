@@ -822,6 +822,7 @@ mod metadata;
 mod overflow_bits;
 mod packed_samples;
 mod samples;
+mod seek;
 
 pub use crate::block::{
     audio_block_count, block_count, correction_block_count, correction_coverage,
@@ -891,6 +892,8 @@ pub use crate::metadata::{
 };
 pub use crate::overflow_bits::{expand_packed_overflow_bits, PackedOverflowBits};
 pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples, PackedSamples};
+pub use crate::seek::{IndexEntry, SetEntry, StreamIndex};
+
 pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
     decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy, decode_run_length,
