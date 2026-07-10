@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 408 — **float `SHIFT_SAME` + `EXCEPTIONS` decode — every
+  documented `0x08` profile shape now reconstructs.** Per the staged
+  `docs/audio/wavpack/spec/wavpack-sample-formats.md` §2.1–§2.2 (plus
+  round-408 black-box pins against reference-encoded probe files):
+  `SHIFT_SAME` reads a one-bit-per-non-zero-sample carrier from the
+  `0x0C` extension stream (`1` fills the vacated low-mantissa window
+  with ones, `0` with zeros; zero samples spend no bit), and
+  `EXCEPTIONS` decodes ±infinity / NaN samples from the bit-length-25
+  sentinel integer (`magnitude << float_shift == 1 << 24`, sign on the
+  normal sign path) plus a `0x0C` marker bit (`0` = infinity, `1` =
+  the 23-bit NaN mantissa payload LSB-first). `FloatInfo::is_supported`
+  is now always `true`; the `FloatShiftSame` / `FloatExceptions`
+  refusals are no longer raised (variants retained for API stability).
+  An `EXCEPTIONS`-capable block without a `0x0C` sub-block is accepted
+  until an exceptional sample actually needs payload bits. Seven new
+  reference-encoded fixtures (`foreign_float_shift_same`,
+  `foreign_float_shift_same_zeros`, `foreign_float_shift_ones`,
+  `foreign_float_exceptions`, `foreign_float_exc_stereo`,
+  `foreign_float_exc_tiny`, `foreign_float_exc_mix`) decode bit-exact
+  with both CRC gates passing, including exact NaN payload bits.
+
+### Fixed
+
+- Round 408 — **short `0x03` weights sub-blocks decode (wire-order
+  prefix rule).** Reference encoders emit `0x03` decorrelation-weights
+  payloads shorter than the pass list (observed black-box: two weight
+  bytes for a five-term stack); `assemble_mono_passes` /
+  `assemble_stereo_passes` previously refused them with
+  `DecorrelationWeightCountMismatch`. A short payload now primes a
+  wire-order **prefix** of the passes and every later weight slot
+  starts at zero (the spec §3.6 "unspecified passes start at 0"
+  convention, mirroring the round-405 short-`0x04` seed-prefix rule);
+  over-long payloads remain malformed.
+
+### Added
+
 - Round 405 — **`wp_log2` / `wp_exp2s` log-domain conversions —
   foreign-file decode unblocked.** New `logpack` module implementing
   the staged `docs/audio/wavpack/spec/wavpack-log2-exp2.md` integer

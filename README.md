@@ -13,7 +13,7 @@ encoder on the write side. **Arbitrary reference-encoded lossless
 files decode bit-exactly** (round 405): 16/24/32-bit integer, 32-bit
 float, mono / stereo / multichannel, every standard encoder effort
 mode — validated black-box against the reference decoder on a
-19-fixture battery committed under `tests/data/`.
+26-fixture battery committed under `tests/data/` (rounds 405/408).
 
 Working surface:
 
@@ -286,10 +286,15 @@ Working surface:
   (mantissa, exponent, sign — `update_float_extension`), not the §5.5
   halfword formula (which holds for int32 only). Typed f32 surface:
   `WavPackBlock::is_float` / `decode_samples_f32` /
-  `decode_stream_f32`. Full-precision, integer-valued,
-  ±0 / denormal / >1.0 and `-h`-mode float files decode bit-exactly
-  with matching `crc_x`; `SHIFT_SAME` and `EXCEPTIONS` (inf/NaN)
-  profiles are typed refusals pending docs coverage.
+  `decode_stream_f32`. Every documented `0x08` profile shape decodes
+  (round 408): full-precision (`SHIFT_SENT`), integer-valued,
+  `SHIFT_ONES`, `SHIFT_SAME` (one-bit-per-non-zero-sample wvx
+  carrier; zero samples spend no bit), ±0 / denormal / >1.0,
+  `ZEROS_SENT`/`NEG_ZEROS`, and `EXCEPTIONS` — ±inf / NaN samples
+  ride a bit-length-25 sentinel integer plus a wvx marker bit (`0` =
+  infinity, `1` = the literal 23-bit NaN mantissa payload), pinned
+  black-box and bit-exact against the reference decoder including
+  exact NaN payload bits.
 * **Sample-rate surface + time-addressed seeking** — the staged §5
   standard-rate table (`STANDARD_SAMPLE_RATES` + `sample_rate_index_for`
   + `Flags::standard_sample_rate`) and the `0x27`
@@ -426,14 +431,11 @@ let frames = reader.read_frames(1024)?; // == window
 ## Not yet supported
 
 `WavPackBlock::decode_samples` refuses the following with a typed
-`Error::UnsupportedBlockFeature`: hybrid (lossy) blocks, low-latency
-block layouts, and two narrow float-profile shapes — `SHIFT_SAME`
-(`0x08` float_flags `0x02`; the staged spec does not say which value
-the identical shifted-in bits take) and `EXCEPTIONS` (`0x20`; the
-per-sample inf/NaN extension payload is not covered by the staged
-spec). **Float and 32-bit-int sample data are decoded** (round 405 —
-see the working-surface bullets), with the `crc_x` extension-CRC
-verdict wired into the §5.6 mute gate. **Multichannel members** are
+`Error::UnsupportedBlockFeature`: hybrid (lossy) blocks and
+low-latency block layouts. **Float and 32-bit-int sample data are
+decoded in full** (rounds 405/408 — every documented `0x08` /
+`0x09` profile shape, see the working-surface bullets), with the
+`crc_x` extension-CRC verdict wired into the §5.6 mute gate. **Multichannel members** are
 handled at stream level: `decode_samples` still refuses a grouped
 member (its per-block shape can't stitch the set), but
 `WavPackBlock::decode_member_samples` decodes one and

@@ -39,13 +39,35 @@
 //!    flag semantics but not the bit order; the layout here is pinned
 //!    black-box against reference-encoded probe files (round 405).
 //!
-//! Exponents at or beyond the IEEE maximum can only occur when
-//! `EXCEPTIONS` (`0x20`) is set (inf / NaN present); their per-sample
-//! extension payload is not covered by the staged spec and the decoder
-//! refuses the flag (see `UnsupportedBlockFeature::FloatExceptions`).
-//! `SHIFT_SAME` (`0x02` — "shifted-in low mantissa bits are all
-//! identical") does not say *which* value the bits share; it is
-//! likewise refused pending a docs clarification.
+//! ## `SHIFT_SAME` (staged spec §2.1, round 408)
+//!
+//! `SHIFT_SAME` (`0x02`) means the vacated low mantissa bits are all
+//! identical *within* each sample but the shared value *varies* from
+//! sample to sample: each non-zero sample with a non-empty vacated
+//! window reads **one carrier bit** from the `0x0C` extension stream —
+//! `1` fills the window with ones, `0` with zeros. Zero samples spend
+//! no carrier bit (round-408 black-box pin: a stream interleaving
+//! exact zeros carries exactly one wvx bit per *non-zero* sample), and
+//! reference-encoded `SHIFT_SAME` blocks anchor `float_max_exp` one
+//! above the largest present exponent so every non-zero sample has a
+//! non-empty window.
+//!
+//! ## `EXCEPTIONS` (staged spec §2.2 + round-408 black-box pin)
+//!
+//! `EXCEPTIONS` (`0x20`) marks a block that carries infinities / NaNs.
+//! On the wire an exceptional sample's decoded integer magnitude
+//! reconstructs to bit length **25** after the static shift (the
+//! sentinel `magnitude << float_shift == 1 << 24`, one bit above the
+//! 24-bit mantissa window that anchors `float_max_exp`); its sign bit
+//! travels the normal §4.2 sign path. The `0x0C` extension stream then
+//! carries, per exceptional sample, one **marker bit**: `0` ⇒ the
+//! mantissa is zero (`±infinity`), `1` ⇒ the full 23-bit NaN mantissa
+//! payload follows LSB-first. The reconstructed exponent is the IEEE
+//! maximum `0xFF`. (The staged spec's §2.2 wording reads the 23-bit
+//! mantissa unconditionally and pins `float_max_exp` at `0xFF`;
+//! round-408 black-box probes show the marker bit and show
+//! `float_max_exp` anchoring the *finite* samples — reported back as a
+//! docs erratum ask.)
 //!
 //! ## The float extension CRC (round-405 erratum)
 //!
@@ -80,7 +102,9 @@ pub const FLOAT_INFO_PAYLOAD_BYTES: usize = 4;
 /// `float_flags` bit `0x01` — shifted-in low mantissa bits are `1`.
 pub const FLOAT_SHIFT_ONES: u8 = 0x01;
 /// `float_flags` bit `0x02` — shifted-in low mantissa bits are all
-/// identical (value source undocumented; refused).
+/// identical within each sample; the shared value is a one-bit-per-
+/// non-zero-sample carrier in the `0x0C` extension stream (staged
+/// spec §2.1).
 pub const FLOAT_SHIFT_SAME: u8 = 0x02;
 /// `float_flags` bit `0x04` — shifted-in low mantissa bits are sent in
 /// the `0x0C` extension stream.
@@ -89,8 +113,10 @@ pub const FLOAT_SHIFT_SENT: u8 = 0x04;
 pub const FLOAT_ZEROS_SENT: u8 = 0x08;
 /// `float_flags` bit `0x10` — negative zeros occur and are preserved.
 pub const FLOAT_NEG_ZEROS: u8 = 0x10;
-/// `float_flags` bit `0x20` — exceptional exponents (inf / NaN) can
-/// occur (refused; per-sample layout undocumented).
+/// `float_flags` bit `0x20` — exceptional values (inf / NaN) occur;
+/// each is a bit-length-25 sentinel integer whose mantissa payload is
+/// carried in the `0x0C` extension stream (staged spec §2.2 +
+/// round-408 black-box pin, see the module doc).
 pub const FLOAT_EXCEPTIONS: u8 = 0x20;
 
 /// Typed expansion of the `0x08` floating-point profile.
@@ -110,18 +136,26 @@ pub struct FloatInfo {
 }
 
 impl FloatInfo {
-    /// `true` when the profile needs the `0x0C` extension stream
-    /// (literal mantissa bits and/or literal zero samples).
+    /// `true` when the profile needs the `0x0C` extension stream on
+    /// every applicable sample (literal mantissa bits, per-sample
+    /// carrier bits, and/or literal zero samples). `EXCEPTIONS` is
+    /// deliberately *not* included: an exceptions-capable profile only
+    /// touches the stream when an exceptional sample actually occurs,
+    /// so its absence is not structural (the per-sample read errors if
+    /// an exception arrives with no stream).
     #[must_use]
     pub fn requires_extension(&self) -> bool {
-        self.float_flags & (FLOAT_SHIFT_SENT | FLOAT_ZEROS_SENT) != 0
+        self.float_flags & (FLOAT_SHIFT_SENT | FLOAT_SHIFT_SAME | FLOAT_ZEROS_SENT) != 0
     }
 
     /// `true` when the profile only uses coding shapes the staged spec
-    /// pins down (everything except `SHIFT_SAME` and `EXCEPTIONS`).
+    /// pins down. Since round 408 (staged spec §2.1–§2.2 + black-box
+    /// pins) every documented `float_flags` shape decodes, so this is
+    /// always `true`; the method is kept for callers written against
+    /// the earlier `SHIFT_SAME` / `EXCEPTIONS` refusals.
     #[must_use]
     pub fn is_supported(&self) -> bool {
-        self.float_flags & (FLOAT_SHIFT_SAME | FLOAT_EXCEPTIONS) == 0
+        true
     }
 }
 
@@ -216,9 +250,24 @@ fn reassemble_one(integer: i32, info: &FloatInfo, ext: Option<&mut BitReader<'_>
     let value = magnitude.wrapping_shl(u32::from(info.float_shift));
     let bit_length = 32 - value.leading_zeros();
     if bit_length > 24 {
-        // The scaled integer overflows the 24-bit mantissa window —
-        // a conformant encoder never produces this (float_max_exp
-        // anchors the largest magnitude at exactly 24 bits).
+        // One bit above the 24-bit mantissa window is the EXCEPTIONS
+        // sentinel (module doc): the sample is an infinity or a NaN
+        // whose mantissa payload lives in the extension stream — one
+        // marker bit, then (marker == 1) the 23-bit NaN mantissa
+        // LSB-first. The sign travelled the normal sign path.
+        if info.float_flags & FLOAT_EXCEPTIONS != 0 && bit_length == 25 {
+            let reader = ext.ok_or(Error::BlockMissingOverflowBits)?;
+            let mantissa = if reader.get_bit()? == 1 {
+                reader.get_bits(23)?
+            } else {
+                0
+            };
+            return Ok(sign | (0xFFu32 << 23) | mantissa);
+        }
+        // Otherwise the scaled integer overflows the 24-bit mantissa
+        // window — a conformant encoder never produces this
+        // (float_max_exp anchors the largest finite magnitude at
+        // exactly 24 bits).
         return Err(Error::FloatMagnitudeOverflow(value));
     }
     let shift_needed = 24 - bit_length;
@@ -238,6 +287,16 @@ fn reassemble_one(integer: i32, info: &FloatInfo, ext: Option<&mut BitReader<'_>
         reader.get_bits(shift_needed)?
     } else if info.float_flags & FLOAT_SHIFT_ONES != 0 {
         (1u32 << shift_needed) - 1
+    } else if info.float_flags & FLOAT_SHIFT_SAME != 0 {
+        // Staged spec §2.1: one carrier bit per non-zero sample —
+        // `1` fills the vacated window with ones, `0` with zeros.
+        // (§2.1 precedence: SENT wins over ONES wins over SAME.)
+        let reader = ext.ok_or(Error::BlockMissingOverflowBits)?;
+        if reader.get_bit()? == 1 {
+            (1u32 << shift_needed) - 1
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -282,16 +341,22 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_flag_shapes_are_reported() {
-        assert!(!info(FLOAT_SHIFT_SAME, 0, 126, 127).is_supported());
-        assert!(!info(FLOAT_EXCEPTIONS, 0, 126, 127).is_supported());
-        assert!(info(
-            FLOAT_SHIFT_SENT | FLOAT_ZEROS_SENT | FLOAT_NEG_ZEROS,
+    fn every_documented_flag_shape_is_supported() {
+        // Round 408: SHIFT_SAME (§2.1) and EXCEPTIONS (§2.2) decode,
+        // so no profile shape is refused any more.
+        for flags in [
             0,
-            126,
-            127
-        )
-        .is_supported());
+            FLOAT_SHIFT_SAME,
+            FLOAT_EXCEPTIONS,
+            FLOAT_SHIFT_SENT | FLOAT_ZEROS_SENT | FLOAT_NEG_ZEROS | FLOAT_EXCEPTIONS,
+        ] {
+            assert!(info(flags, 0, 126, 127).is_supported(), "flags {flags:#x}");
+        }
+        // SHIFT_SAME reads its per-sample carrier from the extension
+        // stream, so it requires one; EXCEPTIONS alone does not (the
+        // stream is only touched when an exceptional sample occurs).
+        assert!(info(FLOAT_SHIFT_SAME, 0, 126, 127).requires_extension());
+        assert!(!info(FLOAT_EXCEPTIONS, 0, 126, 127).requires_extension());
     }
 
     #[test]
@@ -380,6 +445,99 @@ mod tests {
         reassemble_float(&mut pcm, &fi, Some(&mut reader)).unwrap();
         assert_eq!(pcm, [0, 0]);
         assert_eq!(reader.bits_consumed(), 2);
+    }
+
+    #[test]
+    fn shift_same_carrier_bit_selects_all_ones_or_all_zeros() {
+        // §2.1: one carrier bit per non-zero sample fills the vacated
+        // window — 1 = ones, 0 = zeros. Zero samples spend no bit.
+        let fi = info(FLOAT_SHIFT_SAME, 0, 126, 127);
+        // Samples: 1<<20 (3 vacated bits, carrier 1), 0 (no bit),
+        // 1<<22 (1 vacated bit, carrier 0), 1<<23 (0 vacated bits —
+        // no bit read; reference streams anchor max_exp one above the
+        // largest exponent so this is the boundary case).
+        let wire = [0b01u8]; // bit0 = 1 (first sample), bit1 = 0 (third)
+        let mut reader = BitReader::new(&wire);
+        let mut pcm = [1i32 << 20, 0, 1 << 22, 1 << 23];
+        reassemble_float(&mut pcm, &fi, Some(&mut reader)).unwrap();
+        assert_eq!(pcm[0] as u32 & 0x7, 0x7, "carrier 1 fills with ones");
+        assert_eq!(pcm[1], 0, "zero sample is implied +0.0");
+        assert_eq!(pcm[2] as u32 & 0x1, 0, "carrier 0 fills with zeros");
+        assert_eq!((pcm[3] as u32 >> 23) & 0xFF, 126, "full-window sample");
+        assert_eq!(
+            reader.bits_consumed(),
+            2,
+            "exactly one bit per fillable sample"
+        );
+    }
+
+    #[test]
+    fn shift_same_without_a_stream_is_refused() {
+        let fi = info(FLOAT_SHIFT_SAME, 0, 126, 127);
+        let mut pcm = [1i32 << 20];
+        assert_eq!(
+            reassemble_float(&mut pcm, &fi, None),
+            Err(Error::BlockMissingOverflowBits)
+        );
+    }
+
+    #[test]
+    fn exceptions_sentinel_reads_marker_and_nan_mantissa() {
+        // §2.2 + round-408 pin: bit-length-25 sentinel = exceptional;
+        // wvx marker 0 = infinity, 1 = 23-bit NaN mantissa LSB-first.
+        let fi = info(FLOAT_EXCEPTIONS, 0, 126, 127);
+        // Wire: marker 0 (+inf), marker 0 (-inf), marker 1 + 0x155555.
+        let mut bits = vec![0u8, 0, 1];
+        bits.extend((0..23).map(|k| ((0x155555u32 >> k) & 1) as u8));
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            bytes[i / 8] |= b << (i % 8);
+        }
+        let mut reader = BitReader::new(&bytes);
+        let mut pcm = [1i32 << 24, -(1i32 << 24), 1 << 24, 16384];
+        reassemble_float(&mut pcm, &fi, Some(&mut reader)).unwrap();
+        assert_eq!(pcm[0] as u32, 0x7F80_0000, "+infinity");
+        assert_eq!(pcm[1] as u32, 0xFF80_0000, "-infinity (normal sign path)");
+        assert_eq!(pcm[2] as u32, 0x7F95_5555, "NaN payload preserved");
+        // A finite sample in the same block still reconstructs
+        // normally (16384 → bit_length 15 → denormal-free path).
+        assert_eq!((pcm[3] as u32 >> 23) & 0xFF, 117, "finite exponent anchor");
+    }
+
+    #[test]
+    fn exceptions_respect_the_static_shift_in_the_sentinel() {
+        // The sentinel is 1 << 24 *after* the static shift: with
+        // float_shift = 23 the on-wire integer is ±2 (round-408 pin).
+        let fi = info(FLOAT_EXCEPTIONS, 23, 126, 127);
+        let bytes = [0b0u8];
+        let mut reader = BitReader::new(&bytes);
+        let mut pcm = [2i32];
+        reassemble_float(&mut pcm, &fi, Some(&mut reader)).unwrap();
+        assert_eq!(pcm[0] as u32, 0x7F80_0000);
+    }
+
+    #[test]
+    fn exception_without_a_stream_is_refused() {
+        let fi = info(FLOAT_EXCEPTIONS, 0, 126, 127);
+        let mut pcm = [1i32 << 24];
+        assert_eq!(
+            reassemble_float(&mut pcm, &fi, None),
+            Err(Error::BlockMissingOverflowBits)
+        );
+    }
+
+    #[test]
+    fn deep_overflow_is_still_refused_with_exceptions_set() {
+        // Only bit length exactly 25 is the sentinel; deeper overflow
+        // is malformed even on an EXCEPTIONS-capable profile.
+        let fi = info(FLOAT_EXCEPTIONS, 0, 126, 127);
+        let bytes = [0u8];
+        let mut reader = BitReader::new(&bytes);
+        let mut pcm = [1i32 << 26];
+        assert_eq!(
+            reassemble_float(&mut pcm, &fi, Some(&mut reader)),
+            Err(Error::FloatMagnitudeOverflow(1u32 << 26))
+        );
     }
 
     #[test]

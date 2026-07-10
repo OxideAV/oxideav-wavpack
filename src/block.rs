@@ -114,17 +114,21 @@ pub enum UnsupportedBlockFeature {
     /// **No longer raised by [`WavPackBlock::decode_samples`]** (round
     /// 405): float blocks are decoded via the `0x08` profile + `0x0C`
     /// extension fixup (staged spec `wavpack-sample-formats.md` §2/§4).
-    /// Retained as a public variant for API stability; only the two
-    /// narrower float refusals below are still raised.
+    /// Retained as a public variant for API stability.
     FloatData,
-    /// A float block's `0x08` profile carries `SHIFT_SAME` (`0x02` —
-    /// "shifted-in low mantissa bits are all identical"): the staged
-    /// spec does not say which value the identical bits take, so the
-    /// reconstruction is refused pending a docs clarification.
+    /// A float block's `0x08` profile carries `SHIFT_SAME` (`0x02`).
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** (round
+    /// 408): the per-non-zero-sample one-bit carrier in the `0x0C`
+    /// extension stream is decoded per staged spec §2.1. Retained as a
+    /// public variant for API stability.
     FloatShiftSame,
-    /// A float block's `0x08` profile carries `EXCEPTIONS` (`0x20` —
-    /// inf / NaN can occur): the per-sample extension payload of an
-    /// exceptional value is not covered by the staged spec.
+    /// A float block's `0x08` profile carries `EXCEPTIONS` (`0x20`).
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** (round
+    /// 408): inf / NaN samples are decoded via the bit-length-25
+    /// sentinel + `0x0C` marker/mantissa payload (staged spec §2.2 +
+    /// black-box pin). Retained as a public variant for API stability.
     FloatExceptions,
     /// Wiki bit 8 ("int32 mode") is set.
     ///
@@ -1237,40 +1241,40 @@ impl<'a> WavPackBlock<'a> {
     }
 
     /// The float half of [`Self::apply_sample_format_fixups`] (staged
-    /// spec `wavpack-sample-formats.md` §2): expand the mandatory
-    /// `0x08` profile, refuse the two undocumented coding shapes
-    /// (`SHIFT_SAME`, `EXCEPTIONS`), and rebuild each scaled integer
-    /// into its IEEE-754 bit pattern — reading literal mantissa bits /
-    /// literal zeros from the `0x0C` extension stream when the profile
+    /// spec `wavpack-sample-formats.md` §2, §2.1–§2.3): expand the
+    /// mandatory `0x08` profile and rebuild each scaled integer into
+    /// its IEEE-754 bit pattern — reading literal mantissa bits /
+    /// `SHIFT_SAME` carrier bits / literal zeros / exception mantissa
+    /// payloads from the `0x0C` extension stream when the profile
     /// sent them.
+    ///
+    /// A `0x0C` sub-block is demanded up front only for the profile
+    /// shapes that read it on every applicable sample
+    /// ([`crate::FloatInfo::requires_extension`]); an
+    /// `EXCEPTIONS`-capable block without one is accepted until an
+    /// exceptional sample actually needs a payload bit (the per-sample
+    /// read then raises [`Error::BlockMissingOverflowBits`]).
     fn apply_float_fixup(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
         let info_sub = self
             .find_sub_block(SubBlockId::FloatInfo)
             .ok_or(Error::BlockMissingFloatInfo)?;
         let info = crate::float::expand_float_info(info_sub.payload)?;
-        if info.float_flags & crate::float::FLOAT_SHIFT_SAME != 0 {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::FloatShiftSame,
-            ));
+        let overflow = self.packed_overflow_bits();
+        if info.requires_extension() && overflow.is_none() {
+            return Err(Error::BlockMissingOverflowBits);
         }
-        if info.float_flags & crate::float::FLOAT_EXCEPTIONS != 0 {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::FloatExceptions,
-            ));
-        }
-        if info.requires_extension() {
-            let overflow = self
-                .packed_overflow_bits()
-                .ok_or(Error::BlockMissingOverflowBits)?;
-            let stored = overflow.crc_wvx()?;
-            let mut reader = overflow.extension_bit_reader()?;
-            let computed = crate::float::reassemble_float(pcm, &info, Some(&mut reader))?;
-            Ok(Some((computed, stored)))
-        } else {
-            let computed = crate::float::reassemble_float(pcm, &info, None)?;
-            match self.packed_overflow_bits() {
-                Some(overflow) => Ok(Some((computed, overflow.crc_wvx()?))),
-                None => Ok(None),
+        match overflow {
+            Some(overflow) => {
+                let stored = overflow.crc_wvx()?;
+                let mut reader = overflow.extension_bit_reader()?;
+                let computed = crate::float::reassemble_float(pcm, &info, Some(&mut reader))?;
+                Ok(Some((computed, stored)))
+            }
+            None => {
+                // No 0x0C on the wire: reassemble (the fold still runs;
+                // its crc_x register has no stored twin to compare).
+                crate::float::reassemble_float(pcm, &info, None)?;
+                Ok(None)
             }
         }
     }
@@ -3658,23 +3662,119 @@ mod tests {
         assert_eq!(err, Error::BlockMissingFloatInfo);
     }
 
-    #[test]
-    fn decode_samples_float_refuses_the_undocumented_profile_shapes() {
-        // SHIFT_SAME (0x02) and EXCEPTIONS (0x20) have no documented
-        // reconstruction; each is a typed refusal.
-        for (flag_bit, feature) in [
-            (0x02u8, UnsupportedBlockFeature::FloatShiftSame),
-            (0x20u8, UnsupportedBlockFeature::FloatExceptions),
-        ] {
-            let mut payload = Vec::new();
-            append_entropy_info_mono_zero(&mut payload);
-            append_small_sub_block(&mut payload, 0x08, &[flag_bit, 0, 126, 127]);
-            append_packed_samples(&mut payload, &[0x00, 0x00]);
-            let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 7)), &payload);
-            let (block, _) = parse_block(&bytes).expect("parse block");
-            let err = block.decode_samples().expect_err("must refuse");
-            assert_eq!(err, Error::UnsupportedBlockFeature(feature));
+    /// Build a one-sample float block: `0x05` zero medians, the given
+    /// `0x08` profile, the entropy-coded `sample`, and (when non-empty)
+    /// a `0x0C` extension sub-block whose 4-byte `crc_wvx` prefix is
+    /// the caller's expected extension-CRC register.
+    fn synthesise_float_block(
+        profile: [u8; 4],
+        sample: i32,
+        wvx_bits: &[u8],
+        crc_wvx: u32,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_small_sub_block(&mut payload, 0x08, &profile);
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
+        let mut enc_medians =
+            crate::samples::AdaptiveMedians::from_entropy(&info_block, 0).expect("medians");
+        let packed = crate::samples::encode_packed_samples_mono(&[sample], &mut enc_medians)
+            .expect("encode");
+        append_packed_samples(&mut payload, &packed);
+        if !wvx_bits.is_empty() {
+            let mut wvx = crc_wvx.to_le_bytes().to_vec();
+            let mut writer = crate::samples::BitWriter::new();
+            for &bit in wvx_bits {
+                writer.write_bits(u32::from(bit), 1);
+            }
+            wvx.extend_from_slice(&writer.finish());
+            if wvx.len() % 2 != 0 {
+                wvx.push(0);
+            }
+            append_small_sub_block(&mut payload, 0x0C, &wvx);
         }
+        let crc = crate::crc::crc_mono(&[sample]);
+        let mut bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 7)), &payload);
+        bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decode_samples_float_shift_same_reads_the_one_bit_carrier() {
+        // Round 408 (staged spec §2.1): SHIFT_SAME fills the vacated
+        // low mantissa window from a one-bit-per-non-zero-sample wvx
+        // carrier — `1` = all ones. Integer 1<<20 → bit_length 21 →
+        // 3 vacated bits → mantissa low bits 0b111, exponent 123.
+        let profile = [0x02u8, 0, 126, 127];
+        let info = crate::float::expand_float_info(&profile).expect("profile");
+        let mut probe = [1i32 << 20];
+        let mut reader = crate::samples::BitReader::new(&[0x01]);
+        let crc_wvx = crate::float::reassemble_float(&mut probe, &info, Some(&mut reader))
+            .expect("reassemble");
+        let expected_pattern = probe[0];
+        assert_eq!(expected_pattern as u32 & 0x7, 0x7, "carrier 1 = ones");
+        assert_eq!((expected_pattern as u32 >> 23) & 0xFF, 123);
+
+        let bytes = synthesise_float_block(profile, 1 << 20, &[1], crc_wvx);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(
+            block.decode_samples().expect("decode"),
+            vec![expected_pattern]
+        );
+        let (pcm, ok) = block.decode_samples_muted().expect("muted");
+        assert!(ok, "main + extension CRCs must both pass");
+        assert_eq!(pcm, vec![expected_pattern]);
+    }
+
+    #[test]
+    fn decode_samples_float_exceptions_reconstruct_inf_and_nan() {
+        // Round 408 (staged spec §2.2 + black-box pin): an exceptional
+        // sample is the bit-length-25 sentinel integer (1 << 24 after
+        // the static shift); wvx carries one marker bit (0 = infinity)
+        // + 23 NaN mantissa bits when set. Sign travels the normal
+        // sign path (negative integer → negative exceptional value).
+        for (integer, wvx_bits, expect) in [
+            // +infinity: marker 0.
+            (1i32 << 24, vec![0u8], 0x7F80_0000u32),
+            // -infinity: negative sentinel, marker 0.
+            (-(1i32 << 24), vec![0u8], 0xFF80_0000u32),
+            // NaN payload 0x155555: marker 1 + 23 mantissa bits LSB-first.
+            (
+                1i32 << 24,
+                {
+                    let mut v = vec![1u8];
+                    v.extend((0..23).map(|k| ((0x155555u32 >> k) & 1) as u8));
+                    v
+                },
+                0x7F95_5555u32,
+            ),
+        ] {
+            let profile = [0x20u8, 0, 126, 127];
+            let crc_wvx = crate::float::update_float_extension(crate::crc::CRC_INIT, expect);
+            let bytes = synthesise_float_block(profile, integer, &wvx_bits, crc_wvx);
+            let (block, _) = parse_block(&bytes).expect("parse block");
+            assert_eq!(
+                block.decode_samples().expect("decode"),
+                vec![expect as i32],
+                "pattern for integer {integer}"
+            );
+            let (pcm, ok) = block.decode_samples_muted().expect("muted");
+            assert!(ok, "main + extension CRCs must both pass");
+            assert_eq!(pcm, vec![expect as i32]);
+        }
+    }
+
+    #[test]
+    fn decode_samples_float_exception_without_wvx_is_a_typed_error() {
+        // An EXCEPTIONS-capable block is accepted without a 0x0C
+        // sub-block — until an exceptional sample actually needs its
+        // payload bits.
+        let bytes = synthesise_float_block([0x20u8, 0, 126, 127], 1 << 24, &[], 0);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(
+            block.decode_samples().expect_err("payload bits missing"),
+            Error::BlockMissingOverflowBits
+        );
     }
 
     #[test]

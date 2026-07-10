@@ -41,6 +41,13 @@
 //! | `foreign_float_zeros_mono`     | default      | 32-bit float mono with ±0 (`SHIFT_SENT\|ZEROS_SENT\|NEG_ZEROS`) |
 //! | `foreign_float_stereo`         | default      | 32-bit float stereo, >1.0 amplitudes + denormals + ±0 |
 //! | `foreign_float_high_mono`      | `-h`         | 32-bit float mono, full precision |
+//! | `foreign_float_shift_same`     | default      | 32-bit float mono, `SHIFT_SAME` one-bit carrier (round 408) |
+//! | `foreign_float_shift_same_zeros` | default    | `SHIFT_SAME` interleaved with exact zeros (no carrier bit on zeros) |
+//! | `foreign_float_shift_ones`     | default      | 32-bit float mono, `SHIFT_ONES` (no `0x0C` stream) |
+//! | `foreign_float_exceptions`     | default      | `EXCEPTIONS\|SHIFT_SENT` — scattered ±inf / NaN payloads |
+//! | `foreign_float_exc_stereo`     | default      | stereo `EXCEPTIONS\|SHIFT_SENT\|ZEROS_SENT\|NEG_ZEROS` combo |
+//! | `foreign_float_exc_tiny`       | default      | 64-sample `EXCEPTIONS` + short `0x03` weights prefix |
+//! | `foreign_float_exc_mix`        | default      | `EXCEPTIONS` with `float_shift = 1` sentinel scaling |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -141,6 +148,17 @@ foreign_fixture!(float_mono_is_bit_exact, "foreign_float_mono", 1);
 foreign_fixture!(float_zeros_mono_is_bit_exact, "foreign_float_zeros_mono", 1);
 foreign_fixture!(float_stereo_is_bit_exact, "foreign_float_stereo", 2);
 foreign_fixture!(float_high_mono_is_bit_exact, "foreign_float_high_mono", 1);
+foreign_fixture!(float_shift_same_is_bit_exact, "foreign_float_shift_same", 1);
+foreign_fixture!(
+    float_shift_same_zeros_is_bit_exact,
+    "foreign_float_shift_same_zeros",
+    1
+);
+foreign_fixture!(float_shift_ones_is_bit_exact, "foreign_float_shift_ones", 1);
+foreign_fixture!(float_exceptions_is_bit_exact, "foreign_float_exceptions", 1);
+foreign_fixture!(float_exc_stereo_is_bit_exact, "foreign_float_exc_stereo", 2);
+foreign_fixture!(float_exc_tiny_is_bit_exact, "foreign_float_exc_tiny", 1);
+foreign_fixture!(float_exc_mix_is_bit_exact, "foreign_float_exc_mix", 1);
 
 /// A corrupted foreign block must trip the CRC mute gate, not decode to
 /// wrong PCM silently: flip one payload bit deep inside the first
@@ -242,6 +260,42 @@ fn corrupted_int32_extension_bits_fail_the_crc_x_gate() {
         assert!(!all_ok, "extension-bit corruption must fail the gate");
         assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
     }
+}
+
+/// The round-408 exception fixtures must reproduce genuine IEEE
+/// specials — including a NaN whose exact payload bits survive — and
+/// the tiny fixture pins the short-`0x03`-weights wire-order-prefix
+/// rule (2 weight bytes for a 5-term stack) through the stored block
+/// CRC.
+#[test]
+fn foreign_exception_fixtures_reproduce_ieee_specials() {
+    let floats =
+        oxideav_wavpack::decode_stream_f32(include_bytes!("data/foreign_float_exceptions.wv"))
+            .expect("f32 decode");
+    assert!(floats
+        .iter()
+        .any(|f| f.is_infinite() && f.is_sign_positive()));
+    assert!(floats
+        .iter()
+        .any(|f| f.is_infinite() && f.is_sign_negative()));
+    assert!(floats.iter().any(|f| f.is_nan()));
+
+    // exc_tiny: 0.5 everywhere except +inf / NaN(0x155555) / -inf.
+    let tiny = oxideav_wavpack::decode_stream_f32(include_bytes!("data/foreign_float_exc_tiny.wv"))
+        .expect("f32 decode");
+    assert_eq!(tiny.len(), 64);
+    assert_eq!(tiny[10], f32::INFINITY);
+    assert_eq!(
+        tiny[20].to_bits(),
+        0x7F95_5555,
+        "NaN payload bits preserved"
+    );
+    assert_eq!(tiny[30], f32::NEG_INFINITY);
+    assert!(tiny
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| ![10, 20, 30].contains(i))
+        .all(|(_, &f)| f == 0.5));
 }
 
 /// The typed f32 surface reinterprets a float stream's decoded bit

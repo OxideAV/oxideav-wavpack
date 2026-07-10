@@ -1278,8 +1278,11 @@ pub fn recorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
 ///   a mono block (spec §2.1 rejects negative terms for mono).
 /// * [`Error::TooManyDecorrelationPasses`] — more than [`MAX_NTERMS`]
 ///   terms.
-/// * [`Error::DecorrelationWeightCountMismatch`] — the `0x03` payload did
-///   not carry exactly one weight per term.
+/// * [`Error::DecorrelationWeightCountMismatch`] — the `0x03` payload
+///   carries MORE than one weight per term. (A *shorter* payload is
+///   legal: it primes a wire-order prefix of the passes and the rest
+///   start from zero weight — round 408, mirroring the `0x04` seed
+///   prefix rule.)
 /// * [`Error::DecorrelationSamplesOddByteCount`] — the `0x04` payload has
 ///   an odd byte length.
 /// * [`Error::DecorrelationSampleCountMismatch`] — the `0x04` seed count
@@ -1320,18 +1323,26 @@ pub fn assemble_mono_passes(
         return Err(Error::TooManyDecorrelationPasses(terms.len()));
     }
 
-    // Mono: exactly one weight per pass (spec §3.6 / wiki "one or two
-    // weights depending on channels").
-    let weights: Vec<i32> = weights_payload
+    // Mono: one weight per pass (spec §3.6 / wiki "one or two weights
+    // depending on channels"). Like the `0x04` seeds below, a SHORT
+    // `0x03` payload is legal and primes a wire-order **prefix** of
+    // the passes; every pass beyond the stored bytes starts from the
+    // §3.6 "unspecified passes start at 0" zero weight. (Round 408,
+    // pinned black-box: reference-encoded files carry two weight
+    // bytes for a five-term stack, and the stored block CRC only
+    // matches with the front-prefix / zero-remainder fill.) MORE
+    // weights than terms remains malformed.
+    let mut weights: Vec<i32> = weights_payload
         .iter()
         .map(|&b| expand_weight_byte(b))
         .collect();
-    if weights.len() != terms.len() {
+    if weights.len() > terms.len() {
         return Err(Error::DecorrelationWeightCountMismatch {
             expected: terms.len(),
             actual: weights.len(),
         });
     }
+    weights.resize(terms.len(), 0);
 
     // Expand and partition the seed samples per term, in wire order.
     // The payload primes a wire-order **prefix** of the passes: real
@@ -1426,8 +1437,11 @@ pub fn assemble_mono_passes(
 /// * [`Error::InvalidDecorrelationTerm`] — a term byte decodes outside
 ///   the spec valid set `{1..8, 17, 18, -1, -2, -3}`.
 /// * [`Error::TooManyDecorrelationPasses`] — more than [`MAX_NTERMS`].
-/// * [`Error::DecorrelationWeightCountMismatch`] — the `0x03` payload did
-///   not carry exactly `2 * nterms` weight bytes.
+/// * [`Error::DecorrelationWeightCountMismatch`] — the `0x03` payload
+///   carries MORE than `2 * nterms` weight bytes. (A *shorter* payload
+///   is legal: it primes a wire-order prefix of the per-pass A/B
+///   weight pairs and the remaining slots start from zero weight —
+///   round 408, mirroring the `0x04` seed prefix rule.)
 /// * [`Error::DecorrelationSamplesOddByteCount`] — the `0x04` payload has
 ///   an odd byte length.
 /// * [`Error::DecorrelationSampleCountMismatch`] — the `0x04` seed count
@@ -1463,17 +1477,24 @@ pub fn assemble_stereo_passes(
     }
 
     // Stereo: two weights per pass (channel A then channel B within a
-    // pass) per spec §3.6 "one signed byte per pass per channel".
-    let weights: Vec<i32> = weights_payload
+    // pass) per spec §3.6 "one signed byte per pass per channel". As
+    // on the mono side (round 408), a SHORT payload primes a
+    // wire-order prefix of the per-pass A/B pairs and the remaining
+    // slots start from the §3.6 zero weight; more weights than
+    // `2 * nterms` remains malformed. A payload that stops inside a
+    // pass's A+B pair zero-fills that pass's B slot (the same
+    // slot-wise zero convention).
+    let mut weights: Vec<i32> = weights_payload
         .iter()
         .map(|&b| expand_weight_byte(b))
         .collect();
-    if weights.len() != terms.len() * 2 {
+    if weights.len() > terms.len() * 2 {
         return Err(Error::DecorrelationWeightCountMismatch {
             expected: terms.len() * 2,
             actual: weights.len(),
         });
     }
+    weights.resize(terms.len() * 2, 0);
 
     // Expand and partition the seed samples per pass. Each pass consumes
     // channel A's seeds (seed_count words) followed by channel B's seeds
@@ -3082,14 +3103,32 @@ mod tests {
     }
 
     #[test]
-    fn assemble_mono_rejects_weight_count_mismatch() {
+    fn assemble_mono_short_weights_prime_a_wire_order_prefix() {
+        // Round 408: a short 0x03 payload is legal — it primes a
+        // wire-order prefix of the passes, remaining weights zero
+        // (spec §3.6 "unspecified passes start at 0"; black-box pinned
+        // on reference-encoded files via the stored block CRC).
         let terms = vec![term_byte(1, 0), term_byte(2, 0)];
-        // Two terms, one weight. (Weight count is checked before seeds.)
+        let passes = assemble_mono_passes(&terms, &[5], &[]).unwrap();
+        assert_eq!(passes.len(), 2);
+        // Application order reverses the wire order: the stored weight
+        // belongs to the FIRST wire term (term 1), which is the LAST
+        // returned pass.
+        assert_eq!(passes[0].term, 2);
+        assert_eq!(passes[0].weight_a, 0, "unprimed pass starts at zero");
+        assert_eq!(passes[1].term, 1);
+        assert_eq!(passes[1].weight_a, expand_weight_byte(5));
+    }
+
+    #[test]
+    fn assemble_mono_rejects_excess_weights() {
+        // MORE weights than terms is still malformed.
+        let terms = vec![term_byte(1, 0), term_byte(2, 0)];
         assert_eq!(
-            assemble_mono_passes(&terms, &[5], &[]),
+            assemble_mono_passes(&terms, &[5, 6, 7], &[]),
             Err(Error::DecorrelationWeightCountMismatch {
                 expected: 2,
-                actual: 1,
+                actual: 3,
             })
         );
     }
@@ -3352,14 +3391,25 @@ mod tests {
     }
 
     #[test]
-    fn assemble_stereo_rejects_weight_count_mismatch() {
-        // One term needs 2 weights; supply 1.
+    fn assemble_stereo_short_weights_prime_a_wire_order_prefix() {
+        // Round 408: one term's A weight supplied, B (and everything
+        // after) starts at zero — the slot-wise §3.6 zero convention.
+        let terms = vec![term_byte(1, 0)];
+        let passes = assemble_stereo_passes(&terms, &[5], &[]).unwrap();
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].weight_a, expand_weight_byte(5));
+        assert_eq!(passes[0].weight_b, 0);
+    }
+
+    #[test]
+    fn assemble_stereo_rejects_excess_weights() {
+        // MORE than 2 * nterms weights is still malformed.
         let terms = vec![term_byte(1, 0)];
         assert_eq!(
-            assemble_stereo_passes(&terms, &[5], &[]),
+            assemble_stereo_passes(&terms, &[5, 6, 7], &[]),
             Err(Error::DecorrelationWeightCountMismatch {
                 expected: 2,
-                actual: 1,
+                actual: 3,
             })
         );
     }
