@@ -472,13 +472,21 @@ silence stretch, mid/side + balance stereo, `-j0` left/right, 5.1,
 stored block CRC matching. False-stereo blocks (bit 30) now emit both
 duplicated output channels everywhere (a round-408 conformance fix).
 
-The documented correction *fold* arithmetic (`fold_hybrid_correction` /
-`split_hybrid_correction` / `CorrectionFold`) recovers lossless PCM
-from a coarse buffer plus a `0x0B` correction buffer in the
-post-decorrelation placement; wiring the paired `.wvc` stream through
-it end-to-end — including the `HYBRID_SHAPE` / `NEW_SHAPING`
-noise-shaped fold, whose `0x07` seed layout the staged docs name but
-do not transcribe — is the remaining hybrid gap.
+**Hybrid-lossless (`.wv` + `.wvc`) pairs decode end-to-end** for mono
+and left/right-coded stereo (round 408):
+`WavPackBlock::decode_samples_with_correction` /
+`decode_stream_with_correction` read the exact in-bracket offset from
+the `0x0B` correction stream (the same phase-in code as the lossless
+mantissa) and run the `0x07`-seeded noise-shaping filter
+(`ShapingState`: log-packed `[error, acc, (delta)]` seeds, the
+`-((weight*error + 511) >> 10)` temp term, the negative-weight
+unit-magnitude nudge, and the weight-sign-branched error update) —
+five pair fixtures reproduce the original encoder input bit-exactly
+across no-shaping / static / dynamic-noise-shaping encodes. The
+remaining hybrid gaps: **joint-stereo (mid/side) pairs** (typed
+`HybridJointCorrectionUnsupported` refusal — the correction/shaping
+interplay across the §5.4 transform is not yet pinned) and float /
+int32 hybrid pairs.
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged

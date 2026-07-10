@@ -2342,6 +2342,172 @@ pub fn decode_packed_samples_stereo_hybrid(
     Ok(out)
 }
 
+/// Spec §6.5 + §4.1 hybrid-lossless bracket completion: after the
+/// bracketing search narrows `[low, high]` to within `error_limit`,
+/// read the **exact** in-bracket offset from the `0x0B` correction
+/// stream with the same phase-in binary code the lossless mantissa
+/// uses (round-408 black-box pin), instead of taking the midpoint.
+///
+/// Returns `(exact_signed, coarse_signed, bracketed)`; the coarse
+/// value (the midpoint the lossy decode would emit) still drives the
+/// slow-level update and the shaping error state.
+fn decode_bracketed_pair(
+    interval: &SampleInterval,
+    reader: &mut BitReader<'_>,
+    wvc: &mut BitReader<'_>,
+    error_limit: u32,
+) -> Result<(i32, i32, bool)> {
+    if error_limit == 0 {
+        let v = interval.decode_signed_value(reader)?;
+        return Ok((v, v, false));
+    }
+    let mut low = interval.low;
+    let mut high = interval.high;
+    while high - low > error_limit {
+        let mid = (low + high + 1) >> 1;
+        if reader.get_bit()? == 1 {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let coarse_mid = (low + high + 1) >> 1;
+    let exact_mag = SampleInterval::new(low, high).decode_value(wvc)?;
+    let sign = reader.get_bit()?;
+    let (exact, coarse) = if sign == 1 {
+        (!(exact_mag as i32), !(coarse_mid as i32))
+    } else {
+        (exact_mag as i32, coarse_mid as i32)
+    };
+    Ok((exact, coarse, true))
+}
+
+/// Decode `count` mono samples of a hybrid `0x0A` payload **together
+/// with its `0x0B` correction stream**, recovering the lossless values
+/// (staged spec §4.1/§6.5; wire pins round 408).
+///
+/// Returns `(exact, coarse)` residual buffers: the caller decorrelates
+/// the **coarse** buffer (prediction history and weights adapt on the
+/// lossy values) and then folds `exact - coarse` into the output — the
+/// §4.1 post-decorrelation correction fold. `shaping` carries the
+/// `0x07`-seeded noise-shaping filter ([`crate::ShapingState`]).
+#[allow(clippy::type_complexity)]
+pub fn decode_packed_samples_mono_hybrid_lossless(
+    payload: &crate::PackedSamples<'_>,
+    correction: &crate::PackedCorrectionData<'_>,
+    medians: &mut AdaptiveMedians,
+    count: usize,
+    hybrid: &mut crate::HybridState,
+    shaping: &mut crate::ShapingState,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    let mut reader = payload.bit_reader();
+    let mut wvc = correction.bit_reader();
+    let mut state = DecodeState::new();
+    let floor = prealloc_floor(count, payload.len());
+    let mut exact = Vec::with_capacity(floor);
+    let mut coarse = Vec::with_capacity(floor);
+    for _ in 0..count {
+        let limit = hybrid.frame_limits()[0];
+        let temp = shaping.advance(0);
+        let (e, c, bracketed) = if state.zero_run_pending > 0 {
+            state.zero_run_pending -= 1;
+            (0, 0, false)
+        } else if let Some(zero) = try_zero_run_path(&mut reader, medians, &mut state)? {
+            (zero, zero, false)
+        } else {
+            let ones_count = read_folded_ones_count(&mut reader, &mut state.run)?;
+            let interval = medians.sample_interval_for_ones_count(ones_count);
+            medians.adapt(Zone::from_ones_count(ones_count));
+            decode_bracketed_pair(&interval, &mut reader, &mut wvc, limit)?
+        };
+        let (e, temp) = if bracketed {
+            (e.wrapping_add(temp), temp)
+        } else {
+            (e, 0)
+        };
+        hybrid.update_signed(0, c);
+        shaping.update(0, e, c, temp);
+        exact.push(e);
+        coarse.push(c);
+    }
+    Ok((exact, coarse))
+}
+
+/// Stereo twin of [`decode_packed_samples_mono_hybrid_lossless`]:
+/// decodes `frames` interleaved stereo frames of a hybrid `0x0A`
+/// payload with its `0x0B` correction stream, returning interleaved
+/// `(exact, coarse)` residual buffers (round-408 wire pins; validated
+/// bit-exact on left/right-coded stereo — the joint-stereo correction
+/// interplay is refused one level up).
+#[allow(clippy::type_complexity)]
+pub fn decode_packed_samples_stereo_hybrid_lossless(
+    payload: &crate::PackedSamples<'_>,
+    correction: &crate::PackedCorrectionData<'_>,
+    medians: &mut [AdaptiveMedians; 2],
+    frames: usize,
+    hybrid: &mut crate::HybridState,
+    shaping: &mut crate::ShapingState,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    let mut reader = payload.bit_reader();
+    let mut wvc = correction.bit_reader();
+    let mut state = StereoDecodeState::new();
+    let slots = frames.saturating_mul(2);
+    let floor = prealloc_floor(slots, payload.len());
+    let mut exact = Vec::with_capacity(floor);
+    let mut coarse = Vec::with_capacity(floor);
+    let mut frame_limits = [0u32; 2];
+    for slot in 0..slots {
+        let ch = slot & 1;
+        if ch == 0 {
+            frame_limits = hybrid.frame_limits();
+        }
+        let temp = shaping.advance(ch);
+        let (e, c, bracketed) = if state.zero_run_pending > 0 {
+            state.zero_run_pending -= 1;
+            state.next_channel ^= 1;
+            (0, 0, false)
+        } else if let Some(zero) = {
+            if state.run_break {
+                state.run_break = false;
+                None
+            } else if state.zero_run_eligible(medians) {
+                let run = read_zero_run_length(&mut reader)?;
+                if run > 0 {
+                    medians[0].values = [0, 0, 0];
+                    medians[1].values = [0, 0, 0];
+                    state.run_break = true;
+                    state.zero_run_pending = run - 1;
+                    Some(0)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } {
+            state.next_channel ^= 1;
+            (zero, zero, false)
+        } else {
+            let ones_count = read_folded_ones_count(&mut reader, &mut state.run)?;
+            let interval = medians[ch].sample_interval_for_ones_count(ones_count);
+            medians[ch].adapt(Zone::from_ones_count(ones_count));
+            let r = decode_bracketed_pair(&interval, &mut reader, &mut wvc, frame_limits[ch])?;
+            state.next_channel ^= 1;
+            r
+        };
+        let (e, temp) = if bracketed {
+            (e.wrapping_add(temp), temp)
+        } else {
+            (e, 0)
+        };
+        hybrid.update_signed(ch, c);
+        shaping.update(ch, e, c, temp);
+        exact.push(e);
+        coarse.push(c);
+    }
+    Ok((exact, coarse))
+}
+
 /// Decode `count` mono samples from a `0x0A` packed-samples payload,
 /// using a freshly-built [`DecodeState`].
 ///

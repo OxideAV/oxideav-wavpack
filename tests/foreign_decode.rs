@@ -57,6 +57,11 @@
 //! | `foreign_hybrid_stereo24_b4`   | `-b4`        | 24-bit stereo hybrid |
 //! | `foreign_hybrid_float_b4`      | `-b4`        | 32-bit float mono hybrid (`SHIFT_SENT` profile, no wvx — implied zeros) |
 //! | `foreign_hybrid_false_stereo_b4` | `-b4`      | identical-L/R hybrid → false-stereo blocks (bit 30, duplicated output) |
+//! | `foreign_hybrid_pair_mono`     | `-b4 -c`     | wv + wvc lossless pair, dynamic noise shaping (round 408) |
+//! | `foreign_hybrid_pair_mono_s0`  | `-b4 -c -s0` | wv + wvc lossless pair, shaping off (raw §4.1 fold) |
+//! | `foreign_hybrid_pair_mono_sn`  | `-b4 -c -s-0.7` | wv + wvc lossless pair, static negative shaping |
+//! | `foreign_hybrid_pair_multi`    | `-b3 -c`     | wv + wvc lossless pair, 2 blocks + silence stretch |
+//! | `foreign_hybrid_pair_lr`       | `-b4 -c -j0` | wv + wvc lossless STEREO pair, left/right coding |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -202,6 +207,68 @@ fn foreign_hybrid_false_stereo_duplicates_channels() {
     for pair in decoded.samples.chunks_exact(2) {
         assert_eq!(pair[0], pair[1], "false stereo duplicates L to R");
     }
+}
+
+/// wv + wvc hybrid-lossless pairs (round 408): combining the coarse
+/// stream with the correction stream must reproduce the ORIGINAL PCM
+/// bit-exactly — the expected sidecars here are the WAV sources the
+/// reference encoder consumed, not reference decodes, so this pins the
+/// whole §4.1/§6.5 lossless path end-to-end (bracket completion,
+/// 0x07 shaping seeds, the unit-magnitude nudge, the post-decorrelation
+/// fold).
+macro_rules! hybrid_pair_fixture {
+    ($name:ident, $stem:literal) => {
+        #[test]
+        fn $name() {
+            let wv = include_bytes!(concat!("data/", $stem, ".wv"));
+            let wvc = include_bytes!(concat!("data/", $stem, ".wvc"));
+            let expected = expected_pcm(include_bytes!(concat!("data/", $stem, ".pcm32le")));
+            let pcm = oxideav_wavpack::decode_stream_with_correction(wv, wvc).expect("pair decode");
+            assert_eq!(pcm, expected, "lossless PCM must equal the encoder input");
+            // The lossy decode of the same .wv alone must differ (the
+            // coarse stream IS lossy) — guards against the pair path
+            // silently ignoring the correction stream.
+            let lossy = decode_stream(wv).expect("lossy decode");
+            assert_ne!(lossy, expected, "coarse-only decode must be lossy");
+        }
+    };
+}
+
+hybrid_pair_fixture!(hybrid_pair_mono_is_lossless, "foreign_hybrid_pair_mono");
+hybrid_pair_fixture!(
+    hybrid_pair_mono_s0_is_lossless,
+    "foreign_hybrid_pair_mono_s0"
+);
+hybrid_pair_fixture!(
+    hybrid_pair_mono_sn_is_lossless,
+    "foreign_hybrid_pair_mono_sn"
+);
+hybrid_pair_fixture!(hybrid_pair_multi_is_lossless, "foreign_hybrid_pair_multi");
+hybrid_pair_fixture!(hybrid_pair_lr_is_lossless, "foreign_hybrid_pair_lr");
+
+/// Pair-decode refusals: a joint-stereo hybrid block (the default
+/// stereo coding) is a typed round-408 gap; a non-hybrid block has
+/// nothing to correct.
+#[test]
+fn hybrid_pair_joint_stereo_is_a_typed_refusal() {
+    // foreign_hybrid_stereo_b4 is joint-coded; pair it with a synthetic
+    // twin carrying the mono pair's correction bytes (content is
+    // irrelevant — the refusal fires on the block's own flags first).
+    let wv = include_bytes!("data/foreign_hybrid_stereo_b4.wv");
+    let wvc = include_bytes!("data/foreign_hybrid_pair_mono.wvc");
+    let (block, _) = oxideav_wavpack::parse_block(wv).expect("parse");
+    let (corr, _) = oxideav_wavpack::parse_block(wvc).expect("parse corr");
+    assert_eq!(
+        block.decode_samples_with_correction(&corr),
+        Err(oxideav_wavpack::Error::HybridJointCorrectionUnsupported)
+    );
+
+    let lossless = include_bytes!("data/foreign_default_mono16.wv");
+    let (plain, _) = oxideav_wavpack::parse_block(lossless).expect("parse");
+    assert_eq!(
+        plain.decode_samples_with_correction(&corr),
+        Err(oxideav_wavpack::Error::BlockNotHybrid)
+    );
 }
 
 #[test]

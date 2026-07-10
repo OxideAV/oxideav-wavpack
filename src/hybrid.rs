@@ -417,6 +417,117 @@ impl HybridState {
     }
 }
 
+/// Per-channel noise-shaping filter state for the hybrid-lossless
+/// (`.wv` + `.wvc`) decode — the `0x07` `ID_SHAPING_WEIGHTS` seed and
+/// its per-sample recurrence (round-408 black-box pin, bit-exact over
+/// mono no-shaping / static-shaping / dynamic-shaping and left/right
+/// stereo pair fixtures).
+///
+/// ## Wire layout of `0x07` (in the **correction** block)
+///
+/// Little-endian 16-bit **log-packed** words (each unpacked with
+/// [`crate::wp_exp2s`]):
+///
+/// | Shape                | Words                                              |
+/// | -------------------- | -------------------------------------------------- |
+/// | mono, static shaping | `[error, acc]`                                     |
+/// | mono, dynamic (DNS)  | `[error, acc, delta]`                              |
+/// | stereo, static       | `[error0, acc0, error1, acc1]`                     |
+/// | stereo, dynamic      | `[error0, acc0, error1, acc1, delta0, delta1]`     |
+///
+/// The **error seed is negated** on the wire (`error = -wp_exp2s(word)`);
+/// `acc` / `delta` unpack directly. A missing `0x07` (the no-shaping
+/// `-s0` encode) seeds everything at zero, making every `temp` zero —
+/// the raw §4.1 fold.
+///
+/// ## Per-sample recurrence
+///
+/// ```text
+/// acc += delta;  weight = acc >> 16
+/// temp = -((weight * error + 511) >> 10)
+/// if weight < 0 and |temp| >= |error| != 0:
+///     temp = sign(temp) * (|error| - 1)      // unit-magnitude nudge
+/// exact = wvc_bracket_value + temp           // bracketed samples only
+/// error = (exact - coarse)                   // weight <  0
+/// error = (exact - coarse) - temp            // weight >= 0
+/// ```
+///
+/// Zero-run / lossless-dispatch samples apply no `temp` and update the
+/// error state with `exact == coarse` (both zero for run members).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShapingState {
+    error: [i32; 2],
+    acc: [i32; 2],
+    delta: [i32; 2],
+}
+
+impl ShapingState {
+    /// Seed from a `0x07` payload (`None` / empty → all-zero state, the
+    /// no-shaping raw fold). `stereo` selects the per-channel word
+    /// interleave shown in the type-level docs.
+    #[must_use]
+    pub fn from_shaping_words(payload: Option<&[u8]>, stereo: bool) -> Self {
+        let words: Vec<i32> = payload
+            .unwrap_or(&[])
+            .chunks_exact(2)
+            .map(|c| crate::logpack::wp_exp2s(i32::from(i16::from_le_bytes([c[0], c[1]]))))
+            .collect();
+        let g = |i: usize| words.get(i).copied().unwrap_or(0);
+        if stereo {
+            ShapingState {
+                error: [-g(0), -g(2)],
+                acc: [g(1), g(3)],
+                delta: [g(4), g(5)],
+            }
+        } else {
+            ShapingState {
+                error: [-g(0), 0],
+                acc: [g(1), 0],
+                delta: [g(2), 0],
+            }
+        }
+    }
+
+    /// Advance `channel`'s weight one sample (`acc += delta`) and return
+    /// this sample's `temp` term from the pre-update error state.
+    pub fn advance(&mut self, channel: usize) -> i32 {
+        let ch = channel & 1;
+        self.acc[ch] += self.delta[ch];
+        let weight = self.acc[ch] >> 16;
+        let err = self.error[ch];
+        if err == 0 {
+            return 0;
+        }
+        let mut temp = -((weight.wrapping_mul(err) + 511) >> 10);
+        if weight < 0 && temp.unsigned_abs() >= err.unsigned_abs() {
+            // The unit-magnitude nudge: |temp| stays strictly below
+            // |error| under a negative weight.
+            temp = temp.signum() * (err.unsigned_abs() as i32 - 1);
+        }
+        temp
+    }
+
+    /// Fold one decoded sample's outcome back into `channel`'s error
+    /// state. `exact` / `coarse` are the §4.1 lossless and coarse
+    /// values; `temp` is what [`Self::advance`] returned for this
+    /// sample (0 for non-bracketed samples).
+    pub fn update(&mut self, channel: usize, exact: i32, coarse: i32, temp: i32) {
+        let ch = channel & 1;
+        let q = exact.wrapping_sub(coarse);
+        self.error[ch] = if self.acc[ch] >> 16 < 0 {
+            q
+        } else {
+            q.wrapping_sub(temp)
+        };
+    }
+
+    /// The current error state of `channel` (test / introspection).
+    #[must_use]
+    pub fn error(&self, channel: usize) -> i32 {
+        self.error[channel & 1]
+    }
+}
+
 /// `true` when the flag word selects the **noise-shaped** correction fold
 /// (`HYBRID_SHAPE` or `NEW_SHAPING`), which this module does not implement.
 ///
@@ -490,6 +601,107 @@ impl CorrectionFold {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 0x07 shaping state (round 408) --------------------------------
+
+    #[test]
+    fn shaping_seed_layouts_unpack_log_words() {
+        // Mono dynamic: [error, acc, delta]; error word is negated.
+        // Words from a reference-encoded correction block:
+        // [0, -6736, -3602] -> error 0, acc wp_exp2s(-6736),
+        // delta wp_exp2s(-3602).
+        let mut p = Vec::new();
+        for w in [0i16, -6736, -3602] {
+            p.extend_from_slice(&w.to_le_bytes());
+        }
+        let st = ShapingState::from_shaping_words(Some(&p), false);
+        assert_eq!(st.error(0), 0);
+        let mut probe = st;
+        // First advance: acc += delta, weight = acc >> 16.
+        assert_eq!(probe.advance(0), 0, "zero error seed gives zero temp");
+
+        // Stereo static: [err0, acc0, err1, acc1] (no deltas).
+        let mut p = Vec::new();
+        for w in [-1825i16, -6716, -1825, -6716] {
+            p.extend_from_slice(&w.to_le_bytes());
+        }
+        let st = ShapingState::from_shaping_words(Some(&p), true);
+        assert_eq!(st.error(0), -crate::logpack::wp_exp2s(-1825));
+        assert_eq!(st.error(0), 70, "negated log-packed error seed");
+        assert_eq!(st.error(1), 70);
+    }
+
+    #[test]
+    fn shaping_absent_payload_is_the_raw_fold() {
+        let mut st = ShapingState::from_shaping_words(None, false);
+        for _ in 0..8 {
+            assert_eq!(st.advance(0), 0);
+            st.update(0, 123, 120, 0);
+            // weight stays 0 (acc 0, delta 0) → temp stays 0 even with
+            // a non-zero error state.
+            assert_eq!(st.advance(0), 0);
+        }
+    }
+
+    #[test]
+    fn shaping_recurrence_matches_the_black_box_pins() {
+        // Weight -637 (acc seed wp_exp2s(-6736) after one delta of
+        // wp_exp2s(-3602)), error 62 → temp +39; error -55 → temp -34
+        // (round-408 ground-truth rows).
+        let mut p = Vec::new();
+        for w in [0i16, -6736, -3602] {
+            p.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut st = ShapingState::from_shaping_words(Some(&p), false);
+        // Prime the error state as if the previous sample left q = 62.
+        st.update(0, 62, 0, 0);
+        assert_eq!(st.advance(0), 39);
+        st.update(0, -55, 0, 0);
+        assert_eq!(st.advance(0), -34);
+    }
+
+    #[test]
+    fn shaping_unit_magnitude_nudge_caps_small_errors() {
+        // Negative weight, |error| == 1 → temp 0; |error| == 2 with a
+        // strong weight (-768 = -0.75) would round to 2 but is capped
+        // at 1 (round-408 pin: the unit-magnitude nudge).
+        let mut p = Vec::new();
+        // acc word: wp_log2-domain value expanding to -768 << 16.
+        // wp_exp2s(-6806) == -50331648 == -768 * 65536.
+        for w in [0i16, -6806, 0] {
+            p.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut st = ShapingState::from_shaping_words(Some(&p), false);
+        assert_eq!(crate::logpack::wp_exp2s(-6806), -768 << 16);
+        st.update(0, 1, 0, 0);
+        assert_eq!(st.advance(0), 0, "unit error is inert");
+        st.update(0, -1, 0, 0);
+        assert_eq!(st.advance(0), 0);
+        st.update(0, 2, 0, 0);
+        assert_eq!(st.advance(0), 1, "capped strictly below |error|");
+        st.update(0, 90, 0, 0);
+        assert_eq!(st.advance(0), 68, "half products round away from zero");
+    }
+
+    #[test]
+    fn shaping_error_update_branches_on_weight_sign() {
+        // Positive weight: error accumulates q - temp; negative: q.
+        let mut p = Vec::new();
+        for w in [0i16, 6806, 0] {
+            p.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut pos = ShapingState::from_shaping_words(Some(&p), false);
+        pos.update(0, 100, 60, 7);
+        assert_eq!(pos.error(0), 100 - 60 - 7);
+
+        let mut p = Vec::new();
+        for w in [0i16, -6806, 0] {
+            p.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut neg = ShapingState::from_shaping_words(Some(&p), false);
+        neg.update(0, 100, 60, 7);
+        assert_eq!(neg.error(0), 40);
+    }
 
     // ---- 0x06 profile expansion (round 408) ---------------------------
 

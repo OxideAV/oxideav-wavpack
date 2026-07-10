@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 408 — **hybrid-lossless (`.wv` + `.wvc`) pair decode — mono and
+  left/right stereo, bit-exact against the encoder input.** New
+  `WavPackBlock::decode_samples_with_correction` and the stream-level
+  `decode_stream_with_correction` combine the coarse `0x0A` stream with
+  the `0x0B` correction stream per spec §4.1, with the wire behaviour
+  pinned black-box (round 408): after the §6.5 bracketing search
+  narrows `[low, high]`, the **exact in-bracket offset** is read from
+  the correction stream with the same phase-in binary code the lossless
+  mantissa uses; the `0x07` `ID_SHAPING_WEIGHTS` sub-block (carried by
+  the correction block) seeds the per-channel noise-shaping filter as
+  **log-packed** `[error, acc, (delta)]` words (error negated on the
+  wire; stereo interleaves per-channel pairs then deltas); each
+  sample's `temp = -((weight*error + 511) >> 10)` with the
+  negative-weight **unit-magnitude nudge** (`|temp|` capped strictly
+  below `|error|`) folds into the exact value; the error state updates
+  as `exact - coarse` under a negative weight and
+  `exact - coarse - temp` under a non-negative one; and the
+  decorrelation passes run on the **coarse** values with the
+  correction difference folded in afterward (the §4.1
+  post-decorrelation placement). Exposed as `ShapingState` +
+  `decode_packed_samples_{mono,stereo}_hybrid_lossless`. Five pair
+  fixtures (dynamic noise shaping, `-s0`, static `-s-0.7`, multi-block
+  + silence, `-j0` stereo) reproduce the **original encoder input**
+  bit-exactly. Joint-stereo (mid/side) pairs are a typed
+  `Error::HybridJointCorrectionUnsupported` refusal — the
+  correction/shaping interplay across the §5.4 transform is the
+  remaining documented gap (as are float / int32 hybrid pairs).
+
 - Round 408 — **hybrid (lossy) decode — the §6.5 `error_limit` model,
   bit-exact.** Hybrid blocks (flag bit 3) now decode to their coarse
   lossy PCM instead of the `UnsupportedBlockFeature::Hybrid` refusal.

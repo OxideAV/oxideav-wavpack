@@ -615,6 +615,145 @@ impl<'a> WavPackBlock<'a> {
             .collect())
     }
 
+    /// Decode this hybrid block's **lossless** PCM by combining its
+    /// coarse `0x0A` stream with the `0x0B` correction stream carried
+    /// by `correction` (the paired `.wvc` block) — the spec §4.1
+    /// hybrid-lossless path, wire-pinned black-box in round 408.
+    ///
+    /// Per bracketed sample the §6.5 binary search narrows the interval
+    /// as in the lossy decode, then the **exact** in-bracket offset is
+    /// read from the correction stream with the same phase-in binary
+    /// code the lossless mantissa uses; the `0x07`-seeded noise-shaping
+    /// filter ([`crate::ShapingState`]) contributes its per-sample
+    /// `temp` term. The decorrelation passes run on the **coarse**
+    /// values (prediction history and weights adapt on the lossy
+    /// stream) and the correction difference is folded in afterward —
+    /// the §4.1 post-decorrelation placement. Validated bit-exact
+    /// against reference decodes for mono and left/right-coded stereo
+    /// pairs across no-shaping / static-shaping / dynamic-noise-shaping
+    /// encodes.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::BlockNotHybrid`] — this block's `HYBRID_FLAG` is clear.
+    /// * [`Error::HybridJointCorrectionUnsupported`] — this block is
+    ///   joint-stereo (mid/side): the correction/shaping interplay
+    ///   across the §5.4 transform is a round-408 documented gap.
+    /// * [`Error::UnsupportedBlockFeature`] (`FloatData` / `Int32Mode`)
+    ///   — the sample-format extension interplay of a paired decode is
+    ///   not yet pinned.
+    /// * Structural errors as raised by [`Self::decode_samples`].
+    ///
+    /// Round 408.
+    pub fn decode_samples_with_correction(
+        &self,
+        correction: &WavPackBlock<'_>,
+    ) -> Result<Vec<i32>> {
+        let flags = &self.header.flags;
+        if !flags.hybrid {
+            return Err(Error::BlockNotHybrid);
+        }
+        if !self.header.is_audio_block() {
+            return Err(Error::BlockHasNoAudio);
+        }
+        if flags.low_latency_block {
+            return Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::LowLatencyBlock,
+            ));
+        }
+        if flags.float_data {
+            return Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::FloatData,
+            ));
+        }
+        if flags.int32_mode {
+            return Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::Int32Mode,
+            ));
+        }
+        if !flags.is_block_data_mono() && flags.joint_stereo {
+            return Err(Error::HybridJointCorrectionUnsupported);
+        }
+        // A correction twin without an 0x0B sub-block is legal when the
+        // main block spends no bracket bits (e.g. an all-silence block
+        // whose samples are zero-runs): decode against an empty
+        // correction stream; a block that genuinely needs correction
+        // bits surfaces Error::Truncated from the empty reader.
+        static EMPTY_CORRECTION: [u8; 0] = [];
+        let corr_data = correction
+            .packed_correction_data()
+            .unwrap_or_else(|| crate::expand_packed_correction_data(&EMPTY_CORRECTION));
+        let shaping_payload = crate::metadata::find_noise_shaping_profile(&correction.sub_blocks)
+            .map(|sb| sb.payload);
+        let entropy_sub =
+            find_entropy_info(&self.sub_blocks).ok_or(Error::BlockMissingEntropyInfo)?;
+        let entropy = expand_entropy(entropy_sub.payload)?;
+        let packed = find_packed_samples(&self.sub_blocks)
+            .ok_or(Error::BlockMissingPackedSamples)?
+            .validate_length()?;
+        if self.header.block_samples > MAX_DECODE_SAMPLES_PER_BLOCK {
+            return Err(Error::BlockSamplesTooLarge(self.header.block_samples));
+        }
+        let count = self.header.block_samples as usize;
+        let profile_sub = crate::metadata::find_hybrid_profile(&self.sub_blocks)
+            .ok_or(Error::BlockMissingHybridProfile)?;
+        let stereo = !flags.is_block_data_mono();
+        let profile = crate::hybrid::expand_hybrid_profile(profile_sub.payload, stereo)?;
+        let mut hybrid = crate::HybridState::from_profile(&profile);
+        let mut shaping = crate::ShapingState::from_shaping_words(shaping_payload, stereo);
+
+        let (exact, coarse) = if stereo {
+            if entropy_sub.payload.len() != crate::entropy::STEREO_PAYLOAD_BYTES {
+                return Err(Error::InvalidEntropyInfoForStereo);
+            }
+            let mut medians = [
+                crate::samples::AdaptiveMedians::from_seed_values(entropy.medians_left)
+                    .ok_or(Error::InvalidEntropyInfoForStereo)?,
+                crate::samples::AdaptiveMedians::from_seed_values(entropy.medians_right)
+                    .ok_or(Error::InvalidEntropyInfoForStereo)?,
+            ];
+            crate::samples::decode_packed_samples_stereo_hybrid_lossless(
+                &packed,
+                &corr_data,
+                &mut medians,
+                count,
+                &mut hybrid,
+                &mut shaping,
+            )?
+        } else {
+            let mut medians = crate::samples::AdaptiveMedians::from_entropy(&entropy, 0)
+                .ok_or(Error::InvalidEntropyInfoForMono)?;
+            crate::samples::decode_packed_samples_mono_hybrid_lossless(
+                &packed,
+                &corr_data,
+                &mut medians,
+                count,
+                &mut hybrid,
+                &mut shaping,
+            )?
+        };
+
+        // §4.1 post-decorrelation fold: decorrelate the coarse residuals
+        // (the lossy prediction history), then add the exact-coarse
+        // difference per sample.
+        let mut out = coarse.clone();
+        if self.has_decorrelation() {
+            let (terms, weights, samples) = self.decorr_payloads();
+            if stereo {
+                let mut passes = assemble_stereo_passes(terms, weights, samples)?;
+                decorrelate_stereo(&mut passes, &mut out)?;
+            } else {
+                let mut passes = assemble_mono_passes(terms, weights, samples)?;
+                decorrelate_mono(&mut passes, &mut out)?;
+            }
+        }
+        for (o, (e, c)) in out.iter_mut().zip(exact.iter().zip(coarse.iter())) {
+            *o = o.wrapping_add(e.wrapping_sub(*c));
+        }
+        crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
+        Ok(self.expand_false_stereo(out))
+    }
+
     /// Borrow the first `0x0B` packed-correction-data sub-block, or
     /// `None` when none is present. Block-level pairing with the free
     /// [`crate::find_packed_correction_data_sub_block`] finder. Use
@@ -2366,6 +2505,33 @@ pub fn total_correction_payload_bytes(bytes: &[u8]) -> Result<u64> {
 /// coarse (lossy) decode is a separate step (the noise-shaped fold
 /// remains a documented gap), so today's callers use this to locate /
 /// validate / size correction coverage.
+/// Decode a hybrid `.wv` stream **losslessly** against its companion
+/// `.wvc` correction stream (mono / stereo chains, the
+/// [`decode_stream`] shape) — spec §4.1 hybrid-lossless, round 408.
+///
+/// Blocks are paired by [`pair_correction_stream`]; every paired audio
+/// block decodes through
+/// [`WavPackBlock::decode_samples_with_correction`], and an unpaired
+/// block (partial `.wvc` coverage) falls back to its coarse lossy
+/// decode — matching the reference decoder's behaviour when the
+/// correction file ends early. Errors from pairing or decode propagate
+/// verbatim.
+pub fn decode_stream_with_correction(main: &[u8], correction: &[u8]) -> Result<Vec<i32>> {
+    let pairs = pair_correction_stream(main, correction)?;
+    let mut out = Vec::new();
+    for (block, twin) in &pairs {
+        if !block.header.is_audio_block() {
+            continue;
+        }
+        let pcm = match twin {
+            Some(corr) => block.decode_samples_with_correction(corr)?,
+            None => block.decode_samples()?,
+        };
+        out.extend_from_slice(&pcm);
+    }
+    Ok(out)
+}
+
 pub fn pair_correction_stream<'a, 'b>(
     main: &'a [u8],
     correction: &'b [u8],

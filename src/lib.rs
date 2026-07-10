@@ -850,12 +850,12 @@ oxideav_core::register!("wavpack", register);
 pub use crate::block::{
     audio_block_count, block_count, correction_block_count, correction_coverage,
     decode_multichannel_stream, decode_multichannel_stream_muted, decode_stream, decode_stream_f32,
-    decode_stream_muted, decoded_sample_count, first_audio_block, first_correction_block,
-    iter_audio_blocks, iter_blocks, iter_correction_blocks, iter_decoded_blocks,
-    metadata_block_count, multichannel_layout, pair_correction_stream, parse_block, parse_blocks,
-    stream_channel_info, stream_sample_rate, stream_total_samples, total_audio_samples,
-    total_block_samples, total_correction_payload_bytes, AudioBlockIter, BlockIter,
-    CorrectionBlockIter, DecodedStream, MultichannelLayout, StreamDecodeIter,
+    decode_stream_muted, decode_stream_with_correction, decoded_sample_count, first_audio_block,
+    first_correction_block, iter_audio_blocks, iter_blocks, iter_correction_blocks,
+    iter_decoded_blocks, metadata_block_count, multichannel_layout, pair_correction_stream,
+    parse_block, parse_blocks, stream_channel_info, stream_sample_rate, stream_total_samples,
+    total_audio_samples, total_block_samples, total_correction_payload_bytes, AudioBlockIter,
+    BlockIter, CorrectionBlockIter, DecodedStream, MultichannelLayout, StreamDecodeIter,
     UnsupportedBlockFeature, WavPackBlock, MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
 };
 pub use crate::block_header::{
@@ -908,7 +908,7 @@ pub use crate::float::{
 pub use crate::hybrid::{
     expand_hybrid_profile, flags_select_shaping, fold_correction, fold_correction_pair,
     fold_correction_pre_decorrelation, fold_correction_pre_decorrelation_pair, split_correction,
-    CorrectionFold, HybridProfile, HybridState, CROSS_DECORR_FLAG, HYBRID_FLAG,
+    CorrectionFold, HybridProfile, HybridState, ShapingState, CROSS_DECORR_FLAG, HYBRID_FLAG,
     HYBRID_LIMIT_ARG_CEILING, HYBRID_LIMIT_BIAS, HYBRID_PROFILE_MONO_BYTES,
     HYBRID_PROFILE_STEREO_BYTES, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
 };
@@ -935,8 +935,9 @@ pub use crate::seek::{
 
 pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
-    decode_packed_samples_mono_hybrid, decode_packed_samples_stereo,
-    decode_packed_samples_stereo_from_entropy, decode_packed_samples_stereo_hybrid,
+    decode_packed_samples_mono_hybrid, decode_packed_samples_mono_hybrid_lossless,
+    decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy,
+    decode_packed_samples_stereo_hybrid, decode_packed_samples_stereo_hybrid_lossless,
     decode_run_length, decode_sample, decode_sample_stateful, decode_sample_stateful_stereo,
     decode_sample_stateful_stereo_with_limit, decode_sample_stateful_with_limit,
     decode_sample_value, emit_end_of_stream_marker, emit_raw_prefix, emit_zero_run_length,
