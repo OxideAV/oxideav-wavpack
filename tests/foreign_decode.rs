@@ -145,3 +145,47 @@ fn foreign_stereo_window_decode_matches_whole_stream() {
     let window = oxideav_wavpack::decode_range(wv, &index, 500, 300).expect("window decode");
     assert_eq!(window, whole[500 * 2..(500 + 300) * 2].to_vec());
 }
+
+/// Foreign fixtures carry real sample-rate indices (and the `0x27`
+/// custom-rate sub-block): `stream_sample_rate` resolves both carriers
+/// (round 405; staged spec `wavpack-sample-formats.md` §5).
+#[test]
+fn foreign_fixture_sample_rates_resolve() {
+    use oxideav_wavpack::stream_sample_rate;
+    // The WAV sources were synthesized at these rates (see the module
+    // doc); reference `wavpack` stamps the table index — or, for
+    // 12345 Hz, the sentinel 15 plus a 0x27 sub-block.
+    let cases: [(&[u8], u32); 5] = [
+        (include_bytes!("data/foreign_default_mono16.wv"), 44_100),
+        (include_bytes!("data/foreign_default_stereo24.wv"), 48_000),
+        (include_bytes!("data/foreign_default_mono8.wv"), 8_000),
+        (include_bytes!("data/foreign_default_5dot1_16.wv"), 44_100),
+        (include_bytes!("data/foreign_custom_rate_mono16.wv"), 12_345),
+    ];
+    for (wv, rate) in cases {
+        assert_eq!(stream_sample_rate(wv).expect("rate resolution"), Some(rate));
+    }
+}
+
+/// Time-addressed seeking over a foreign file: `seek_seconds` lands on
+/// `round(seconds * rate)` and reads the same frames as a frame seek.
+#[test]
+fn foreign_time_seek_matches_frame_seek() {
+    use oxideav_wavpack::StreamReader;
+    let wv = include_bytes!("data/foreign_default_stereo16.wv");
+    let mut reader = StreamReader::new(wv).expect("reader");
+    assert_eq!(reader.sample_rate().expect("rate"), Some(44_100));
+
+    reader.seek_seconds(0.01).expect("time seek"); // 441 frames
+    assert_eq!(reader.position(), 441);
+    let via_time = reader.read_frames(64).expect("read");
+    reader.seek(441).expect("frame seek");
+    assert_eq!(reader.read_frames(64).expect("read"), via_time);
+
+    // Past-the-end times clamp to the end-of-stream cursor state.
+    reader.seek_seconds(1e9).expect("clamped seek");
+    assert!(reader.is_at_end());
+    // Negative / non-finite times are refused.
+    assert!(reader.seek_seconds(-0.5).is_err());
+    assert!(reader.seek_seconds(f64::NAN).is_err());
+}

@@ -1679,6 +1679,89 @@ pub fn encode_block_stereo_smallest(
 /// [`crate::block::MAX_DECODE_SAMPLES_PER_BLOCK`] decode ceiling.
 pub const DEFAULT_BLOCK_SAMPLES: usize = 22_050;
 
+/// Stamp a sample rate into an encoded `.wv` byte stream (round 405).
+///
+/// The block encoders in this crate leave the header bits 23..=26
+/// sample-rate index at `0`; this post-pass rewrites every block
+/// header in `stream` to carry `rate` per the staged spec
+/// `wavpack-sample-formats.md` §5:
+///
+/// * a **standard** rate (one of [`crate::STANDARD_SAMPLE_RATES`])
+///   sets its table index on every block — a pure header patch, byte
+///   length unchanged;
+/// * a **non-standard** rate sets the sentinel index `15` on every
+///   block and appends the `0x27` sub-block (3-byte little-endian Hz)
+///   to the metadata of the stream's first audio block — but only
+///   when that block is the start of the stream (`block_index == 0`),
+///   matching the spec's "emitted once for the stream (with the first
+///   block)"; a mid-stream chain (later packets of a running encode)
+///   gets the sentinel index only.
+///
+/// The flag word and metadata region are not covered by the header
+/// CRC (spec §5 folds decoded samples only), so no CRC is recomputed.
+/// Returns [`Error::CustomSampleRateOutOfRange`] for a zero rate or a
+/// non-standard rate beyond the 24-bit `0x27` field; block-parse
+/// errors surface verbatim.
+pub fn set_stream_sample_rate(stream: &[u8], rate: u32) -> Result<Vec<u8>> {
+    if rate == 0 {
+        return Err(Error::CustomSampleRateOutOfRange(rate));
+    }
+    let index = match crate::block_header::sample_rate_index_for(rate) {
+        Some(i) => i,
+        None => {
+            if rate > 0x00FF_FFFF {
+                return Err(Error::CustomSampleRateOutOfRange(rate));
+            }
+            crate::block_header::SAMPLE_RATE_INDEX_CUSTOM
+        }
+    };
+    let custom = index == crate::block_header::SAMPLE_RATE_INDEX_CUSTOM;
+
+    let mut out = Vec::with_capacity(stream.len() + 8);
+    let mut rest = stream;
+    let mut stamped_0x27 = false;
+    while !rest.is_empty() {
+        let (header, _) = crate::block_header::parse_block_header(rest)?;
+        let total = 8 + header.ck_size as usize;
+        if rest.len() < total {
+            return Err(Error::Truncated);
+        }
+        let (block_bytes, tail) = rest.split_at(total);
+        let start = out.len();
+        out.extend_from_slice(block_bytes);
+
+        // Patch flag-word bits 23..=26 (header offset 24..28, LE).
+        let flags_off = start + 24;
+        let mut flags = u32::from_le_bytes(out[flags_off..flags_off + 4].try_into().unwrap());
+        flags = (flags & !(0b1111 << 23)) | (u32::from(index) << 23);
+        out[flags_off..flags_off + 4].copy_from_slice(&flags.to_le_bytes());
+
+        // Append the 0x27 sub-block to the stream's first audio block
+        // when the rate is non-standard and this chain starts the
+        // stream.
+        if custom && !stamped_0x27 && header.block_samples > 0 && header.block_index == 0 {
+            let payload = [
+                (rate & 0xFF) as u8,
+                ((rate >> 8) & 0xFF) as u8,
+                ((rate >> 16) & 0xFF) as u8,
+            ];
+            // 3-byte payload: odd size, padded to 2 words on the wire.
+            out.push(0x27 | ID_FLAG_ODD_SIZE);
+            out.push(2); // size in 16-bit words, pad included
+            out.extend_from_slice(&payload);
+            out.push(0);
+            // Grow ck_size (header offset 4..8, LE) by the 6 appended
+            // bytes.
+            let ck_off = start + 4;
+            let ck = u32::from_le_bytes(out[ck_off..ck_off + 4].try_into().unwrap()) + 6;
+            out[ck_off..ck_off + 4].copy_from_slice(&ck.to_le_bytes());
+            stamped_0x27 = true;
+        }
+        rest = tail;
+    }
+    Ok(out)
+}
+
 /// Encode a mono PCM buffer into a multi-block `.wv` byte stream — a
 /// chain of `wvpk` blocks each carrying up to `block_samples` samples,
 /// in the order [`crate::block::decode_stream`] concatenates them.
@@ -3579,5 +3662,103 @@ mod tests {
             encode_block_stereo_auto(&[1, 2, 3], DecorrProfile::Fast, 2, 0, 1),
             Err(Error::EncodeStereoOddLength(3))
         ));
+    }
+
+    // ---- set_stream_sample_rate (round 405) ----
+
+    #[test]
+    fn stamp_standard_rate_patches_every_header_and_stays_decodable() {
+        let pcm: Vec<i32> = (0..3000).map(|i| ((i * 37) % 4001) - 2000).collect();
+        // Two blocks (chunk 1000), so both headers must be patched.
+        let stream = encode_stream_mono(&pcm, 1000, 2).unwrap();
+        let stamped = set_stream_sample_rate(&stream, 44_100).unwrap();
+        assert_eq!(stamped.len(), stream.len(), "standard rate is a pure patch");
+        assert_eq!(decode_stream(&stamped).unwrap(), pcm, "PCM unchanged");
+        assert_eq!(crate::stream_sample_rate(&stamped).unwrap(), Some(44_100));
+        // Every block header carries the index.
+        for block in crate::iter_blocks(&stamped) {
+            let block = block.unwrap();
+            assert_eq!(block.header().flags.standard_sample_rate(), Some(44_100));
+        }
+    }
+
+    #[test]
+    fn stamp_custom_rate_appends_0x27_to_the_first_block_only() {
+        let pcm: Vec<i32> = (0..2500).map(|i| ((i * 91) % 801) - 400).collect();
+        let stream = encode_stream_mono(&pcm, 1000, 2).unwrap();
+        let stamped = set_stream_sample_rate(&stream, 12_345).unwrap();
+        assert_eq!(
+            stamped.len(),
+            stream.len() + 6,
+            "custom rate appends one 6-byte 0x27 sub-block"
+        );
+        assert_eq!(decode_stream(&stamped).unwrap(), pcm, "PCM unchanged");
+        assert_eq!(crate::stream_sample_rate(&stamped).unwrap(), Some(12_345));
+        let mut with_27 = 0;
+        for block in crate::iter_blocks(&stamped) {
+            let block = block.unwrap();
+            assert!(block.header().flags.has_custom_sample_rate());
+            if crate::find_non_standard_sample_rate(block.sub_blocks()).is_some() {
+                with_27 += 1;
+                assert_eq!(block.sample_rate().unwrap(), Some(12_345));
+            }
+        }
+        assert_eq!(with_27, 1, "0x27 is emitted once, with the first block");
+    }
+
+    #[test]
+    fn stamp_custom_rate_mid_stream_chain_sets_sentinel_only() {
+        // A chain whose first block has a non-zero block_index is a
+        // continuation (later packets of a running encode): the
+        // sentinel index is set but no 0x27 is inserted.
+        let pcm: Vec<i32> = (0..500).map(|i| (i % 101) - 50).collect();
+        // A single block whose block_index says it starts at frame
+        // 5000 — not the head of the stream.
+        let stream = encode_block_mono(&pcm, 2, 5_000, TOTAL_SAMPLES_UNKNOWN).unwrap();
+        let stamped = set_stream_sample_rate(&stream, 12_345).unwrap();
+        assert_eq!(stamped.len(), stream.len(), "no 0x27 on a mid-stream chain");
+        let (block, _) = crate::parse_block(&stamped).unwrap();
+        assert!(block.header().flags.has_custom_sample_rate());
+        assert_eq!(
+            block.sample_rate().unwrap(),
+            None,
+            "rate deferred to the stream head"
+        );
+    }
+
+    #[test]
+    fn stamp_refuses_out_of_range_rates() {
+        let stream = encode_stream_mono(&[1, 2, 3, 4], 0, 2).unwrap();
+        assert_eq!(
+            set_stream_sample_rate(&stream, 0),
+            Err(Error::CustomSampleRateOutOfRange(0))
+        );
+        assert_eq!(
+            set_stream_sample_rate(&stream, 0x0100_0000),
+            Err(Error::CustomSampleRateOutOfRange(0x0100_0000))
+        );
+        // The 24-bit ceiling itself is representable.
+        let stamped = set_stream_sample_rate(&stream, 0x00FF_FFFF).unwrap();
+        assert_eq!(
+            crate::stream_sample_rate(&stamped).unwrap(),
+            Some(0x00FF_FFFF)
+        );
+    }
+
+    #[test]
+    fn stamp_round_trips_through_the_reference_shaped_decoders() {
+        // Stereo + joint + decorr search output stays intact under the
+        // stamp (flags/metadata are outside the sample CRC).
+        let pcm: Vec<i32> = (0..2000)
+            .map(|i| (((i * 13) % 997) - 498) * ((i % 2) * 2 - 1))
+            .collect();
+        let stream = encode_stream_stereo_best(&pcm, 0, 2, DecorrProfile::Normal).unwrap();
+        for rate in [8000u32, 96_000, 12_345] {
+            let stamped = set_stream_sample_rate(&stream, rate).unwrap();
+            assert_eq!(decode_stream(&stamped).unwrap(), pcm, "rate {rate}");
+            let (_, ok) = crate::decode_stream_muted(&stamped).unwrap();
+            assert!(ok, "CRC gate must still pass at rate {rate}");
+            assert_eq!(crate::stream_sample_rate(&stamped).unwrap(), Some(rate));
+        }
     }
 }

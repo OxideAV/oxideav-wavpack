@@ -851,14 +851,15 @@ pub use crate::block::{
     decode_stream_muted, decoded_sample_count, first_audio_block, first_correction_block,
     iter_audio_blocks, iter_blocks, iter_correction_blocks, iter_decoded_blocks,
     metadata_block_count, multichannel_layout, pair_correction_stream, parse_block, parse_blocks,
-    stream_total_samples, total_audio_samples, total_block_samples, total_correction_payload_bytes,
-    AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream, MultichannelLayout,
-    StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock, MAX_DECODE_SAMPLES_PER_BLOCK,
-    MAX_MULTICHANNEL_CHANNELS,
+    stream_sample_rate, stream_total_samples, total_audio_samples, total_block_samples,
+    total_correction_payload_bytes, AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream,
+    MultichannelLayout, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
+    MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
 };
 pub use crate::block_header::{
-    parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE,
-    MIN_VERSION, TOTAL_SAMPLES_UNKNOWN,
+    parse_block_header, sample_rate_index_for, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC,
+    MAX_VERSION, MIN_CK_SIZE, MIN_VERSION, SAMPLE_RATE_INDEX_CUSTOM, STANDARD_SAMPLE_RATES,
+    TOTAL_SAMPLES_UNKNOWN,
 };
 pub use crate::correction::{expand_packed_correction_data, PackedCorrectionData};
 pub use crate::crc::{
@@ -889,8 +890,8 @@ pub use crate::encode::{
     encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
     encode_multichannel_stream, encode_multichannel_stream_at, encode_stream_mono,
     encode_stream_mono_best, encode_stream_mono_smallest, encode_stream_stereo,
-    encode_stream_stereo_best, encode_stream_stereo_smallest, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
-    ENCODE_VERSION,
+    encode_stream_stereo_best, encode_stream_stereo_smallest, set_stream_sample_rate,
+    DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
 };
 pub use crate::entropy::{
     expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,
@@ -910,11 +911,12 @@ pub use crate::logpack::{
 pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
-    find_noise_shaping_profile, find_packed_correction_data, find_packed_correction_data_sub_block,
-    find_packed_overflow_bits, find_packed_overflow_bits_sub_block, find_packed_samples,
-    parse_md5_checksum, parse_metadata_sub_block, walk_metadata, Md5Checksum, MetadataSubBlock,
-    SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK,
-    MD5_DIGEST_BYTES,
+    find_noise_shaping_profile, find_non_standard_sample_rate, find_packed_correction_data,
+    find_packed_correction_data_sub_block, find_packed_overflow_bits,
+    find_packed_overflow_bits_sub_block, find_packed_samples, parse_md5_checksum,
+    parse_metadata_sub_block, parse_non_standard_sample_rate, walk_metadata, Md5Checksum,
+    MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE,
+    ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
 };
 pub use crate::overflow_bits::{expand_packed_overflow_bits, PackedOverflowBits};
 pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples, PackedSamples};

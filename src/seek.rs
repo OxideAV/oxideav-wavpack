@@ -666,6 +666,44 @@ impl<'a> StreamReader<'a> {
         self.position == self.index.end_frame()
     }
 
+    /// The stream's sample rate in Hz (standard-rate table index or
+    /// the `0x27` non-standard rate — [`crate::stream_sample_rate`]),
+    /// or `None` when unknown. Round 405.
+    pub fn sample_rate(&self) -> Result<Option<u32>> {
+        crate::stream_sample_rate(self.bytes)
+    }
+
+    /// Move the cursor to the frame nearest `seconds` (time-addressed
+    /// seek): `frame = round(seconds * sample_rate)`, clamped to the
+    /// stream's frame range like a plain [`Self::seek`].
+    ///
+    /// Requires the stream's sample rate to be resolvable
+    /// ([`Self::sample_rate`]); a custom-rate stream missing its
+    /// `0x27` sub-block is refused with [`Error::SampleRateUnknown`],
+    /// and a negative / non-finite `seconds` with
+    /// [`Error::SeekOutOfRange`] (frame domain bounds). Round 405.
+    pub fn seek_seconds(&mut self, seconds: f64) -> Result<()> {
+        let Some(rate) = self.sample_rate()? else {
+            return Err(Error::SampleRateUnknown);
+        };
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(Error::SeekOutOfRange {
+                requested: u64::MAX,
+                first_frame: self.index.first_frame(),
+                end_frame: self.index.end_frame(),
+            });
+        }
+        let frame = (seconds * f64::from(rate)).round();
+        // Clamp the continuous time domain onto the discrete frame
+        // range; the plain seek re-validates.
+        let frame = if frame >= self.index.end_frame() as f64 {
+            self.index.end_frame()
+        } else {
+            frame as u64
+        };
+        self.seek(frame.max(self.index.first_frame()))
+    }
+
     /// Move the cursor to the absolute frame index `frame`.
     ///
     /// Any position in `[first_frame, end_frame]` is accepted —

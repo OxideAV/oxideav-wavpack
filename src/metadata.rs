@@ -564,6 +564,30 @@ pub fn find_multichannel_info<'walk, 'a>(
     find_first(subs, SubBlockId::MultichannelInfo)
 }
 
+/// Convenience wrapper for [`find_first`] specialised to the `0x27`
+/// non-standard-sampling-rate payload, present when the block header's
+/// bits 23..=26 rate index is the custom sentinel `15`. Pair with
+/// [`parse_non_standard_sample_rate`] to obtain the rate in Hz.
+pub fn find_non_standard_sample_rate<'walk, 'a>(
+    subs: &'walk [MetadataSubBlock<'a>],
+) -> Option<&'walk MetadataSubBlock<'a>> {
+    find_first(subs, SubBlockId::NonStandardSampleRate)
+}
+
+/// Parse the payload of a `0x27` non-standard-sampling-rate sub-block.
+///
+/// Staged spec `wavpack-sample-formats.md` §5: the payload is a
+/// **3-byte little-endian** unsigned integer giving the exact sample
+/// rate in Hz (`b[0] + (b[1] << 8) + (b[2] << 16)`, 24-bit range). Any
+/// other payload length is malformed and rejected with
+/// [`Error::SampleRatePayloadLength`].
+pub fn parse_non_standard_sample_rate(payload: &[u8]) -> Result<u32> {
+    let [b0, b1, b2] = payload else {
+        return Err(Error::SampleRatePayloadLength(payload.len()));
+    };
+    Ok(u32::from(*b0) | (u32::from(*b1) << 8) | (u32::from(*b2) << 16))
+}
+
 /// Walk a metadata list and return the first `0x0A` packed-samples
 /// sub-block already wrapped as a typed [`crate::PackedSamples`]
 /// view — the round-12 typed counterpart to [`find_audio_payload`].
@@ -1245,6 +1269,50 @@ mod tests {
         assert!(sub.is_md5_payload());
         let md5 = parse_md5_checksum(sub.payload).unwrap();
         assert_eq!(md5.as_bytes(), &digest);
+    }
+
+    // ---- 0x27 non-standard sample rate (round 405) ----
+
+    #[test]
+    fn parse_non_standard_sample_rate_reads_three_le_bytes() {
+        // Staged spec wavpack-sample-formats.md §5:
+        // rate = b[0] + (b[1] << 8) + (b[2] << 16).
+        assert_eq!(
+            parse_non_standard_sample_rate(&[0x39, 0x30, 0x00]),
+            Ok(12345)
+        );
+        assert_eq!(parse_non_standard_sample_rate(&[0x00, 0x00, 0x00]), Ok(0));
+        assert_eq!(
+            parse_non_standard_sample_rate(&[0xFF, 0xFF, 0xFF]),
+            Ok(16_777_215)
+        );
+    }
+
+    #[test]
+    fn parse_non_standard_sample_rate_rejects_wrong_lengths() {
+        for n in [0usize, 1, 2, 4, 5, 8] {
+            let payload = vec![0u8; n];
+            assert_eq!(
+                parse_non_standard_sample_rate(&payload),
+                Err(Error::SampleRatePayloadLength(n)),
+                "len {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_non_standard_sample_rate_locates_0x27() {
+        let mut stream = synth_small(0x05, &[0u8; 6]);
+        // 3-byte payload -> odd-size flag + one wire pad byte.
+        stream.extend(synth_small(0x27 | ID_FLAG_ODD_SIZE, &[0x39, 0x30, 0x00]));
+        let subs = walk_metadata(&stream).unwrap();
+        let sub = find_non_standard_sample_rate(&subs).expect("0x27 present");
+        assert!(sub.is_sample_rate_payload());
+        assert_eq!(parse_non_standard_sample_rate(sub.payload), Ok(12345));
+        // Absent -> None.
+        let bare = synth_small(0x05, &[0u8; 6]);
+        let subs = walk_metadata(&bare).unwrap();
+        assert!(find_non_standard_sample_rate(&subs).is_none());
     }
 
     // ---- Walker convenience finders ----

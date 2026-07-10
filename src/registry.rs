@@ -342,6 +342,17 @@ impl Encoder for WavPackEncoder {
             }
         }
 
+        // Stamp the caller-declared sample rate into every block
+        // header (standard-rate index, or the sentinel 15 + a 0x27
+        // sub-block on the stream's first block for non-standard
+        // rates) so the emitted chain self-describes its rate
+        // (round 405).
+        if let Some(rate) = self.params.sample_rate {
+            if rate > 0 {
+                data = crate::encode::set_stream_sample_rate(&data, rate).map_err(invalid)?;
+            }
+        }
+
         let mut packet = Packet::new(0, self.time_base(), data);
         packet.pts = audio.pts;
         packet.dts = audio.pts;

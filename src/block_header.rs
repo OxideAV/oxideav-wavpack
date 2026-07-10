@@ -45,6 +45,34 @@ pub const MAX_VERSION: u16 = 0x0410;
 /// "may be 0xFFFFFFFF if unknown".
 pub const TOTAL_SAMPLES_UNKNOWN: u32 = 0xFFFF_FFFF;
 
+/// The fixed standard sample-rate table the wiki bits 23..=26 index
+/// selects from (staged spec `wavpack-sample-formats.md` §5;
+/// mechanically transcribed from the staged CSV
+/// `docs/audio/wavpack/tables/sample-rates.csv`). Index `15` is not in
+/// the table: it is the custom/unknown sentinel whose actual rate is
+/// carried in a `0x27` sub-block.
+pub const STANDARD_SAMPLE_RATES: [u32; 15] = [
+    6000, 8000, 9600, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000,
+    192000,
+];
+
+/// The bits 23..=26 sample-rate index for `rate`, when it is one of the
+/// 15 standard rates ([`STANDARD_SAMPLE_RATES`]); `None` for a
+/// non-standard rate (encoders then write the sentinel index `15` and
+/// carry the exact rate in a `0x27` sub-block — staged spec
+/// `wavpack-sample-formats.md` §5).
+pub fn sample_rate_index_for(rate: u32) -> Option<u8> {
+    STANDARD_SAMPLE_RATES
+        .iter()
+        .position(|&r| r == rate)
+        .map(|i| i as u8)
+}
+
+/// The custom/unknown sentinel value of the bits 23..=26 sample-rate
+/// index (staged spec `wavpack-sample-formats.md` §5: "index `15` means
+/// the rate is **not** in the table").
+pub const SAMPLE_RATE_INDEX_CUSTOM: u8 = 15;
+
 /// Parsed WavPack block header.
 ///
 /// All multi-byte integer fields are stored in little-endian on disk
@@ -305,7 +333,19 @@ impl Flags {
     /// actual sample rate is carried out-of-band in metadata sub-block
     /// `0x27` ("non-standard sampling rate" per the wiki IDs listing).
     pub fn has_custom_sample_rate(&self) -> bool {
-        self.sample_rate_index == 15
+        self.sample_rate_index == SAMPLE_RATE_INDEX_CUSTOM
+    }
+
+    /// The standard sample rate the bits 23..=26 index selects from the
+    /// fixed 15-entry table ([`STANDARD_SAMPLE_RATES`], staged spec
+    /// `wavpack-sample-formats.md` §5), or `None` for the custom /
+    /// unknown sentinel `15` (the rate is then carried in a `0x27`
+    /// sub-block — see [`crate::WavPackBlock::sample_rate`], which
+    /// resolves both cases).
+    pub fn standard_sample_rate(&self) -> Option<u32> {
+        STANDARD_SAMPLE_RATES
+            .get(usize::from(self.sample_rate_index))
+            .copied()
     }
 
     /// `true` when the wiki bit 31 "low-latency block (experimental,
@@ -864,6 +904,40 @@ mod tests {
                 !f.has_custom_sample_rate(),
                 "sample_rate_index {idx} should not be 'custom'"
             );
+        }
+    }
+
+    #[test]
+    fn standard_sample_rate_resolves_every_table_index() {
+        // Every index 0..=14 maps to its staged-CSV table entry
+        // (docs/audio/wavpack/tables/sample-rates.csv); 15 is the
+        // custom sentinel with no table rate.
+        for (idx, &rate) in STANDARD_SAMPLE_RATES.iter().enumerate() {
+            let f = Flags::from_raw((idx as u32) << 23);
+            assert_eq!(f.standard_sample_rate(), Some(rate), "index {idx}");
+        }
+        let custom = Flags::from_raw(15u32 << 23);
+        assert_eq!(custom.standard_sample_rate(), None);
+    }
+
+    #[test]
+    fn sample_rate_table_matches_the_staged_spec_anchors() {
+        // Spec wavpack-sample-formats.md §5 table corners.
+        assert_eq!(STANDARD_SAMPLE_RATES[0], 6000);
+        assert_eq!(STANDARD_SAMPLE_RATES[3], 11025);
+        assert_eq!(STANDARD_SAMPLE_RATES[9], 44100);
+        assert_eq!(STANDARD_SAMPLE_RATES[14], 192_000);
+        assert_eq!(STANDARD_SAMPLE_RATES.len(), 15);
+    }
+
+    #[test]
+    fn sample_rate_index_for_inverts_the_table() {
+        for (idx, &rate) in STANDARD_SAMPLE_RATES.iter().enumerate() {
+            assert_eq!(sample_rate_index_for(rate), Some(idx as u8), "{rate} Hz");
+        }
+        // Non-standard rates have no index (they go through 0x27).
+        for rate in [0u32, 1, 7999, 12345, 44101, 384_000] {
+            assert_eq!(sample_rate_index_for(rate), None, "{rate} Hz");
         }
     }
 

@@ -667,6 +667,34 @@ impl<'a> WavPackBlock<'a> {
         }
     }
 
+    /// The block's sample rate in Hz, resolving both documented
+    /// carriers (staged spec `wavpack-sample-formats.md` §5):
+    ///
+    /// * header flag bits 23..=26 select one of the 15 standard rates
+    ///   ([`crate::STANDARD_SAMPLE_RATES`]);
+    /// * the sentinel index `15` defers to the `0x27`
+    ///   non-standard-sampling-rate sub-block (3-byte little-endian
+    ///   Hz), which is emitted once for the stream, with the first
+    ///   block.
+    ///
+    /// Returns `Ok(None)` when the index is the custom sentinel and
+    /// this block carries no `0x27` sub-block (later blocks of a
+    /// custom-rate stream — resolve via the stream's first block, or
+    /// [`crate::stream_sample_rate`]). Returns
+    /// [`Error::SampleRatePayloadLength`] for a malformed `0x27`
+    /// payload. Round 405.
+    pub fn sample_rate(&self) -> Result<Option<u32>> {
+        if let Some(rate) = self.header.flags.standard_sample_rate() {
+            return Ok(Some(rate));
+        }
+        match crate::metadata::find_non_standard_sample_rate(&self.sub_blocks) {
+            Some(sub) => Ok(Some(crate::metadata::parse_non_standard_sample_rate(
+                sub.payload,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
     /// Locate the `0x26` MD5-checksum sub-block and parse its 16-byte
     /// payload into a typed [`Md5Checksum`].
     ///
@@ -1730,6 +1758,24 @@ pub fn stream_total_samples(bytes: &[u8]) -> Result<Option<Option<u32>>> {
     }
     let (header, _) = parse_block_header(bytes)?;
     Ok(Some(header.total_samples_in_file()))
+}
+
+/// The stream's sample rate in Hz, resolved from its first audio
+/// block: the standard-rate table for header indices `0..=14`, or the
+/// `0x27` non-standard-sampling-rate sub-block (emitted once for the
+/// stream, with the first block) for the custom sentinel `15` (staged
+/// spec `wavpack-sample-formats.md` §5).
+///
+/// Returns `Ok(None)` when the stream has no audio blocks, or when the
+/// index is the custom sentinel and the first audio block carries no
+/// `0x27` sub-block (rate genuinely unknown). Parse errors and a
+/// malformed `0x27` payload ([`Error::SampleRatePayloadLength`])
+/// surface verbatim. Round 405.
+pub fn stream_sample_rate(bytes: &[u8]) -> Result<Option<u32>> {
+    match first_audio_block(bytes)? {
+        Some(block) => block.sample_rate(),
+        None => Ok(None),
+    }
 }
 
 /// Peek the first audio block in `bytes` — the first block whose

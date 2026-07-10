@@ -50,6 +50,22 @@ pub enum Error {
     /// the wiki "IDs" listing ("16-byte MD5 sum of raw audio data").
     /// The contained number is the observed byte count.
     Md5ChecksumLength(usize),
+    /// A `0x27` non-standard-sampling-rate sub-block had a payload
+    /// whose byte count was not the fixed 3-byte little-endian rate
+    /// field the staged spec `wavpack-sample-formats.md` §5 documents.
+    /// The contained number is the observed byte count.
+    SampleRatePayloadLength(usize),
+    /// An encoder was asked to stamp a non-standard sample rate that
+    /// does not fit the 24-bit `0x27` field (staged spec
+    /// `wavpack-sample-formats.md` §5: up to 16 777 215 Hz), or a zero
+    /// rate. The contained number is the offending rate.
+    CustomSampleRateOutOfRange(u32),
+    /// A time-addressed operation (seconds → frames) needed the
+    /// stream's sample rate, but it could not be resolved: the header
+    /// carries the custom sentinel index `15` and no `0x27`
+    /// non-standard-sampling-rate sub-block is present on the first
+    /// audio block.
+    SampleRateUnknown,
     /// A `0x0A` packed-samples sub-block had an odd-length payload. The
     /// clean-room entropy doc
     /// `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 states the
@@ -441,6 +457,18 @@ impl core::fmt::Display for Error {
             Error::Md5ChecksumLength(n) => write!(
                 f,
                 "oxideav-wavpack: 0x26 MD5-checksum payload has {n} bytes (expected 16)"
+            ),
+            Error::SampleRatePayloadLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x27 non-standard-sample-rate payload has {n} bytes (expected 3)"
+            ),
+            Error::CustomSampleRateOutOfRange(rate) => write!(
+                f,
+                "oxideav-wavpack: custom sample rate {rate} Hz is outside the 24-bit 0x27 range (1..=16777215)"
+            ),
+            Error::SampleRateUnknown => write!(
+                f,
+                "oxideav-wavpack: stream sample rate unknown (custom index 15 with no 0x27 sub-block); time-addressed seeking needs a resolvable rate"
             ),
             Error::PackedSamplesOddLength(n) => write!(
                 f,

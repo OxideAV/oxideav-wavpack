@@ -23,6 +23,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   meta anchors, and the §1 round-trip bounds (exact below magnitude
   115, ~0.1% across the 32-bit range).
 
+- Round 405 — **sample-rate surface (staged table + `0x27`).**
+  `STANDARD_SAMPLE_RATES` (the 15-entry index table, mechanically
+  transcribed from the staged `docs/audio/wavpack/tables/sample-rates.csv`),
+  `sample_rate_index_for`, `Flags::standard_sample_rate`,
+  `parse_non_standard_sample_rate` / `find_non_standard_sample_rate`
+  (the 3-byte little-endian `0x27` carrier for the sentinel index 15),
+  `WavPackBlock::sample_rate`, and the stream-level
+  `stream_sample_rate`. Seeking gains its time-addressed layer:
+  `StreamReader::sample_rate` + `StreamReader::seek_seconds`
+  (typed `Error::SampleRateUnknown` when a custom-rate stream lacks its
+  `0x27`). On the write side, `set_stream_sample_rate` stamps an
+  encoded chain post-hoc (standard rates patch every header's bits
+  23..=26; non-standard rates set the sentinel and append the `0x27`
+  sub-block to the stream's first block, once), and the registry
+  `WavPackEncoder` applies it automatically from the caller-declared
+  `CodecParameters::sample_rate` — validated black-box: the reference
+  decoder reports both a stamped standard rate (44100) and a stamped
+  custom rate (12345) and decodes the stamped streams bit-exactly.
+
 ### Changed
 
 - Round 405 — **`0x05` median / `0x04` seed expansion is now the
