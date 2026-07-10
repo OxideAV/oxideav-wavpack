@@ -99,6 +99,15 @@ pub enum Error {
     /// clear) — reinterpreting integer PCM as bit patterns would be
     /// silent corruption.
     BlockNotFloat,
+    /// A `0x0D` multichannel-information sub-block had a payload the
+    /// first-member `[count, mask]` form cannot carry: empty, or longer
+    /// than the 1-byte count plus a 4-byte mask (the extended `0x0D`
+    /// form for >32 channels / reordering, whose layout the staged spec
+    /// does not pin). The contained number is the observed byte count.
+    ChannelInfoLength(usize),
+    /// A `0x0D` multichannel-information sub-block declared zero total
+    /// channels.
+    ChannelInfoZeroChannels,
     /// A `0x08` float-info sub-block had a payload whose byte count was
     /// not the fixed 4 bytes (`float_flags, float_shift, float_max_exp,
     /// float_norm_exp`) the staged spec `wavpack-sample-formats.md` §2
@@ -542,6 +551,14 @@ impl core::fmt::Display for Error {
             Error::BlockNotFloat => write!(
                 f,
                 "oxideav-wavpack: float-typed decode on a non-float block (FLOAT_DATA bit 7 is clear)"
+            ),
+            Error::ChannelInfoLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x0D multichannel-info payload has {n} bytes (first-member form is 1 count byte + 0..=4 mask bytes)"
+            ),
+            Error::ChannelInfoZeroChannels => write!(
+                f,
+                "oxideav-wavpack: 0x0D multichannel-info declares zero channels"
             ),
             Error::FloatInfoLength(n) => write!(
                 f,

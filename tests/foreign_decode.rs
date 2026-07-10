@@ -286,3 +286,25 @@ fn corrupted_float_extension_bits_fail_the_crc_x_gate() {
         assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
     }
 }
+
+/// The 5.1 foreign fixture's first member declares its geometry via
+/// the `0x0D` `[count, mask]` sub-block (staged spec
+/// `wavpack-sample-formats.md` §6): 6 channels, the standard 5.1
+/// speaker mask 0x3F — matching the decoded interleave width.
+#[test]
+fn foreign_5dot1_channel_info_declares_count_and_mask() {
+    let wv = include_bytes!("data/foreign_default_5dot1_16.wv");
+    let info = oxideav_wavpack::stream_channel_info(wv)
+        .expect("parse")
+        .expect("5.1 stream carries 0x0D");
+    assert_eq!(info.count, 6);
+    assert_eq!(info.mask, 0x3F, "standard 5.1 speaker mask");
+    assert_eq!(info.assigned_positions(), 6);
+    let decoded = decode_multichannel_stream(wv).expect("decode");
+    assert_eq!(decoded.channels, usize::from(info.count));
+    // Plain mono / stereo files carry no 0x0D.
+    let mono = include_bytes!("data/foreign_default_mono16.wv");
+    assert!(oxideav_wavpack::stream_channel_info(mono)
+        .expect("parse")
+        .is_none());
+}

@@ -91,6 +91,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (6/6), five pinned as integration fixtures plus a float
   extension-corruption trip-wire.
 
+- Round 405 — **`0x0D` first-member channel geometry.** Typed
+  `ChannelInfo` (`count`, little-endian Microsoft speaker `mask`,
+  `mask_bytes`, `assigned_positions`) with `parse_channel_info`
+  implementing the staged `wavpack-sample-formats.md` §6 erratum pin
+  (`[count, mask]`, zero-length mask = no assignment; the extended
+  >32-channel form is a typed `ChannelInfoLength` refusal), plus
+  `WavPackBlock::channel_info` and the stream-level
+  `stream_channel_info`. Pinned against the reference-encoded 5.1
+  fixture (`count 6`, mask `0x3F`, matching the decoded width).
+
 ### Changed
 
 - Round 405 — **`0x05` median / `0x04` seed expansion is now the

@@ -564,6 +564,65 @@ pub fn find_multichannel_info<'walk, 'a>(
     find_first(subs, SubBlockId::MultichannelInfo)
 }
 
+/// Typed expansion of the first-member `0x0D` multichannel-information
+/// sub-block — `[count, mask]` (staged spec `wavpack-sample-formats.md`
+/// §6, issue-#204 erratum pin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelInfo {
+    /// Total number of channels in the stream (the 1-byte `count`
+    /// field, first on the wire).
+    pub count: u8,
+    /// Microsoft `WAVEFORMATEXTENSIBLE` speaker bit-mask, little-endian
+    /// on the wire (bit 0 = front-left, bit 1 = front-right, bit 2 =
+    /// front-center, bit 3 = LFE, … in the usual Microsoft
+    /// speaker-position order). `0` means "no assignment".
+    pub mask: u32,
+    /// How many mask bytes were on the wire (`0..=4`; `0` means the
+    /// sub-block carried only the count — "no assignment").
+    pub mask_bytes: u8,
+}
+
+impl ChannelInfo {
+    /// Number of speaker positions assigned by [`Self::mask`] (its
+    /// popcount). A conformant stream keeps this at or below
+    /// [`Self::count`]; `0` means unassigned channels.
+    #[must_use]
+    pub fn assigned_positions(&self) -> u32 {
+        self.mask.count_ones()
+    }
+}
+
+/// Parse the payload of a first-member `0x0D` multichannel-information
+/// sub-block into a typed [`ChannelInfo`].
+///
+/// Staged spec `wavpack-sample-formats.md` §6 (erratum pin): the
+/// **first member** form is `[count (1 byte), mask (little-endian, byte
+/// length = sub-block length − 1)]`; a zero-length mask means "no
+/// assignment". A payload longer than `1 + 4` bytes is the extended
+/// `0x0D` form (later encoders, >32 channels / reordering) whose layout
+/// the staged spec does not pin — rejected with
+/// [`Error::ChannelInfoLength`], as is an empty payload. A zero channel
+/// count is rejected with [`Error::ChannelInfoZeroChannels`].
+pub fn parse_channel_info(payload: &[u8]) -> Result<ChannelInfo> {
+    let (count, mask_bytes) = match payload {
+        [] => return Err(Error::ChannelInfoLength(0)),
+        [count, rest @ ..] if rest.len() <= 4 => (*count, rest),
+        _ => return Err(Error::ChannelInfoLength(payload.len())),
+    };
+    if count == 0 {
+        return Err(Error::ChannelInfoZeroChannels);
+    }
+    let mut mask = 0u32;
+    for (i, &b) in mask_bytes.iter().enumerate() {
+        mask |= u32::from(b) << (8 * i);
+    }
+    Ok(ChannelInfo {
+        count,
+        mask,
+        mask_bytes: mask_bytes.len() as u8,
+    })
+}
+
 /// Convenience wrapper for [`find_first`] specialised to the `0x27`
 /// non-standard-sampling-rate payload, present when the block header's
 /// bits 23..=26 rate index is the custom sentinel `15`. Pair with
@@ -1313,6 +1372,49 @@ mod tests {
         let bare = synth_small(0x05, &[0u8; 6]);
         let subs = walk_metadata(&bare).unwrap();
         assert!(find_non_standard_sample_rate(&subs).is_none());
+    }
+
+    // ---- 0x0D first-member channel info (round 405) ----
+
+    #[test]
+    fn parse_channel_info_reads_count_then_le_mask() {
+        // 5.1: count 6, mask 0x3F (FL|FR|FC|LFE|BL|BR), one mask byte.
+        let ci = parse_channel_info(&[6, 0x3F]).unwrap();
+        assert_eq!(
+            ci,
+            ChannelInfo {
+                count: 6,
+                mask: 0x3F,
+                mask_bytes: 1
+            }
+        );
+        assert_eq!(ci.assigned_positions(), 6);
+        // Multi-byte masks are little-endian.
+        let ci = parse_channel_info(&[8, 0x3F, 0x06]).unwrap();
+        assert_eq!(ci.mask, 0x063F);
+        assert_eq!(ci.mask_bytes, 2);
+        // A zero-length mask means "no assignment".
+        let ci = parse_channel_info(&[4]).unwrap();
+        assert_eq!(ci.mask, 0);
+        assert_eq!(ci.mask_bytes, 0);
+        assert_eq!(ci.assigned_positions(), 0);
+        // Full 4-byte mask.
+        let ci = parse_channel_info(&[32, 0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!(ci.mask, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn parse_channel_info_rejects_malformed_payloads() {
+        assert_eq!(parse_channel_info(&[]), Err(Error::ChannelInfoLength(0)));
+        // Longer than count + 4 mask bytes = the extended 0x0D form.
+        assert_eq!(
+            parse_channel_info(&[6, 1, 2, 3, 4, 5]),
+            Err(Error::ChannelInfoLength(6))
+        );
+        assert_eq!(
+            parse_channel_info(&[0, 0x3F]),
+            Err(Error::ChannelInfoZeroChannels)
+        );
     }
 
     // ---- Walker convenience finders ----

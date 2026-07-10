@@ -853,10 +853,10 @@ pub use crate::block::{
     decode_stream_muted, decoded_sample_count, first_audio_block, first_correction_block,
     iter_audio_blocks, iter_blocks, iter_correction_blocks, iter_decoded_blocks,
     metadata_block_count, multichannel_layout, pair_correction_stream, parse_block, parse_blocks,
-    stream_sample_rate, stream_total_samples, total_audio_samples, total_block_samples,
-    total_correction_payload_bytes, AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream,
-    MultichannelLayout, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
-    MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
+    stream_channel_info, stream_sample_rate, stream_total_samples, total_audio_samples,
+    total_block_samples, total_correction_payload_bytes, AudioBlockIter, BlockIter,
+    CorrectionBlockIter, DecodedStream, MultichannelLayout, StreamDecodeIter,
+    UnsupportedBlockFeature, WavPackBlock, MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
 };
 pub use crate::block_header::{
     parse_block_header, sample_rate_index_for, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC,
@@ -920,10 +920,10 @@ pub use crate::metadata::{
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
     find_noise_shaping_profile, find_non_standard_sample_rate, find_packed_correction_data,
     find_packed_correction_data_sub_block, find_packed_overflow_bits,
-    find_packed_overflow_bits_sub_block, find_packed_samples, parse_md5_checksum,
-    parse_metadata_sub_block, parse_non_standard_sample_rate, walk_metadata, Md5Checksum,
-    MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE,
-    ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
+    find_packed_overflow_bits_sub_block, find_packed_samples, parse_channel_info,
+    parse_md5_checksum, parse_metadata_sub_block, parse_non_standard_sample_rate, walk_metadata,
+    ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE,
+    ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
 };
 pub use crate::overflow_bits::{expand_packed_overflow_bits, PackedOverflowBits};
 pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples, PackedSamples};
