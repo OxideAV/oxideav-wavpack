@@ -197,11 +197,30 @@ pub fn reassemble_float(
     let mut crc_x = crate::crc::CRC_INIT;
     for slot in pcm.iter_mut() {
         let integer = *slot;
-        let bits = reassemble_one(integer, info, ext.as_deref_mut())?;
+        let bits = reassemble_one(integer, info, ext.as_deref_mut(), false)?;
         crc_x = update_float_extension(crc_x, bits);
         *slot = bits as i32;
     }
     Ok(crc_x)
+}
+
+/// [`reassemble_float`] for a block that carries **no** `0x0C`
+/// extension stream even though the profile names extension-fed fills
+/// — the shape a **hybrid (lossy)** float block takes on the wire
+/// (round-408 black-box pin: reference hybrid float files keep the
+/// `SHIFT_SENT` profile flag but omit the wvx sub-block; the dropped
+/// low mantissa bits are implied zero in the lossy reconstruction).
+///
+/// Extension-fed fields default: `SHIFT_SENT` / `SHIFT_SAME` windows
+/// fill with zeros, a `ZEROS_SENT` zero integer decodes to implied
+/// `+0.0`. An `EXCEPTIONS` sentinel still needs its mantissa payload
+/// and errors with [`Error::BlockMissingOverflowBits`] — an
+/// exceptional value cannot be implied.
+pub fn reassemble_float_implied(pcm: &mut [i32], info: &FloatInfo) -> Result<()> {
+    for slot in pcm.iter_mut() {
+        *slot = reassemble_one(*slot, info, None, true)? as i32;
+    }
+    Ok(())
 }
 
 /// One float-sample step of the extension CRC (module-doc erratum):
@@ -216,7 +235,15 @@ pub fn update_float_extension(crc_x: u32, float_bits: u32) -> u32 {
 }
 
 /// Reconstruct one float bit pattern from its scaled integer.
-fn reassemble_one(integer: i32, info: &FloatInfo, ext: Option<&mut BitReader<'_>>) -> Result<u32> {
+/// `implied` selects the no-extension-stream lossy defaults (see
+/// [`reassemble_float_implied`]) instead of erroring on a missing
+/// reader.
+fn reassemble_one(
+    integer: i32,
+    info: &FloatInfo,
+    ext: Option<&mut BitReader<'_>>,
+    implied: bool,
+) -> Result<u32> {
     let sign = if integer < 0 { 1u32 << 31 } else { 0 };
     let magnitude = integer.unsigned_abs();
 
@@ -231,7 +258,14 @@ fn reassemble_one(integer: i32, info: &FloatInfo, ext: Option<&mut BitReader<'_>
         // included). Clear = a true zero, whose sign bit follows only
         // under NEG_ZEROS. All fields LSB-first. (Round-405 black-box
         // pin; see the module doc.)
-        let reader = ext.ok_or(Error::BlockMissingOverflowBits)?;
+        let Some(reader) = ext else {
+            if implied {
+                // Lossy stream without wvx: every zero is an implied
+                // +0.0.
+                return Ok(0);
+            }
+            return Err(Error::BlockMissingOverflowBits);
+        };
         if reader.get_bit()? == 1 {
             let mantissa = reader.get_bits(23)?;
             let exponent = reader.get_bits(8)?;
@@ -256,6 +290,9 @@ fn reassemble_one(integer: i32, info: &FloatInfo, ext: Option<&mut BitReader<'_>
         // marker bit, then (marker == 1) the 23-bit NaN mantissa
         // LSB-first. The sign travelled the normal sign path.
         if info.float_flags & FLOAT_EXCEPTIONS != 0 && bit_length == 25 {
+            // An exceptional value cannot be implied — its mantissa
+            // payload only exists in the extension stream, so a missing
+            // reader is an error even in the lossy (implied) mode.
             let reader = ext.ok_or(Error::BlockMissingOverflowBits)?;
             let mantissa = if reader.get_bit()? == 1 {
                 reader.get_bits(23)?
@@ -283,19 +320,29 @@ fn reassemble_one(integer: i32, info: &FloatInfo, ext: Option<&mut BitReader<'_>
     let low_bits = if shift_needed == 0 {
         0
     } else if info.float_flags & FLOAT_SHIFT_SENT != 0 {
-        let reader = ext.ok_or(Error::BlockMissingOverflowBits)?;
-        reader.get_bits(shift_needed)?
+        match ext {
+            Some(reader) => reader.get_bits(shift_needed)?,
+            // Lossy stream without wvx: the sent bits are implied zero.
+            None if implied => 0,
+            None => return Err(Error::BlockMissingOverflowBits),
+        }
     } else if info.float_flags & FLOAT_SHIFT_ONES != 0 {
         (1u32 << shift_needed) - 1
     } else if info.float_flags & FLOAT_SHIFT_SAME != 0 {
         // Staged spec §2.1: one carrier bit per non-zero sample —
         // `1` fills the vacated window with ones, `0` with zeros.
         // (§2.1 precedence: SENT wins over ONES wins over SAME.)
-        let reader = ext.ok_or(Error::BlockMissingOverflowBits)?;
-        if reader.get_bit()? == 1 {
-            (1u32 << shift_needed) - 1
-        } else {
-            0
+        match ext {
+            Some(reader) => {
+                if reader.get_bit()? == 1 {
+                    (1u32 << shift_needed) - 1
+                } else {
+                    0
+                }
+            }
+            // Lossy stream without wvx: the carrier is implied zero.
+            None if implied => 0,
+            None => return Err(Error::BlockMissingOverflowBits),
         }
     } else {
         0

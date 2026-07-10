@@ -93,6 +93,15 @@ pub enum Error {
     /// A block with flag bit 7 (`FLOAT_DATA`) set carries no `0x08`
     /// float-info sub-block describing the reconstruction profile.
     BlockMissingFloatInfo,
+    /// A hybrid block (flag bit 3) carries no `0x06` hybrid-profile
+    /// sub-block seeding the per-channel `error_limit` state (staged
+    /// spec `wavpack-entropy-decode.md` §6.5).
+    BlockMissingHybridProfile,
+    /// A `0x06` hybrid-profile sub-block had a payload whose byte count
+    /// did not match the block's channel shape (4 bytes for mono /
+    /// false-stereo, 8 for stereo — round-408 black-box pin). The
+    /// contained number is the observed byte count.
+    HybridProfileLength(usize),
     /// A float-typed decode (`decode_samples_f32` /
     /// `decode_stream_f32`) was asked to decode a block/stream whose
     /// samples are integers, not IEEE floats (header flag bit 7
@@ -551,6 +560,14 @@ impl core::fmt::Display for Error {
             Error::BlockNotFloat => write!(
                 f,
                 "oxideav-wavpack: float-typed decode on a non-float block (FLOAT_DATA bit 7 is clear)"
+            ),
+            Error::BlockMissingHybridProfile => write!(
+                f,
+                "oxideav-wavpack: hybrid block (flag bit 3) carries no 0x06 hybrid-profile sub-block"
+            ),
+            Error::HybridProfileLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x06 hybrid-profile payload has {n} bytes (expected 4 mono / 8 stereo)"
             ),
             Error::ChannelInfoLength(n) => write!(
                 f,

@@ -11,17 +11,20 @@
 //! *fold* — where in the per-sample pipeline the correction value is added
 //! to the reconstructed lossy value to recover the exact original.
 //!
-//! This module implements exactly that documented fold arithmetic as typed
-//! primitives. The fold is a pure consumer of two already-decoded integer
-//! values (one lossy main value, one correction value) — it does **not**
-//! decode either entropy stream and does not depend on the (undocumented)
-//! lossy main-stream `error_limit` derivation or the `read_shaping_info`
-//! layout. Those gaps block the full hybrid *decode path*; the fold step
-//! they feed is fully specified, so it is lifted here onto the public
-//! surface the same way every other documented spec operation in this
-//! crate is (the §3 weight arithmetic, the §4.2 entropy ladder, the §5 CRC
-//! steps): a small, pinned, exact building block the consuming path drives
-//! when the remaining gaps close.
+//! This module carries two layers:
+//!
+//! * the documented **fold arithmetic** as typed primitives — a pure
+//!   consumer of two already-decoded integer values (one lossy main
+//!   value, one correction value);
+//! * since round 408, the **`error_limit` model** that decodes the
+//!   lossy `0x0A` stream itself: [`HybridProfile`] (the `0x06` seed),
+//!   [`HybridState`] (the per-channel slow-level recurrence and the
+//!   per-frame limit derivation, including the stereo balance
+//!   redistribution), consumed by the `samples` module's bracketing
+//!   loops. The staged spec §6.5 gives the structural model; the exact
+//!   integer recurrence was pinned **black-box** against reference
+//!   hybrid decodes (bit-exact over a mono/stereo/multi-block/
+//!   silence/bitrate-sweep fixture battery).
 //!
 //! ## Where the fold sits (spec §4.1)
 //!
@@ -62,12 +65,18 @@
 //!
 //! ## Not covered (documented gaps)
 //!
-//! The **noise-shaping** variant (`HYBRID_SHAPE` `0x40` / `NEW_SHAPING`
-//! `0x20000000`, spec §4.1) replaces the raw add with a first-order
-//! error-feedback filter whose per-channel shaping weight/state come from
-//! the `read_shaping_info` metadata — a layout the staged docs name but do
-//! not transcribe. The raw-add fold here is the `HYBRID_SHAPE`-clear case
-//! (the common hybrid mode); the shaped variant stays a documented gap.
+//! The **noise-shaping** variant of the correction fold (`HYBRID_SHAPE`
+//! `0x40` / `NEW_SHAPING` `0x20000000`, spec §4.1) replaces the raw add
+//! with a first-order error-feedback filter whose per-channel shaping
+//! weight/state come from the `0x07` metadata — a seed layout the
+//! staged docs name but do not transcribe. The raw-add fold here is the
+//! `HYBRID_SHAPE`-clear case; the shaped **fold** stays a documented
+//! gap. (Note the shaping bits do NOT affect the `.wv`-only lossy
+//! decode — round-408 black-box fixtures carry `HYBRID_SHAPE` and
+//! decode bit-exact without any shaping arithmetic; the filter only
+//! participates when folding a `0x0B` correction stream.)
+
+use crate::error::{Error, Result};
 
 /// The `HYBRID_FLAG` bit (`0x08`, spec §6): the block is a hybrid (lossy
 /// main + optional correction) block.
@@ -196,6 +205,218 @@ pub fn split_correction(original: i32, lossy: i32) -> i32 {
     original.wrapping_sub(lossy)
 }
 
+/// On-wire byte length of a `0x06` hybrid-profile payload for a block
+/// whose data is mono / false-stereo: two little-endian 16-bit words —
+/// the log-packed initial `slow_level` and the bitrate word (round-408
+/// black-box pin; see [`expand_hybrid_profile`]).
+pub const HYBRID_PROFILE_MONO_BYTES: usize = 4;
+
+/// On-wire byte length of a `0x06` hybrid-profile payload for a stereo
+/// block: four little-endian 16-bit words — the two per-channel
+/// log-packed initial `slow_level`s, the shared bitrate word, and the
+/// balance word (round-408 black-box pin).
+pub const HYBRID_PROFILE_STEREO_BYTES: usize = 8;
+
+/// The constant offset in the `error_limit` argument
+/// (`ema - bitrate + 256`, staged spec §6.5 model + round-408 pin).
+pub const HYBRID_LIMIT_BIAS: i32 = 256;
+
+/// Defensive ceiling on the `error_limit` log argument before
+/// [`crate::wp_exp2s`] expansion: `30 << 8 | 0xff` keeps the expanded
+/// limit within `u32` (int part 30 → mantissa shifted left 21, max
+/// `0x1ff << 21 < 2^31`). Arguments above it saturate the limit to
+/// `u32::MAX` (an interval is never wider than `2^31 - 1`, so any such
+/// limit means "stop immediately"). Unreachable on conformant streams
+/// (it needs a tracked signal level near 2^30).
+pub const HYBRID_LIMIT_ARG_CEILING: i32 = (30 << 8) | 0xff;
+
+/// Typed expansion of the `0x06` `ID_HYBRID_PROFILE` sub-block — the
+/// per-block seed of the hybrid `error_limit` state (staged spec
+/// `wavpack-entropy-decode.md` §6.5; exact wire layout pinned black-box
+/// in round 408 against reference-encoded hybrid files).
+///
+/// Layout (little-endian 16-bit words):
+///
+/// | Word | Mono / false-stereo         | Stereo                          |
+/// | ---- | --------------------------- | ------------------------------- |
+/// | 0    | `slow_level` seed (log word)| channel-0 `slow_level` seed     |
+/// | 1    | bitrate word                | channel-1 `slow_level` seed     |
+/// | 2    | —                           | bitrate word (shared)           |
+/// | 3    | —                           | balance word                    |
+///
+/// The `slow_level` seeds are **log-packed** exactly like the `0x05`
+/// medians: the linear state is recovered with [`crate::wp_exp2s`].
+/// The bitrate word is in the same 8-fractional-bit log domain
+/// (empirically `max(0, bits_per_sample * 256 - 568)` across the
+/// reference encoder's `-b` range — the decoder just consumes it). The
+/// stereo balance word anchors the per-channel limit split (observed
+/// `0x0100` on mid/side blocks, `0` on left/right blocks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridProfile {
+    /// Log-packed per-channel `slow_level` seeds (`[word, 0]` for a
+    /// mono profile).
+    pub level_words: [i16; 2],
+    /// The bitrate word (log-domain bits-per-sample target).
+    pub bitrate: i32,
+    /// The stereo balance word (`0` for a mono profile).
+    pub balance: i32,
+    /// `true` when the profile carries the 4-word stereo layout.
+    pub stereo: bool,
+}
+
+/// Expand a `0x06` hybrid-profile payload into a typed
+/// [`HybridProfile`].
+///
+/// `stereo` selects the expected layout from the block's channel shape
+/// (`!Flags::is_block_data_mono()`): 4 bytes for mono / false-stereo,
+/// 8 bytes for stereo. Any other length is
+/// [`Error::HybridProfileLength`].
+pub fn expand_hybrid_profile(payload: &[u8], stereo: bool) -> Result<HybridProfile> {
+    let word = |i: usize| i16::from_le_bytes([payload[2 * i], payload[2 * i + 1]]);
+    if stereo {
+        if payload.len() != HYBRID_PROFILE_STEREO_BYTES {
+            return Err(Error::HybridProfileLength(payload.len()));
+        }
+        Ok(HybridProfile {
+            level_words: [word(0), word(1)],
+            bitrate: i32::from(word(2)),
+            balance: i32::from(word(3)),
+            stereo: true,
+        })
+    } else {
+        if payload.len() != HYBRID_PROFILE_MONO_BYTES {
+            return Err(Error::HybridProfileLength(payload.len()));
+        }
+        Ok(HybridProfile {
+            level_words: [word(0), 0],
+            bitrate: i32::from(word(1)),
+            balance: 0,
+            stereo: false,
+        })
+    }
+}
+
+/// The running hybrid `error_limit` state of one block (staged spec
+/// §6.5 "where `error_limit` comes from"; exact recurrence pinned
+/// black-box in round 408, bit-exact against reference decodes over
+/// mono/stereo/multi-block/silence/bitrate-sweep fixtures).
+///
+/// Per coded channel the state is a linear `slow_level` accumulator
+/// seeded from the profile's log-packed level word
+/// (`wp_exp2s(level_word)`). Every decoded sample updates its
+/// channel's accumulator with the sample's pre-sign magnitude:
+///
+/// ```text
+/// slow_level -= (slow_level + 128) >> 8;
+/// slow_level += wp_log2(magnitude);
+/// ```
+///
+/// (zero samples — including zero-run members — update with
+/// `wp_log2(0) == 0`, decaying the level through silence).
+///
+/// The per-sample `error_limit` is derived **at frame start** (per
+/// sample for mono; once per L/R pair for stereo, both channels from
+/// the same pre-frame states):
+///
+/// ```text
+/// ema_ch  = (slow_level_ch + 128) >> 8            (log domain)
+/// mono:    arg = ema_0 - bitrate + 256
+/// stereo:  delta = (ema_0 - ema_1 - balance) >> 1  (arithmetic shift)
+///          arg_0 = ema_0 - delta - bitrate + 256
+///          arg_1 = ema_1 + delta - bitrate + 256
+/// limit_ch = wp_exp2s(arg_ch)   when arg_ch > 0, else 0 (lossless)
+/// ```
+///
+/// The stereo `delta` redistributes precision between the channels
+/// around the profile's balance anchor (the flag-bit-10 "hybrid noise
+/// balanced" behaviour); with `balance == 0` and equal levels it
+/// degenerates to two independent mono channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridState {
+    slow_level: [u32; 2],
+    bitrate: i32,
+    balance: i32,
+    stereo: bool,
+}
+
+impl HybridState {
+    /// Seed the running state from a block's expanded `0x06` profile.
+    ///
+    /// Each `slow_level` accumulator starts at `wp_exp2s(level_word)`
+    /// (negative words clamp to 0 — a level is a magnitude).
+    #[must_use]
+    pub fn from_profile(profile: &HybridProfile) -> Self {
+        let seed = |w: i16| crate::logpack::wp_exp2s(i32::from(w)).max(0) as u32;
+        HybridState {
+            slow_level: [seed(profile.level_words[0]), seed(profile.level_words[1])],
+            bitrate: profile.bitrate,
+            balance: profile.balance,
+            stereo: profile.stereo,
+        }
+    }
+
+    /// The linear `slow_level` accumulator of `channel` (0 or 1).
+    #[must_use]
+    pub fn slow_level(&self, channel: usize) -> u32 {
+        self.slow_level[channel & 1]
+    }
+
+    /// Expand one limit argument, with the defensive
+    /// [`HYBRID_LIMIT_ARG_CEILING`] saturation.
+    fn limit_from_arg(arg: i32) -> u32 {
+        if arg <= 0 {
+            0
+        } else if arg > HYBRID_LIMIT_ARG_CEILING {
+            u32::MAX
+        } else {
+            crate::logpack::wp_exp2s(arg) as u32
+        }
+    }
+
+    /// Compute the frame's per-channel `error_limit`s from the current
+    /// (pre-frame) states. Index 0 is the mono limit / stereo channel
+    /// 0; index 1 is stereo channel 1 (0 for mono states — a mono
+    /// frame is one sample).
+    #[must_use]
+    pub fn frame_limits(&self) -> [u32; 2] {
+        let ema0 = ((self.slow_level[0] + 128) >> 8) as i32;
+        if !self.stereo {
+            return [
+                Self::limit_from_arg(ema0 - self.bitrate + HYBRID_LIMIT_BIAS),
+                0,
+            ];
+        }
+        let ema1 = ((self.slow_level[1] + 128) >> 8) as i32;
+        let delta = (ema0 - ema1 - self.balance) >> 1;
+        [
+            Self::limit_from_arg(ema0 - delta - self.bitrate + HYBRID_LIMIT_BIAS),
+            Self::limit_from_arg(ema1 + delta - self.bitrate + HYBRID_LIMIT_BIAS),
+        ]
+    }
+
+    /// Fold one decoded sample's **pre-sign magnitude** (the bracket /
+    /// mantissa value before the §4.2 step-7 complement) into
+    /// `channel`'s running level. Must be called for **every** emitted
+    /// sample of that channel, including zeros from the §4.2 step-1
+    /// zero-run path (`wp_log2(0) == 0` decays the level).
+    pub fn update(&mut self, channel: usize, magnitude: u32) {
+        let sl = &mut self.slow_level[channel & 1];
+        *sl = *sl - ((*sl + 128) >> 8) + crate::logpack::wp_log2(magnitude) as u32;
+    }
+
+    /// [`Self::update`] keyed on a signed decoded sample (the §4.2
+    /// step-7 output): a negative sample's magnitude is its bitwise
+    /// complement.
+    pub fn update_signed(&mut self, channel: usize, sample: i32) {
+        let magnitude = if sample < 0 {
+            !sample as u32
+        } else {
+            sample as u32
+        };
+        self.update(channel, magnitude);
+    }
+}
+
 /// `true` when the flag word selects the **noise-shaped** correction fold
 /// (`HYBRID_SHAPE` or `NEW_SHAPING`), which this module does not implement.
 ///
@@ -269,6 +490,127 @@ impl CorrectionFold {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 0x06 profile expansion (round 408) ---------------------------
+
+    #[test]
+    fn expand_mono_profile_reads_level_and_bitrate() {
+        // The b4 mono profile observed on reference files:
+        // level word 0x143f, bitrate word 0x01c8 (456).
+        let p = expand_hybrid_profile(&[0x3f, 0x14, 0xc8, 0x01], false).unwrap();
+        assert_eq!(p.level_words, [0x143f, 0]);
+        assert_eq!(p.bitrate, 456);
+        assert_eq!(p.balance, 0);
+        assert!(!p.stereo);
+    }
+
+    #[test]
+    fn expand_stereo_profile_reads_levels_rate_and_balance() {
+        // The b4 mid/side stereo profile observed on reference files:
+        // level words 0x1412 / 0x13e3, shared bitrate 456, balance 256.
+        let p =
+            expand_hybrid_profile(&[0x12, 0x14, 0xe3, 0x13, 0xc8, 0x01, 0x00, 0x01], true).unwrap();
+        assert_eq!(p.level_words, [0x1412, 0x13e3]);
+        assert_eq!(p.bitrate, 456);
+        assert_eq!(p.balance, 256);
+        assert!(p.stereo);
+    }
+
+    #[test]
+    fn expand_rejects_shape_mismatched_lengths() {
+        for (payload, stereo) in [
+            (&[0u8; 4][..], true),  // stereo block, mono-sized payload
+            (&[0u8; 8][..], false), // mono block, stereo-sized payload
+            (&[0u8; 2][..], false),
+            (&[0u8; 6][..], true),
+            (&[0u8; 0][..], false),
+        ] {
+            assert_eq!(
+                expand_hybrid_profile(payload, stereo),
+                Err(Error::HybridProfileLength(payload.len())),
+                "len {} stereo {stereo}",
+                payload.len()
+            );
+        }
+    }
+
+    // ---- slow-level state + limits (round-408 black-box pins) ---------
+
+    #[test]
+    fn mono_state_seeds_and_derives_the_pinned_limit() {
+        // Level word 0x143f log-unpacks to 622592; ema = 2432;
+        // arg = 2432 - 456 + 256 = 2232; wp_exp2s(2232) = 210. These
+        // are the exact opening values of the reference-encoded b4
+        // mono fixture the recurrence was pinned against.
+        let p = expand_hybrid_profile(&[0x3f, 0x14, 0xc8, 0x01], false).unwrap();
+        let state = HybridState::from_profile(&p);
+        assert_eq!(state.slow_level(0), crate::logpack::wp_exp2s(0x143f) as u32);
+        assert_eq!(state.slow_level(0), 622_592);
+        assert_eq!(state.frame_limits(), [210, 0]);
+    }
+
+    #[test]
+    fn update_applies_the_slow_level_recurrence() {
+        // sl' = sl - ((sl + 128) >> 8) + wp_log2(mag).
+        let p = expand_hybrid_profile(&[0x3f, 0x14, 0xc8, 0x01], false).unwrap();
+        let mut state = HybridState::from_profile(&p);
+        let sl = state.slow_level(0);
+        state.update(0, 1000);
+        let expect = sl - ((sl + 128) >> 8) + crate::logpack::wp_log2(1000) as u32;
+        assert_eq!(state.slow_level(0), expect);
+        // Zero magnitudes decay the level (wp_log2(0) == 0).
+        let sl = state.slow_level(0);
+        state.update(0, 0);
+        assert_eq!(state.slow_level(0), sl - ((sl + 128) >> 8));
+    }
+
+    #[test]
+    fn update_signed_uses_the_complement_magnitude() {
+        // A negative sample's magnitude is its bitwise complement
+        // (spec §4.2 step 7 sign rule): -1000 → 999.
+        let p = expand_hybrid_profile(&[0x3f, 0x14, 0xc8, 0x01], false).unwrap();
+        let mut a = HybridState::from_profile(&p);
+        let mut b = HybridState::from_profile(&p);
+        a.update_signed(0, -1000);
+        b.update(0, 999);
+        assert_eq!(a.slow_level(0), b.slow_level(0));
+    }
+
+    #[test]
+    fn stereo_limits_redistribute_around_the_balance_word() {
+        // The frame-start delta rule: delta = (ema0 - ema1 - balance)
+        // >> 1 (arithmetic); arg0 = ema0 - delta - rate + 256, arg1 =
+        // ema1 + delta - rate + 256. With ema0 - ema1 == balance the
+        // channels behave as two independent mono channels.
+        let p =
+            expand_hybrid_profile(&[0x12, 0x14, 0xe3, 0x13, 0xc8, 0x01, 0x00, 0x01], true).unwrap();
+        let state = HybridState::from_profile(&p);
+        let ema0 = ((state.slow_level(0) + 128) >> 8) as i32;
+        let ema1 = ((state.slow_level(1) + 128) >> 8) as i32;
+        let delta = (ema0 - ema1 - 256) >> 1;
+        let expect0 = crate::logpack::wp_exp2s(ema0 - delta - 456 + 256) as u32;
+        let expect1 = crate::logpack::wp_exp2s(ema1 + delta - 456 + 256) as u32;
+        assert_eq!(state.frame_limits(), [expect0, expect1]);
+    }
+
+    #[test]
+    fn non_positive_limit_argument_means_lossless() {
+        // A large bitrate word pushes the argument non-positive: the
+        // limit is 0 and the §6.5 dispatch takes the lossless mantissa
+        // path.
+        let p = expand_hybrid_profile(&[0x3f, 0x14, 0xff, 0x7f], false).unwrap();
+        let state = HybridState::from_profile(&p);
+        assert_eq!(state.frame_limits(), [0, 0]);
+    }
+
+    #[test]
+    fn negative_level_words_clamp_to_zero() {
+        // A negative log word would unpack to a negative "magnitude";
+        // the seed clamps at zero instead of wrapping through u32.
+        let p = expand_hybrid_profile(&[0x00, 0x80, 0x00, 0x00], false).unwrap();
+        let state = HybridState::from_profile(&p);
+        assert_eq!(state.slow_level(0), 0);
+    }
 
     // ---- constants ---------------------------------------------------
 

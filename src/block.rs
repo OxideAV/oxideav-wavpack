@@ -105,9 +105,14 @@ pub const MAX_MULTICHANNEL_CHANNELS: usize = 256;
 /// two "experimental" / "low-latency" bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedBlockFeature {
-    /// Wiki bit 3 ("hybrid profile (lossy compression)") is set. The
-    /// per-sample loop's spec §4.2 step 6 binary-search refinement for
-    /// `error_limit != 0` (the hybrid path) is not yet implemented.
+    /// Wiki bit 3 ("hybrid profile (lossy compression)") is set.
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** (round
+    /// 408): hybrid blocks decode to their coarse (lossy) PCM via the
+    /// staged spec §6.5 error_limit model — the `0x06` profile seed,
+    /// the per-channel slow-level recurrence and the bracketing binary
+    /// search, all pinned black-box bit-exact against reference
+    /// decodes. Retained as a public variant for API stability.
     Hybrid,
     /// Wiki bit 7 ("floating point data present") is set.
     ///
@@ -795,10 +800,10 @@ impl<'a> WavPackBlock<'a> {
     /// [`Error::UnsupportedBlockFeature`] so the caller can surface a
     /// precise diagnostic. The refused cases are:
     ///
-    /// * [`UnsupportedBlockFeature::Hybrid`] — flag bit 3 ("hybrid
-    ///   profile (lossy compression)") set; the per-sample loop's
-    ///   `spec/wavpack-entropy-decode.md` §4.2 step 6 binary-search
-    ///   refinement for `error_limit != 0` is not yet implemented.
+    /// * (hybrid, flag bit 3, is **decoded** since round 408 — the
+    ///   §6.5 error_limit model produces the coarse lossy PCM; a
+    ///   hybrid block missing its `0x06` profile raises
+    ///   [`Error::BlockMissingHybridProfile`] instead.)
     /// * [`UnsupportedBlockFeature::FloatData`] — flag bit 7 set; the
     ///   `0x0C` overflow-bits sub-block layout is undocumented.
     /// * [`UnsupportedBlockFeature::Int32Mode`] — flag bit 8 set; the
@@ -878,7 +883,32 @@ impl<'a> WavPackBlock<'a> {
         // buffer, so applying the shift here keeps the public PCM correct
         // without disturbing the CRC comparison.
         crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
-        Ok(pcm)
+        Ok(self.expand_false_stereo(pcm))
+    }
+
+    /// Expand a decoded one-channel buffer into the interleaved
+    /// two-channel output a **false-stereo** block represents (wiki
+    /// flag bit 30: the stream is stereo but this block's two channels
+    /// are identical, so only one was coded). The reference decoder
+    /// emits both channels; round 408 pinned this black-box on a
+    /// hybrid-encoded identical-L/R file (the encoder routinely emits
+    /// bit 30 for such content) — the fix applies to lossless
+    /// false-stereo blocks identically.
+    ///
+    /// A no-op for every other shape (true mono bit 2, or real
+    /// stereo). Runs AFTER the CRC fold and the sample-format / shift
+    /// fixups — those all operate on the coded single channel.
+    fn expand_false_stereo(&self, pcm: Vec<i32>) -> Vec<i32> {
+        let flags = &self.header.flags;
+        if !flags.false_stereo || flags.mono {
+            return pcm;
+        }
+        let mut out = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm {
+            out.push(s);
+            out.push(s);
+        }
+        out
     }
 
     /// Decode this block's PCM up to but **not including** the final
@@ -923,14 +953,16 @@ impl<'a> WavPackBlock<'a> {
             return Err(Error::BlockHasNoAudio);
         }
 
-        // Refuse feature combinations the per-sample loop does not yet
-        // support. Order roughly matches the wiki "Flags meaning"
-        // listing for stable diagnostic output.
-        if flags.hybrid {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::Hybrid,
-            ));
-        }
+        // Hybrid (lossy) blocks are decoded since round 408: the §6.5
+        // error_limit model (0x06 profile seed + per-channel slow-level
+        // recurrence + bracketing binary search) replaces the lossless
+        // mantissa read. The 0x06 hybrid-profile sub-block is mandatory
+        // on a hybrid block; its expansion happens in the channel
+        // branches below (the payload length is keyed on the block's
+        // channel shape). Without a companion 0x0B correction stream
+        // the decoded PCM is the coarse (lossy) reference decode; the
+        // stored block CRC covers exactly those coarse samples, so the
+        // §5.6 mute gate stays meaningful.
         // FLOAT_DATA (bit 7) and INT32_DATA (bit 8) are no longer
         // refused here: the float reconstruction is undone by the
         // round-405 sample-format fixup the public decode paths run
@@ -1022,8 +1054,34 @@ impl<'a> WavPackBlock<'a> {
         let entropy = expand_entropy(entropy_sub.payload)?;
         let count = header.block_samples as usize;
 
+        // Hybrid blocks seed the §6.5 error_limit state from the
+        // mandatory 0x06 profile (round 408). The profile layout is
+        // keyed on the block's channel shape.
+        let hybrid_profile = if flags.hybrid {
+            let sub = crate::metadata::find_hybrid_profile(&self.sub_blocks)
+                .ok_or(Error::BlockMissingHybridProfile)?;
+            Some(crate::hybrid::expand_hybrid_profile(
+                sub.payload,
+                !flags.is_block_data_mono(),
+            )?)
+        } else {
+            None
+        };
+
         if flags.is_block_data_mono() {
-            let mut residuals = decode_packed_samples_mono_from_entropy(&packed, &entropy, count)?;
+            let mut residuals = if let Some(profile) = &hybrid_profile {
+                let mut medians = crate::samples::AdaptiveMedians::from_entropy(&entropy, 0)
+                    .ok_or(Error::InvalidEntropyInfoForMono)?;
+                let mut hybrid = crate::HybridState::from_profile(profile);
+                crate::samples::decode_packed_samples_mono_hybrid(
+                    &packed,
+                    &mut medians,
+                    count,
+                    &mut hybrid,
+                )?
+            } else {
+                decode_packed_samples_mono_from_entropy(&packed, &entropy, count)?
+            };
             if has_decorr {
                 // The entropy stream carried residuals, not PCM. Assemble
                 // the §3.7 application-ordered pass list from the
@@ -1056,8 +1114,17 @@ impl<'a> WavPackBlock<'a> {
                 crate::samples::AdaptiveMedians::from_seed_values(entropy.medians_right)
                     .ok_or(Error::InvalidEntropyInfoForStereo)?,
             ];
-            let mut residuals =
-                crate::samples::decode_packed_samples_stereo(&packed, &mut medians, count)?;
+            let mut residuals = if let Some(profile) = &hybrid_profile {
+                let mut hybrid = crate::HybridState::from_profile(profile);
+                crate::samples::decode_packed_samples_stereo_hybrid(
+                    &packed,
+                    &mut medians,
+                    count,
+                    &mut hybrid,
+                )?
+            } else {
+                crate::samples::decode_packed_samples_stereo(&packed, &mut medians, count)?
+            };
             if has_decorr {
                 // Stereo residuals arrive interleaved [L0, R0, L1, R1, …].
                 // Assemble the §3.7 application-ordered stereo pass list
@@ -1082,12 +1149,13 @@ impl<'a> WavPackBlock<'a> {
         }
     }
 
-    /// `true` when this block carries `1` decoded channel (mono / false-
-    /// stereo, the [`Flags::is_block_data_mono`] union), `false` when it
-    /// carries `2` (interleaved stereo). The per-member channel count a
-    /// multichannel set sums over its members. Round 378.
+    /// The number of decoded output channels this block carries: `1`
+    /// for true mono (flag bit 2), `2` for interleaved stereo and for
+    /// **false-stereo** (bit 30 — one coded channel the decoder
+    /// duplicates to both outputs; round 408). The per-member channel
+    /// count a multichannel set sums over its members. Round 378.
     fn member_channel_count(&self) -> usize {
-        if self.header.flags.is_block_data_mono() {
+        if self.header.flags.mono {
             1
         } else {
             2
@@ -1122,18 +1190,16 @@ impl<'a> WavPackBlock<'a> {
     /// frame interleave the per-member buffers via
     /// [`decode_multichannel_stream`]; this method is the per-member leg.
     ///
-    /// All other refusals ([`UnsupportedBlockFeature::Hybrid`],
-    /// `FloatData`, `Int32Mode`, `LowLatencyBlock`,
-    /// `CrossChannelDecorrelation`) and structural errors still fire — a
-    /// member exercising those is no more decodable than a standalone
-    /// block that does. Round 378.
+    /// All other refusals and structural errors still fire — a member
+    /// exercising those is no more decodable than a standalone block
+    /// that does. Round 378.
     pub fn decode_member_samples(&self) -> Result<Vec<i32>> {
         let mut pcm = self.decode_member_preshift()?;
         // Round 405: int32 sample-format fixup (see
         // `apply_int32_fixup`), verdict unenforced on the plain path.
         self.apply_sample_format_fixups(&mut pcm)?;
         crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
-        Ok(pcm)
+        Ok(self.expand_false_stereo(pcm))
     }
 
     /// Decode a multichannel-set member's PCM with the spec §5.6 CRC
@@ -1160,7 +1226,7 @@ impl<'a> WavPackBlock<'a> {
         } else {
             pcm.iter_mut().for_each(|s| *s = 0);
         }
-        Ok((pcm, crc_ok))
+        Ok((self.expand_false_stereo(pcm), crc_ok))
     }
 
     /// Decode this block's PCM ([`Self::decode_samples`]) and verify the
@@ -1261,6 +1327,15 @@ impl<'a> WavPackBlock<'a> {
         let info = crate::float::expand_float_info(info_sub.payload)?;
         let overflow = self.packed_overflow_bits();
         if info.requires_extension() && overflow.is_none() {
+            // A hybrid (lossy) float block legitimately omits the wvx
+            // stream while keeping the profile flags: the dropped low
+            // mantissa bits are implied zero (round-408 black-box pin
+            // against reference hybrid float decodes). On a lossless
+            // block the absence is structural.
+            if self.header.flags.hybrid {
+                crate::float::reassemble_float_implied(pcm, &info)?;
+                return Ok(None);
+            }
             return Err(Error::BlockMissingOverflowBits);
         }
         match overflow {
@@ -1353,7 +1428,7 @@ impl<'a> WavPackBlock<'a> {
             // buffer is shift-invariant, so no fixup is needed.
             pcm.iter_mut().for_each(|s| *s = 0);
         }
-        Ok((pcm, crc_ok))
+        Ok((self.expand_false_stereo(pcm), crc_ok))
     }
 
     /// Borrow the raw `0x02` / `0x03` / `0x04` decorrelation sub-block
@@ -1378,10 +1453,12 @@ impl<'a> WavPackBlock<'a> {
     /// success, computed from the parsed header alone — no entropy
     /// expansion, no per-sample-loop call.
     ///
-    /// Returns `block_samples()` on a mono / false-stereo block (one
-    /// `i32` per sample) and `block_samples() * 2` on a stereo block
-    /// (two interleaved `i32`s per sample frame). Metadata-only blocks
-    /// (`block_samples == 0`) return `0` — they carry no PCM at all.
+    /// Returns `block_samples()` on a true mono block (one `i32` per
+    /// sample) and `block_samples() * 2` on a stereo OR false-stereo
+    /// block (two interleaved `i32`s per sample frame — a false-stereo
+    /// block's single coded channel is duplicated to both outputs,
+    /// round 408). Metadata-only blocks (`block_samples == 0`) return
+    /// `0` — they carry no PCM at all.
     ///
     /// The wiki bit 2 + bit 30 union (the [`Flags::is_block_data_mono`]
     /// accessor) drives the per-block shape choice, mirroring the
@@ -1400,7 +1477,7 @@ impl<'a> WavPackBlock<'a> {
     /// Round 230.
     pub fn decoded_sample_count(&self) -> u64 {
         let samples = self.header.block_samples as u64;
-        if self.header.flags.is_block_data_mono() {
+        if self.header.flags.mono {
             samples
         } else {
             samples * 2
@@ -2122,11 +2199,9 @@ pub fn iter_audio_blocks(bytes: &[u8]) -> AudioBlockIter<'_> {
 /// noise-shaping profile, `0x0B` packed correction data) as the
 /// hybrid-mode companion content; this iterator surfaces every block
 /// that carries either, regardless of whether the block is otherwise an
-/// audio block (`block_samples > 0`) or a metadata-only block. The
-/// hybrid-mode decode itself is gated on
-/// [`UnsupportedBlockFeature::Hybrid`]; this iterator's role is
-/// structural introspection — counting / locating / sizing — without
-/// committing to a decode semantics. Round 233.
+/// audio block (`block_samples > 0`) or a metadata-only block. This
+/// iterator's role is structural introspection — counting / locating /
+/// sizing — without committing to a decode semantics. Round 233.
 #[derive(Debug, Clone)]
 pub struct CorrectionBlockIter<'a> {
     /// Underlying block iterator. Drives parse + walks the byte buffer;
@@ -2287,11 +2362,10 @@ pub fn total_correction_payload_bytes(bytes: &[u8]) -> Result<u64> {
 /// Metadata-only blocks (`block_samples == 0`) on either side are
 /// skipped — they never carry sample words to pair. Parse errors from
 /// either chain surface verbatim. Note this is **structural** pairing
-/// only: consuming a pair's `0x0B` words in a hybrid decode stays
-/// gated on the hybrid entropy derivation (the
-/// [`crate::UnsupportedBlockFeature::Hybrid`] refusal), so today's
-/// callers use this to locate / validate / size correction coverage
-/// on the lossless path.
+/// only: folding a pair's `0x0B` correction words into the round-408
+/// coarse (lossy) decode is a separate step (the noise-shaped fold
+/// remains a documented gap), so today's callers use this to locate /
+/// validate / size correction coverage.
 pub fn pair_correction_stream<'a, 'b>(
     main: &'a [u8],
     correction: &'b [u8],
@@ -3392,8 +3466,9 @@ mod tests {
 
     #[test]
     fn decode_samples_muted_propagates_decode_errors() {
-        // A hybrid block is refused by decode_samples; the muted gate
-        // surfaces the same typed error rather than a (pcm, bool) pair.
+        // A hybrid block without its mandatory 0x06 profile is refused
+        // by decode_samples; the muted gate surfaces the same typed
+        // error rather than a (pcm, bool) pair.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
@@ -3402,16 +3477,15 @@ mod tests {
         let (block, _) = parse_block(&bytes).expect("parse block");
         assert_eq!(
             block.decode_samples_muted(),
-            Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::Hybrid
-            ))
+            Err(Error::BlockMissingHybridProfile)
         );
     }
 
     #[test]
     fn verify_decoded_crc_propagates_decode_errors() {
-        // A hybrid block is refused by decode_samples; verify_decoded_crc
-        // surfaces the same typed error rather than a CRC result.
+        // A hybrid block without its mandatory 0x06 profile is refused
+        // by decode_samples; verify_decoded_crc surfaces the same typed
+        // error rather than a CRC result.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
@@ -3420,9 +3494,7 @@ mod tests {
         let (block, _) = parse_block(&bytes).expect("parse block");
         assert_eq!(
             block.verify_decoded_crc(),
-            Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::Hybrid
-            ))
+            Err(Error::BlockMissingHybridProfile)
         );
     }
 
@@ -3632,20 +3704,45 @@ mod tests {
     }
 
     #[test]
-    fn decode_samples_rejects_hybrid_lossy_profile() {
-        // Bit 3 set → hybrid lossy profile. The per-sample loop has no
-        // error_limit binary-search refinement, so the composer refuses
-        // these blocks with a typed feature tag.
+    fn decode_samples_hybrid_requires_the_0x06_profile() {
+        // Round 408: hybrid (bit 3) blocks are decoded, not refused —
+        // but the 0x06 hybrid-profile seed is mandatory; a hybrid
+        // block without it is malformed.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
         let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 3)), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
-        let err = block.decode_samples().expect_err("must refuse hybrid");
-        assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
-        );
+        let err = block.decode_samples().expect_err("0x06 is mandatory");
+        assert_eq!(err, Error::BlockMissingHybridProfile);
+    }
+
+    #[test]
+    fn decode_samples_hybrid_mono_decodes_with_a_profile() {
+        // A hybrid mono block whose 0x06 seeds a large error_limit:
+        // integer 0 codes as a bracket that stops immediately (interval
+        // [0,0] wide enough), so the zero-median one-sample stream
+        // decodes to the coarse value 0. Level word 0 -> slow_level 0,
+        // bitrate 0 -> arg = 0 - 0 + 256 -> limit wp_exp2s(256) = 1.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_small_sub_block(&mut payload, 0x06, &[0, 0, 0, 0]);
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
+        let mut enc_medians =
+            crate::samples::AdaptiveMedians::from_entropy(&info_block, 0).expect("medians");
+        // A zero sample encodes identically under bracketing (interval
+        // [0, 0] needs no bits beyond prefix + sign).
+        let packed =
+            crate::samples::encode_packed_samples_mono(&[0], &mut enc_medians).expect("encode");
+        append_packed_samples(&mut payload, &packed);
+        let crc = crate::crc::crc_mono(&[0]);
+        let mut bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 3)), &payload);
+        bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.decode_samples().expect("hybrid decode"), vec![0]);
+        let (pcm, ok) = block.decode_samples_muted().expect("muted");
+        assert!(ok, "coarse-value CRC must match");
+        assert_eq!(pcm, vec![0]);
     }
 
     #[test]
@@ -4004,7 +4101,9 @@ mod tests {
         let got = block
             .decode_samples()
             .expect("false-stereo decode ignores inter-channel flags");
-        assert_eq!(got, vec![0]);
+        // Round 408: the single coded channel is duplicated to both
+        // stereo outputs.
+        assert_eq!(got, vec![0, 0]);
     }
 
     #[test]
@@ -4252,7 +4351,9 @@ mod tests {
         assert!(block.header.flags.false_stereo);
         assert!(block.header.flags.is_block_data_mono());
         let got = block.decode_samples().expect("false-stereo decode");
-        assert_eq!(got, vec![0]);
+        // Round 408: decoded through the mono loop, then duplicated to
+        // the two stereo outputs the container represents.
+        assert_eq!(got, vec![0, 0]);
     }
 
     #[test]
@@ -5179,21 +5280,18 @@ mod tests {
     }
 
     #[test]
-    fn decode_stream_propagates_unsupported_block_feature_from_decode_samples() {
-        // An audio block with the hybrid (bit 3) flag set: parse cleanly,
-        // but decode_samples refuses with
-        // Error::UnsupportedBlockFeature(Hybrid). decode_stream surfaces
-        // that verbatim.
+    fn decode_stream_propagates_decode_errors_from_decode_samples() {
+        // An audio block with the hybrid (bit 3) flag set but no 0x06
+        // profile: parses cleanly, decode_samples refuses with
+        // BlockMissingHybridProfile. decode_stream surfaces that
+        // verbatim.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
         let flags = flags_with((1 << 2) | (1 << 3)); // mono + hybrid
         let bytes = synthesise_block(1, flags, &payload);
-        let err = decode_stream(&bytes).expect_err("must refuse hybrid");
-        assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
-        );
+        let err = decode_stream(&bytes).expect_err("0x06 is mandatory");
+        assert_eq!(err, Error::BlockMissingHybridProfile);
     }
 
     #[test]
@@ -5211,10 +5309,11 @@ mod tests {
 
     #[test]
     fn decode_stream_stops_at_first_decode_error_and_discards_prior_pcm() {
-        // [good audio block][hybrid audio block] → decode_stream should
-        // return the hybrid block's UnsupportedBlockFeature error, not
-        // the leading good block's [0] PCM (eager wrapper discards
-        // partial output, per the contract).
+        // [good audio block][hybrid-without-0x06 audio block] →
+        // decode_stream should return the malformed block's
+        // BlockMissingHybridProfile error, not the leading good block's
+        // [0] PCM (eager wrapper discards partial output, per the
+        // contract).
         let good = synthesise_decodable_mono_block_one_zero_sample();
         let mut hybrid_payload = Vec::new();
         append_entropy_info_mono_zero(&mut hybrid_payload);
@@ -5226,10 +5325,7 @@ mod tests {
         bytes.extend_from_slice(&bad);
 
         let err = decode_stream(&bytes).expect_err("must propagate the second block's error");
-        assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
-        );
+        assert_eq!(err, Error::BlockMissingHybridProfile);
     }
 
     #[test]
@@ -5288,9 +5384,10 @@ mod tests {
 
     #[test]
     fn iter_decoded_blocks_fuses_on_first_decode_error() {
-        // First block parses + decodes fine; second block parses but
-        // raises a decode-time UnsupportedBlockFeature error. The
-        // iterator must yield the error and fuse.
+        // First block parses + decodes fine; second block (hybrid
+        // without its mandatory 0x06 profile) parses but raises a
+        // decode-time error. The iterator must yield the error and
+        // fuse.
         let good = synthesise_decodable_mono_block_one_zero_sample();
         let mut hybrid_payload = Vec::new();
         append_entropy_info_mono_zero(&mut hybrid_payload);
@@ -5302,12 +5399,7 @@ mod tests {
         let mut iter = iter_decoded_blocks(&bytes);
         assert_eq!(iter.next().expect("first ok").expect("ok"), vec![0]);
         let second = iter.next().expect("second is the error");
-        assert_eq!(
-            second,
-            Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::Hybrid
-            ))
-        );
+        assert_eq!(second, Err(Error::BlockMissingHybridProfile));
         // Round-219 fuse mechanism composes through: BlockIter fuses on
         // its first error, and on a decode error the underlying iterator
         // already advanced past the bad block — so a follow-up next() may
@@ -6552,11 +6644,11 @@ mod tests {
     }
 
     #[test]
-    fn block_with_correction_data_but_unsupported_hybrid_flag_still_refuses_decode() {
-        // The presence of a 0x0B payload does NOT make decode_samples
-        // succeed on a hybrid block — the per-sample loop still gates
-        // on the hybrid flag. This pins the contract: the typed view
-        // is structural introspection, not a decode-enablement.
+    fn block_with_correction_data_but_no_hybrid_profile_still_refuses_decode() {
+        // The presence of a 0x0B payload does NOT stand in for the
+        // mandatory 0x06 hybrid-profile seed: a hybrid block without
+        // 0x06 has no error_limit state to run the round-408 §6.5
+        // decode from, whatever else it carries.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
@@ -6564,11 +6656,8 @@ mod tests {
         let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 3)), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
         assert!(block.has_packed_correction_data());
-        let err = block.decode_samples().expect_err("must still refuse");
-        assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Hybrid)
-        );
+        let err = block.decode_samples().expect_err("0x06 is mandatory");
+        assert_eq!(err, Error::BlockMissingHybridProfile);
     }
 
     // ---- Round-239 total_samples_in_file / end_sample_index /
@@ -7389,11 +7478,12 @@ mod tests {
     }
 
     #[test]
-    fn multichannel_false_stereo_member_counts_as_one_channel() {
-        // A false-stereo member (wiki bit 30: stereo container, mono data)
-        // carries one decoded channel, exactly like a plain mono member.
-        // Patch a mono member's flag word: clear bit 2 (mono), set bit 30
-        // (false_stereo). The data is still a single channel.
+    fn multichannel_false_stereo_member_counts_as_two_channels() {
+        // A false-stereo member (wiki bit 30: stereo container, mono
+        // data) contributes TWO output channels — its single coded
+        // channel duplicated (round 408, black-box pinned against the
+        // reference decoder's output shape). Patch a mono member's flag
+        // word: clear bit 2 (mono), set bit 30 (false_stereo).
         let total = 2;
         let mut first = mono_member(&[10, 11], 0, total, 0b01);
         {
@@ -7406,11 +7496,11 @@ mod tests {
         stream.extend(mono_member(&[20, 21], 0, total, 0b10));
 
         let decoded = decode_multichannel_stream(&stream).unwrap();
-        // 2 channels: false-stereo member (1) + mono member (1).
-        assert_eq!(decoded.channels, 2);
-        assert_eq!(decoded.samples, vec![10, 20, 11, 21]);
+        // 3 channels: false-stereo member (2, duplicated) + mono (1).
+        assert_eq!(decoded.channels, 3);
+        assert_eq!(decoded.samples, vec![10, 10, 20, 11, 11, 21]);
         // Layout agrees.
-        assert_eq!(multichannel_layout(&stream).unwrap().channels, 2);
+        assert_eq!(multichannel_layout(&stream).unwrap().channels, 3);
     }
 
     #[test]

@@ -48,6 +48,15 @@
 //! | `foreign_float_exc_stereo`     | default      | stereo `EXCEPTIONS\|SHIFT_SENT\|ZEROS_SENT\|NEG_ZEROS` combo |
 //! | `foreign_float_exc_tiny`       | default      | 64-sample `EXCEPTIONS` + short `0x03` weights prefix |
 //! | `foreign_float_exc_mix`        | default      | `EXCEPTIONS` with `float_shift = 1` sentinel scaling |
+//! | `foreign_hybrid_mono_b4`       | `-b4`        | 16-bit mono hybrid (lossy), 4 bits/sample (round 408) |
+//! | `foreign_hybrid_mono_b2`       | `-b2`        | 16-bit mono hybrid at the minimum bitrate |
+//! | `foreign_hybrid_multiblock_b3` | `-b3`        | 16-bit mono hybrid, 2 blocks + a silence stretch (zero-run + level decay) |
+//! | `foreign_hybrid_stereo_b4`     | `-b4`        | 16-bit stereo hybrid, mid/side + balance, unbalanced levels + silence |
+//! | `foreign_hybrid_lr_b4`         | `-b4 -j0`    | 16-bit stereo hybrid, left/right coding (balance word 0) |
+//! | `foreign_hybrid_5dot1_b4`      | `-b4`        | 16-bit 5.1 hybrid (stereo + mono members) |
+//! | `foreign_hybrid_stereo24_b4`   | `-b4`        | 24-bit stereo hybrid |
+//! | `foreign_hybrid_float_b4`      | `-b4`        | 32-bit float mono hybrid (`SHIFT_SENT` profile, no wvx — implied zeros) |
+//! | `foreign_hybrid_false_stereo_b4` | `-b4`      | identical-L/R hybrid → false-stereo blocks (bit 30, duplicated output) |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -159,6 +168,51 @@ foreign_fixture!(float_exceptions_is_bit_exact, "foreign_float_exceptions", 1);
 foreign_fixture!(float_exc_stereo_is_bit_exact, "foreign_float_exc_stereo", 2);
 foreign_fixture!(float_exc_tiny_is_bit_exact, "foreign_float_exc_tiny", 1);
 foreign_fixture!(float_exc_mix_is_bit_exact, "foreign_float_exc_mix", 1);
+foreign_fixture!(hybrid_mono_b4_is_bit_exact, "foreign_hybrid_mono_b4", 1);
+foreign_fixture!(hybrid_mono_b2_is_bit_exact, "foreign_hybrid_mono_b2", 1);
+foreign_fixture!(
+    hybrid_multiblock_b3_is_bit_exact,
+    "foreign_hybrid_multiblock_b3",
+    1
+);
+foreign_fixture!(hybrid_stereo_b4_is_bit_exact, "foreign_hybrid_stereo_b4", 2);
+foreign_fixture!(hybrid_lr_b4_is_bit_exact, "foreign_hybrid_lr_b4", 2);
+foreign_fixture!(hybrid_5dot1_b4_is_bit_exact, "foreign_hybrid_5dot1_b4", 6);
+foreign_fixture!(
+    hybrid_stereo24_b4_is_bit_exact,
+    "foreign_hybrid_stereo24_b4",
+    2
+);
+foreign_fixture!(hybrid_float_b4_is_bit_exact, "foreign_hybrid_float_b4", 1);
+foreign_fixture!(
+    hybrid_false_stereo_b4_is_bit_exact,
+    "foreign_hybrid_false_stereo_b4",
+    2
+);
+
+/// Hybrid-specific shape assertions on top of the bit-exact battery:
+/// the lossy decode carries real coding error against the WAV source
+/// (it IS lossy), the false-stereo fixture duplicates its coded
+/// channel, and a corrupted hybrid payload still trips the CRC gate.
+#[test]
+fn foreign_hybrid_false_stereo_duplicates_channels() {
+    let wv = include_bytes!("data/foreign_hybrid_false_stereo_b4.wv");
+    let decoded = oxideav_wavpack::decode_multichannel_stream(wv).expect("decode");
+    assert_eq!(decoded.channels, 2);
+    for pair in decoded.samples.chunks_exact(2) {
+        assert_eq!(pair[0], pair[1], "false stereo duplicates L to R");
+    }
+}
+
+#[test]
+fn corrupted_hybrid_block_is_muted_or_refused() {
+    let mut wv = include_bytes!("data/foreign_hybrid_mono_b4.wv").to_vec();
+    wv[600] ^= 0x08; // deep inside the 0x0A payload
+    if let Ok((pcm, all_ok)) = decode_stream_muted(&wv) {
+        assert!(!all_ok, "corruption must fail the coarse-value CRC gate");
+        assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
+    }
+}
 
 /// A corrupted foreign block must trip the CRC mute gate, not decode to
 /// wrong PCM silently: flip one payload bit deep inside the first

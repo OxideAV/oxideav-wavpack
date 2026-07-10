@@ -906,9 +906,11 @@ pub use crate::float::{
     FLOAT_NEG_ZEROS, FLOAT_SHIFT_ONES, FLOAT_SHIFT_SAME, FLOAT_SHIFT_SENT, FLOAT_ZEROS_SENT,
 };
 pub use crate::hybrid::{
-    flags_select_shaping, fold_correction, fold_correction_pair, fold_correction_pre_decorrelation,
-    fold_correction_pre_decorrelation_pair, split_correction, CorrectionFold, CROSS_DECORR_FLAG,
-    HYBRID_FLAG, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
+    expand_hybrid_profile, flags_select_shaping, fold_correction, fold_correction_pair,
+    fold_correction_pre_decorrelation, fold_correction_pre_decorrelation_pair, split_correction,
+    CorrectionFold, HybridProfile, HybridState, CROSS_DECORR_FLAG, HYBRID_FLAG,
+    HYBRID_LIMIT_ARG_CEILING, HYBRID_LIMIT_BIAS, HYBRID_PROFILE_MONO_BYTES,
+    HYBRID_PROFILE_STEREO_BYTES, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
 };
 pub use crate::int32::{expand_int32_info, reassemble_int32, Int32Info, INT32_INFO_PAYLOAD_BYTES};
 pub use crate::logpack::{
@@ -933,13 +935,16 @@ pub use crate::seek::{
 
 pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
-    decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy, decode_run_length,
-    decode_sample, decode_sample_stateful, decode_sample_stateful_stereo, decode_sample_value,
-    emit_end_of_stream_marker, emit_raw_prefix, emit_zero_run_length, encode_packed_samples_mono,
-    encode_packed_samples_mono_from_entropy, encode_packed_samples_stereo,
-    encode_packed_samples_stereo_from_entropy, golomb_interval, read_folded_ones_count,
-    read_raw_prefix, read_sign_and_apply, read_zero_run_length, split_sign, AdaptiveMedians,
-    BitReader, BitWriter, DecodeState, GolombInterval, Medians, RunState, SampleInterval,
-    StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR, GET_MED_SHIFT,
-    INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP, UNARY_ESCAPE,
+    decode_packed_samples_mono_hybrid, decode_packed_samples_stereo,
+    decode_packed_samples_stereo_from_entropy, decode_packed_samples_stereo_hybrid,
+    decode_run_length, decode_sample, decode_sample_stateful, decode_sample_stateful_stereo,
+    decode_sample_stateful_stereo_with_limit, decode_sample_stateful_with_limit,
+    decode_sample_value, emit_end_of_stream_marker, emit_raw_prefix, emit_zero_run_length,
+    encode_packed_samples_mono, encode_packed_samples_mono_from_entropy,
+    encode_packed_samples_stereo, encode_packed_samples_stereo_from_entropy, golomb_interval,
+    read_folded_ones_count, read_raw_prefix, read_sign_and_apply, read_zero_run_length, split_sign,
+    AdaptiveMedians, BitReader, BitWriter, DecodeState, GolombInterval, Medians, RunState,
+    SampleInterval, StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR,
+    GET_MED_SHIFT, INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP,
+    UNARY_ESCAPE,
 };

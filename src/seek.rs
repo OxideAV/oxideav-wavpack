@@ -75,12 +75,11 @@ impl IndexEntry {
     }
 
     /// Number of decoded channels this block contributes as a
-    /// multichannel-set member: `1` for mono / false-stereo data,
-    /// `2` for interleaved stereo (the
-    /// [`Flags::is_block_data_mono`] union the decoder itself
-    /// dispatches on).
+    /// multichannel-set member: `1` for true mono (flag bit 2), `2`
+    /// for interleaved stereo AND for false-stereo (bit 30 — one coded
+    /// channel duplicated to both outputs by the decoder; round 408).
     pub fn member_channels(&self) -> usize {
-        if self.flags.is_block_data_mono() {
+        if self.flags.mono {
             1
         } else {
             2
@@ -430,11 +429,7 @@ fn decode_set(
                 found: block.header().block_samples,
             });
         }
-        let member_channels = if block.flags().is_block_data_mono() {
-            1
-        } else {
-            2
-        };
+        let member_channels = if block.flags().mono { 1 } else { 2 };
         if member_channels != entry.member_channels() {
             return Err(Error::MultichannelSetMalformed);
         }

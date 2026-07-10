@@ -8,6 +8,53 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 408 — **hybrid (lossy) decode — the §6.5 `error_limit` model,
+  bit-exact.** Hybrid blocks (flag bit 3) now decode to their coarse
+  lossy PCM instead of the `UnsupportedBlockFeature::Hybrid` refusal.
+  Per the staged `wavpack-entropy-decode.md` §6.5 structural model,
+  with the exact integer arithmetic pinned **black-box** against
+  reference decodes (round 408): the `0x06` `ID_HYBRID_PROFILE`
+  sub-block seeds per-channel linear `slow_level` accumulators
+  (log-packed level words via `wp_exp2s`, a shared log-domain bitrate
+  word, and a stereo balance word); every decoded sample folds
+  `slow_level -= (slow_level + 128) >> 8; slow_level +=
+  wp_log2(magnitude)`; the per-sample `error_limit` is
+  `wp_exp2s(ema - bitrate + 256)` (mono) with the stereo pair
+  redistributed at frame start by `delta = (ema0 - ema1 - balance) >>
+  1`; and the §4.2 step-6 mantissa read becomes the bracketing binary
+  search (`mid = (low + high + 1) >> 1`, bit 1 → `low = mid`, else
+  `high = mid - 1`, while `high - low > error_limit`; the final
+  interval's midpoint is the coarse value, sign bit last). New public
+  surface: `HybridProfile` / `expand_hybrid_profile`, `HybridState`
+  (seed / `frame_limits` / `update_signed`),
+  `SampleInterval::decode_bracketed_value`, and the
+  `decode_packed_samples_{mono,stereo}_hybrid` loops; `decode_samples`
+  and every stream/seek/multichannel path dispatch automatically. The
+  stored block CRC covers the coarse samples, so the §5.6 mute gate
+  applies unchanged. Hybrid float blocks (lossy float) reassemble with
+  implied-zero extension fills (`reassemble_float_implied`) — the
+  reference encoder keeps the `SHIFT_SENT` profile flag but omits the
+  wvx stream in lossy mode. Nine reference-encoded hybrid fixtures
+  (mono b2/b4, multi-block + silence b3, mid/side + balance stereo,
+  `-j0` left/right, 5.1, 24-bit, float, false-stereo) decode
+  bit-exact with all block CRCs green. A hybrid block without `0x06`
+  raises the new `Error::BlockMissingHybridProfile`; a
+  shape-mismatched payload raises `Error::HybridProfileLength`.
+
+### Fixed
+
+- Round 408 — **false-stereo blocks emit both output channels.** A
+  false-stereo block (flag bit 30: stereo container, one coded
+  channel) previously decoded to a single channel; the reference
+  decoder duplicates the coded channel to both outputs (black-box
+  pinned on an identical-L/R hybrid encode, which the reference
+  encoder routinely folds into false-stereo blocks). `decode_samples`,
+  the muted twins, the member paths, `decoded_sample_count`,
+  multichannel assembly and the seek index now all treat false-stereo
+  as two duplicated output channels.
+
+### Added
+
 - Round 408 — **float `SHIFT_SAME` + `EXCEPTIONS` decode — every
   documented `0x08` profile shape now reconstructs.** Per the staged
   `docs/audio/wavpack/spec/wavpack-sample-formats.md` §2.1–§2.2 (plus

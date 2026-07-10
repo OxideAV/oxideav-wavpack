@@ -1352,6 +1352,47 @@ impl SampleInterval {
         read_sign_and_apply(reader, magnitude)
     }
 
+    /// Spec §6.5 hybrid replacement for steps 6 + 7: bracket the value
+    /// by a binary search over `[low, high]` instead of reading the
+    /// exact mantissa, then read the sign bit.
+    ///
+    /// With `error_limit == 0` this **is** the lossless
+    /// [`Self::decode_signed_value`] (the §6.5 dispatch). Otherwise
+    /// (round-408 black-box pin, bit-exact against reference decodes):
+    ///
+    /// ```text
+    /// while high - low > error_limit {
+    ///     mid = (low + high + 1) >> 1;
+    ///     if get_bit() { low = mid } else { high = mid - 1 }
+    /// }
+    /// magnitude = (low + high + 1) >> 1     // midpoint of the final
+    /// ```                                   // interval
+    ///
+    /// followed by the §4.2 step-7 sign bit (complement rule). One bit
+    /// is consumed per narrowing; a larger `error_limit` stops the
+    /// search sooner (the lossy-bitrate knob).
+    pub fn decode_bracketed_value(
+        &self,
+        reader: &mut BitReader<'_>,
+        error_limit: u32,
+    ) -> Result<i32> {
+        if error_limit == 0 {
+            return self.decode_signed_value(reader);
+        }
+        let mut low = self.low;
+        let mut high = self.high;
+        while high - low > error_limit {
+            let mid = (low + high + 1) >> 1;
+            if reader.get_bit()? == 1 {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let magnitude = (low + high + 1) >> 1;
+        read_sign_and_apply(reader, magnitude)
+    }
+
     /// Exact inverse of [`Self::decode_mantissa`]: emit the truncated-
     /// binary bit pattern for the mantissa `code` inside this interval
     /// (spec §4.2 step 6 first paragraph, write side).
@@ -2171,6 +2212,134 @@ pub fn decode_sample_stateful(
     // consumes. The result is built in i32 space: the magnitude can be
     // up to INTERVAL_MASK_31 (2^31 - 1), which fits.
     interval.decode_signed_value(reader)
+}
+
+/// One-sample hybrid variant of [`decode_sample_stateful`]: identical
+/// §4.2 ladder, with step 6 dispatched through
+/// [`SampleInterval::decode_bracketed_value`] under the caller's
+/// `error_limit` (staged spec §6.5; `0` = lossless). The zero-run
+/// paths are unchanged — a hybrid stream still takes them when the
+/// medians collapse (verified black-box on silence-bearing hybrid
+/// fixtures, round 408).
+///
+/// The caller owns the per-channel `error_limit` derivation and the
+/// [`crate::HybridState::update_signed`] fold of the returned sample
+/// (see [`decode_packed_samples_mono_hybrid`]).
+pub fn decode_sample_stateful_with_limit(
+    reader: &mut BitReader<'_>,
+    medians: &mut AdaptiveMedians,
+    state: &mut DecodeState,
+    error_limit: u32,
+) -> Result<i32> {
+    if state.zero_run_pending > 0 {
+        state.zero_run_pending -= 1;
+        return Ok(0);
+    }
+    if let Some(zero_sample) = try_zero_run_path(reader, medians, state)? {
+        return Ok(zero_sample);
+    }
+    let ones_count = read_folded_ones_count(reader, &mut state.run)?;
+    let interval = medians.sample_interval_for_ones_count(ones_count);
+    medians.adapt(Zone::from_ones_count(ones_count));
+    interval.decode_bracketed_value(reader, error_limit)
+}
+
+/// Decode `count` mono samples of a **hybrid** (lossy) `0x0A` payload
+/// (staged spec §6.5, round-408 black-box pin).
+///
+/// Per sample, the `error_limit` is derived from `hybrid`'s current
+/// (pre-sample) state, the sample is decoded with the §6.5 bracketing
+/// search ([`decode_sample_stateful_with_limit`]), and the sample's
+/// pre-sign magnitude is folded back into the running level — for
+/// **every** emitted sample, including zero-run zeros (`wp_log2(0) ==
+/// 0` decays the level through silence). Seed `hybrid` from the
+/// block's `0x06` profile ([`crate::HybridState::from_profile`]).
+///
+/// The returned samples are the **coarse** (lossy) values; combining
+/// them with a `0x0B` correction stream recovers lossless PCM (spec
+/// §4.1/§4.3 — not driven here).
+pub fn decode_packed_samples_mono_hybrid(
+    payload: &crate::PackedSamples<'_>,
+    medians: &mut AdaptiveMedians,
+    count: usize,
+    hybrid: &mut crate::HybridState,
+) -> Result<Vec<i32>> {
+    let mut reader = payload.bit_reader();
+    let mut state = DecodeState::new();
+    let mut out = Vec::with_capacity(prealloc_floor(count, payload.len()));
+    for _ in 0..count {
+        let limit = hybrid.frame_limits()[0];
+        let sample = decode_sample_stateful_with_limit(&mut reader, medians, &mut state, limit)?;
+        hybrid.update_signed(0, sample);
+        out.push(sample);
+    }
+    Ok(out)
+}
+
+/// One-sample hybrid variant of [`decode_sample_stateful_stereo`]:
+/// the same interleaved §4.2 ladder with step 6 dispatched through
+/// [`SampleInterval::decode_bracketed_value`] under the caller's
+/// `error_limit` for the sample's channel.
+pub fn decode_sample_stateful_stereo_with_limit(
+    reader: &mut BitReader<'_>,
+    medians: &mut [AdaptiveMedians; 2],
+    state: &mut StereoDecodeState,
+    error_limit: u32,
+) -> Result<i32> {
+    if state.zero_run_pending > 0 {
+        state.zero_run_pending -= 1;
+        state.next_channel ^= 1;
+        return Ok(0);
+    }
+    if let Some(zero_sample) = try_zero_run_path_stereo(reader, medians, state)? {
+        state.next_channel ^= 1;
+        return Ok(zero_sample);
+    }
+    let ch = state.next_channel as usize;
+    let ones_count = read_folded_ones_count(reader, &mut state.run)?;
+    let interval = medians[ch].sample_interval_for_ones_count(ones_count);
+    medians[ch].adapt(Zone::from_ones_count(ones_count));
+    let result = interval.decode_bracketed_value(reader, error_limit)?;
+    state.next_channel ^= 1;
+    Ok(result)
+}
+
+/// Decode `frames` stereo frames of a **hybrid** (lossy) `0x0A`
+/// payload, returning `frames * 2` interleaved samples (staged spec
+/// §6.5, round-408 black-box pin).
+///
+/// Both channels' `error_limit`s are derived once per frame — at the
+/// frame boundary, from the pre-frame states
+/// ([`crate::HybridState::frame_limits`], which also applies the
+/// balance redistribution) — and each decoded sample folds its
+/// pre-sign magnitude back into its channel's running level (zero-run
+/// zeros included).
+pub fn decode_packed_samples_stereo_hybrid(
+    payload: &crate::PackedSamples<'_>,
+    medians: &mut [AdaptiveMedians; 2],
+    frames: usize,
+    hybrid: &mut crate::HybridState,
+) -> Result<Vec<i32>> {
+    let mut reader = payload.bit_reader();
+    let mut state = StereoDecodeState::new();
+    let slots = frames.saturating_mul(2);
+    let mut out = Vec::with_capacity(prealloc_floor(slots, payload.len()));
+    let mut frame_limits = [0u32; 2];
+    for slot in 0..slots {
+        let ch = slot & 1;
+        if ch == 0 {
+            frame_limits = hybrid.frame_limits();
+        }
+        let sample = decode_sample_stateful_stereo_with_limit(
+            &mut reader,
+            medians,
+            &mut state,
+            frame_limits[ch],
+        )?;
+        hybrid.update_signed(ch, sample);
+        out.push(sample);
+    }
+    Ok(out)
 }
 
 /// Decode `count` mono samples from a `0x0A` packed-samples payload,
@@ -5830,6 +5999,75 @@ mod tests {
         const POSITIVE: i32 = apply_sign(5, false);
         assert_eq!(NEGATIVE, -6);
         assert_eq!(POSITIVE, 5);
+    }
+
+    #[test]
+    fn decode_bracketed_value_walks_the_binary_search() {
+        // §6.5 bracketing (round-408 pin): interval [0, 100], limit 30.
+        // Wire bits 1, 0 narrow to [50, 74] (width 24 <= 30), midpoint
+        // (50 + 74 + 1) >> 1 = 62; sign bit 0 keeps the magnitude.
+        let mut w = BitWriter::new();
+        w.write_bit(1); // low = (0+100+1)>>1 = 50
+        w.write_bit(0); // high = (50+100+1)>>1 - 1 = 74
+        w.write_bit(0); // sign
+        let bytes = w.finish();
+        let mut reader = BitReader::new(&bytes);
+        let interval = SampleInterval::new(0, 100);
+        assert_eq!(
+            interval.decode_bracketed_value(&mut reader, 30).unwrap(),
+            62
+        );
+        assert_eq!(reader.bits_consumed(), 3);
+    }
+
+    #[test]
+    fn decode_bracketed_value_sign_bit_complements() {
+        // Same walk with the sign bit set: the §4.2 step-7 complement.
+        let mut w = BitWriter::new();
+        w.write_bit(1);
+        w.write_bit(0);
+        w.write_bit(1); // sign
+        let bytes = w.finish();
+        let mut reader = BitReader::new(&bytes);
+        let interval = SampleInterval::new(0, 100);
+        assert_eq!(
+            interval.decode_bracketed_value(&mut reader, 30).unwrap(),
+            !62
+        );
+    }
+
+    #[test]
+    fn decode_bracketed_value_stops_immediately_when_wide_limit() {
+        // Interval narrower than the limit: no narrowing bits, just the
+        // sign; magnitude is the interval midpoint.
+        let mut w = BitWriter::new();
+        w.write_bit(0); // sign only
+        let bytes = w.finish();
+        let mut reader = BitReader::new(&bytes);
+        let interval = SampleInterval::new(10, 20);
+        assert_eq!(
+            interval.decode_bracketed_value(&mut reader, 100).unwrap(),
+            (10 + 20 + 1) >> 1
+        );
+        assert_eq!(reader.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn decode_bracketed_value_zero_limit_is_the_lossless_path() {
+        // §6.5 dispatch: error_limit == 0 → the exact phase-in mantissa
+        // decode. Verify against decode_signed_value on the same bits.
+        let mut w = BitWriter::new();
+        w.write_bits(0b1011, 4);
+        w.write_bit(0);
+        let bytes = w.finish();
+        let interval = SampleInterval::new(3, 20);
+        let mut r1 = BitReader::new(&bytes);
+        let mut r2 = BitReader::new(&bytes);
+        assert_eq!(
+            interval.decode_bracketed_value(&mut r1, 0).unwrap(),
+            interval.decode_signed_value(&mut r2).unwrap()
+        );
+        assert_eq!(r1.bits_consumed(), r2.bits_consumed());
     }
 
     #[test]

@@ -9,11 +9,13 @@ Pure-Rust WavPack lossless audio codec for the
 
 The crate parses the WavPack block container and decodes the
 modified-Rice entropy stream to PCM, with a matching exact-inverse
-encoder on the write side. **Arbitrary reference-encoded lossless
-files decode bit-exactly** (round 405): 16/24/32-bit integer, 32-bit
-float, mono / stereo / multichannel, every standard encoder effort
-mode — validated black-box against the reference decoder on a
-26-fixture battery committed under `tests/data/` (rounds 405/408).
+encoder on the write side. **Arbitrary reference-encoded lossless AND
+hybrid (lossy) files decode bit-exactly** (rounds 405/408):
+16/24/32-bit integer, 32-bit float (every documented `0x08` profile
+shape, inf/NaN included), mono / stereo / false-stereo /
+multichannel, every standard encoder effort mode, and the hybrid
+`-b` bitrate range — validated black-box against the reference
+decoder on a 35-fixture battery committed under `tests/data/`.
 
 Working surface:
 
@@ -340,8 +342,9 @@ Working surface:
   partial coverage pairs `None`), `correction_coverage` summarises
   `(paired, total)`, and `WavPackBlock::expects_correction` classifies
   which blocks *want* a twin (wiki bit-3 hybrid flag). Structural
-  plumbing for the two-file lossless path — consuming the paired
-  `0x0B` words stays gated on the hybrid entropy docs gap below.
+  plumbing for the two-file lossless path — folding the paired `0x0B`
+  words into the (now-decoded) coarse PCM stays gated on the shaped
+  correction-fold docs gap below.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -430,9 +433,10 @@ let frames = reader.read_frames(1024)?; // == window
 
 ## Not yet supported
 
-`WavPackBlock::decode_samples` refuses the following with a typed
-`Error::UnsupportedBlockFeature`: hybrid (lossy) blocks and
-low-latency block layouts. **Float and 32-bit-int sample data are
+`WavPackBlock::decode_samples` refuses only low-latency block layouts
+(wiki bit 31, "do not decode") with a typed
+`Error::UnsupportedBlockFeature`. **Hybrid (lossy) blocks are decoded**
+(round 408 — see below). **Float and 32-bit-int sample data are
 decoded in full** (rounds 405/408 — every documented `0x08` /
 `0x09` profile shape, see the working-surface bullets), with the
 `crc_x` extension-CRC verdict wired into the §5.6 mute gate. **Multichannel members** are
@@ -451,30 +455,30 @@ documents only as an optimisation *hint* ("can be used to optimize
 decoding arithmetic"), not a value the decoder must clamp against, so no
 clip is applied for correctness.
 
-The **hybrid** (lossy main + `.wvc` correction) decode path's documented
-*fold* arithmetic is now implemented (`hybrid` module + the block-level
-`fold_hybrid_correction` / `split_hybrid_correction` / `CorrectionFold`
-surface): the spec §4.1 post-decorrelation raw add
-`lossless = reconstructed + correction` that turns a reconstructed lossy
-buffer plus a matching correction-residual buffer into lossless PCM (and
-its exact encode inverse). The `CorrectionFold::from_flags` selector
-distinguishes the three §4.1 placements — post-decorrelation,
-`CROSS_DECORR` pre-decorrelation, and `HYBRID_SHAPE` / `NEW_SHAPING`
-noise-shaped — and the block-level fold applies the post-decorrelation
-case end-to-end while refusing the other two.
+**Hybrid (lossy) `.wv` files decode end-to-end** (round 408): the
+staged spec §6.5 `error_limit` model is implemented with its exact
+integer arithmetic pinned black-box against reference decodes — the
+`0x06` profile seeds per-channel `slow_level` accumulators
+(`HybridProfile` / `HybridState`), every sample folds
+`slow_level -= (slow_level + 128) >> 8; slow_level += wp_log2(mag)`,
+the per-sample limit is `wp_exp2s(ema - bitrate + 256)` with the
+stereo pair redistributed at frame start by
+`delta = (ema0 - ema1 - balance) >> 1`, and the step-6 mantissa read
+becomes the §6.5 bracketing binary search
+(`SampleInterval::decode_bracketed_value`). Nine reference-encoded
+hybrid fixtures (mono at the bitrate extremes, multi-block with a
+silence stretch, mid/side + balance stereo, `-j0` left/right, 5.1,
+24-bit, lossy float, false-stereo) decode **bit-exactly** with every
+stored block CRC matching. False-stereo blocks (bit 30) now emit both
+duplicated output channels everywhere (a round-408 conformance fix).
 
-The remaining **blocker on a docs gap** is the lossy main-stream entropy
-*decode* that would produce the lossy buffer the fold consumes: the staged
-docs note that the lossy `0x0A` decode replaces the §4.2 step-6
-truncated-binary mantissa with a binary-search refinement loop over
-`[low, high]` *until the interval is within `error_limit`* — but the
-**derivation of `error_limit`** itself (the `update_error_limit` rule from
-the hybrid profile / `slow_level` / bitrate) and the **`read_shaping_info`
-metadata layout** (for the noise-shaped fold) are named in the provenance
-index but not transcribed into the spec. Without `error_limit` the lossy
-main stream cannot be decoded from raw `.wv` bytes, so the *end-to-end*
-hybrid decode from a bitstream stays refused — but a caller holding both
-residual buffers can now recover lossless PCM via the block-level fold.
+The documented correction *fold* arithmetic (`fold_hybrid_correction` /
+`split_hybrid_correction` / `CorrectionFold`) recovers lossless PCM
+from a coarse buffer plus a `0x0B` correction buffer in the
+post-decorrelation placement; wiring the paired `.wvc` stream through
+it end-to-end — including the `HYBRID_SHAPE` / `NEW_SHAPING`
+noise-shaped fold, whose `0x07` seed layout the staged docs name but
+do not transcribe — is the remaining hybrid gap.
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged
