@@ -817,6 +817,7 @@ mod encode;
 mod entropy;
 mod error;
 mod fixup;
+mod float;
 mod hybrid;
 mod int32;
 mod logpack;
@@ -848,7 +849,7 @@ oxideav_core::register!("wavpack", register);
 
 pub use crate::block::{
     audio_block_count, block_count, correction_block_count, correction_coverage,
-    decode_multichannel_stream, decode_multichannel_stream_muted, decode_stream,
+    decode_multichannel_stream, decode_multichannel_stream_muted, decode_stream, decode_stream_f32,
     decode_stream_muted, decoded_sample_count, first_audio_block, first_correction_block,
     iter_audio_blocks, iter_blocks, iter_correction_blocks, iter_decoded_blocks,
     metadata_block_count, multichannel_layout, pair_correction_stream, parse_block, parse_blocks,
@@ -900,6 +901,10 @@ pub use crate::entropy::{
 };
 pub use crate::error::{Error, Result};
 pub use crate::fixup::{apply_left_shift, apply_left_shift_buffer};
+pub use crate::float::{
+    expand_float_info, reassemble_float, FloatInfo, FLOAT_EXCEPTIONS, FLOAT_INFO_PAYLOAD_BYTES,
+    FLOAT_NEG_ZEROS, FLOAT_SHIFT_ONES, FLOAT_SHIFT_SAME, FLOAT_SHIFT_SENT, FLOAT_ZEROS_SENT,
+};
 pub use crate::hybrid::{
     flags_select_shaping, fold_correction, fold_correction_pair, fold_correction_pre_decorrelation,
     fold_correction_pre_decorrelation_pair, split_correction, CorrectionFold, CROSS_DECORR_FLAG,

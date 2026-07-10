@@ -90,6 +90,26 @@ pub enum Error {
     /// A block with flag bit 8 (`INT32_DATA`) set carries no `0x09`
     /// int32-info sub-block describing the low-bit reduction.
     BlockMissingInt32Info,
+    /// A block with flag bit 7 (`FLOAT_DATA`) set carries no `0x08`
+    /// float-info sub-block describing the reconstruction profile.
+    BlockMissingFloatInfo,
+    /// A float-typed decode (`decode_samples_f32` /
+    /// `decode_stream_f32`) was asked to decode a block/stream whose
+    /// samples are integers, not IEEE floats (header flag bit 7
+    /// clear) — reinterpreting integer PCM as bit patterns would be
+    /// silent corruption.
+    BlockNotFloat,
+    /// A `0x08` float-info sub-block had a payload whose byte count was
+    /// not the fixed 4 bytes (`float_flags, float_shift, float_max_exp,
+    /// float_norm_exp`) the staged spec `wavpack-sample-formats.md` §2
+    /// documents. The contained number is the observed byte count.
+    FloatInfoLength(usize),
+    /// A float block's scaled integer overflows the 24-bit mantissa
+    /// window after the static `float_shift` — a conformant encoder
+    /// anchors the largest magnitude at exactly 24 bits via
+    /// `float_max_exp`, so a wider value is malformed. The contained
+    /// number is the offending shifted magnitude.
+    FloatMagnitudeOverflow(u32),
     /// A `0x0C` extension sub-block's payload is shorter than its
     /// mandatory 4-byte little-endian `crc_wvx` prefix (staged spec
     /// `wavpack-sample-formats.md` §4). The contained number is the
@@ -514,6 +534,22 @@ impl core::fmt::Display for Error {
             Error::BlockMissingInt32Info => write!(
                 f,
                 "oxideav-wavpack: block flags INT32_DATA (bit 8) but no 0x09 int32-info sub-block is present"
+            ),
+            Error::BlockMissingFloatInfo => write!(
+                f,
+                "oxideav-wavpack: block flags FLOAT_DATA (bit 7) but no 0x08 float-info sub-block is present"
+            ),
+            Error::BlockNotFloat => write!(
+                f,
+                "oxideav-wavpack: float-typed decode on a non-float block (FLOAT_DATA bit 7 is clear)"
+            ),
+            Error::FloatInfoLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x08 float-info payload has {n} bytes (expected 4: flags, shift, max_exp, norm_exp)"
+            ),
+            Error::FloatMagnitudeOverflow(v) => write!(
+                f,
+                "oxideav-wavpack: float scaled integer {v:#x} overflows the 24-bit mantissa window (malformed against float_max_exp)"
             ),
             Error::OverflowBitsTooShort(n) => write!(
                 f,

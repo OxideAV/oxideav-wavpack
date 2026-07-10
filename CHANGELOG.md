@@ -64,6 +64,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   matching `crc_x`, and an extension-bit corruption trip-wire pinned as
   integration fixtures.
 
+- Round 405 — **float (`FLOAT_DATA`) sample-format decode.** Blocks
+  with flag bit 7 are decoded, not refused: the new `float` module
+  implements the staged `wavpack-sample-formats.md` §2 `0x08` profile
+  (`FloatInfo` / `expand_float_info`) and the scaled-integer →
+  IEEE-754 reconstruction — static `float_shift`, per-sample mantissa
+  normalisation anchored on `float_max_exp`, vacated low bits filled
+  as zeros / ones (`SHIFT_ONES`) / literal `0x0C` bits (`SHIFT_SENT`),
+  and `ZEROS_SENT` zero samples (marker bit; literal
+  mantissa23+exponent8+sign1 for sub-integer magnitudes incl.
+  denormals; `NEG_ZEROS`-gated sign for true ±0) — the wire layouts
+  the staged spec names but does not bit-pin were established
+  black-box via differential probes against reference-encoded files.
+  **Erratum found:** the float extension CRC does *not* use the
+  `wavpack-decorrelation.md` §5.5 halfword formula (that form holds
+  for int32 only); it folds three mono-CRC steps per sample —
+  mantissa, exponent, sign (`update_float_extension`) — pinned by
+  single-bit differential probes (weights `9<<k` / `3` / `1`).
+  `SHIFT_SAME` and `EXCEPTIONS` (inf/NaN) profiles are refused with
+  the new typed `UnsupportedBlockFeature::FloatShiftSame` /
+  `FloatExceptions`. Typed f32 surface: `WavPackBlock::is_float` /
+  `decode_samples_f32` and the stream-level `decode_stream_f32`
+  (refusing integer streams via `Error::BlockNotFloat`). Validated
+  black-box: integer-valued, full-precision, ±0/denormal/>1.0 and
+  `-h`-mode float files decode **bit-exactly** with matching `crc_x`
+  (6/6), five pinned as integration fixtures plus a float
+  extension-corruption trip-wire.
+
 ### Changed
 
 - Round 405 — **`0x05` median / `0x04` seed expansion is now the

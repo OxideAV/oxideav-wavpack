@@ -109,13 +109,29 @@ pub enum UnsupportedBlockFeature {
     /// per-sample loop's spec §4.2 step 6 binary-search refinement for
     /// `error_limit != 0` (the hybrid path) is not yet implemented.
     Hybrid,
-    /// Wiki bit 7 ("floating point data present") is set. The float
-    /// container fix-up uses the `0x0C` overflow-bits sub-block whose
-    /// layout the wiki does not document.
+    /// Wiki bit 7 ("floating point data present") is set.
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** (round
+    /// 405): float blocks are decoded via the `0x08` profile + `0x0C`
+    /// extension fixup (staged spec `wavpack-sample-formats.md` §2/§4).
+    /// Retained as a public variant for API stability; only the two
+    /// narrower float refusals below are still raised.
     FloatData,
-    /// Wiki bit 8 ("int32 mode") is set. The large/shifted-int
-    /// container fix-up uses the `0x09` int32-info sub-block whose
-    /// layout the wiki does not document.
+    /// A float block's `0x08` profile carries `SHIFT_SAME` (`0x02` —
+    /// "shifted-in low mantissa bits are all identical"): the staged
+    /// spec does not say which value the identical bits take, so the
+    /// reconstruction is refused pending a docs clarification.
+    FloatShiftSame,
+    /// A float block's `0x08` profile carries `EXCEPTIONS` (`0x20` —
+    /// inf / NaN can occur): the per-sample extension payload of an
+    /// exceptional value is not covered by the staged spec.
+    FloatExceptions,
+    /// Wiki bit 8 ("int32 mode") is set.
+    ///
+    /// **No longer raised by [`WavPackBlock::decode_samples`]** (round
+    /// 405): int32 blocks are decoded via the `0x09` profile + `0x0C`
+    /// extension fixup (staged spec `wavpack-sample-formats.md` §3/§4).
+    /// Retained as a public variant for API stability.
     Int32Mode,
     /// Wiki bits 11..=12 ("multi-channel start and end blocks") do not
     /// carry the standalone-block degenerate marker `0b11`, i.e. the
@@ -170,6 +186,12 @@ impl core::fmt::Display for UnsupportedBlockFeature {
         let name = match self {
             UnsupportedBlockFeature::Hybrid => "hybrid lossy profile (flag bit 3)",
             UnsupportedBlockFeature::FloatData => "float-point data (flag bit 7)",
+            UnsupportedBlockFeature::FloatShiftSame => {
+                "float SHIFT_SAME low-bit coding (0x08 float_flags bit 0x02)"
+            }
+            UnsupportedBlockFeature::FloatExceptions => {
+                "float inf/NaN exceptions (0x08 float_flags bit 0x20)"
+            }
             UnsupportedBlockFeature::Int32Mode => "int32 container mode (flag bit 8)",
             UnsupportedBlockFeature::MultichannelMember => {
                 "multi-block multichannel grouping (flag bits 11..=12 != 0b11)"
@@ -695,6 +717,31 @@ impl<'a> WavPackBlock<'a> {
         }
     }
 
+    /// `true` when this block's samples are 32-bit IEEE floats
+    /// (header flag bit 7 `FLOAT_DATA`): [`Self::decode_samples`] then
+    /// returns the floats' **bit patterns** in its `i32` slots — see
+    /// [`Self::decode_samples_f32`] for the typed view. Round 405.
+    pub fn is_float(&self) -> bool {
+        self.header.flags.float_data
+    }
+
+    /// Decode a float block's PCM as `f32` samples — the typed twin of
+    /// [`Self::decode_samples`] for blocks with `FLOAT_DATA` set (the
+    /// `i32` decode slots carry IEEE-754 bit patterns; this
+    /// reinterprets them). Refuses a non-float block with
+    /// [`Error::BlockNotFloat`] so integer PCM cannot be
+    /// misinterpreted as bit patterns. Round 405.
+    pub fn decode_samples_f32(&self) -> Result<Vec<f32>> {
+        if !self.is_float() {
+            return Err(Error::BlockNotFloat);
+        }
+        Ok(self
+            .decode_samples()?
+            .into_iter()
+            .map(|bits| f32::from_bits(bits as u32))
+            .collect())
+    }
+
     /// Locate the `0x26` MD5-checksum sub-block and parse its 16-byte
     /// payload into a typed [`Md5Checksum`].
     ///
@@ -806,7 +853,7 @@ impl<'a> WavPackBlock<'a> {
         // final left shift. The plain decode does not enforce the
         // extension-CRC verdict (matching its posture on the main CRC —
         // use the muted twins for the §5.6 gate).
-        self.apply_int32_fixup(&mut pcm)?;
+        self.apply_sample_format_fixups(&mut pcm)?;
         // Spec §1 pipeline / §5.2: the left-shift fixup is the final
         // normalization stage, applied after the CRC fold. The CRC paths
         // call `decode_samples_preshift` directly and fold the pre-shift
@@ -866,12 +913,13 @@ impl<'a> WavPackBlock<'a> {
                 UnsupportedBlockFeature::Hybrid,
             ));
         }
-        if flags.float_data {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::FloatData,
-            ));
-        }
-        // INT32_DATA (bit 8) is no longer refused here: the large /
+        // FLOAT_DATA (bit 7) and INT32_DATA (bit 8) are no longer
+        // refused here: the float reconstruction is undone by the
+        // round-405 sample-format fixup the public decode paths run
+        // after this pre-shift body (staged spec
+        // `wavpack-sample-formats.md` §2/§4 — the profile refusals
+        // that remain, SHIFT_SAME / EXCEPTIONS, fire from the fixup).
+        // INT32_DATA likewise: the large /
         // shifted-integer reduction is undone by the round-405
         // `apply_int32_fixup` stage the public decode paths run after
         // this pre-shift body (staged spec `wavpack-sample-formats.md`
@@ -1065,7 +1113,7 @@ impl<'a> WavPackBlock<'a> {
         let mut pcm = self.decode_member_preshift()?;
         // Round 405: int32 sample-format fixup (see
         // `apply_int32_fixup`), verdict unenforced on the plain path.
-        self.apply_int32_fixup(&mut pcm)?;
+        self.apply_sample_format_fixups(&mut pcm)?;
         crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
         Ok(pcm)
     }
@@ -1085,7 +1133,7 @@ impl<'a> WavPackBlock<'a> {
         let mut crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
         if crc_ok {
             // Round 405: extension-CRC verdict joins the §5.6 gate.
-            if let Some((computed, stored)) = self.apply_int32_fixup(&mut pcm)? {
+            if let Some((computed, stored)) = self.apply_sample_format_fixups(&mut pcm)? {
                 crc_ok = computed == stored;
             }
         }
@@ -1129,7 +1177,7 @@ impl<'a> WavPackBlock<'a> {
         let main_ok = self.crc_of_decoded(&pcm) == self.header.crc();
         // Spec §5.6: when a 0x0C extension stream participated, the
         // accumulated crc_x must also match its stored crc_wvx.
-        let ext_ok = match self.apply_int32_fixup(&mut pcm)? {
+        let ext_ok = match self.apply_sample_format_fixups(&mut pcm)? {
             Some((computed, stored)) => computed == stored,
             None => true,
         };
@@ -1167,6 +1215,54 @@ impl<'a> WavPackBlock<'a> {
     /// refusals: [`Error::BlockMissingInt32Info`],
     /// [`Error::BlockMissingOverflowBits`], [`Error::Int32InfoLength`],
     /// [`Error::Int32InfoConflict`], [`Error::OverflowBitsTooShort`].
+    fn apply_sample_format_fixups(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
+        if self.header.flags.float_data {
+            return self.apply_float_fixup(pcm);
+        }
+        self.apply_int32_fixup(pcm)
+    }
+
+    /// The float half of [`Self::apply_sample_format_fixups`] (staged
+    /// spec `wavpack-sample-formats.md` §2): expand the mandatory
+    /// `0x08` profile, refuse the two undocumented coding shapes
+    /// (`SHIFT_SAME`, `EXCEPTIONS`), and rebuild each scaled integer
+    /// into its IEEE-754 bit pattern — reading literal mantissa bits /
+    /// literal zeros from the `0x0C` extension stream when the profile
+    /// sent them.
+    fn apply_float_fixup(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
+        let info_sub = self
+            .find_sub_block(SubBlockId::FloatInfo)
+            .ok_or(Error::BlockMissingFloatInfo)?;
+        let info = crate::float::expand_float_info(info_sub.payload)?;
+        if info.float_flags & crate::float::FLOAT_SHIFT_SAME != 0 {
+            return Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::FloatShiftSame,
+            ));
+        }
+        if info.float_flags & crate::float::FLOAT_EXCEPTIONS != 0 {
+            return Err(Error::UnsupportedBlockFeature(
+                UnsupportedBlockFeature::FloatExceptions,
+            ));
+        }
+        if info.requires_extension() {
+            let overflow = self
+                .packed_overflow_bits()
+                .ok_or(Error::BlockMissingOverflowBits)?;
+            let stored = overflow.crc_wvx()?;
+            let mut reader = overflow.extension_bit_reader()?;
+            let computed = crate::float::reassemble_float(pcm, &info, Some(&mut reader))?;
+            Ok(Some((computed, stored)))
+        } else {
+            let computed = crate::float::reassemble_float(pcm, &info, None)?;
+            match self.packed_overflow_bits() {
+                Some(overflow) => Ok(Some((computed, overflow.crc_wvx()?))),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// The int32 half of [`Self::apply_sample_format_fixups`] (staged
+    /// spec `wavpack-sample-formats.md` §3).
     fn apply_int32_fixup(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
         if !self.header.flags.int32_mode {
             return Ok(None);
@@ -1225,7 +1321,7 @@ impl<'a> WavPackBlock<'a> {
             // Round 405: run the int32 sample-format fixup and fold its
             // §5.5 extension-CRC verdict into the gate (spec §5.6: the
             // block is muted when *either* CRC fails).
-            if let Some((computed, stored)) = self.apply_int32_fixup(&mut pcm)? {
+            if let Some((computed, stored)) = self.apply_sample_format_fixups(&mut pcm)? {
                 crc_ok = computed == stored;
             }
         }
@@ -1836,6 +1932,22 @@ pub fn stream_total_samples(bytes: &[u8]) -> Result<Option<Option<u32>>> {
     }
     let (header, _) = parse_block_header(bytes)?;
     Ok(Some(header.total_samples_in_file()))
+}
+
+/// Decode a whole float `.wv` stream to `f32` PCM — the typed twin of
+/// [`decode_stream`] for streams whose blocks carry `FLOAT_DATA`
+/// (their `i32` decode slots are IEEE-754 bit patterns). The stream's
+/// first audio block decides floatness; a non-float stream is refused
+/// with [`Error::BlockNotFloat`]. Round 405.
+pub fn decode_stream_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    match first_audio_block(bytes)? {
+        Some(block) if block.is_float() => Ok(decode_stream(bytes)?
+            .into_iter()
+            .map(|bits| f32::from_bits(bits as u32))
+            .collect()),
+        Some(_) => Err(Error::BlockNotFloat),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// The stream's sample rate in Hz, resolved from its first audio
@@ -3503,16 +3615,79 @@ mod tests {
     }
 
     #[test]
-    fn decode_samples_rejects_float_data_profile() {
+    fn decode_samples_float_mode_requires_the_0x08_profile() {
+        // Round 405: FLOAT_DATA (bit 7) blocks are decoded, not
+        // refused — but the 4-byte 0x08 float-info profile is
+        // mandatory; a block flagging bit 7 without it is malformed.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
         let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 7)), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
-        let err = block.decode_samples().expect_err("must refuse float");
+        let err = block.decode_samples().expect_err("0x08 is mandatory");
+        assert_eq!(err, Error::BlockMissingFloatInfo);
+    }
+
+    #[test]
+    fn decode_samples_float_refuses_the_undocumented_profile_shapes() {
+        // SHIFT_SAME (0x02) and EXCEPTIONS (0x20) have no documented
+        // reconstruction; each is a typed refusal.
+        for (flag_bit, feature) in [
+            (0x02u8, UnsupportedBlockFeature::FloatShiftSame),
+            (0x20u8, UnsupportedBlockFeature::FloatExceptions),
+        ] {
+            let mut payload = Vec::new();
+            append_entropy_info_mono_zero(&mut payload);
+            append_small_sub_block(&mut payload, 0x08, &[flag_bit, 0, 126, 127]);
+            append_packed_samples(&mut payload, &[0x00, 0x00]);
+            let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 7)), &payload);
+            let (block, _) = parse_block(&bytes).expect("parse block");
+            let err = block.decode_samples().expect_err("must refuse");
+            assert_eq!(err, Error::UnsupportedBlockFeature(feature));
+        }
+    }
+
+    #[test]
+    fn decode_samples_float_intvalued_profile_reconstructs_bit_patterns() {
+        // flags 0 / shift 9 / max_exp 126: the integer-valued float
+        // profile observed on reference files. Entropy value 16384
+        // reconstructs 0.5f32; the main CRC folds the PRE-fixup
+        // integer.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_small_sub_block(&mut payload, 0x08, &[0, 9, 126, 127]);
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
+        let mut enc_medians =
+            crate::samples::AdaptiveMedians::from_entropy(&info_block, 0).expect("medians");
+        let packed =
+            crate::samples::encode_packed_samples_mono(&[16384], &mut enc_medians).expect("encode");
+        append_packed_samples(&mut payload, &packed);
+        let crc = crate::crc::crc_mono(&[16384]);
+        let mut bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 7)), &payload);
+        bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(block.is_float());
         assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::FloatData)
+            block.decode_samples().expect("decode"),
+            vec![0.5f32.to_bits() as i32]
+        );
+        assert_eq!(block.decode_samples_f32().expect("f32 decode"), vec![0.5]);
+        let (pcm, ok) = block.decode_samples_muted().expect("muted");
+        assert!(ok, "pre-fixup CRC fold must match");
+        assert_eq!(pcm, vec![0.5f32.to_bits() as i32]);
+    }
+
+    #[test]
+    fn decode_samples_f32_refuses_integer_blocks() {
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0x00, 0x00]);
+        let bytes = synthesise_block(1, flags_with(1 << 2), &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(!block.is_float());
+        assert_eq!(
+            block.decode_samples_f32().expect_err("must refuse"),
+            Error::BlockNotFloat
         );
     }
 

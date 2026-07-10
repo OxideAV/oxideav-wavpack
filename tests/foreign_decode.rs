@@ -36,6 +36,11 @@
 //! | `foreign_int32_zeros_mono`     | default      | 32-bit int mono, 12 redundant trailing zero bits |
 //! | `foreign_int32_stereo`         | default      | 32-bit int stereo |
 //! | `foreign_int32_high_stereo`    | `-h`         | 32-bit int stereo |
+//! | `foreign_float_intvalued_mono` | default      | 32-bit float mono, integer-valued (`float_flags = 0`) |
+//! | `foreign_float_mono`           | default      | 32-bit float mono, full precision (`SHIFT_SENT`) |
+//! | `foreign_float_zeros_mono`     | default      | 32-bit float mono with ±0 (`SHIFT_SENT\|ZEROS_SENT\|NEG_ZEROS`) |
+//! | `foreign_float_stereo`         | default      | 32-bit float stereo, >1.0 amplitudes + denormals + ±0 |
+//! | `foreign_float_high_mono`      | `-h`         | 32-bit float mono, full precision |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -127,6 +132,15 @@ foreign_fixture!(
     "foreign_int32_high_stereo",
     2
 );
+foreign_fixture!(
+    float_intvalued_mono_is_bit_exact,
+    "foreign_float_intvalued_mono",
+    1
+);
+foreign_fixture!(float_mono_is_bit_exact, "foreign_float_mono", 1);
+foreign_fixture!(float_zeros_mono_is_bit_exact, "foreign_float_zeros_mono", 1);
+foreign_fixture!(float_stereo_is_bit_exact, "foreign_float_stereo", 2);
+foreign_fixture!(float_high_mono_is_bit_exact, "foreign_float_high_mono", 1);
 
 /// A corrupted foreign block must trip the CRC mute gate, not decode to
 /// wrong PCM silently: flip one payload bit deep inside the first
@@ -224,6 +238,49 @@ fn corrupted_int32_extension_bits_fail_the_crc_x_gate() {
     let mut wv = clean.to_vec();
     wv[pos + payload.len() / 2] ^= 0x01;
 
+    if let Ok((pcm, all_ok)) = decode_stream_muted(&wv) {
+        assert!(!all_ok, "extension-bit corruption must fail the gate");
+        assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
+    }
+}
+
+/// The typed f32 surface reinterprets a float stream's decoded bit
+/// patterns; a non-float (integer) stream is refused.
+#[test]
+fn float_typed_decode_matches_bit_patterns_and_refuses_integers() {
+    let wv = include_bytes!("data/foreign_float_stereo.wv");
+    let expected = expected_pcm(include_bytes!("data/foreign_float_stereo.pcm32le"));
+    let floats = oxideav_wavpack::decode_stream_f32(wv).expect("f32 decode");
+    assert_eq!(floats.len(), expected.len());
+    for (f, bits) in floats.iter().zip(&expected) {
+        assert_eq!(f.to_bits(), *bits as u32, "bit-pattern parity");
+    }
+    // ±0 and denormals survive the typed reinterpretation.
+    assert!(floats.iter().any(|f| *f == 0.0 && f.is_sign_negative()));
+
+    let int_wv = include_bytes!("data/foreign_default_mono16.wv");
+    assert!(matches!(
+        oxideav_wavpack::decode_stream_f32(int_wv),
+        Err(oxideav_wavpack::Error::BlockNotFloat)
+    ));
+}
+
+/// Corrupting a float block's extension bitstream trips the crc_x arm
+/// of the mute gate (the float fold — mantissa/exponent/sign triples).
+#[test]
+fn corrupted_float_extension_bits_fail_the_crc_x_gate() {
+    let clean = include_bytes!("data/foreign_float_mono.wv");
+    let (block, _) = oxideav_wavpack::parse_block(clean).expect("parse");
+    let payload = block
+        .find_packed_overflow_bits_sub_block()
+        .expect("float fixture carries a 0x0C sub-block")
+        .payload;
+    let pos = clean
+        .windows(payload.len())
+        .position(|w| w == payload)
+        .expect("payload bytes locatable");
+    let mut wv = clean.to_vec();
+    wv[pos + payload.len() / 2] ^= 0x01;
     if let Ok((pcm, all_ok)) = decode_stream_muted(&wv) {
         assert!(!all_ok, "extension-bit corruption must fail the gate");
         assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
