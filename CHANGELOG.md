@@ -42,6 +42,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decoder reports both a stamped standard rate (44100) and a stamped
   custom rate (12345) and decodes the stamped streams bit-exactly.
 
+- Round 405 — **int32 (`INT32_DATA`) sample-format decode.** Blocks
+  with flag bit 8 are decoded, not refused: the new `int32` module
+  implements the staged `wavpack-sample-formats.md` §3 `0x09` profile
+  (`Int32Info` / `expand_int32_info`: 4-byte `sent_bits, zeros, ones,
+  dups`, mutually-exclusive redundancy enforced) and the §4 per-sample
+  reassembly (`reassemble_int32`: `sent_bits` literal low bits from the
+  `0x0C` extension bitstream LSB-first, redundancy pattern re-inserted
+  below them). `PackedOverflowBits` gains the §4 structured accessors
+  `crc_wvx` (the 4-byte little-endian stored extension CRC at the head
+  of the `0x0C` payload) and `extension_bit_reader`; the §5.5 `crc_x`
+  fold runs over every reassembled value and joins the §5.6 mute gate
+  in `decode_samples_muted` / `decode_member_samples_muted` /
+  `verify_decoded_crc` (a block is muted when *either* CRC fails). The
+  fixup runs after the main-CRC fold and before the header left-shift,
+  matching the staged pipeline. Typed refusals:
+  `BlockMissingInt32Info`, `Int32InfoLength`, `Int32InfoConflict`,
+  `BlockMissingOverflowBits`, `OverflowBitsTooShort`. Validated
+  black-box against reference-encoded 32-bit files (default + `-h`,
+  mono/stereo, sent-bits and trailing-zeros profiles): bit-exact PCM,
+  matching `crc_x`, and an extension-bit corruption trip-wire pinned as
+  integration fixtures.
+
 ### Changed
 
 - Round 405 — **`0x05` median / `0x04` seed expansion is now the

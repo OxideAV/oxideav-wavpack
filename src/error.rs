@@ -66,6 +66,35 @@ pub enum Error {
     /// non-standard-sampling-rate sub-block is present on the first
     /// audio block.
     SampleRateUnknown,
+    /// A `0x09` int32-info sub-block had a payload whose byte count was
+    /// not the fixed 4 bytes (`sent_bits, zeros, ones, dups`) the
+    /// staged spec `wavpack-sample-formats.md` §3 documents. The
+    /// contained number is the observed byte count.
+    Int32InfoLength(usize),
+    /// A `0x09` int32-info sub-block populated more than one of its
+    /// mutually exclusive redundancy fields (staged spec
+    /// `wavpack-sample-formats.md` §3: "only one of `zeros` / `ones` /
+    /// `dups` is non-zero for a given block").
+    Int32InfoConflict {
+        /// The wire `zeros` field.
+        zeros: u8,
+        /// The wire `ones` field.
+        ones: u8,
+        /// The wire `dups` field.
+        dups: u8,
+    },
+    /// A block whose sample-format profile requires the `0x0C`
+    /// extension bitstream (int32 `sent_bits > 0`, or float literal
+    /// bits) carries no `0x0C` sub-block.
+    BlockMissingOverflowBits,
+    /// A block with flag bit 8 (`INT32_DATA`) set carries no `0x09`
+    /// int32-info sub-block describing the low-bit reduction.
+    BlockMissingInt32Info,
+    /// A `0x0C` extension sub-block's payload is shorter than its
+    /// mandatory 4-byte little-endian `crc_wvx` prefix (staged spec
+    /// `wavpack-sample-formats.md` §4). The contained number is the
+    /// observed byte count.
+    OverflowBitsTooShort(usize),
     /// A `0x0A` packed-samples sub-block had an odd-length payload. The
     /// clean-room entropy doc
     /// `docs/audio/wavpack/spec/wavpack-entropy-decode.md` §1 states the
@@ -469,6 +498,26 @@ impl core::fmt::Display for Error {
             Error::SampleRateUnknown => write!(
                 f,
                 "oxideav-wavpack: stream sample rate unknown (custom index 15 with no 0x27 sub-block); time-addressed seeking needs a resolvable rate"
+            ),
+            Error::Int32InfoLength(n) => write!(
+                f,
+                "oxideav-wavpack: 0x09 int32-info payload has {n} bytes (expected 4: sent_bits, zeros, ones, dups)"
+            ),
+            Error::Int32InfoConflict { zeros, ones, dups } => write!(
+                f,
+                "oxideav-wavpack: 0x09 int32-info populates more than one redundancy field (zeros={zeros}, ones={ones}, dups={dups}; spec \u{00A7}3 makes them mutually exclusive)"
+            ),
+            Error::BlockMissingOverflowBits => write!(
+                f,
+                "oxideav-wavpack: sample-format profile requires the 0x0C extension bitstream but the block carries no 0x0C sub-block"
+            ),
+            Error::BlockMissingInt32Info => write!(
+                f,
+                "oxideav-wavpack: block flags INT32_DATA (bit 8) but no 0x09 int32-info sub-block is present"
+            ),
+            Error::OverflowBitsTooShort(n) => write!(
+                f,
+                "oxideav-wavpack: 0x0C extension payload has {n} bytes, shorter than its 4-byte crc_wvx prefix"
             ),
             Error::PackedSamplesOddLength(n) => write!(
                 f,

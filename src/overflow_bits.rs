@@ -14,19 +14,17 @@
 //! or `>24`-bit integer sample needs once the main stream's entropy
 //! decode has produced the low-order mantissa.
 //!
-//! The wiki places **no internal structure** on the `0x0C` payload — it
-//! is a contiguous bitstream the downstream float / large-integer
-//! container fix-up consumes left-to-right alongside the main `0x0A`
-//! stream. The typed view therefore carries the bytes verbatim and
-//! exposes the same byte-length / bit-reader-factory surface
-//! [`crate::PackedSamples`] (`0x0A`) and [`crate::PackedCorrectionData`]
-//! (`0x0B`) expose. The float / int32 container fix-ups that would
-//! consume the wrapped bytes themselves remain gated on the
-//! [`crate::UnsupportedBlockFeature::FloatData`] /
-//! [`crate::UnsupportedBlockFeature::Int32Mode`] feature refusals in
-//! [`crate::WavPackBlock::decode_samples`]; this module adds only the
-//! typed view + walker bridge, so callers staging the deferred fix-up
-//! have a single concrete handoff into the round-5/6/15 bit reader.
+//! The staged spec `docs/audio/wavpack/spec/wavpack-sample-formats.md`
+//! §4 fixes the payload's internal structure (round 405): a **32-bit
+//! little-endian `crc_wvx`** — the stored extension CRC compared
+//! against the accumulated `crc_x` at block end — followed by the
+//! packed extension bitstream, read LSB-first like the `0x0A` main
+//! stream. The typed view carries the bytes verbatim and exposes both
+//! the raw byte-length / bit-reader surface ([`crate::PackedSamples`] /
+//! [`crate::PackedCorrectionData`] symmetry) and the structured
+//! accessors [`PackedOverflowBits::crc_wvx`] /
+//! [`PackedOverflowBits::extension_bit_reader`] the int32 / float
+//! sample-format fix-ups consume during the fixup/normalise stage.
 //!
 //! ## Length: unconstrained by the wiki
 //!
@@ -98,8 +96,12 @@ impl<'a> PackedOverflowBits<'a> {
     }
 
     /// Construct a fresh [`BitReader`] positioned at bit 0 of the
-    /// payload, ready to feed the float / large-integer container
-    /// fix-up.
+    /// **raw payload** — including the 4-byte `crc_wvx` prefix the
+    /// staged spec `wavpack-sample-formats.md` §4 places at the head
+    /// of the `0x0C` payload. Decoders consuming the extension
+    /// bitstream want [`Self::extension_bit_reader`] (which skips the
+    /// prefix) paired with [`Self::crc_wvx`]; this raw view remains
+    /// for byte-level inspection.
     ///
     /// Each call returns an independent reader — the
     /// [`PackedOverflowBits`] view itself carries no read cursor, so
@@ -107,6 +109,37 @@ impl<'a> PackedOverflowBits<'a> {
     /// (e.g. one for a probe and one for the real decode).
     pub fn bit_reader(&self) -> BitReader<'a> {
         BitReader::new(self.bytes)
+    }
+
+    /// The stored extension CRC — the **32-bit little-endian
+    /// `crc_wvx`** at the head of the `0x0C` payload (staged spec
+    /// `wavpack-sample-formats.md` §4), which the decoder compares
+    /// against the accumulated `crc_x` at block end (spec
+    /// `wavpack-decorrelation.md` §5.5/§5.6).
+    ///
+    /// Returns [`Error::OverflowBitsTooShort`](crate::Error::OverflowBitsTooShort)
+    /// when the payload cannot even hold the prefix.
+    pub fn crc_wvx(&self) -> crate::error::Result<u32> {
+        let Some(prefix) = self.bytes.get(..4) else {
+            return Err(crate::Error::OverflowBitsTooShort(self.bytes.len()));
+        };
+        Ok(u32::from_le_bytes([
+            prefix[0], prefix[1], prefix[2], prefix[3],
+        ]))
+    }
+
+    /// Construct a fresh [`BitReader`] over the **extension
+    /// bitstream** — the payload bytes after the 4-byte `crc_wvx`
+    /// prefix (staged spec `wavpack-sample-formats.md` §4), consumed
+    /// LSB-first like the `0x0A` main stream.
+    ///
+    /// Returns [`Error::OverflowBitsTooShort`](crate::Error::OverflowBitsTooShort)
+    /// when the payload cannot even hold the prefix.
+    pub fn extension_bit_reader(&self) -> crate::error::Result<BitReader<'a>> {
+        let Some(rest) = self.bytes.get(4..) else {
+            return Err(crate::Error::OverflowBitsTooShort(self.bytes.len()));
+        };
+        Ok(BitReader::new(rest))
     }
 }
 

@@ -818,6 +818,7 @@ mod entropy;
 mod error;
 mod fixup;
 mod hybrid;
+mod int32;
 mod logpack;
 mod metadata;
 mod overflow_bits;
@@ -904,6 +905,7 @@ pub use crate::hybrid::{
     fold_correction_pre_decorrelation_pair, split_correction, CorrectionFold, CROSS_DECORR_FLAG,
     HYBRID_FLAG, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
 };
+pub use crate::int32::{expand_int32_info, reassemble_int32, Int32Info, INT32_INFO_PAYLOAD_BYTES};
 pub use crate::logpack::{
     expand_log_word, pack_log_word, quantize_log_value, wp_exp2s, wp_log2, EXP2_TABLE, LOG2_TABLE,
     MAX_LOG2_INPUT, MAX_LOG_WORD,

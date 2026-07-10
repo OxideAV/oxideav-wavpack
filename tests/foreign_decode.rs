@@ -32,6 +32,10 @@
 //! | `foreign_default_stereo24`     | default      | 24-bit stereo    |
 //! | `foreign_default_5dot1_16`     | default      | 16-bit 5.1       |
 //! | `foreign_custom_rate_mono16`   | default      | 16-bit mono, non-standard 12345 Hz (`0x27`) |
+//! | `foreign_int32_mono`           | default      | 32-bit int mono (`INT32_DATA`, `0x09` + `0x0C` sent bits) |
+//! | `foreign_int32_zeros_mono`     | default      | 32-bit int mono, 12 redundant trailing zero bits |
+//! | `foreign_int32_stereo`         | default      | 32-bit int stereo |
+//! | `foreign_int32_high_stereo`    | `-h`         | 32-bit int stereo |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -115,6 +119,14 @@ foreign_fixture!(
     "foreign_custom_rate_mono16",
     1
 );
+foreign_fixture!(int32_mono_is_bit_exact, "foreign_int32_mono", 1);
+foreign_fixture!(int32_zeros_mono_is_bit_exact, "foreign_int32_zeros_mono", 1);
+foreign_fixture!(int32_stereo_is_bit_exact, "foreign_int32_stereo", 2);
+foreign_fixture!(
+    int32_high_stereo_is_bit_exact,
+    "foreign_int32_high_stereo",
+    2
+);
 
 /// A corrupted foreign block must trip the CRC mute gate, not decode to
 /// wrong PCM silently: flip one payload bit deep inside the first
@@ -188,4 +200,32 @@ fn foreign_time_seek_matches_frame_seek() {
     // Negative / non-finite times are refused.
     assert!(reader.seek_seconds(-0.5).is_err());
     assert!(reader.seek_seconds(f64::NAN).is_err());
+}
+
+/// Corrupting the `0x0C` extension bitstream of an int32 block must
+/// trip the §5.5 extension-CRC arm of the mute gate even when the main
+/// sample CRC (folded over the pre-fixup buffer) still matches.
+#[test]
+fn corrupted_int32_extension_bits_fail_the_crc_x_gate() {
+    let clean = include_bytes!("data/foreign_int32_mono.wv");
+    // Find the 0x0C sub-block in the first block and flip a bit deep
+    // inside its extension payload (past the 4-byte crc_wvx prefix).
+    let (block, _) = oxideav_wavpack::parse_block(clean).expect("parse");
+    let overflow = block
+        .find_packed_overflow_bits_sub_block()
+        .expect("int32 fixture carries a 0x0C sub-block");
+    // Locate the payload inside the file bytes by searching for its
+    // (unique, high-entropy) contents.
+    let payload = overflow.payload;
+    let pos = clean
+        .windows(payload.len())
+        .position(|w| w == payload)
+        .expect("payload bytes locatable");
+    let mut wv = clean.to_vec();
+    wv[pos + payload.len() / 2] ^= 0x01;
+
+    if let Ok((pcm, all_ok)) = decode_stream_muted(&wv) {
+        assert!(!all_ok, "extension-bit corruption must fail the gate");
+        assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
+    }
 }

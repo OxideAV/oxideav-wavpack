@@ -801,6 +801,12 @@ impl<'a> WavPackBlock<'a> {
     /// the pre-shift buffer to compare against the stored header CRC.
     pub fn decode_samples(&self) -> Result<Vec<i32>> {
         let mut pcm = self.decode_samples_preshift()?;
+        // Round 405: the int32 sample-format fixup (0x0C extension bits
+        // + redundancy re-insertion) runs between the CRC fold and the
+        // final left shift. The plain decode does not enforce the
+        // extension-CRC verdict (matching its posture on the main CRC —
+        // use the muted twins for the §5.6 gate).
+        self.apply_int32_fixup(&mut pcm)?;
         // Spec §1 pipeline / §5.2: the left-shift fixup is the final
         // normalization stage, applied after the CRC fold. The CRC paths
         // call `decode_samples_preshift` directly and fold the pre-shift
@@ -865,11 +871,14 @@ impl<'a> WavPackBlock<'a> {
                 UnsupportedBlockFeature::FloatData,
             ));
         }
-        if flags.int32_mode {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::Int32Mode,
-            ));
-        }
+        // INT32_DATA (bit 8) is no longer refused here: the large /
+        // shifted-integer reduction is undone by the round-405
+        // `apply_int32_fixup` stage the public decode paths run after
+        // this pre-shift body (staged spec `wavpack-sample-formats.md`
+        // §3/§4 — the `0x0C` extension bits and redundancy re-insertion
+        // happen at fixup/normalise time, outside the prediction loop,
+        // and the §5 main CRC folds over the buffer *this* body
+        // returns).
         // Wiki bit 28 "robust block (experimental, okay to ignore if
         // encountered)" is exactly that — ignorable. Real-world
         // encoders set it routinely, and a round-393 black-box
@@ -1054,6 +1063,9 @@ impl<'a> WavPackBlock<'a> {
     /// block that does. Round 378.
     pub fn decode_member_samples(&self) -> Result<Vec<i32>> {
         let mut pcm = self.decode_member_preshift()?;
+        // Round 405: int32 sample-format fixup (see
+        // `apply_int32_fixup`), verdict unenforced on the plain path.
+        self.apply_int32_fixup(&mut pcm)?;
         crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
         Ok(pcm)
     }
@@ -1070,7 +1082,13 @@ impl<'a> WavPackBlock<'a> {
     /// [`Self::decode_samples_muted`] does. Round 378.
     pub fn decode_member_samples_muted(&self) -> Result<(Vec<i32>, bool)> {
         let mut pcm = self.decode_member_preshift()?;
-        let crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        let mut crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        if crc_ok {
+            // Round 405: extension-CRC verdict joins the §5.6 gate.
+            if let Some((computed, stored)) = self.apply_int32_fixup(&mut pcm)? {
+                crc_ok = computed == stored;
+            }
+        }
         if crc_ok {
             crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
         } else {
@@ -1107,8 +1125,15 @@ impl<'a> WavPackBlock<'a> {
         // (before the final left-shift normalization). Fold the pre-shift
         // buffer so the comparison matches the stored header CRC even for
         // sub-byte-depth blocks (non-zero `left_shift`).
-        let pcm = self.decode_samples_preshift()?;
-        Ok(self.crc_of_decoded(&pcm) == self.header.crc())
+        let mut pcm = self.decode_samples_preshift()?;
+        let main_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        // Spec §5.6: when a 0x0C extension stream participated, the
+        // accumulated crc_x must also match its stored crc_wvx.
+        let ext_ok = match self.apply_int32_fixup(&mut pcm)? {
+            Some((computed, stored)) => computed == stored,
+            None => true,
+        };
+        Ok(main_ok && ext_ok)
     }
 
     /// Fold the spec §5 running CRC over an already-decoded PCM buffer in
@@ -1123,6 +1148,51 @@ impl<'a> WavPackBlock<'a> {
             crate::crc::crc_mono(pcm)
         } else {
             crate::crc::crc_stereo_interleaved(pcm)
+        }
+    }
+
+    /// Apply the round-405 **int32 sample-format fixup** in place
+    /// (staged spec `wavpack-sample-formats.md` §3/§4): when flag bit 8
+    /// (`INT32_DATA`) is set, complete each entropy-decoded sample with
+    /// its `sent_bits` literal low bits from the `0x0C` extension
+    /// bitstream and re-insert the stripped redundancy pattern, per the
+    /// block's `0x09` int32-info profile. Runs at fixup/normalise time —
+    /// after decorrelation and the §5 main-CRC fold, before the header
+    /// left-shift.
+    ///
+    /// Returns `Some((computed_crc_x, stored_crc_wvx))` when a `0x0C`
+    /// extension stream participated (the spec §5.5/§5.6 comparison
+    /// inputs; the caller decides whether to enforce it), `None` when
+    /// the block is not int32 or moved no extension bits. Typed
+    /// refusals: [`Error::BlockMissingInt32Info`],
+    /// [`Error::BlockMissingOverflowBits`], [`Error::Int32InfoLength`],
+    /// [`Error::Int32InfoConflict`], [`Error::OverflowBitsTooShort`].
+    fn apply_int32_fixup(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
+        if !self.header.flags.int32_mode {
+            return Ok(None);
+        }
+        let info_sub = self
+            .find_sub_block(SubBlockId::Int32Info)
+            .ok_or(Error::BlockMissingInt32Info)?;
+        let info = crate::int32::expand_int32_info(info_sub.payload)?;
+        if info.requires_extension() {
+            let overflow = self
+                .packed_overflow_bits()
+                .ok_or(Error::BlockMissingOverflowBits)?;
+            let stored = overflow.crc_wvx()?;
+            let mut reader = overflow.extension_bit_reader()?;
+            let computed = crate::int32::reassemble_int32(pcm, &info, Some(&mut reader))?;
+            Ok(Some((computed, stored)))
+        } else {
+            // Redundancy-only reduction: no literal bits to read. The
+            // spec ties the crc_x accumulation to the presence of a
+            // 0x0C stream (decorrelation doc §5.5), so compare only
+            // when one is on the wire.
+            let computed = crate::int32::reassemble_int32(pcm, &info, None)?;
+            match self.packed_overflow_bits() {
+                Some(overflow) => Ok(Some((computed, overflow.crc_wvx()?))),
+                None => Ok(None),
+            }
         }
     }
 
@@ -1150,7 +1220,15 @@ impl<'a> WavPackBlock<'a> {
         // pre-shift samples ("before final shift"). Fold the pre-shift
         // buffer, then apply the left-shift fixup to whatever PCM we emit.
         let mut pcm = self.decode_samples_preshift()?;
-        let crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        let mut crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        if crc_ok {
+            // Round 405: run the int32 sample-format fixup and fold its
+            // §5.5 extension-CRC verdict into the gate (spec §5.6: the
+            // block is muted when *either* CRC fails).
+            if let Some((computed, stored)) = self.apply_int32_fixup(&mut pcm)? {
+                crc_ok = computed == stored;
+            }
+        }
         if crc_ok {
             // CRC matched: emit the final container-scaled PCM (apply the
             // wiki bits-13..=17 left-shift normalization the public
@@ -2806,24 +2884,23 @@ mod tests {
         append_small_sub_block(payload, 0x05, &[0u8; 6]);
     }
 
-    /// Append a 0x05 entropy-info sub-block carrying a minimal-stereo
-    /// seed (left = right = `[1, 0, 0]`). The non-zero left-median value
-    /// is what `EntropyInfo::is_mono()` (a content-only predicate)
-    /// inspects to report `false`, so the stereo decode path is taken
-    /// even though `get_med(0) = (1 >> 4) + 1 = 1` still leaves both
-    /// channels eligible for the spec §4.2 step 1 zero-run fast path.
+    /// Append a 0x05 entropy-info sub-block carrying a small non-zero
+    /// stereo seed. The non-zero left-median value is what
+    /// `EntropyInfo::is_mono()` (a content-only predicate) inspects to
+    /// report `false`, so the stereo decode path is taken.
     ///
-    /// On-disk wire format per the wiki "Entropy info" + `0x04`
-    /// log-packed expansion: each 16-bit median word is
-    /// `[mantissa_lo, exponent_hi]` with mantissa signed and exponent
-    /// biased by `-9`. The bytes `[0x01, 0x09]` decode as
-    /// `mantissa = 1, exponent = 9, shift = 0`, giving `median = 1`.
+    /// Each 16-bit median word is a little-endian signed log word
+    /// expanded by `crate::wp_exp2s` (round 405): `0x0901` expands to
+    /// `median = 257` on both channels, so neither channel is eligible
+    /// for the spec §4.2 step 1 zero-run fast path (`median[0] > 1`).
+    /// Encoder-side tests seed their `AdaptiveMedians` through the same
+    /// expansion, so the two directions stay in lockstep.
     fn append_entropy_info_stereo_minimal(payload: &mut Vec<u8>) {
         let mut bytes = [0u8; 12];
         bytes[0] = 0x01;
-        bytes[1] = 0x09; // left medians[0] = 1
+        bytes[1] = 0x09; // left medians[0] = wp_exp2s(0x0901) = 257
         bytes[6] = 0x01;
-        bytes[7] = 0x09; // right medians[0] = 1
+        bytes[7] = 0x09; // right medians[0] = 257
         append_small_sub_block(payload, 0x05, &bytes);
     }
 
@@ -3440,17 +3517,46 @@ mod tests {
     }
 
     #[test]
-    fn decode_samples_rejects_int32_mode() {
+    fn decode_samples_int32_mode_requires_the_0x09_profile() {
+        // Round 405: INT32_DATA (bit 8) blocks are decoded, not
+        // refused — but the 4-byte 0x09 int32-info profile is
+        // mandatory; a block flagging bit 8 without it is malformed.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
         let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 8)), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
-        let err = block.decode_samples().expect_err("must refuse int32");
-        assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::Int32Mode)
-        );
+        let err = block.decode_samples().expect_err("0x09 is mandatory");
+        assert_eq!(err, Error::BlockMissingInt32Info);
+    }
+
+    #[test]
+    fn decode_samples_int32_zeros_profile_scales_the_pcm() {
+        // An INT32_DATA block whose 0x09 profile strips 4 redundant
+        // trailing zero bits: the decoded PCM is the entropy-decoded
+        // value shifted left by 4 (no 0x0C needed), and the §5 main
+        // CRC folds over the PRE-fixup buffer.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_small_sub_block(&mut payload, 0x09, &[0, 4, 0, 0]);
+        // One-sample 0x0A stream: value 1 (zone 0 → prefix 0, no
+        // mantissa with fresh medians... build via the encoder).
+        let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
+        let mut enc_medians =
+            crate::samples::AdaptiveMedians::from_entropy(&info_block, 0).expect("medians");
+        let packed =
+            crate::samples::encode_packed_samples_mono(&[3], &mut enc_medians).expect("encode");
+        append_packed_samples(&mut payload, &packed);
+        let crc = crate::crc::crc_mono(&[3]); // pre-fixup fold
+        let mut bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 8)), &payload);
+        bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.decode_samples().expect("decode"), vec![3 << 4]);
+        // The main CRC (over the pre-fixup value 3) gates cleanly.
+        let (pcm, ok) = block.decode_samples_muted().expect("muted decode");
+        assert!(ok, "pre-fixup CRC fold must match");
+        assert_eq!(pcm, vec![3 << 4]);
+        assert!(block.verify_decoded_crc().expect("verify"));
     }
 
     #[test]
