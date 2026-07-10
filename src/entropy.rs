@@ -17,22 +17,25 @@
 //! * Mono   — 3 medians × 2 bytes = **6 bytes** on the wire.
 //! * Stereo — 6 medians × 2 bytes = **12 bytes** on the wire.
 //!
-//! ## Log-pack: "as described above"
+//! ## Log-pack: the signed 16-bit log word
 //!
 //! The wiki phrase "log-packed into 16 bits as described above"
 //! points back to the immediately preceding *Decorrelation samples*
-//! section, which is the only other 16-bit log-pack the wiki has
-//! described to this point in the document (the *Decorrelation
-//! weights* recipe packs into 8 bits, not 16):
+//! section — the same 16-bit log-pack the `0x04` seed samples use (the
+//! *Decorrelation weights* recipe packs into 8 bits, not 16).
 //!
-//! > Each sample is 32-bit but stored in 16 bits, lower 8 bits are
-//! > mantiss and high 8 bits are exponent-9, i.e if exponent < 9
-//! > shift mantiss right, otherwise left.
+//! Each median is a **little-endian signed 16-bit log word** expanded
+//! by the [`crate::wp_exp2s`] log→value conversion (staged spec
+//! `docs/audio/wavpack/spec/wavpack-log2-exp2.md` §5: "each median =
+//! `wp_exp2s(u16)`", sign-extended; §6 pins the all-zero word as the
+//! canonical exact zero). Both the `0x05` medians and the `0x04` seeds
+//! flow through the shared
+//! [`expand_sample_word`](crate::decorrelation) helper.
 //!
-//! Each median is therefore an `[mantissa_lo, exponent_hi]`
-//! little-endian word identical to the round-3 sample word, expanded
-//! through the same [`expand_sample_word`](crate::decorrelation)
-//! helper (re-used here as `crate::decorrelation::expand_sample_word`).
+//! Round 405: `wp_exp2s` replaced the wiki's linear
+//! mantissa/exponent-9 shorthand, whose reading demonstrably diverges
+//! from reference-encoded files for every non-zero word (see the
+//! `crate::logpack` module docs).
 //!
 //! ## Output shape
 //!
@@ -188,10 +191,11 @@ impl EntropyInfo {
 /// Expand the payload of a `0x05` entropy-info sub-block into a
 /// typed [`EntropyInfo`] value.
 ///
-/// Each median is read as a little-endian 16-bit word and expanded
-/// through the same `[mantissa_lo, exponent_hi]` log-pack the wiki
-/// describes for the `0x04` decorrelation-samples sub-block (mantissa
-/// signed; exponent biased by `-9`).
+/// Each median is read as a little-endian signed 16-bit log word and
+/// expanded through [`crate::wp_exp2s`] — the same log-domain pack the
+/// `0x04` decorrelation-samples sub-block uses (staged spec
+/// `wavpack-log2-exp2.md` §5; the all-zero word is the canonical
+/// exact zero per §6).
 ///
 /// The payload length must be either 6 bytes (one set, mono block)
 /// or 12 bytes (two sets, stereo block). Any other length is a
@@ -229,21 +233,24 @@ fn read_median_set(set: &[u8]) -> [i32; MEDIANS_PER_CHANNEL] {
 mod tests {
     use super::*;
 
-    // Helper: build a 2-byte log-packed median word from an unsigned
-    // (mantissa, exponent) pair — the on-disk wire order matches the
-    // round-3 decorrelation-samples expander.
-    fn median_word(mantissa: u8, exponent: u8) -> [u8; 2] {
-        [mantissa, exponent]
+    // Helper: build the 2-byte little-endian log word whose wp_exp2s
+    // expansion is exactly `value` (test values stay in the
+    // exactly-representable small-magnitude range).
+    fn median_word(value: i32) -> [u8; 2] {
+        assert_eq!(
+            crate::quantize_log_value(value),
+            value,
+            "test median must be exactly log-word-representable"
+        );
+        crate::pack_log_word(value)
     }
 
     #[test]
     fn mono_payload_decodes_one_set_and_zeros_right() {
-        // Three medians, exponent = 9 means shift = 0, so the mantissa
-        // is returned unchanged.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&median_word(0x10, 0x09)); // +16
-        bytes.extend_from_slice(&median_word(0x20, 0x09)); // +32
-        bytes.extend_from_slice(&median_word(0x40, 0x09)); // +64
+        bytes.extend_from_slice(&median_word(16));
+        bytes.extend_from_slice(&median_word(32));
+        bytes.extend_from_slice(&median_word(64));
 
         let info = expand_entropy(&bytes).unwrap();
         assert_eq!(info.medians_left, [16, 32, 64]);
@@ -255,13 +262,13 @@ mod tests {
     fn stereo_payload_decodes_two_sets_in_left_then_right_order() {
         let mut bytes = Vec::new();
         // Left channel medians: 1, 2, 3.
-        bytes.extend_from_slice(&median_word(0x01, 0x09));
-        bytes.extend_from_slice(&median_word(0x02, 0x09));
-        bytes.extend_from_slice(&median_word(0x03, 0x09));
+        for m in [1, 2, 3] {
+            bytes.extend_from_slice(&median_word(m));
+        }
         // Right channel medians: 4, 5, 6.
-        bytes.extend_from_slice(&median_word(0x04, 0x09));
-        bytes.extend_from_slice(&median_word(0x05, 0x09));
-        bytes.extend_from_slice(&median_word(0x06, 0x09));
+        for m in [4, 5, 6] {
+            bytes.extend_from_slice(&median_word(m));
+        }
 
         let info = expand_entropy(&bytes).unwrap();
         assert_eq!(info.medians_left, [1, 2, 3]);
@@ -270,18 +277,19 @@ mod tests {
     }
 
     #[test]
-    fn stereo_payload_handles_negative_mantissa_via_sign_extension() {
-        // Reuse the round-3 sample expander's signed-mantissa
-        // contract: 0xFF mantissa at exponent 9 → -1.
+    fn stereo_payload_handles_negative_log_words_via_sign_extension() {
+        // The log word is signed (wp_exp2s is odd — staged spec §4
+        // step 1): a word with the top bit set decodes to a negated
+        // magnitude, not a huge positive one.
         let mut bytes = Vec::new();
         // Left: -1, -2, -3.
-        bytes.extend_from_slice(&median_word(0xFF, 0x09));
-        bytes.extend_from_slice(&median_word(0xFE, 0x09));
-        bytes.extend_from_slice(&median_word(0xFD, 0x09));
+        for m in [-1, -2, -3] {
+            bytes.extend_from_slice(&median_word(m));
+        }
         // Right: 7, 8, 9.
-        bytes.extend_from_slice(&median_word(0x07, 0x09));
-        bytes.extend_from_slice(&median_word(0x08, 0x09));
-        bytes.extend_from_slice(&median_word(0x09, 0x09));
+        for m in [7, 8, 9] {
+            bytes.extend_from_slice(&median_word(m));
+        }
 
         let info = expand_entropy(&bytes).unwrap();
         assert_eq!(info.medians_left, [-1, -2, -3]);
@@ -289,27 +297,28 @@ mod tests {
     }
 
     #[test]
-    fn log_pack_shift_left_branch_applies_to_medians() {
-        // exponent = 11 → shift left 2. mantissa = +4 → 16.
+    fn log_word_int_part_scales_the_median_by_powers_of_two() {
+        // The staged spec §4 step 3 shift pivot: int part 9 leaves the
+        // 9-bit mantissa (0x100 with zero fraction) unshifted; 10
+        // doubles it; 8 halves it.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&median_word(0x04, 0x0B)); // +4 << 2 = 16
-        bytes.extend_from_slice(&median_word(0x01, 0x0C)); // +1 << 3 = 8
-        bytes.extend_from_slice(&median_word(0x02, 0x0A)); // +2 << 1 = 4
+        bytes.extend_from_slice(&(9i16 << 8).to_le_bytes()); // 0x100
+        bytes.extend_from_slice(&(10i16 << 8).to_le_bytes()); // 0x200
+        bytes.extend_from_slice(&(8i16 << 8).to_le_bytes()); // 0x80
 
         let info = expand_entropy(&bytes).unwrap();
-        assert_eq!(info.medians_left, [16, 8, 4]);
+        assert_eq!(info.medians_left, [0x100, 0x200, 0x80]);
     }
 
     #[test]
-    fn log_pack_shift_right_branch_applies_to_medians() {
-        // exponent = 7 → shift right 2. mantissa = 0x40 (+64) → 16.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&median_word(0x40, 0x07)); // +64 >> 2 = 16
-        bytes.extend_from_slice(&median_word(0x20, 0x08)); // +32 >> 1 = 16
-        bytes.extend_from_slice(&median_word(0x10, 0x09)); // +16 >> 0 = 16
+    fn worked_example_log_word_expands_in_a_median_slot() {
+        // Spec §4 worked example: word 2807 = 0x0af7 ↔ value 1000.
+        let mut bytes = 2807i16.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&median_word(0));
+        bytes.extend_from_slice(&median_word(0));
 
         let info = expand_entropy(&bytes).unwrap();
-        assert_eq!(info.medians_left, [16, 16, 16]);
+        assert_eq!(info.medians_left, [1000, 0, 0]);
     }
 
     #[test]

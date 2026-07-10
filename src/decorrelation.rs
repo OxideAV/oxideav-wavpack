@@ -124,8 +124,10 @@ pub const TERM_DELTA_MASK: u8 = 0x07;
 /// On-disk size, in bytes, of each decorrelation-samples entry (one
 /// 16-bit word per the wiki "stored in 16 bits" sentence).
 pub const SAMPLE_ON_WIRE_BYTES: usize = 2;
-/// Bias the wiki applies to the exponent half of a sample word
-/// ("high 8 bits are exponent-9").
+/// Shift pivot of the 16-bit log-word encoding (the wiki's "high 8
+/// bits are exponent-9" shorthand): an integer log part of `9` leaves
+/// the 9-bit mantissa unshifted. See [`crate::wp_exp2s`] (staged spec
+/// `wavpack-log2-exp2.md` §4 step 3 / §7 "exp2 shift pivot").
 pub const SAMPLE_EXPONENT_BIAS: i32 = 9;
 
 /// Right-shift applied to the `weight * sample` product in
@@ -468,19 +470,21 @@ fn expand_weight_byte(byte: u8) -> i32 {
 /// Expand the payload of a `0x04` decorrelation-samples sub-block
 /// into a typed [`DecorrelationSamples`] value.
 ///
-/// Each pair of bytes is read as a little-endian 16-bit word and
-/// expanded through the wiki's exponent / mantissa formula:
+/// Each pair of bytes is read as a little-endian **signed 16-bit log
+/// word** and expanded through the [`crate::wp_exp2s`] log→value
+/// conversion (staged spec `wavpack-log2-exp2.md` §5: "each stored
+/// 16-bit field is little-endian; it is sign-extended … and passed to
+/// `wp_exp2s`"). The all-zero word is the canonical exact zero (§6
+/// erratum pin).
 ///
-/// ```text
-/// // word = [mantissa_lo, exponent_hi] little-endian
-/// // result is mantissa shifted by (exponent - 9)
-/// if exponent < 9 { result = mantissa >> (9 - exponent) }
-/// else            { result = mantissa << (exponent - 9) }
-/// ```
-///
-/// The mantissa is treated as a signed 8-bit value before the shift so
-/// negative samples sign-extend into the 32-bit result before the
-/// shift direction is chosen.
+/// The wiki's linear "lower 8 bits are mantiss, high 8 bits are
+/// exponent-9" shorthand approximates this encoding (same shift pivot
+/// [`SAMPLE_EXPONENT_BIAS`]) but omits the fractional mantissa table
+/// and the implicit `0x100` mantissa bit; black-box cross-validation
+/// against reference-encoded files (r393, wvunpack as an opaque
+/// binary) showed the linear reading diverges for every non-zero word,
+/// so the staged log-domain conversion is the authoritative one
+/// (round 405).
 ///
 /// Returns [`Error::DecorrelationSamplesOddByteCount`] when the payload
 /// length is not a multiple of two — the wiki guarantees every sample
@@ -561,42 +565,15 @@ pub fn partition_decorrelation_samples(
 /// ([`crate::entropy::expand_entropy`]) can re-use the same 16-bit
 /// log-pack — the wiki "Entropy info" section's
 /// "log-packed into 16 bits as described above" cross-reference points
-/// back to this routine.
-pub(crate) fn expand_sample_word(mantissa_byte: u8, exponent_byte: u8) -> i32 {
-    // The mantissa half is signed (so negative samples sign-extend
-    // through the shift); the exponent half is unsigned and biased
-    // by 9 per the wiki "exponent-9" shorthand.
-    let mantissa = (mantissa_byte as i8) as i32;
-    let exponent = exponent_byte as i32;
-    let shift = exponent - SAMPLE_EXPONENT_BIAS;
-    if shift >= 0 {
-        // Clamp the shift to 31 — beyond that the result is
-        // indeterminate per Rust's shift overflow rules. Wiki-bounded
-        // exponent values stay well below this in practice (the
-        // mantissa is only 8 bits so a shift past ~24 already lies
-        // outside the usable i32 range), but we want a defined
-        // behaviour for malformed inputs rather than a panic.
-        if shift >= 32 {
-            // Mantissa = 0 produces 0 regardless; other values
-            // saturate to the appropriate signed extreme.
-            return match mantissa.signum() {
-                0 => 0,
-                1 => i32::MAX,
-                _ => i32::MIN,
-            };
-        }
-        mantissa << shift
-    } else {
-        // shift is negative; rust requires the shift amount to be
-        // positive, so flip the direction.
-        let abs_shift = -shift;
-        // Beyond 31, an arithmetic right-shift saturates to the sign
-        // of the mantissa.
-        if abs_shift >= 32 {
-            return if mantissa < 0 { -1 } else { 0 };
-        }
-        mantissa >> abs_shift
-    }
+/// at the same encoding.
+///
+/// The two wire bytes form a little-endian signed 16-bit log word,
+/// expanded by [`crate::wp_exp2s`] (staged spec `wavpack-log2-exp2.md`
+/// §4/§5). Round 405: this replaced the wiki's linear
+/// mantissa/exponent shorthand, which diverges from reference-encoded
+/// files for every non-zero word.
+pub(crate) fn expand_sample_word(lo_byte: u8, hi_byte: u8) -> i32 {
+    crate::logpack::expand_log_word(lo_byte, hi_byte)
 }
 
 /// Scale a decorrelation predictor sample by a working weight.
@@ -785,9 +762,15 @@ impl DecorrPass {
     /// predictor's first read sees the correct lag. `seed_b` is ignored
     /// on a mono pass (pass it `&[]`).
     ///
+    /// An **empty** `seed_a` builds an unprimed pass (all-zero history):
+    /// the `0x04` payload primes only a wire-order prefix of a block's
+    /// passes, and passes beyond that prefix start from zero history
+    /// (round 405; see [`assemble_mono_passes`]). A cross term with an
+    /// empty `seed_a` leaves both channels unprimed.
+    ///
     /// Returns [`Error::InvalidDecorrelationTerm`] for a term outside the
     /// spec's valid set, and [`Error::DecorrelationSeedUnderflow`] when a
-    /// channel does not supply enough seed samples for the term.
+    /// channel supplies a non-empty but short seed slice for the term.
     pub fn new(
         term: i8,
         delta: i32,
@@ -801,11 +784,13 @@ impl DecorrPass {
         }
         let mut history_a = [0i32; MAX_TERM as usize];
         let mut history_b = [0i32; MAX_TERM as usize];
-        seed_history(term, seed_a, &mut history_a)?;
+        if !seed_a.is_empty() {
+            seed_history(term, seed_a, &mut history_a)?;
+        }
         // A cross term seeds both channels; a per-channel term that the
         // caller is driving in stereo also seeds B. A mono caller passes
         // an empty slice and B stays zeroed.
-        if !seed_b.is_empty() || is_cross_term(term) {
+        if !seed_b.is_empty() || (is_cross_term(term) && !seed_a.is_empty()) {
             seed_history(term, seed_b, &mut history_b)?;
         }
         Ok(DecorrPass {
@@ -1348,22 +1333,43 @@ pub fn assemble_mono_passes(
         });
     }
 
-    // Expand and partition the seed samples per term, in wire order. The
-    // total must equal the sum of per-term seed counts.
+    // Expand and partition the seed samples per term, in wire order.
+    // The payload primes a wire-order **prefix** of the passes: real
+    // encoders may store seeds for fewer passes than the term list
+    // carries (commonly just the first wire pass), and the remaining
+    // passes start from zero history — the same "unspecified passes
+    // start at 0" convention spec §3.6 states for the weights. (Pinned
+    // black-box in round 405: reference-encoded files carry one term's
+    // worth of `0x04` seeds for a five-term stack, and the stored
+    // block CRC only matches when the unprimed passes seed zero.) A
+    // payload that stops mid-term is malformed.
     let seeds = expand_samples(samples_payload)?;
-    let expected_seeds: usize = terms.iter().map(|&t| seed_count(t)).sum();
-    if seeds.samples.len() != expected_seeds {
-        return Err(Error::DecorrelationSampleCountMismatch {
-            expected: expected_seeds,
-            actual: seeds.samples.len(),
-        });
-    }
     let mut seed_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
     let mut cursor = 0usize;
     for &t in &terms {
         let n = seed_count(t);
-        seed_groups.push(&seeds.samples[cursor..cursor + n]);
-        cursor += n;
+        if cursor == seeds.samples.len() {
+            // Seed payload exhausted: this pass (and every later one)
+            // starts with zero history.
+            seed_groups.push(&[]);
+        } else if cursor + n <= seeds.samples.len() {
+            seed_groups.push(&seeds.samples[cursor..cursor + n]);
+            cursor += n;
+        } else {
+            // Mid-term truncation: not a whole number of per-term
+            // groups.
+            return Err(Error::DecorrelationSampleCountMismatch {
+                expected: cursor + n,
+                actual: seeds.samples.len(),
+            });
+        }
+    }
+    if cursor != seeds.samples.len() {
+        // More seeds than the whole term list can consume.
+        return Err(Error::DecorrelationSampleCountMismatch {
+            expected: cursor,
+            actual: seeds.samples.len(),
+        });
     }
 
     // Build passes in wire order, then reverse to application order so the
@@ -1471,24 +1477,38 @@ pub fn assemble_stereo_passes(
 
     // Expand and partition the seed samples per pass. Each pass consumes
     // channel A's seeds (seed_count words) followed by channel B's seeds
-    // (another seed_count words).
+    // (another seed_count words). As on the mono side, the payload
+    // primes a wire-order **prefix** of the passes (real encoders may
+    // store seeds for fewer passes than the term list carries; the
+    // remaining passes start from zero history — round 405, pinned
+    // black-box against reference-encoded files via the stored block
+    // CRC). A payload that stops inside a pass's A+B group is malformed.
     let seeds = expand_samples(samples_payload)?;
-    let expected_seeds: usize = terms.iter().map(|&t| seed_count(t) * 2).sum();
-    if seeds.samples.len() != expected_seeds {
-        return Err(Error::DecorrelationSampleCountMismatch {
-            expected: expected_seeds,
-            actual: seeds.samples.len(),
-        });
-    }
     let mut seed_a_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
     let mut seed_b_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
     let mut cursor = 0usize;
     for &t in &terms {
         let n = seed_count(t);
-        seed_a_groups.push(&seeds.samples[cursor..cursor + n]);
-        cursor += n;
-        seed_b_groups.push(&seeds.samples[cursor..cursor + n]);
-        cursor += n;
+        if cursor == seeds.samples.len() {
+            seed_a_groups.push(&[]);
+            seed_b_groups.push(&[]);
+        } else if cursor + 2 * n <= seeds.samples.len() {
+            seed_a_groups.push(&seeds.samples[cursor..cursor + n]);
+            cursor += n;
+            seed_b_groups.push(&seeds.samples[cursor..cursor + n]);
+            cursor += n;
+        } else {
+            return Err(Error::DecorrelationSampleCountMismatch {
+                expected: cursor + 2 * n,
+                actual: seeds.samples.len(),
+            });
+        }
+    }
+    if cursor != seeds.samples.len() {
+        return Err(Error::DecorrelationSampleCountMismatch {
+            expected: cursor,
+            actual: seeds.samples.len(),
+        });
     }
 
     // Build passes in wire order (weight_a = weights[2i], weight_b =
@@ -1557,47 +1577,32 @@ pub fn quantize_weight(weight: i32) -> i32 {
 }
 
 /// Pack a seed-history sample into its canonical `0x04` on-wire 16-bit
-/// log-word `[mantissa, exponent]` — the nearest-value inverse of the
-/// wiki exponent/mantissa expansion ([`expand_samples`]): a signed 8-bit
-/// mantissa shifted left by `exponent - 9`.
+/// log word — the nearest-value forward inverse of the log-domain
+/// expansion ([`expand_samples`] / [`crate::wp_exp2s`]).
 ///
-/// The canonical form uses the smallest exponent whose arithmetic
-/// right-shift fits the mantissa in `i8`, so any value with at most 8
-/// significant bits round-trips exactly (including every `-128..=127`
-/// verbatim at exponent `9`, and any such value scaled by a power of
-/// two). Wider values quantize by dropping low bits (arithmetic-shift
-/// truncation, toward negative infinity) — the exactness predicate is
-/// `quantize_seed_sample(v) == v` (see [`quantize_seed_sample`]).
+/// The magnitude is logged with [`crate::wp_log2`] and the word's sign
+/// carries the value's sign (`wp_exp2s` is odd — staged spec
+/// `wavpack-log2-exp2.md` §4 step 1). Zero packs to the canonical
+/// all-zero word (§6 erratum pin; a round-393 black-box
+/// cross-validation showed reference decoders accept only that zero
+/// form). The pack is a quantizer: small magnitudes round-trip exactly
+/// and wide ones to within the 8-fractional-bit table precision — the
+/// exactness predicate is `quantize_seed_sample(v) == v` (see
+/// [`quantize_seed_sample`]).
 pub fn pack_sample_word(value: i32) -> [u8; 2] {
-    if value == 0 {
-        // Canonical zero is the all-zero word `0x0000` (mantissa 0,
-        // exponent 0 → right-shift to 0), NOT `[0, 9]` (mantissa 0 at
-        // the unshifted exponent). Both expand to 0 under the wiki
-        // reading, but a round-393 black-box cross-validation
-        // (wvunpack as an opaque binary) showed reference decoders
-        // mute blocks whose zero seeds are written in the `[0, 9]`
-        // form while accepting the all-zero word — so the all-zero
-        // word is the interoperable canonical zero.
-        return [0, 0];
-    }
-    let mut shift = 0u32;
-    while !(i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&(value >> shift)) {
-        shift += 1;
-    }
-    let mantissa = (value >> shift) as i8 as u8;
-    [mantissa, SAMPLE_EXPONENT_BIAS as u8 + shift as u8]
+    crate::logpack::pack_log_word(value)
 }
 
 /// Quantize a seed-history sample to the nearest value the `0x04`
-/// log-word can represent: `expand ∘ pack`. Values with at most 8
-/// significant bits are returned verbatim; wider values lose their low
-/// bits (truncation toward negative infinity). Idempotent, like
+/// log-word can represent: `expand ∘ pack` ([`crate::quantize_log_value`]).
+/// Values that the 16-bit log word represents exactly (all small
+/// magnitudes) are returned verbatim; wider values quantize to the
+/// table's 8-fractional-bit precision. Idempotent, like
 /// [`quantize_weight`] — an encoder priming pass history from real PCM
 /// must prime with the quantized values so the decoder's seed expansion
 /// reconstructs the identical history.
 pub fn quantize_seed_sample(value: i32) -> i32 {
-    let [mantissa, exponent] = pack_sample_word(value);
-    expand_sample_word(mantissa, exponent)
+    crate::logpack::quantize_log_value(value)
 }
 
 /// Pack a `(term, delta)` pair into its `0x02` on-wire term byte — the
@@ -1828,45 +1833,36 @@ mod tests {
     // ---- Samples (0x04) ----
 
     #[test]
-    fn sample_word_exponent_eq_9_returns_mantissa_unshifted() {
-        // exponent = 9 → shift amount = 0 → mantissa returned as-is.
-        // mantissa = 0x10 (= +16), exponent = 9.
-        let s = expand_sample_word(0x10, 0x09);
-        assert_eq!(s, 16);
-        // mantissa = 0xFF (= -1 signed), exponent = 9 → result = -1.
-        let s = expand_sample_word(0xFF, 0x09);
-        assert_eq!(s, -1);
+    fn sample_word_is_a_signed_log_word_expanded_by_wp_exp2s() {
+        // The staged log2/exp2 spec §4 worked example: log word
+        // 2807 = 0x0af7 expands to 1000; the sign lives on the whole
+        // word (odd function), so the negated word expands to -1000.
+        let s = expand_sample_word(0xf7, 0x0a);
+        assert_eq!(s, 1000);
+        let [lo, hi] = (-2807i16).to_le_bytes();
+        assert_eq!(expand_sample_word(lo, hi), -1000);
+        // Log word 256 = 0x0100 expands to 1 (spec meta anchor).
+        assert_eq!(expand_sample_word(0x00, 0x01), 1);
+        // The canonical all-zero word is the exact zero (spec §6 pin).
+        assert_eq!(expand_sample_word(0x00, 0x00), 0);
     }
 
     #[test]
-    fn sample_word_exponent_lt_9_shifts_mantissa_right() {
-        // exponent = 7 → 9 - 7 = 2 → mantissa shifted right by 2.
-        // mantissa = 0x40 (= +64) >> 2 = 16.
-        assert_eq!(expand_sample_word(0x40, 0x07), 16);
-        // mantissa = 0x80 (= -128 signed) >> 2 = -32 (arithmetic shift).
-        assert_eq!(expand_sample_word(0x80, 0x07), -32);
-        // exponent = 0 → 9 - 0 = 9. mantissa = 0x40 >> 9 = 0.
-        assert_eq!(expand_sample_word(0x40, 0x00), 0);
-    }
-
-    #[test]
-    fn sample_word_exponent_gt_9_shifts_mantissa_left() {
-        // exponent = 11 → 11 - 9 = 2 → mantissa shifted left by 2.
-        // mantissa = +4 << 2 = 16.
-        assert_eq!(expand_sample_word(0x04, 0x0B), 16);
-        // mantissa = -4 (0xFC) << 2 = -16.
-        assert_eq!(expand_sample_word(0xFC, 0x0B), -16);
-        // exponent = 24 → shift left 15. mantissa = 1 → 32768.
-        assert_eq!(expand_sample_word(0x01, 0x18), 32768);
+    fn sample_word_int_part_selects_the_mantissa_shift() {
+        // Spec §4 step 3: int part 9 leaves the 9-bit mantissa
+        // unshifted (0x100 with a zero fraction), 10 doubles it, 8
+        // halves it.
+        assert_eq!(expand_sample_word(0x00, 0x09), 0x100);
+        assert_eq!(expand_sample_word(0x00, 0x0a), 0x200);
+        assert_eq!(expand_sample_word(0x00, 0x08), 0x80);
     }
 
     #[test]
     fn sample_payload_pairs_bytes_into_words() {
-        // Three samples: (mant, exp) = (0x10, 0x09), (0x40, 0x07),
-        // (0x04, 0x0B). Expanded values: 16, 16, 16.
-        let payload = [0x10, 0x09, 0x40, 0x07, 0x04, 0x0B];
+        // Three log words: 0x0af7 (= 1000), 0x0100 (= 1), 0x0000 (= 0).
+        let payload = [0xf7, 0x0a, 0x00, 0x01, 0x00, 0x00];
         let s = expand_samples(&payload).unwrap();
-        assert_eq!(s.samples, vec![16, 16, 16]);
+        assert_eq!(s.samples, vec![1000, 1, 0]);
     }
 
     #[test]
@@ -2233,11 +2229,13 @@ mod tests {
     fn partition_samples_round_trip_against_expand_samples() {
         // Build the wire from per-term seed samples, expand it, then
         // partition it back to the same per-term layout. terms 6 (1) +
-        // 18 (2) = 3 seed samples. Each on-disk sample is a 16-bit
-        // [mantissa_lo, exponent_hi] word with exponent=9 (no shift),
-        // so the mantissa byte is the value directly.
-        // Wire: (1, 9), (2, 9), (3, 9).
-        let wire = [0x01, 0x09, 0x02, 0x09, 0x03, 0x09];
+        // 18 (2) = 3 seed samples. Each on-disk sample is a
+        // little-endian signed 16-bit log word packed with
+        // pack_sample_word (small magnitudes round-trip exactly).
+        let mut wire = Vec::new();
+        for v in [1i32, 2, 3] {
+            wire.extend_from_slice(&pack_sample_word(v));
+        }
         let ds = expand_samples(&wire).unwrap();
         assert_eq!(ds.samples, vec![1, 2, 3]);
         let dt = expand_terms(&[6, 18]);
@@ -2248,25 +2246,17 @@ mod tests {
     }
 
     #[test]
-    fn sample_extreme_exponents_saturate_rather_than_panic() {
-        // Exponent = 0xFF means a shift of 0xFF - 9 = 246 → far beyond
-        // i32. The expander saturates rather than panicking on the
-        // overflow.
-        let positive = expand_sample_word(0x01, 0xFF);
-        assert_eq!(positive, i32::MAX);
-        let negative = expand_sample_word(0xFF, 0xFF);
-        assert_eq!(negative, i32::MIN);
-        let zero = expand_sample_word(0x00, 0xFF);
-        assert_eq!(zero, 0);
-        // Exponent = 0 means a right-shift of 9 — well within range,
-        // already covered above. Verify the >= 32 branch on the
-        // right-shift side too by abusing a hypothetical exponent
-        // of -23: but exponents are unsigned bytes so that's not
-        // reachable from the wire. The expander still guards against
-        // it for malformed callers. Synthesise via the lowest exponent
-        // byte (0x00); 0x00 → shift = -9, which fits the < 32 branch.
-        // We can't reach abs_shift >= 32 from the wire alone, but
-        // the guard is there for defence in depth.
+    fn sample_extreme_log_words_stay_defined_rather_than_panic() {
+        // A conformant stream keeps log words within ±8447 (the
+        // staged spec §7 max); hostile words with int parts far past
+        // the 32-bit magnitude ceiling must expand to *some* defined
+        // value without panicking (the left shift wraps).
+        let _ = expand_sample_word(0x01, 0x7F);
+        let _ = expand_sample_word(0xFF, 0x7F);
+        let _ = expand_sample_word(0x00, 0x80); // i16::MIN word
+        let _ = expand_sample_word(0xFF, 0xFF); // -1 log word
+                                                // The all-zero word stays the canonical exact zero.
+        assert_eq!(expand_sample_word(0x00, 0x00), 0);
     }
 
     // ---- apply_weight (spec §3.1) ----
@@ -2997,7 +2987,11 @@ mod tests {
     /// mantissa untouched (shift = 0), so `[v as i8 as u8, 9]` round-trips
     /// to `v` for any `v` in `-128..=127`.
     fn seed_word(v: i32) -> [u8; 2] {
-        [v as i8 as u8, 9]
+        // On-wire signed 16-bit log word; test seeds stay in the
+        // exactly-representable small-magnitude range so the
+        // forward/inverse pair agrees by construction.
+        assert_eq!(quantize_seed_sample(v), v, "test seed must be exact");
+        pack_sample_word(v)
     }
 
     #[test]
@@ -3101,14 +3095,103 @@ mod tests {
     }
 
     #[test]
-    fn assemble_mono_rejects_seed_count_mismatch() {
-        // term 1 needs 1 seed; supply 0.
-        let terms = vec![term_byte(1, 0)];
+    fn assemble_mono_accepts_prefix_seed_payloads() {
+        // The 0x04 payload primes a wire-order *prefix* of the passes
+        // (round 405): real encoders store seeds for fewer passes than
+        // the term list carries, and the rest start from zero history.
+        // Two terms (17 then 2 on the wire), seeds for the first only.
+        let terms = vec![term_byte(17, 2), term_byte(2, 1)];
+        let mut seeds = Vec::new();
+        seeds.extend_from_slice(&seed_word(7));
+        seeds.extend_from_slice(&seed_word(-9));
+        let passes = assemble_mono_passes(&terms, &[5, 6], &seeds).unwrap();
+        assert_eq!(passes.len(), 2);
+        // Application order reverses the wire: the primed wire-first
+        // pass (term 17) is applied last.
+        assert_eq!(passes[0].term, 2);
+        assert_eq!(passes[1].term, 17);
+        // The unprimed pass equals one built with explicit zero
+        // history and the primed one carries the wire seeds.
+        let unprimed = DecorrPass::new(2, 1, expand_weight_byte(6), 0, &[], &[]).unwrap();
+        assert_eq!(passes[0], unprimed);
+        let primed = DecorrPass::new(17, 2, expand_weight_byte(5), 0, &[7, -9], &[]).unwrap();
+        assert_eq!(passes[1], primed);
+        // An entirely empty seed payload is the degenerate prefix: every
+        // pass starts unprimed.
+        let passes = assemble_mono_passes(&terms, &[5, 6], &[]).unwrap();
+        assert_eq!(passes.len(), 2);
+    }
+
+    #[test]
+    fn assemble_mono_rejects_mid_term_seed_truncation() {
+        // term 2 needs 2 seeds; supplying 1 stops inside the term's
+        // group — malformed, not a legal prefix.
+        let terms = vec![term_byte(2, 0)];
+        let seeds = seed_word(3);
         assert_eq!(
-            assemble_mono_passes(&terms, &[5], &[]),
+            assemble_mono_passes(&terms, &[5], &seeds),
+            Err(Error::DecorrelationSampleCountMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn assemble_mono_rejects_seed_surplus() {
+        // term 1 consumes 1 seed; a second seed word has no pass to
+        // prime.
+        let terms = vec![term_byte(1, 0)];
+        let mut seeds = Vec::new();
+        seeds.extend_from_slice(&seed_word(3));
+        seeds.extend_from_slice(&seed_word(4));
+        assert_eq!(
+            assemble_mono_passes(&terms, &[5], &seeds),
             Err(Error::DecorrelationSampleCountMismatch {
                 expected: 1,
-                actual: 0,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn assemble_stereo_accepts_prefix_seed_payloads() {
+        // Stereo prefix rule: a pass's group is channel A's seeds then
+        // channel B's; the payload may stop at a group boundary.
+        let terms = vec![term_byte(18, 2), term_byte(-1, 1)];
+        let mut seeds = Vec::new();
+        for v in [7, -9, 11, -13] {
+            seeds.extend_from_slice(&seed_word(v)); // term 18: A(2) + B(2)
+        }
+        let passes = assemble_stereo_passes(&terms, &[5, 6, 7, 8], &seeds).unwrap();
+        assert_eq!(passes.len(), 2);
+        assert_eq!(passes[0].term, -1, "unprimed cross pass applied first");
+        let unprimed = DecorrPass::new(
+            -1,
+            1,
+            expand_weight_byte(7),
+            expand_weight_byte(8),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(passes[0], unprimed);
+        let primed = DecorrPass::new(
+            18,
+            2,
+            expand_weight_byte(5),
+            expand_weight_byte(6),
+            &[7, -9],
+            &[11, -13],
+        )
+        .unwrap();
+        assert_eq!(passes[1], primed);
+        // Stopping inside a pass's A+B group (3 of 4 seeds) is refused.
+        assert_eq!(
+            assemble_stereo_passes(&terms, &[5, 6, 7, 8], &seeds[..6]),
+            Err(Error::DecorrelationSampleCountMismatch {
+                expected: 4,
+                actual: 3,
             })
         );
     }
@@ -3283,13 +3366,15 @@ mod tests {
 
     #[test]
     fn assemble_stereo_rejects_seed_count_mismatch() {
-        // term 1 needs 1 seed per channel = 2 words; supply 0.
+        // term 1 needs 1 seed per channel = 2 words; supplying only
+        // channel A's word stops inside the pass's A+B group (an empty
+        // payload would be a legal zero-history prefix — round 405).
         let terms = vec![term_byte(1, 0)];
         assert_eq!(
-            assemble_stereo_passes(&terms, &[5, 6], &[]),
+            assemble_stereo_passes(&terms, &[5, 6], &seed_word(3)),
             Err(Error::DecorrelationSampleCountMismatch {
                 expected: 2,
-                actual: 0,
+                actual: 1,
             })
         );
     }
@@ -3372,42 +3457,55 @@ mod tests {
     /// power-of-two multiples pack exactly through larger exponents.
     #[test]
     fn pack_sample_word_exact_for_representable_values() {
-        for v in -128..=127i32 {
-            let [m, e] = pack_sample_word(v);
-            assert_eq!(expand_sample_word(m, e), v, "verbatim at {v}");
-            if v != 0 {
-                assert_eq!(e, SAMPLE_EXPONENT_BIAS as u8, "minimal exponent at {v}");
-            }
+        // The 16-bit log word resolves every magnitude below 115
+        // exactly (the staged spec §1 "exact for the small magnitudes
+        // that actually occur as seeds"), symmetrically for both signs.
+        for v in -114..=114i32 {
+            let [lo, hi] = pack_sample_word(v);
+            assert_eq!(expand_sample_word(lo, hi), v, "verbatim at {v}");
         }
-        for shift in 1..=20u32 {
-            for base in [-128i32, -77, -1, 1, 77, 127] {
-                let v = base << shift;
-                let [m, e] = pack_sample_word(v);
-                assert_eq!(expand_sample_word(m, e), v, "shifted {base} << {shift}");
-            }
+        // The spec §4 worked example round-trips exactly at 1000.
+        let [lo, hi] = pack_sample_word(1000);
+        assert_eq!(u16::from_le_bytes([lo, hi]), 2807);
+        assert_eq!(expand_sample_word(lo, hi), 1000);
+        // Powers of two are exact across the range (fraction 0).
+        for k in 0..=30u32 {
+            let v = 1i32 << k;
+            let [lo, hi] = pack_sample_word(v);
+            assert_eq!(expand_sample_word(lo, hi), v, "2^{k}");
+            let [lo, hi] = pack_sample_word(-v);
+            assert_eq!(expand_sample_word(lo, hi), -v, "-2^{k}");
         }
-        // The i32 extremes are exactly representable (−128 << 24, etc.).
-        let [m, e] = pack_sample_word(i32::MIN);
-        assert_eq!(expand_sample_word(m, e), i32::MIN);
     }
 
-    /// Quantization truncates low bits toward negative infinity and is
-    /// idempotent; values within 8 significant bits are untouched.
+    /// Quantization maps a value to the nearest log-word-representable
+    /// one and is idempotent; small magnitudes are untouched.
     #[test]
-    fn quantize_seed_sample_truncates_and_is_idempotent() {
+    fn quantize_seed_sample_quantizes_and_is_idempotent() {
         assert_eq!(quantize_seed_sample(0), 0);
-        assert_eq!(quantize_seed_sample(127), 127);
-        assert_eq!(quantize_seed_sample(-128), -128);
-        // 301 needs 9 significant bits → the low bit is dropped.
-        assert_eq!(quantize_seed_sample(301), 300);
-        // -301 >> 1 = -151 still exceeds the i8 mantissa, so the canonical
-        // form shifts by 2: (-301 >> 2) << 2 = -76 << 2 = -304.
-        assert_eq!(quantize_seed_sample(-301), -304);
-        for v in [-100_000, -301, -129, 129, 301, 100_000, i32::MAX] {
+        assert_eq!(quantize_seed_sample(114), 114);
+        assert_eq!(quantize_seed_sample(-114), -114);
+        // 115 is the first magnitude the 8-fractional-bit log table
+        // cannot resolve (see the logpack round-trip test).
+        assert_eq!(quantize_seed_sample(115), 114);
+        assert_eq!(quantize_seed_sample(-115), -114);
+        for v in [-100_000, -301, -129, 129, 301, 100_000] {
             let q = quantize_seed_sample(v);
-            assert!(q <= v, "truncation toward -inf at {v}");
+            // Log-domain rounding stays within ~0.1% of the input
+            // (staged spec §1).
+            let tol = (v.unsigned_abs() / 512).max(1) as i64;
+            assert!(
+                (i64::from(q) - i64::from(v)).abs() <= tol,
+                "quantize error at {v}: {q}"
+            );
             assert_eq!(quantize_seed_sample(q), q, "idempotence at {v}");
         }
+        // At the i32 ceiling the quantized magnitude rounds up past
+        // i32::MAX and wraps (32-bit two's-complement arithmetic, same
+        // wrapping posture as the reconstruction adds); the wrapped
+        // value is itself a fixpoint.
+        let q = quantize_seed_sample(i32::MAX);
+        assert_eq!(quantize_seed_sample(q), q);
     }
 
     /// `encode_term_byte` is the exact inverse of `decode_term_byte`
@@ -3520,11 +3618,13 @@ mod tests {
             serialize_mono_passes(&[p]),
             Err(Error::EncodeWeightNotRepresentable(5))
         );
-        // Seed 301 needs 9 significant bits.
-        let p = DecorrPass::new(1, 0, 0, 0, &[301], &[]).unwrap();
+        // Seed 115 is the first magnitude the 16-bit log word cannot
+        // represent exactly (it quantizes to 114 — see the logpack
+        // round-trip test), so the exact serializer refuses it.
+        let p = DecorrPass::new(1, 0, 0, 0, &[115], &[]).unwrap();
         assert_eq!(
             serialize_mono_passes(&[p]),
-            Err(Error::EncodeSeedNotRepresentable(301))
+            Err(Error::EncodeSeedNotRepresentable(115))
         );
         // Delta 9 does not fit the 3-bit field.
         let p = DecorrPass::new(1, 9, 0, 0, &[0], &[]).unwrap();

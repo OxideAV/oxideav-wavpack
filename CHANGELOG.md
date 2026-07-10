@@ -6,8 +6,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 405 — **`wp_log2` / `wp_exp2s` log-domain conversions —
+  foreign-file decode unblocked.** New `logpack` module implementing
+  the staged `docs/audio/wavpack/spec/wavpack-log2-exp2.md` integer
+  log2/exp2 pair: `wp_log2` (magnitude → 8-fractional-bit log word,
+  bit-length integer part, `avalue >> 9` interpolation bias),
+  `wp_exp2s` (signed log word → value, odd function, implicit `0x100`
+  mantissa bit, shift pivot 9), the 256-entry `LOG2_TABLE` /
+  `EXP2_TABLE` mechanically transcribed from the staged
+  `docs/audio/wavpack/tables/wp-log2.csv` / `wp-exp2.csv`, and the
+  wire helpers `expand_log_word` / `pack_log_word` /
+  `quantize_log_value`. Pinned to the spec's worked example
+  (`1000 ↔ 2807`), the canonical-zero erratum (`0x0000 ↔ 0`, §6), the
+  meta anchors, and the §1 round-trip bounds (exact below magnitude
+  115, ~0.1% across the 32-bit range).
+
 ### Changed
 
+- Round 405 — **`0x05` median / `0x04` seed expansion is now the
+  log-domain `wp_exp2s`** (was: the wiki's linear mantissa/exponent-9
+  shorthand, which diverges from reference-encoded files for every
+  non-zero word). `expand_samples` / `expand_entropy` read each
+  little-endian 16-bit field as a signed log word;
+  `pack_sample_word` / `quantize_seed_sample` are the matching
+  log-domain forward inverses. The all-zero word keeps expanding to
+  the exact zero, so streams this crate's own zero-seed encoder writes
+  are unchanged.
+- Round 405 — **`0x04` seed payloads prime a wire-order prefix of the
+  decorrelation passes.** Real encoders store seeds for fewer passes
+  than the `0x02` term list carries (commonly one term's worth for a
+  five-term stack); the remaining passes now start from zero history —
+  the same "unspecified passes start at 0" convention spec §3.6 states
+  for weights — instead of the whole block being refused with a seed
+  count mismatch. Mid-group truncation and seed surplus remain typed
+  refusals. Net effect of the three round-405 changes, validated
+  black-box against `wvunpack` 5.9 (opaque binary): arbitrary
+  reference-encoded lossless files (default / `-f` / `-h` / `-hh` /
+  `-hh -x4` modes, 8/16/24-bit, mono / stereo / 5.1, custom sample
+  rates) now decode **bit-exactly** with the stored block CRC
+  matching, where every non-zero-median file was previously mis-seeded.
 - Round 372 — `encode_block_mono` / `encode_block_stereo` dropped their
   `passes: &[DecorrPass]` parameter (all added this same round, unreleased)
   and are now the raw (no-decorrelation) lossless path only. Decorrelated

@@ -75,13 +75,6 @@ const STANDALONE_MULTICHANNEL_MARKER: u32 = 0b11 << 11;
 /// (mantissa byte + exponent byte).
 const MEDIAN_WORD_BYTES: usize = 2;
 
-/// Bias subtracted from the stored exponent byte by the decoder's
-/// log-pack expander ([`crate::decorrelation`] `expand_sample_word`):
-/// an exponent byte of `9` means "shift 0", i.e. the mantissa byte is
-/// the value verbatim. Mirrored here so the seed packer is the forward
-/// inverse for the zero-seed case this encoder writes.
-const EXPONENT_BIAS_BYTE: u8 = 9;
-
 /// Append a metadata sub-block (`id` byte, word-count size field,
 /// payload, trailing odd-size pad) to `out`, mirroring the byte layout
 /// [`crate::metadata::parse_metadata_sub_block`] reads back.
@@ -126,27 +119,22 @@ fn append_sub_block(out: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Log-pack one median / seed value into its 2-byte wire word for the
-/// zero-or-small-seed case this encoder uses.
+/// Log-pack one median / seed value into its 2-byte wire word.
 ///
-/// The decoder expands a word `(mantissa, exponent)` to
-/// `mantissa << (exponent - 9)` (signed mantissa). For a value in the
-/// signed-8-bit range we can store it verbatim with exponent byte `9`
-/// (shift 0), so the round trip is exact. This encoder only ever needs
-/// the zero seed (`[0, 0, 0]`), which packs to the canonical all-zero
-/// word `[0x00, 0x00]` (see the round-393 interop note inside), but the
-/// small-value path is kept so future seeds in `-128..=127` round-trip.
+/// The word is the signed 16-bit **log word** the decoder expands with
+/// [`crate::wp_exp2s`] (round 405; staged spec `wavpack-log2-exp2.md`
+/// §5), produced by [`crate::pack_log_word`] — the zero seed this
+/// encoder writes on every block packs to the canonical all-zero word
+/// (§6 erratum pin). Returns `None` when the log word would only
+/// quantize the value (not represent it exactly), so a caller seeding
+/// non-trivial medians must quantize explicitly
+/// ([`crate::quantize_log_value`]) instead of silently de-syncing the
+/// encoder-side median state from what the decoder will expand.
 fn pack_median_word(value: i32) -> Option<[u8; MEDIAN_WORD_BYTES]> {
-    if value == 0 {
-        // Canonical zero is the all-zero word — see the round-393
-        // interop note on [`crate::pack_sample_word`]: both `[0, 0]`
-        // and `[0, 9]` expand to 0 under the wiki reading, but
-        // black-box cross-validation (wvunpack as an opaque binary)
-        // showed reference decoders only read the all-zero word as a
-        // zero median.
-        Some([0, 0])
-    } else if (i8::MIN as i32..=i8::MAX as i32).contains(&value) {
-        Some([(value as i8) as u8, EXPONENT_BIAS_BYTE])
+    let word = crate::pack_log_word(value);
+    let [lo, hi] = word;
+    if crate::expand_log_word(lo, hi) == value {
+        Some(word)
     } else {
         None
     }
@@ -157,17 +145,18 @@ fn pack_median_word(value: i32) -> Option<[u8; MEDIAN_WORD_BYTES]> {
 ///
 /// `seeds` carries one `[m0, m1, m2]` set per channel in left-then-right
 /// wire order (the order [`crate::entropy::expand_entropy`] reads).
-/// Every seed must be in the signed-8-bit range so [`pack_median_word`]
-/// can represent it exactly; this encoder always passes the zero seed.
+/// Every seed must be exactly log-word-representable so
+/// [`pack_median_word`] round-trips it; this encoder always passes the
+/// zero seed.
 fn pack_entropy_info(seeds: &[[i32; 3]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(seeds.len() * 3 * MEDIAN_WORD_BYTES);
     for set in seeds {
         for &m in set {
-            // The zero seed (and any value in -128..=127) is always
+            // The zero seed (and any small value) is always
             // representable; the caller only ever passes the zero seed,
             // so the `unwrap_or` default is unreachable in practice but
-            // keeps the helper total.
-            let word = pack_median_word(m).unwrap_or([0, EXPONENT_BIAS_BYTE]);
+            // keeps the helper total (canonical zero word).
+            let word = pack_median_word(m).unwrap_or([0, 0]);
             out.extend_from_slice(&word);
         }
     }

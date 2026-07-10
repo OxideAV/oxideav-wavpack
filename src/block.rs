@@ -3843,8 +3843,15 @@ mod tests {
     /// This sidesteps the log-pack helper used by
     /// `append_entropy_info_stereo_minimal` and lets the test pick the
     /// channel-0 median by value.
-    fn append_entropy_info_mono_seed(payload: &mut Vec<u8>, seed: [u8; 3]) {
-        let bytes = [seed[0], 0x09, seed[1], 0x09, seed[2], 0x09];
+    fn append_entropy_info_mono_seed(payload: &mut Vec<u8>, seed: [i32; 3]) {
+        // Each median is a little-endian signed 16-bit log word
+        // (crate::wp_exp2s expansion); test seeds stay in the
+        // exactly-representable small-magnitude range.
+        let mut bytes = Vec::with_capacity(6);
+        for v in seed {
+            assert_eq!(crate::quantize_log_value(v), v, "test median exact");
+            bytes.extend_from_slice(&crate::pack_log_word(v));
+        }
         append_small_sub_block(payload, 0x05, &bytes);
     }
 
