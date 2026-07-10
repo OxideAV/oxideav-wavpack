@@ -9,7 +9,11 @@ Pure-Rust WavPack lossless audio codec for the
 
 The crate parses the WavPack block container and decodes the
 modified-Rice entropy stream to PCM, with a matching exact-inverse
-encoder on the write side.
+encoder on the write side. **Arbitrary reference-encoded lossless
+files decode bit-exactly** (round 405): 16/24/32-bit integer, 32-bit
+float, mono / stereo / multichannel, every standard encoder effort
+mode — validated black-box against the reference decoder on a
+19-fixture battery committed under `tests/data/`.
 
 Working surface:
 
@@ -242,6 +246,72 @@ Working surface:
   okay to ignore" and bit 5 `CROSS_DECORR` on lossless blocks, whose
   only documented consumer is the hybrid §4.1 fold — reference
   encoders set both on ordinary files).
+* **`wp_log2` / `wp_exp2s` log-domain conversions + foreign-file
+  decode** — the `logpack` module implements the staged
+  `spec/wavpack-log2-exp2.md` integer log2/exp2 pair with the 256-entry
+  tables transcribed from the staged CSVs: `wp_log2` (bit-length
+  integer part + 8 fractional table bits, `>>9` interpolation bias),
+  `wp_exp2s` (odd, implicit `0x100` mantissa bit, shift pivot 9), and
+  the wire helpers `expand_log_word` / `pack_log_word` /
+  `quantize_log_value`. The `0x05` medians and `0x04` seeds expand
+  through `wp_exp2s` (replacing the wiki's linear shorthand, which
+  diverges on every non-zero word), and `0x04` payloads prime a
+  wire-order *prefix* of the pass list (remaining passes start from
+  zero history). Net effect: files this crate did not encode decode
+  bit-exactly — the r405 battery covers default / `-f` / `-h` / `-hh`
+  / `-hh -x4` modes, 8/16/24-bit, mono / stereo / 5.1 / custom rates,
+  with every stored CRC matching.
+* **int32 (`INT32_DATA`) sample-format decode** — the `int32` module
+  implements the staged `spec/wavpack-sample-formats.md` §3 `0x09`
+  profile (`sent_bits` / `zeros` / `ones` / `dups`,
+  mutually-exclusive redundancy enforced) and the §4 per-sample
+  reassembly: `sent_bits` literal low bits read LSB-first from the
+  `0x0C` extension bitstream, the stripped redundancy pattern
+  re-inserted below them, and the §5.5 extension CRC (`crc_x`) folded
+  over every reassembled value and compared against the `crc_wvx`
+  stored at the head of the `0x0C` payload — the extension-CRC verdict
+  joins the §5.6 mute gate. 32-bit reference files (sent-bits and
+  trailing-zeros profiles, default + `-h`) decode bit-exactly.
+* **float (`FLOAT_DATA`) sample-format decode** — the `float` module
+  implements the staged §2 `0x08` profile: scaled-integer → IEEE-754
+  reconstruction (static `float_shift`, per-sample mantissa
+  normalisation anchored on `float_max_exp`), vacated low bits filled
+  as zeros / ones (`SHIFT_ONES`) / literal `0x0C` bits (`SHIFT_SENT`),
+  and `ZEROS_SENT` zero samples (marker bit → literal
+  mantissa23+exponent8+sign1 for sub-integer magnitudes including
+  denormals, or a true ±0 with a `NEG_ZEROS`-gated sign). The wire
+  layouts the staged spec names but does not bit-pin were established
+  black-box via differential probes, surfacing a **spec erratum**: the
+  float extension CRC folds three mono-CRC steps per sample
+  (mantissa, exponent, sign — `update_float_extension`), not the §5.5
+  halfword formula (which holds for int32 only). Typed f32 surface:
+  `WavPackBlock::is_float` / `decode_samples_f32` /
+  `decode_stream_f32`. Full-precision, integer-valued,
+  ±0 / denormal / >1.0 and `-h`-mode float files decode bit-exactly
+  with matching `crc_x`; `SHIFT_SAME` and `EXCEPTIONS` (inf/NaN)
+  profiles are typed refusals pending docs coverage.
+* **Sample-rate surface + time-addressed seeking** — the staged §5
+  standard-rate table (`STANDARD_SAMPLE_RATES` + `sample_rate_index_for`
+  + `Flags::standard_sample_rate`) and the `0x27`
+  non-standard-sampling-rate sub-block (3-byte little-endian Hz;
+  `parse_non_standard_sample_rate` / `find_non_standard_sample_rate`)
+  resolve through `WavPackBlock::sample_rate` and the stream-level
+  `stream_sample_rate`. `StreamReader` gains `sample_rate` +
+  `seek_seconds` (typed `SampleRateUnknown` when a custom-rate stream
+  lacks its `0x27`). On the write side `set_stream_sample_rate` stamps
+  an encoded chain post-hoc (standard rates patch every header's rate
+  index; non-standard rates set the sentinel `15` and append the
+  `0x27` once, with the stream's first block) and the registry
+  `WavPackEncoder` applies it from the caller-declared
+  `CodecParameters::sample_rate` — the reference decoder reads both
+  stamped forms and decodes the streams bit-exactly.
+* **`0x0D` first-member channel geometry** — `parse_channel_info` /
+  `ChannelInfo` (staged §6 erratum pin: `[count, mask]` with a
+  little-endian Microsoft speaker mask; zero-length mask = "no
+  assignment"; the extended >32-channel form is a typed refusal),
+  exposed via `WavPackBlock::channel_info` and `stream_channel_info` —
+  the reference 5.1 fixture declares `count 6`, mask `0x3F`, matching
+  the decoded interleave width.
 * **Framework registry wiring (dual API)** — `register` installs the
   codec into an `oxideav_core::RuntimeContext` (`CodecInfo`:
   decode + encode, lossless, SW priority, the staged-wiki `WVPK`
@@ -336,41 +406,41 @@ use oxideav_wavpack::encode_stream_stereo_smallest;
 let wv = encode_stream_stereo_smallest(&pcm, 0, 2)?;
 assert_eq!(decode_stream(&wv)?, pcm);
 
+// Foreign files (reference-encoded) decode the same way — and float
+// streams have a typed f32 twin:
+use oxideav_wavpack::{decode_stream_f32, stream_channel_info, stream_sample_rate};
+let rate = stream_sample_rate(file_bytes)?;        // Some(44100) / 0x27 custom
+let geometry = stream_channel_info(file_bytes)?;   // 0x0D [count, mask]
+let f32_pcm = decode_stream_f32(float_file_bytes)?;
+
 // Seek: index the stream once (header-only), then decode windows —
-// or drive the playback-shaped cursor:
+// or drive the playback-shaped cursor (frame- or time-addressed):
 use oxideav_wavpack::{decode_range, StreamIndex, StreamReader};
 let index = StreamIndex::scan(&wv)?;
 let window = decode_range(&wv, &index, 44100, 1024)?; // frames 44100..45124
 let mut reader = StreamReader::new(&wv)?;
-reader.seek(44100)?;
+reader.seek_seconds(1.0)?; // == reader.seek(44100)? at 44.1 kHz
 let frames = reader.read_frames(1024)?; // == window
 ```
 
 ## Not yet supported
 
 `WavPackBlock::decode_samples` refuses the following with a typed
-`Error::UnsupportedBlockFeature`: hybrid (lossy) blocks, float and
-32-bit-int sample data, low-latency / robust block layouts, and — on
-non-hybrid stereo blocks — the `CROSS_DECORR` flag (bit 5).
-**Multichannel members** are no longer a dead end: `decode_samples` still
-refuses a grouped member (its per-block shape can't stitch the set), but
-`WavPackBlock::decode_member_samples` decodes one, and the stream-level
-`decode_multichannel_stream` reassembles the whole interleaved frame from
-a stream's member sets (see the working-surface bullet). **Mono and
-stereo** lossless decorrelation are wired all the way through
-`decode_samples` (entropy → residuals → `assemble_mono_passes` /
-`assemble_stereo_passes` → `decorrelate_mono` / `decorrelate_stereo` →
-PCM), including the negative cross terms (`-1`/`-2`/`-3`) on stereo and
-the spec §5.4 joint-stereo (mid/side) undo.
-The `CROSS_DECORR` flag stays refused on a lossless stereo block because
-the staged decorrelation doc §4.1 documents it only in the hybrid-stereo
-correction-folding context — so it has no defined main-stream meaning
-here (the lossless inter-channel predictors are the negative `0x02` decorr
-*terms*, which **are** decoded). The §5 block CRC is exposed at block
-level via `WavPackBlock::verify_decoded_crc` (non-mutating checker) and
-`WavPackBlock::decode_samples_muted` (the spec §5.6 mute gate), and at
-stream level via `decode_stream_muted`. The extension CRC (`crc_x`, §5.5)
-over `0x0C` wide/float data is pending its consumer.
+`Error::UnsupportedBlockFeature`: hybrid (lossy) blocks, low-latency
+block layouts, and two narrow float-profile shapes — `SHIFT_SAME`
+(`0x08` float_flags `0x02`; the staged spec does not say which value
+the identical shifted-in bits take) and `EXCEPTIONS` (`0x20`; the
+per-sample inf/NaN extension payload is not covered by the staged
+spec). **Float and 32-bit-int sample data are decoded** (round 405 —
+see the working-surface bullets), with the `crc_x` extension-CRC
+verdict wired into the §5.6 mute gate. **Multichannel members** are
+handled at stream level: `decode_samples` still refuses a grouped
+member (its per-block shape can't stitch the set), but
+`WavPackBlock::decode_member_samples` decodes one and
+`decode_multichannel_stream` reassembles the whole interleaved frame.
+The §5 block CRC is exposed at block level via
+`WavPackBlock::verify_decoded_crc` / `decode_samples_muted` and at
+stream level via `decode_stream_muted`.
 
 The **left-shift** half of the decorrelation-spec §1 "shift/clip fixups"
 stage is now applied (see the working-surface bullet above); the **clip**
@@ -404,47 +474,36 @@ main stream cannot be decoded from raw `.wv` bytes, so the *end-to-end*
 hybrid decode from a bitstream stays refused — but a caller holding both
 residual buffers can now recover lossless PCM via the block-level fold.
 
-**Decoding arbitrary reference-encoded files** stays blocked on one
-precise docs gap: the `wp_log2` / `wp_exp2s` **log-packed 16-bit
-encoding** used by the `0x05` entropy medians and `0x04` decorrelation
-seeds. The staged spec names `wp_exp2s` (§3.6, entropy §1) but never
-transcribes the algorithm or its fractional lookup table, and the
-wiki's linear "lower 8 bits are mantiss, high 8 bits are exponent-9"
-reading demonstrably diverges from reference-encoded files for
-non-zero values (cross-validation showed reference words like `0x0711`
-expanding to values the linear reading cannot produce; only the
-all-zero word agrees). Every reference encoder writes non-zero medians
-on real content, so end-to-end decode of foreign files mis-seeds —
-while this crate's own zero-seed streams are fully bidirectional
-(decoded by reference tools bit-exactly, and vice versa for the
-zero-seed subset). The needed transcription: `wp_exp2s` /
-`wp_log2` exact integer algorithm + table.
+Both round-404 docs gaps are closed (round 405): **foreign
+reference-encoded files decode bit-exactly** via the staged
+`wp_log2` / `wp_exp2s` transcription, and **seeking is
+time-addressed** via the staged sample-rate table + `0x27`
+(`StreamReader::seek_seconds`). The crate is wired into the
+`oxideav-core` framework registry: `Decoder` / `Encoder` trait impls,
+the `register` entry point, and the direct `decoder::make_decoder` /
+`encoder::make_encoder` factory endpoints; the registry encoder stamps
+the caller-declared sample rate into every emitted chain.
 
-**Seeking is frame-addressed, not time-addressed**: the wiki documents
-the flags bits 23..=26 sampling-rate *index* (and the `15 =
-unknown/custom` sentinel pointing at sub-block `0x27`), but the staged
-docs carry **no table mapping index values `0..=14` to Hz** — so the
-seek layer cannot convert seconds to frames (a docs gap; the frame
-domain itself is fully documented and implemented).
-
-The crate **is** wired into the `oxideav-core` framework registry (see
-the working-surface bullet): `Decoder` / `Encoder` trait impls, the
-`register` entry point, and the direct `decoder::make_decoder` /
-`encoder::make_encoder` factory endpoints. Time-addressed seeking and a
-registry-reported sample rate remain limited by the sampling-rate-index
-docs gap above (the decoder echoes the caller-supplied rate only).
+**Float / int32 encode** stays out of scope for the write side (the
+encoder emits integer PCM at 1..=4-byte container widths; it does not
+originate `FLOAT_DATA` / `INT32_DATA` reductions).
 
 ## Provenance
 
 Clean-room from the staged material under `docs/audio/wavpack/`: the
 block-structure and sub-block-ID wiki listing, the clean-room
 entropy-decode trace `docs/audio/wavpack/spec/wavpack-entropy-decode.md`,
-and — for the block CRC (`§5`) and the decorrelation weight arithmetic
-(`§3` + the `§6` constants summary + the `§7` sanity vectors) — the
-clean-room decorrelation/CRC trace
-`docs/audio/wavpack/spec/wavpack-decorrelation.md`. No external library
-source, archived prior history, or online resources were consulted at
-any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
+the decorrelation/CRC trace
+`docs/audio/wavpack/spec/wavpack-decorrelation.md`, and — round 405 —
+the log-domain conversions `spec/wavpack-log2-exp2.md` (tables
+mechanically transcribed from `tables/wp-log2.csv` / `wp-exp2.csv`),
+the extended sample formats `spec/wavpack-sample-formats.md`, and the
+standard-rate table `tables/sample-rates.csv`. Wire details the staged
+docs name but do not bit-pin (the float `ZEROS_SENT` layout and the
+float extension-CRC fold) were established black-box with the
+reference binaries as opaque oracles, never their source. No external
+library source, archived prior history, or online resources were
+consulted at any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
 and `decode_multichannel_stream` (plus its CRC-muted and `multichannel_layout`
 twins) entry points, carries an `encode_roundtrip` **round-trip
 oracle** target (fuzz bytes → PCM + mode-grid control → `*_best` encode
@@ -461,7 +520,10 @@ found (and the fix pinned) an adversarial-history overflow in the
 term-17/18 extrapolator predictors — all twelve predictor sites are
 now 32-bit wrapping, matching the wrapping reconstruction adds around
 them, with the minimized input kept as a corpus regression seed;
-964 unit tests synthesise
+1023 unit tests plus a 27-test
+foreign-decode integration battery (19 reference-encoded fixtures
+under `tests/data/`, all pinned bit-exact with matching stored CRCs,
+plus corruption trip-wires through both CRC gates) synthesise
 minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
 reject boundaries, pin the §5 CRC primitives to the spec's worked
