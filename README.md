@@ -510,8 +510,15 @@ mantissa / sent-bits from the correction block —
 **lossy** `.wv`-only decode of a sent-bits int32 hybrid file fills
 the missing wvx window with implied zeros (`reassemble_int32_implied`,
 mirroring the round-408 float posture), pinned bit-exact against the
-reference lossy decode. Every hybrid shape the reference encoder
-produces now decodes: no hybrid gaps remain.
+reference lossy decode. The pair decode is CRC-gated end-to-end: the
+`.wvc` header stores the §5 running CRC of the **lossless** decode
+(round-415 pin — folded over the pre-fixup samples, exactly as the
+`.wv` header's covers the lossy decode), so
+`decode_samples_with_correction_muted` /
+`decode_stream_with_correction_muted` apply the §5.6 mute gate
+against it (extension `crc_x` verdict included), zeroing a corrupt
+block instead of emitting wrong samples. Every hybrid shape the
+reference encoder produces now decodes: no hybrid gaps remain.
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged

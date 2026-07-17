@@ -244,6 +244,13 @@ macro_rules! hybrid_pair_fixture {
             // silently ignoring the correction stream.
             let lossy = decode_stream(wv).expect("lossy decode");
             assert_ne!(lossy, expected, "coarse-only decode must be lossy");
+            // Round 415: the .wvc header stores the §5 CRC of the
+            // LOSSLESS decode — the muted pair twin must pass its gate
+            // on every block and emit the same PCM.
+            let (muted, all_ok) = oxideav_wavpack::decode_stream_with_correction_muted(wv, wvc)
+                .expect("muted pair decode");
+            assert!(all_ok, "stored .wvc lossless CRC(s) must match");
+            assert_eq!(muted, expected, "muted-path PCM");
         }
     };
 }
@@ -308,6 +315,33 @@ hybrid_pair_fixture!(
 );
 hybrid_pair_fixture!(hybrid_pair_multi_is_lossless, "foreign_hybrid_pair_multi");
 hybrid_pair_fixture!(hybrid_pair_lr_is_lossless, "foreign_hybrid_pair_lr");
+
+/// Corrupting the `.wvc` correction payload must trip the round-415
+/// pair mute gate (the `.wvc` header CRC covers the LOSSLESS decode):
+/// the block is zeroed and `all_crc_ok` is false — never silently
+/// wrong samples.
+#[test]
+fn corrupted_correction_stream_is_muted_or_refused() {
+    let wv = include_bytes!("data/foreign_hybrid_pair_js.wv");
+    let clean = include_bytes!("data/foreign_hybrid_pair_js.wvc");
+    let expected = expected_pcm(include_bytes!("data/foreign_hybrid_pair_js.pcm32le"));
+    // Flip one bit deep inside the correction block's 0x0B payload.
+    let mut wvc = clean.to_vec();
+    let target = wvc.len() / 2;
+    wvc[target] ^= 0x04;
+    match oxideav_wavpack::decode_stream_with_correction_muted(wv, &wvc) {
+        Ok((pcm, all_ok)) => {
+            assert!(!all_ok, "corruption must fail the lossless CRC gate");
+            assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
+        }
+        Err(_) => {} // a structural refusal is equally acceptable
+    }
+    // The unmuted path (no gate) decodes to WRONG samples on the same
+    // corruption — demonstrating the gate is what catches it.
+    if let Ok(pcm) = oxideav_wavpack::decode_stream_with_correction(wv, &wvc) {
+        assert_ne!(pcm, expected);
+    }
+}
 
 /// Pair-decode refusal: a non-hybrid block has nothing to correct.
 /// (Joint-stereo pairs — the default stereo coding — decode since

@@ -676,6 +676,32 @@ impl<'a> WavPackBlock<'a> {
         &self,
         correction: &WavPackBlock<'_>,
     ) -> Result<Vec<i32>> {
+        let mut out = self.decode_samples_with_correction_prefixup(correction)?;
+        // Sample-format fixups (float / int32) read the 0x0C extension
+        // stream that a pair encode places in the CORRECTION block
+        // (round-415 structural pin), then the final left shift runs.
+        self.apply_sample_format_fixups_with(
+            &mut out,
+            correction
+                .packed_overflow_bits()
+                .or_else(|| self.packed_overflow_bits()),
+        )?;
+        crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
+        Ok(self.expand_false_stereo(out))
+    }
+
+    /// The pre-fixup core of [`Self::decode_samples_with_correction`]:
+    /// the lossless integer buffer after the entropy + correction +
+    /// decorrelation + (joint) shaping stages, **before** the
+    /// sample-format fixups, the left shift and the false-stereo
+    /// expansion — the form the `.wvc` header's §5 CRC is folded over
+    /// (round-415 black-box pin: the correction block's stored CRC is
+    /// the §5 mono/stereo recurrence over the lossless pre-fixup
+    /// samples, exactly as the `.wv` header's is over the lossy ones).
+    fn decode_samples_with_correction_prefixup(
+        &self,
+        correction: &WavPackBlock<'_>,
+    ) -> Result<Vec<i32>> {
         let flags = &self.header.flags;
         if !flags.hybrid {
             return Err(Error::BlockNotHybrid);
@@ -727,25 +753,14 @@ impl<'a> WavPackBlock<'a> {
                     .ok_or(Error::InvalidEntropyInfoForStereo)?,
             ];
             if flags.joint_stereo {
-                let mut out = self.decode_joint_samples_with_correction(
+                return self.decode_joint_samples_with_correction(
                     &packed,
                     &corr_data,
                     &mut medians,
                     count,
                     &mut hybrid,
                     &mut shaping,
-                )?;
-                // Sample-format fixups read the 0x0C extension stream
-                // that a pair encode places in the CORRECTION block
-                // (round-415 structural pin), then the final left shift.
-                self.apply_sample_format_fixups_with(
-                    &mut out,
-                    correction
-                        .packed_overflow_bits()
-                        .or_else(|| self.packed_overflow_bits()),
-                )?;
-                crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
-                return Ok(out);
+                );
             }
             crate::samples::decode_packed_samples_stereo_hybrid_lossless(
                 &packed,
@@ -785,17 +800,48 @@ impl<'a> WavPackBlock<'a> {
         for (o, (e, c)) in out.iter_mut().zip(exact.iter().zip(coarse.iter())) {
             *o = o.wrapping_add(e.wrapping_sub(*c));
         }
-        // Sample-format fixups (float / int32) read the 0x0C extension
-        // stream that a pair encode places in the CORRECTION block
-        // (round-415 structural pin), then the final left shift runs.
-        self.apply_sample_format_fixups_with(
-            &mut out,
-            correction
+        Ok(out)
+    }
+
+    /// [`Self::decode_samples_with_correction`] with the spec §5.6 CRC
+    /// **mute gate** applied against the correction block's stored CRC.
+    ///
+    /// Round-415 black-box pin: a pair encode stores the §5 running CRC
+    /// of the **lossless** decode in the `.wvc` block header (folded, as
+    /// always, over the pre-fixup / pre-shift samples), exactly as the
+    /// `.wv` header stores the lossy decode's — so a two-file decode is
+    /// integrity-checked end-to-end by the correction header alone. When
+    /// the correction block carries a `0x0C` extension stream its §5.5
+    /// `crc_x` verdict joins the gate, mirroring
+    /// [`Self::decode_samples_muted`].
+    ///
+    /// Returns `(pcm, crc_ok)`; on a mismatch the buffer is zeroed (the
+    /// §5.6 mute) instead of surfacing wrong samples. Errors propagate
+    /// exactly as from [`Self::decode_samples_with_correction`].
+    /// Round 415.
+    pub fn decode_samples_with_correction_muted(
+        &self,
+        correction: &WavPackBlock<'_>,
+    ) -> Result<(Vec<i32>, bool)> {
+        let mut pcm = self.decode_samples_with_correction_prefixup(correction)?;
+        let mut crc_ok = self.crc_of_decoded(&pcm) == correction.header.crc();
+        if crc_ok {
+            let overflow = correction
                 .packed_overflow_bits()
-                .or_else(|| self.packed_overflow_bits()),
-        )?;
-        crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
-        Ok(self.expand_false_stereo(out))
+                .or_else(|| self.packed_overflow_bits());
+            if let Some((computed, stored)) =
+                self.apply_sample_format_fixups_with(&mut pcm, overflow)?
+            {
+                crc_ok = computed == stored;
+            }
+        }
+        if crc_ok {
+            crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
+        } else {
+            // Spec §5.6: mute (zero) the block on a CRC mismatch.
+            pcm.iter_mut().for_each(|s| *s = 0);
+        }
+        Ok((self.expand_false_stereo(pcm), crc_ok))
     }
 
     /// Joint (mid/side) leg of [`Self::decode_samples_with_correction`]
@@ -2675,6 +2721,38 @@ pub fn decode_stream_with_correction(main: &[u8], correction: &[u8]) -> Result<V
         out.extend_from_slice(&pcm);
     }
     Ok(out)
+}
+
+/// [`decode_stream_with_correction`] with the spec §5.6 per-block CRC
+/// **mute gate** applied — the pair twin of [`decode_stream_muted`].
+///
+/// Every paired audio block is gated by
+/// [`WavPackBlock::decode_samples_with_correction_muted`] against the
+/// `.wvc` header's stored **lossless** CRC (round-415 pin; the `0x0C`
+/// extension-CRC verdict joins the gate when present); an unpaired
+/// block (partial `.wvc` coverage) falls back to the coarse
+/// [`WavPackBlock::decode_samples_muted`] gate against its own `.wv`
+/// header CRC. A failing block is muted (zeroed) independently;
+/// `all_crc_ok` reports whether every gate passed. Round 415.
+pub fn decode_stream_with_correction_muted(
+    main: &[u8],
+    correction: &[u8],
+) -> Result<(Vec<i32>, bool)> {
+    let pairs = pair_correction_stream(main, correction)?;
+    let mut out = Vec::new();
+    let mut all_ok = true;
+    for (block, twin) in &pairs {
+        if !block.header.is_audio_block() {
+            continue;
+        }
+        let (pcm, ok) = match twin {
+            Some(corr) => block.decode_samples_with_correction_muted(corr)?,
+            None => block.decode_samples_muted()?,
+        };
+        all_ok &= ok;
+        out.extend_from_slice(&pcm);
+    }
+    Ok((out, all_ok))
 }
 
 /// Decode a hybrid **float** `.wv` + `.wvc` pair to `f32` PCM — the

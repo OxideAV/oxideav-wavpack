@@ -17,6 +17,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 415 — **CRC-gated (muted) pair decode: the `.wvc` header
+  stores the lossless decode's §5 CRC.** Black-box pin over the whole
+  13-fixture pair battery: the correction block's header CRC is the §5
+  mono/stereo running CRC folded over the **lossless** pre-fixup
+  decode, exactly as the `.wv` header's covers the lossy one — so a
+  two-file decode is integrity-checked end-to-end from the pair's own
+  headers. New `WavPackBlock::decode_samples_with_correction_muted`
+  and stream-level `decode_stream_with_correction_muted` apply the
+  §5.6 mute gate against it (the `0x0C` extension-CRC verdict joins
+  the gate when present; unpaired blocks fall back to the coarse
+  `.wv`-header gate), zeroing a failing block instead of emitting
+  wrong samples — pinned by a corruption trip-wire that flips one
+  `0x0B` payload bit and by muted-twin parity across every pair
+  fixture.
+
 - Round 415 — **float / int32 hybrid-lossless pairs decode, bit-exact;
   int32 hybrid lossy decode gains the implied-zeros fill.** A pair
   encode carries the `0x0C` wvx extension stream in the `.wvc` twin
