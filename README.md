@@ -494,9 +494,15 @@ post-decorrelation shaping leg). Ten pair fixtures reproduce the
 original encoder input bit-exactly across no-shaping / static
 negative / static positive / dynamic-noise-shaping encodes,
 left/right + joint coding, 16- and 24-bit, single- and multi-block
-with silence stretches. The remaining hybrid gaps: `-cc`-style
-`CROSS_DECORR` pairs (the §4.1 pre-decorrelation fold placement) and
-float / int32 hybrid pairs.
+with silence stretches. `CROSS_DECORR`-flagged pairs (the reference
+maximum-compression hybrid mode) are a further round-415 pin: the bit
+is decorative on current-version files — three cross-flagged fixtures
+(joint dynamic / joint unshaped / left-right dynamic) decode
+bit-exactly under the same post-decorrelation fold, so
+`fold_hybrid_correction` / `split_hybrid_correction` accept the cross
+placement and only the noise-shaped placement still routes through
+the full pair decode. The remaining hybrid gap: float / int32 hybrid
+pairs.
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged

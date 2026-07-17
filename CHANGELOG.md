@@ -17,6 +17,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 415 — **`CROSS_DECORR` hybrid pairs pinned decorative;
+  cross-flagged blocks fold raw.** Reference maximum-compression
+  hybrid pairs set flag bit 5 (`CROSS_DECORR`), whose staged-spec §4.1
+  description is a *pre*-decorrelation fold placement — but three
+  cross-flagged reference pair fixtures
+  (`foreign_hybrid_pair_{js_cc,js_cc_s0,lr_cc}`: joint dynamic, joint
+  unshaped, left/right dynamic) decode **bit-exactly under the
+  post-decorrelation fold**, establishing black-box that the bit is
+  decorative on current-version (`0x410`) files exactly as it is on
+  lossless stereo blocks. `CorrectionFold::is_supported_raw_fold` now
+  includes `PreDecorrelationCross`, so `fold_hybrid_correction` /
+  `split_hybrid_correction` accept cross-flagged blocks; only the
+  noise-shaped placement still refuses the raw add.
+
 - Round 415 — **joint (mid/side) stereo hybrid-lossless pair decode,
   bit-exact against the encoder input.** The reference encoder's
   *default* stereo hybrid coding no longer refuses a pair decode: the

@@ -569,9 +569,20 @@ pub enum CorrectionFold {
     PostDecorrelation,
     /// The correction is folded into the lossy input **before** the
     /// decorrelation passes (spec §4.1, the `CROSS_DECORR` `0x20`
-    /// zero-delay correction). Requires re-running decorrelation after the
-    /// fold, so it cannot be applied to a reconstructed output buffer;
-    /// [`fold_correction_pre_decorrelation`] applies at the input stage.
+    /// zero-delay correction); [`fold_correction_pre_decorrelation`]
+    /// applies at the input stage.
+    ///
+    /// **Round-415 empirical pin:** current-version (`0x410`) reference
+    /// encoders set `CROSS_DECORR` on their maximum-compression hybrid
+    /// pairs, yet those files decode **bit-exactly with the
+    /// post-decorrelation fold** — mono / left-right / joint, shaped and
+    /// unshaped alike (see the `foreign_hybrid_pair_*cc*` fixtures). The
+    /// bit is decorative on such files, exactly as it is on lossless
+    /// stereo blocks; a genuinely pre-decorrelation-folded stream (the
+    /// staged spec's description, presumably an earlier-version layout)
+    /// has not been observed black-box. The end-to-end pair decoder
+    /// therefore applies the post-decorrelation placement regardless of
+    /// this flag.
     PreDecorrelationCross,
     /// The correction is applied through the `HYBRID_SHAPE` / `NEW_SHAPING`
     /// error-feedback filter (spec §4.1). Not a raw add; its
@@ -598,14 +609,21 @@ impl CorrectionFold {
         }
     }
 
-    /// `true` when this placement is the plain post-decorrelation raw add
-    /// (the only fold this crate applies end-to-end). The other two
-    /// placements require either re-running decorrelation
-    /// ([`Self::PreDecorrelationCross`]) or the undocumented shaping filter
-    /// ([`Self::NoiseShaped`]).
+    /// `true` when the block's corrections fold as a plain
+    /// post-decorrelation raw add. Since round 415 this includes
+    /// [`Self::PreDecorrelationCross`]: `CROSS_DECORR` is set decoratively
+    /// by current-version reference encoders and their pairs are
+    /// bit-exact under the post-decorrelation placement (see the variant
+    /// docs). Only [`Self::NoiseShaped`] is excluded — a shaped fold
+    /// routes each correction through the `0x07` error-feedback filter,
+    /// so an after-the-fact raw add over a decoded buffer cannot
+    /// reproduce it (use the end-to-end pair decode instead).
     #[must_use]
     pub fn is_supported_raw_fold(self) -> bool {
-        matches!(self, CorrectionFold::PostDecorrelation)
+        matches!(
+            self,
+            CorrectionFold::PostDecorrelation | CorrectionFold::PreDecorrelationCross
+        )
     }
 }
 
@@ -995,8 +1013,11 @@ mod tests {
             CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG),
             CorrectionFold::PreDecorrelationCross
         );
+        // Round 415: the raw post-decorrelation fold covers cross-flagged
+        // blocks too — current-version reference encoders set the bit
+        // decoratively and their pairs are bit-exact under the raw add.
         assert!(
-            !CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG).is_supported_raw_fold()
+            CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG).is_supported_raw_fold()
         );
     }
 

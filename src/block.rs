@@ -512,10 +512,13 @@ impl<'a> WavPackBlock<'a> {
     /// [`crate::CorrectionFold::NoiseShaped`], `CROSS_DECORR` selects
     /// [`crate::CorrectionFold::PreDecorrelationCross`], and otherwise the
     /// default [`crate::CorrectionFold::PostDecorrelation`] raw add applies.
-    /// Only the post-decorrelation placement is folded end-to-end by
-    /// [`Self::fold_hybrid_correction`]; the other two require, respectively,
-    /// re-running decorrelation after a pre-pass fold or the (undocumented)
-    /// noise-shaping filter. Round 367.
+    /// Both non-shaped placements fold end-to-end via
+    /// [`Self::fold_hybrid_correction`] (round 415: current-version
+    /// reference encoders set `CROSS_DECORR` decoratively — their pairs
+    /// are bit-exact under the post-decorrelation add); the noise-shaped
+    /// placement routes through the `0x07` error-feedback filter and needs
+    /// the full pair decode ([`Self::decode_samples_with_correction`]).
+    /// Round 367; cross placement folded since round 415.
     pub fn hybrid_correction_placement(&self) -> crate::CorrectionFold {
         crate::CorrectionFold::from_flags(self.header.flags.raw)
     }
@@ -549,9 +552,12 @@ impl<'a> WavPackBlock<'a> {
     /// # Errors
     ///
     /// * [`Error::HybridFoldPlacementUnsupported`] — the block's flags
-    ///   select [`crate::CorrectionFold::PreDecorrelationCross`] or
-    ///   [`crate::CorrectionFold::NoiseShaped`], neither of which is a plain
-    ///   post-decorrelation raw add.
+    ///   select [`crate::CorrectionFold::NoiseShaped`]: a shaped fold
+    ///   routes each correction through the `0x07` error-feedback filter,
+    ///   so it is not a raw add (use
+    ///   [`Self::decode_samples_with_correction`]). `CROSS_DECORR`-flagged
+    ///   blocks are accepted since round 415 — the bit is decorative on
+    ///   current-version files and their pairs fold post-decorrelation.
     /// * [`Error::HybridCorrectionLengthMismatch`] — `correction.len() !=
     ///   lossy.len()` (the §4.1 fold reads exactly one correction residual
     ///   per decoded sample).
@@ -586,14 +592,15 @@ impl<'a> WavPackBlock<'a> {
     /// lossy)) == original`. Both buffers are in the same per-channel shape
     /// [`Self::decode_samples`] uses (mono, or interleaved `[L0, R0, …]`).
     ///
-    /// As with the decode-side fold, this is the plain post-decorrelation
-    /// (spec §4.1) case: the `CROSS_DECORR` / noise-shaped placements are
-    /// refused, and the two buffers must be the same length.
+    /// As with the decode-side fold, this is the raw post-decorrelation
+    /// (spec §4.1) case: the noise-shaped placement is refused
+    /// (`CROSS_DECORR`-flagged blocks are accepted since round 415), and
+    /// the two buffers must be the same length.
     ///
     /// # Errors
     ///
     /// * [`Error::HybridFoldPlacementUnsupported`] — the block's flags
-    ///   select a placement other than the post-decorrelation raw add.
+    ///   select the noise-shaped placement, which is not a raw add.
     /// * [`Error::HybridCorrectionLengthMismatch`] — `original.len() !=
     ///   lossy.len()`.
     ///
@@ -7347,11 +7354,15 @@ mod tests {
     }
 
     #[test]
-    fn fold_hybrid_correction_refuses_cross_decorr() {
+    fn fold_hybrid_correction_accepts_cross_decorr() {
+        // Round 415: `CROSS_DECORR` is set decoratively by current-version
+        // reference encoders — their pairs are bit-exact under the
+        // post-decorrelation raw add, so the fold applies to cross-flagged
+        // blocks too (only noise shaping is excluded).
         let bytes = synthesise_block(2, flags_with((1 << 3) | (1 << 5)), &[]);
         let (block, _) = parse_block(&bytes).unwrap();
-        let err = block.fold_hybrid_correction(&[1, 2], &[0, 0]).unwrap_err();
-        assert!(matches!(err, Error::HybridFoldPlacementUnsupported));
+        let out = block.fold_hybrid_correction(&[10, -20], &[1, -2]).unwrap();
+        assert_eq!(out, vec![11, -22]);
     }
 
     #[test]
@@ -7392,16 +7403,16 @@ mod tests {
     }
 
     #[test]
-    fn split_hybrid_correction_refuses_cross_and_shaped_and_mismatch() {
-        // CROSS_DECORR placement.
+    fn split_hybrid_correction_refuses_shaped_and_mismatch() {
+        // CROSS_DECORR placement folds as the raw post-decorrelation add
+        // (round 415 — the bit is decorative on current-version files),
+        // so the split accepts it symmetrically.
         let cross = synthesise_block(2, flags_with((1 << 3) | (1 << 5)), &[]);
         let (cblock, _) = parse_block(&cross).unwrap();
-        assert!(matches!(
-            cblock
-                .split_hybrid_correction(&[1, 2], &[0, 0])
-                .unwrap_err(),
-            Error::HybridFoldPlacementUnsupported
-        ));
+        assert_eq!(
+            cblock.split_hybrid_correction(&[11, -22], &[10, -20]).unwrap(),
+            vec![1, -2]
+        );
         // Noise-shaped placement.
         let shaped = synthesise_block(2, flags_with((1 << 3) | (1 << 6)), &[]);
         let (sblock, _) = parse_block(&shaped).unwrap();

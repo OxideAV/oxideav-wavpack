@@ -67,6 +67,9 @@
 //! | `foreign_hybrid_pair_js_sp`    | `-b4 -c -s0.7` | joint pair, static POSITIVE shaping (weight regime the r408 set never hit) |
 //! | `foreign_hybrid_pair_js_multi` | `-b3 -c`     | joint pair, 2+ blocks with a silence stretch (zero-run × shaping-state interplay) |
 //! | `foreign_hybrid_pair_js24`     | `-b4 -c`     | 24-bit joint pair |
+//! | `foreign_hybrid_pair_js_cc`    | `-b4 -cc`    | joint pair, `CROSS_DECORR` flag + dynamic shaping (round 415 — the bit is decorative; post-decorrelation fold is bit-exact) |
+//! | `foreign_hybrid_pair_js_cc_s0` | `-b4 -cc -s0` | joint `CROSS_DECORR` pair, shaping off |
+//! | `foreign_hybrid_pair_lr_cc`    | `-b4 -cc -j0` | left/right `CROSS_DECORR` pair, dynamic shaping |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -248,6 +251,12 @@ hybrid_pair_fixture!(
     "foreign_hybrid_pair_js_multi"
 );
 hybrid_pair_fixture!(hybrid_pair_js24_is_lossless, "foreign_hybrid_pair_js24");
+hybrid_pair_fixture!(hybrid_pair_js_cc_is_lossless, "foreign_hybrid_pair_js_cc");
+hybrid_pair_fixture!(
+    hybrid_pair_js_cc_s0_is_lossless,
+    "foreign_hybrid_pair_js_cc_s0"
+);
+hybrid_pair_fixture!(hybrid_pair_lr_cc_is_lossless, "foreign_hybrid_pair_lr_cc");
 hybrid_pair_fixture!(
     hybrid_pair_mono_s0_is_lossless,
     "foreign_hybrid_pair_mono_s0"
