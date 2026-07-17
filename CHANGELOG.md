@@ -17,6 +17,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 415 — **multichannel (member-set) hybrid-lossless pair
+  decode.** `decode_multichannel_stream_with_correction` (+ its
+  §5.6-muted twin) aligns member blocks one-to-one across the `.wv`
+  and `.wvc` files via `pair_correction_stream` and decodes each
+  paired member hybrid-lossless before the wiki bits-11..=12 set
+  interleave; unpaired members fall back to the coarse member decode.
+  The single-file walker now delegates to the pair walker with an
+  empty correction chain (bit-identical behaviour). Pinned by a
+  reference-encoded 16-bit 5.1 pair fixture
+  (`foreign_hybrid_pair_5dot1`) reassembling the encoder input
+  bit-exactly with every member's lossless CRC matching.
+
 - Round 415 — **CRC-gated (muted) pair decode: the `.wvc` header
   stores the lossless decode's §5 CRC.** Black-box pin over the whole
   13-fixture pair battery: the correction block's header CRC is the §5

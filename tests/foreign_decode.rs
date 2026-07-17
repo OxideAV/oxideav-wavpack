@@ -75,6 +75,7 @@
 //! | `foreign_hybrid_pair_int32`    | `-b4 -c`     | 32-bit int mono pair (`0x09` sent-bits + wvc-carried `0x0C`) |
 //! | `foreign_hybrid_pair_int32_js` | `-b4 -c`     | 32-bit int JOINT-stereo pair |
 //! | `foreign_hybrid_int32_b4`      | `-b4 -c` (wv only) | 32-bit int hybrid LOSSY decode — the pair's `.wv` alone; sent-bits fill with implied zeros |
+//! | `foreign_hybrid_pair_5dot1`    | `-b4 -c`     | 16-bit 5.1 wv + wvc pair (member sets pair one-to-one across the two files) |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -315,6 +316,29 @@ hybrid_pair_fixture!(
 );
 hybrid_pair_fixture!(hybrid_pair_multi_is_lossless, "foreign_hybrid_pair_multi");
 hybrid_pair_fixture!(hybrid_pair_lr_is_lossless, "foreign_hybrid_pair_lr");
+
+/// A 5.1 wv + wvc pair reassembles losslessly through the multichannel
+/// pair walker: member blocks pair one-to-one across the two files and
+/// each decodes hybrid-lossless before the set interleave (round 415).
+#[test]
+fn hybrid_pair_5dot1_is_lossless() {
+    let wv = include_bytes!("data/foreign_hybrid_pair_5dot1.wv");
+    let wvc = include_bytes!("data/foreign_hybrid_pair_5dot1.wvc");
+    let expected = expected_pcm(include_bytes!("data/foreign_hybrid_pair_5dot1.pcm32le"));
+    let decoded = oxideav_wavpack::decode_multichannel_stream_with_correction(wv, wvc)
+        .expect("5.1 pair decode");
+    assert_eq!(decoded.channels, 6);
+    assert_eq!(decoded.samples, expected, "lossless 5.1 PCM");
+    // The coarse-only decode must differ (it IS lossy).
+    let lossy = decode_multichannel_stream(wv).expect("lossy decode");
+    assert_ne!(lossy.samples, expected);
+    // Muted twin: every member's .wvc lossless CRC must match.
+    let (muted, all_ok) =
+        oxideav_wavpack::decode_multichannel_stream_with_correction_muted(wv, wvc)
+            .expect("muted 5.1 pair decode");
+    assert!(all_ok, "per-member lossless CRCs must match");
+    assert_eq!(muted.samples, expected);
+}
 
 /// Corrupting the `.wvc` correction payload must trip the round-415
 /// pair mute gate (the `.wvc` header CRC covers the LOSSLESS decode):

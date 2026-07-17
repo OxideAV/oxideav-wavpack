@@ -3129,6 +3129,43 @@ pub fn decode_multichannel_stream_muted(bytes: &[u8]) -> Result<(DecodedStream, 
     decode_multichannel_inner(bytes, true)
 }
 
+/// Decode a hybrid **multichannel** `.wv` stream losslessly against its
+/// companion `.wvc` correction stream — the multichannel twin of
+/// [`decode_stream_with_correction`] (round 415).
+///
+/// Member blocks are aligned with their correction twins by
+/// [`pair_correction_stream`] (the `.wv` and `.wvc` files have identical
+/// block structure, so each set's members pair one-to-one); each paired
+/// member decodes through
+/// [`WavPackBlock::decode_samples_with_correction`] and an unpaired
+/// member (partial `.wvc` coverage) falls back to its coarse lossy
+/// member decode. The wiki bits-11..=12 set grouping, channel
+/// interleave, and shape refusals are exactly
+/// [`decode_multichannel_stream`]'s. Plain mono / stereo pairs decode
+/// identically to [`decode_stream_with_correction`] with `channels`
+/// reported as `1` / `2`.
+pub fn decode_multichannel_stream_with_correction(
+    main: &[u8],
+    correction: &[u8],
+) -> Result<DecodedStream> {
+    let (stream, _all_crc_ok) = decode_multichannel_pair_inner(main, correction, false)?;
+    Ok(stream)
+}
+
+/// [`decode_multichannel_stream_with_correction`] with the spec §5.6
+/// per-member CRC **mute gate** applied — each paired member is gated
+/// against its `.wvc` header's stored **lossless** CRC (round-415 pin;
+/// extension `crc_x` verdicts included), each unpaired member against
+/// its own `.wv` header CRC. A failing member contributes zeros for its
+/// channel slots while the set's other members survive; `all_crc_ok`
+/// reports whether every gate passed. Round 415.
+pub fn decode_multichannel_stream_with_correction_muted(
+    main: &[u8],
+    correction: &[u8],
+) -> Result<(DecodedStream, bool)> {
+    decode_multichannel_pair_inner(main, correction, true)
+}
+
 /// Shared grouping-walk core for [`decode_multichannel_stream`] (plain,
 /// `muted == false`) and [`decode_multichannel_stream_muted`]
 /// (`muted == true`). Walks the wiki bits-11..=12 member sets, decodes
@@ -3136,6 +3173,23 @@ pub fn decode_multichannel_stream_muted(bytes: &[u8]) -> Result<(DecodedStream, 
 /// frames. Returns the assembled stream plus whether every member's §5 CRC
 /// matched (always `true` in the non-muted mode, which does not fold CRCs).
 fn decode_multichannel_inner(bytes: &[u8], muted: bool) -> Result<(DecodedStream, bool)> {
+    // An empty correction chain pairs every member with `None`, making
+    // the pair walker decode each member standalone — bit-identical to
+    // the historical single-file walk.
+    decode_multichannel_pair_inner(bytes, &[], muted)
+}
+
+/// Grouping-walk core shared by the single-file and `.wv` + `.wvc` pair
+/// multichannel decoders. Members are aligned with their correction
+/// twins by [`pair_correction_stream`]; a paired member decodes through
+/// the round-415 hybrid-lossless path (CRC-gated against the `.wvc`
+/// header's lossless CRC in muted mode), an unpaired member through the
+/// standalone member path (gated against its own `.wv` header CRC).
+fn decode_multichannel_pair_inner(
+    bytes: &[u8],
+    correction: &[u8],
+    muted: bool,
+) -> Result<(DecodedStream, bool)> {
     // Per-set accumulator: the decoded per-member channel buffers of the
     // currently-open set, plus the set's agreed frame count.
     //
@@ -3151,8 +3205,7 @@ fn decode_multichannel_inner(bytes: &[u8], muted: bool) -> Result<(DecodedStream
     let mut open_channels: Option<Vec<Vec<i32>>> = None;
     let mut open_frames: u32 = 0;
 
-    for parsed in iter_blocks(bytes) {
-        let block = parsed?;
+    for (block, twin) in pair_correction_stream(bytes, correction)? {
         if !block.header.is_audio_block() {
             // Metadata-only block: no PCM, not a set member. Per the wiki
             // "Block structure" allowance for block_samples == 0.
@@ -3188,14 +3241,22 @@ fn decode_multichannel_inner(bytes: &[u8], muted: bool) -> Result<(DecodedStream
 
         // Decode this member's own 1 or 2 channels (the grouping marker is
         // accepted, not refused), then split the interleaved buffer into
-        // per-channel flat buffers and append them to the open set.
+        // per-channel flat buffers and append them to the open set. A
+        // member aligned with a `.wvc` twin decodes hybrid-lossless.
         let member_channels = block.member_channel_count();
-        let pcm = if muted {
-            let (pcm, crc_ok) = block.decode_member_samples_muted()?;
-            all_crc_ok &= crc_ok;
-            pcm
-        } else {
-            block.decode_member_samples()?
+        let pcm = match (&twin, muted) {
+            (Some(corr), true) => {
+                let (pcm, crc_ok) = block.decode_samples_with_correction_muted(corr)?;
+                all_crc_ok &= crc_ok;
+                pcm
+            }
+            (Some(corr), false) => block.decode_samples_with_correction(corr)?,
+            (None, true) => {
+                let (pcm, crc_ok) = block.decode_member_samples_muted()?;
+                all_crc_ok &= crc_ok;
+                pcm
+            }
+            (None, false) => block.decode_member_samples()?,
         };
         let set = open_channels
             .as_mut()
