@@ -10,12 +10,14 @@ Pure-Rust WavPack lossless audio codec for the
 The crate parses the WavPack block container and decodes the
 modified-Rice entropy stream to PCM, with a matching exact-inverse
 encoder on the write side. **Arbitrary reference-encoded lossless AND
-hybrid (lossy) files decode bit-exactly** (rounds 405/408):
-16/24/32-bit integer, 32-bit float (every documented `0x08` profile
-shape, inf/NaN included), mono / stereo / false-stereo /
-multichannel, every standard encoder effort mode, and the hybrid
-`-b` bitrate range — validated black-box against the reference
-decoder on a 35-fixture battery committed under `tests/data/`.
+hybrid files — including every `.wv`+`.wvc` hybrid-lossless pair
+shape — decode bit-exactly** (rounds 405/408/415): 16/24/32-bit
+integer, 32-bit float (every documented `0x08` profile shape, inf/NaN
+included), mono / stereo (left-right and joint) / false-stereo /
+multichannel, every standard encoder effort mode, the hybrid `-b`
+bitrate range, and the `-c`/`-cc` correction-file modes — validated
+black-box against the reference decoder on a 54-fixture battery
+committed under `tests/data/`.
 
 Working surface:
 
@@ -421,6 +423,17 @@ let rate = stream_sample_rate(file_bytes)?;        // Some(44100) / 0x27 custom
 let geometry = stream_channel_info(file_bytes)?;   // 0x0D [count, mask]
 let f32_pcm = decode_stream_f32(float_file_bytes)?;
 
+// Hybrid-lossless two-file (.wv + .wvc) decode — every pair shape the
+// reference encoder produces, CRC-gated by the .wvc header's lossless
+// CRC, with float / multichannel twins:
+use oxideav_wavpack::{
+    decode_multichannel_stream_with_correction, decode_stream_with_correction,
+    decode_stream_with_correction_muted,
+};
+let pcm = decode_stream_with_correction(wv_bytes, wvc_bytes)?;   // bit-exact original
+let (pcm, all_crc_ok) = decode_stream_with_correction_muted(wv_bytes, wvc_bytes)?;
+let surround = decode_multichannel_stream_with_correction(wv_51, wvc_51)?; // 5.1 pairs
+
 // Seek: index the stream once (header-only), then decode windows —
 // or drive the playback-shaped cursor (frame- or time-addressed):
 use oxideav_wavpack::{decode_range, StreamIndex, StreamReader};
@@ -565,14 +578,22 @@ cross-walker invariants over every non-decoding stream walker plus the
 decoder; index tiling / set / locate invariants; full-span +
 fuzz-chosen-window `decode_range` and chunked `StreamReader` walks
 bit-equal to the whole-stream decode, muted PCM + verdict parity
-included). A round-386 campaign
+included), and a round-415 `correction_pair_decode` **differential**
+target over the two-file pair surface (plain/muted parity, the
+empty-correction identity against the lossy decode, and
+plain/multichannel walker parity, at a fuzz-chosen `(main,
+correction)` split). A round-386 campaign
 found (and the fix pinned) an adversarial-history overflow in the
 term-17/18 extrapolator predictors — all twelve predictor sites are
 now 32-bit wrapping, matching the wrapping reconstruction adds around
-them, with the minimized input kept as a corpus regression seed;
-1023 unit tests plus a 27-test
-foreign-decode integration battery (19 reference-encoded fixtures
-under `tests/data/`, all pinned bit-exact with matching stored CRCs,
+them, with the minimized input kept as a corpus regression seed; a
+round-415 campaign did the same for two overflow sites in the `0x07`
+shaping-state recurrence (accumulator add / temp bias / seed
+negation, all now 32-bit wrapping);
+1054 unit tests plus a 68-test
+foreign-decode integration battery (54 reference-encoded fixtures
+under `tests/data/` — including 18 hybrid-lossless `wv+wvc` pairs —
+all pinned bit-exact with matching stored CRCs,
 plus corruption trip-wires through both CRC gates) synthesise
 minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /

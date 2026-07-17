@@ -15,7 +15,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only the stable decode / encode / seek / registry surface. No semantic
   or signature changes.
 
+### Fixed
+
+- Round 415 — **two adversarial-input overflow sites in the `0x07`
+  shaping state** (found by the new `correction_pair_decode` fuzz
+  target; minimized inputs kept as corpus regression seeds): the
+  per-sample accumulator add and the `temp` product/bias now wrap in
+  32 bits (the same posture as the round-386 wrapping predictors),
+  the negative-weight nudge computes `|err| - 1` in `u32` (an
+  `i32::MIN` error state no longer overflows), and the error-seed
+  negation wraps (an adversarial log word can expand to `i32::MIN`).
+  Reference-encoded streams are unaffected — every conformance
+  fixture still decodes bit-exactly.
+
 ### Added
+
+- Round 415 — **`correction_pair_decode` differential fuzz target**
+  over the two-file pair surface: plain/muted parity (the muted path
+  may out-succeed the plain path only on a failed gate, preserves the
+  PCM shape, and is bit-identical on a clean gate), the
+  empty-correction identity against the single-file lossy decode, the
+  f32 twin's panic-freedom, and plain/multichannel walker parity on
+  1–2-channel streams, over a fuzz-chosen 16-bit-fraction split of
+  the input into `(main, correction)` halves. Corpus seeded with
+  seven pair fixtures split exactly at their `.wv`/`.wvc` boundary.
 
 - Round 415 — **multichannel (member-set) hybrid-lossless pair
   decode.** `decode_multichannel_stream_with_correction` (+ its
