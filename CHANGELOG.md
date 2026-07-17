@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Internal plumbing re-exports (entropy-ladder primitives, decorrelation /
+  CRC / log-pack arithmetic, metadata walkers and finders, sub-block
+  expanders, pass-derivation helpers — 188 items kept `pub` for the test
+  suites) are now `#[doc(hidden)]`, so rustdoc and semver tooling track
+  only the stable decode / encode / seek / registry surface. No semantic
+  or signature changes.
+
 ### Added
 
 - Round 408 — **hybrid-lossless (`.wv` + `.wvc`) pair decode — mono and

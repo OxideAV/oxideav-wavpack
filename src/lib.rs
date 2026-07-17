@@ -863,12 +863,49 @@ pub use crate::block_header::{
     MAX_VERSION, MIN_CK_SIZE, MIN_VERSION, SAMPLE_RATE_INDEX_CUSTOM, STANDARD_SAMPLE_RATES,
     TOTAL_SAMPLES_UNKNOWN,
 };
-pub use crate::correction::{expand_packed_correction_data, PackedCorrectionData};
+// Typed sub-block views that appear in `WavPackBlock` accessor signatures
+// stay on the stable surface; their expanders/finders are internal (below).
+pub use crate::correction::PackedCorrectionData;
+pub use crate::encode::{
+    detect_left_shift, encode_block_mono, encode_block_mono_auto, encode_block_mono_best,
+    encode_block_mono_searched, encode_block_mono_shifted, encode_block_mono_smallest,
+    encode_block_mono_with_decorr, encode_block_stereo, encode_block_stereo_auto,
+    encode_block_stereo_best, encode_block_stereo_joint, encode_block_stereo_joint_auto,
+    encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
+    encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
+    encode_multichannel_stream, encode_multichannel_stream_at, encode_stream_mono,
+    encode_stream_mono_best, encode_stream_mono_smallest, encode_stream_stereo,
+    encode_stream_stereo_best, encode_stream_stereo_smallest, set_stream_sample_rate,
+    DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
+};
+pub use crate::entropy::EntropyInfo;
+pub use crate::error::{Error, Result};
+pub use crate::hybrid::CorrectionFold;
+pub use crate::metadata::{ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId};
+pub use crate::overflow_bits::PackedOverflowBits;
+pub use crate::packed_samples::PackedSamples;
+pub use crate::seek::{
+    decode_range, decode_range_muted, IndexEntry, SetEntry, StreamIndex, StreamReader,
+};
+
+// ---------------------------------------------------------------------------
+// Internal surface. Everything below is plumbing kept `pub` for the test
+// suites; it is not part of the stable API and is hidden from rustdoc and
+// from semver tracking. Prefer the stream/block entry points above.
+// ---------------------------------------------------------------------------
+
+// Internal: 0x0B correction-payload expander (pair APIs above are stable).
+#[doc(hidden)]
+pub use crate::correction::expand_packed_correction_data;
+// Internal: block/extension CRC arithmetic used inside the decode pipeline.
+#[doc(hidden)]
 pub use crate::crc::{
     crc_extension, crc_joint_stereo_interleaved, crc_mono, crc_stereo_interleaved,
     undo_joint_stereo, update_extension, update_mono, update_stereo, BlockCrc, ExtensionCrc,
     CRC_INIT, JOINT_STEREO_FLAG,
 };
+// Internal: spec §3 decorrelation ladder primitives and wire constants.
+#[doc(hidden)]
 pub use crate::decorrelation::{
     apply_weight, assemble_mono_passes, assemble_stereo_passes, decode_term_byte, decorrelate_mono,
     decorrelate_stereo, decorrelation_sample_count, encode_term_byte, expand_samples, expand_terms,
@@ -881,42 +918,48 @@ pub use crate::decorrelation::{
     TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, WEIGHT_CLIP,
     WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
 };
+// Internal: pass-derivation helpers producing internal `DecorrPass` lists
+// (the `encode_block_*` / `encode_stream_*` entry points above are stable).
+#[doc(hidden)]
 pub use crate::encode::{
     derive_mono_passes, derive_mono_passes_iterated, derive_mono_passes_searched,
     derive_stereo_passes, derive_stereo_passes_iterated, derive_stereo_passes_searched,
-    detect_left_shift, encode_block_mono, encode_block_mono_auto, encode_block_mono_best,
-    encode_block_mono_searched, encode_block_mono_shifted, encode_block_mono_smallest,
-    encode_block_mono_with_decorr, encode_block_stereo, encode_block_stereo_auto,
-    encode_block_stereo_best, encode_block_stereo_joint, encode_block_stereo_joint_auto,
-    encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
-    encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
-    encode_multichannel_stream, encode_multichannel_stream_at, encode_stream_mono,
-    encode_stream_mono_best, encode_stream_mono_smallest, encode_stream_stereo,
-    encode_stream_stereo_best, encode_stream_stereo_smallest, set_stream_sample_rate,
-    DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
 };
+// Internal: 0x05 entropy-info expander and wire-size constants.
+#[doc(hidden)]
 pub use crate::entropy::{
-    expand_entropy, EntropyInfo, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,
+    expand_entropy, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,
     STEREO_PAYLOAD_BYTES,
 };
-pub use crate::error::{Error, Result};
+// Internal: left-shift fixup applied by `decode_samples` itself.
+#[doc(hidden)]
 pub use crate::fixup::{apply_left_shift, apply_left_shift_buffer};
+// Internal: FLOAT_DATA (0x08) profile plumbing behind `decode_stream_f32`.
+#[doc(hidden)]
 pub use crate::float::{
     expand_float_info, reassemble_float, FloatInfo, FLOAT_EXCEPTIONS, FLOAT_INFO_PAYLOAD_BYTES,
     FLOAT_NEG_ZEROS, FLOAT_SHIFT_ONES, FLOAT_SHIFT_SAME, FLOAT_SHIFT_SENT, FLOAT_ZEROS_SENT,
 };
+// Internal: hybrid-mode fold/split plumbing behind the pair decode APIs.
+#[doc(hidden)]
 pub use crate::hybrid::{
     expand_hybrid_profile, flags_select_shaping, fold_correction, fold_correction_pair,
     fold_correction_pre_decorrelation, fold_correction_pre_decorrelation_pair, split_correction,
-    CorrectionFold, HybridProfile, HybridState, ShapingState, CROSS_DECORR_FLAG, HYBRID_FLAG,
+    HybridProfile, HybridState, ShapingState, CROSS_DECORR_FLAG, HYBRID_FLAG,
     HYBRID_LIMIT_ARG_CEILING, HYBRID_LIMIT_BIAS, HYBRID_PROFILE_MONO_BYTES,
     HYBRID_PROFILE_STEREO_BYTES, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
 };
+// Internal: INT32_DATA (0x09) profile plumbing behind `decode_stream`.
+#[doc(hidden)]
 pub use crate::int32::{expand_int32_info, reassemble_int32, Int32Info, INT32_INFO_PAYLOAD_BYTES};
+// Internal: integer log2/exp2 wire converters used by the expanders.
+#[doc(hidden)]
 pub use crate::logpack::{
     expand_log_word, pack_log_word, quantize_log_value, wp_exp2s, wp_log2, EXP2_TABLE, LOG2_TABLE,
     MAX_LOG2_INPUT, MAX_LOG_WORD,
 };
+// Internal: metadata walkers/finders (the typed views above are stable).
+#[doc(hidden)]
 pub use crate::metadata::{
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
@@ -924,15 +967,17 @@ pub use crate::metadata::{
     find_packed_correction_data_sub_block, find_packed_overflow_bits,
     find_packed_overflow_bits_sub_block, find_packed_samples, parse_channel_info,
     parse_md5_checksum, parse_metadata_sub_block, parse_non_standard_sample_rate, walk_metadata,
-    ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId, ID_FLAG_LARGE_SIZE,
-    ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
+    ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
 };
-pub use crate::overflow_bits::{expand_packed_overflow_bits, PackedOverflowBits};
-pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples, PackedSamples};
-pub use crate::seek::{
-    decode_range, decode_range_muted, IndexEntry, SetEntry, StreamIndex, StreamReader,
-};
-
+// Internal: 0x0C overflow-bits expander (typed view above is stable).
+#[doc(hidden)]
+pub use crate::overflow_bits::expand_packed_overflow_bits;
+// Internal: 0x0A packed-samples expander/validator (typed view is stable).
+#[doc(hidden)]
+pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples};
+// Internal: spec §4.2 modified-Rice entropy ladder (readers, writers,
+// per-sample state machines and their spec constants).
+#[doc(hidden)]
 pub use crate::samples::{
     apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
     decode_packed_samples_mono_hybrid, decode_packed_samples_mono_hybrid_lossless,
