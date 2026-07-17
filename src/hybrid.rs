@@ -421,7 +421,18 @@ impl HybridState {
 /// (`.wv` + `.wvc`) decode — the `0x07` `ID_SHAPING_WEIGHTS` seed and
 /// its per-sample recurrence (round-408 black-box pin, bit-exact over
 /// mono no-shaping / static-shaping / dynamic-shaping and left/right
-/// stereo pair fixtures).
+/// stereo pair fixtures; extended to static-positive weights in round
+/// 415).
+///
+/// The two channels are **output** channels: for mono and left/right
+/// stereo they coincide with the coded channels and the temps fold
+/// in-line in the entropy loop, while joint (mid/side) blocks keep the
+/// same left/right states but transform the temps into the coded
+/// domain per frame (`t_m = t_l - t_r`;
+/// `t_s = t_r + ((mid + t_m) >> 1) - (mid >> 1)` on the output-domain
+/// mid) and fold the effective per-output deltas back into
+/// [`Self::update`] — the round-415 joint pair pin (see
+/// `WavPackBlock::decode_samples_with_correction`).
 ///
 /// ## Wire layout of `0x07` (in the **correction** block)
 ///

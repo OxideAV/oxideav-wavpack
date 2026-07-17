@@ -2437,8 +2437,10 @@ pub fn decode_packed_samples_mono_hybrid_lossless(
 /// decodes `frames` interleaved stereo frames of a hybrid `0x0A`
 /// payload with its `0x0B` correction stream, returning interleaved
 /// `(exact, coarse)` residual buffers (round-408 wire pins; validated
-/// bit-exact on left/right-coded stereo — the joint-stereo correction
-/// interplay is refused one level up).
+/// bit-exact on left/right-coded stereo). Joint (mid/side) blocks
+/// need the shaping temps applied in the output domain instead — use
+/// [`decode_packed_samples_stereo_hybrid_lossless_raw`] and apply the
+/// filter after decorrelation (round 415).
 #[allow(clippy::type_complexity)]
 pub fn decode_packed_samples_stereo_hybrid_lossless(
     payload: &crate::PackedSamples<'_>,
@@ -2506,6 +2508,90 @@ pub fn decode_packed_samples_stereo_hybrid_lossless(
         coarse.push(c);
     }
     Ok((exact, coarse))
+}
+
+/// The **raw** (shaping-free) twin of
+/// [`decode_packed_samples_stereo_hybrid_lossless`], for the
+/// joint-stereo pair decode (round-415 black-box pin).
+///
+/// Joint (mid/side) hybrid blocks apply the `0x07` noise-shaping
+/// filter per **output** channel (left/right) — the shaping temp for
+/// the *side* channel depends on the decorrelated (output-domain) mid
+/// value, which is only known after the decorrelation passes run. The
+/// entropy loop therefore cannot fold the temps in-line the way the
+/// mono / left-right paths do; instead this variant returns the
+/// unshaped bracket-exact values plus a per-slot `bracketed` flag
+/// (spec §6.5 — only bracketed samples receive a shaping temp), and
+/// the caller applies the output-domain shaping after decorrelation
+/// (see `WavPackBlock::decode_samples_with_correction`).
+///
+/// Returns `(raw, coarse, bracketed)`, all in interleaved slot order:
+/// `raw` is the exact in-bracket value read from the `0x0B` stream
+/// with **no** shaping temp folded in, `coarse` the lossy midpoint the
+/// `.wv`-only decode would produce, and `bracketed[i]` whether slot
+/// `i` went through the §6.5 bracketing search (zero-run members and
+/// `error_limit == 0` samples do not).
+#[allow(clippy::type_complexity)]
+pub fn decode_packed_samples_stereo_hybrid_lossless_raw(
+    payload: &crate::PackedSamples<'_>,
+    correction: &crate::PackedCorrectionData<'_>,
+    medians: &mut [AdaptiveMedians; 2],
+    frames: usize,
+    hybrid: &mut crate::HybridState,
+) -> Result<(Vec<i32>, Vec<i32>, Vec<bool>)> {
+    let mut reader = payload.bit_reader();
+    let mut wvc = correction.bit_reader();
+    let mut state = StereoDecodeState::new();
+    let slots = frames.saturating_mul(2);
+    let floor = prealloc_floor(slots, payload.len());
+    let mut raw = Vec::with_capacity(floor);
+    let mut coarse = Vec::with_capacity(floor);
+    let mut bracketed = Vec::with_capacity(floor);
+    let mut frame_limits = [0u32; 2];
+    for slot in 0..slots {
+        let ch = slot & 1;
+        if ch == 0 {
+            frame_limits = hybrid.frame_limits();
+        }
+        let (e, c, b) = if state.zero_run_pending > 0 {
+            state.zero_run_pending -= 1;
+            state.next_channel ^= 1;
+            (0, 0, false)
+        } else if let Some(zero) = {
+            if state.run_break {
+                state.run_break = false;
+                None
+            } else if state.zero_run_eligible(medians) {
+                let run = read_zero_run_length(&mut reader)?;
+                if run > 0 {
+                    medians[0].values = [0, 0, 0];
+                    medians[1].values = [0, 0, 0];
+                    state.run_break = true;
+                    state.zero_run_pending = run - 1;
+                    Some(0)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } {
+            state.next_channel ^= 1;
+            (zero, zero, false)
+        } else {
+            let ones_count = read_folded_ones_count(&mut reader, &mut state.run)?;
+            let interval = medians[ch].sample_interval_for_ones_count(ones_count);
+            medians[ch].adapt(Zone::from_ones_count(ones_count));
+            let r = decode_bracketed_pair(&interval, &mut reader, &mut wvc, frame_limits[ch])?;
+            state.next_channel ^= 1;
+            r
+        };
+        hybrid.update_signed(ch, c);
+        raw.push(e);
+        coarse.push(c);
+        bracketed.push(b);
+    }
+    Ok((raw, coarse, bracketed))
 }
 
 /// Decode `count` mono samples from a `0x0A` packed-samples payload,

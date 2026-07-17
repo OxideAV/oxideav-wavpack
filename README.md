@@ -473,20 +473,30 @@ stored block CRC matching. False-stereo blocks (bit 30) now emit both
 duplicated output channels everywhere (a round-408 conformance fix).
 
 **Hybrid-lossless (`.wv` + `.wvc`) pairs decode end-to-end** for mono
-and left/right-coded stereo (round 408):
+and both stereo codings (rounds 408/415):
 `WavPackBlock::decode_samples_with_correction` /
 `decode_stream_with_correction` read the exact in-bracket offset from
 the `0x0B` correction stream (the same phase-in code as the lossless
 mantissa) and run the `0x07`-seeded noise-shaping filter
 (`ShapingState`: log-packed `[error, acc, (delta)]` seeds, the
 `-((weight*error + 511) >> 10)` temp term, the negative-weight
-unit-magnitude nudge, and the weight-sign-branched error update) —
-five pair fixtures reproduce the original encoder input bit-exactly
-across no-shaping / static / dynamic-noise-shaping encodes. The
-remaining hybrid gaps: **joint-stereo (mid/side) pairs** (typed
-`HybridJointCorrectionUnsupported` refusal — the correction/shaping
-interplay across the §5.4 transform is not yet pinned) and float /
-int32 hybrid pairs.
+unit-magnitude nudge, and the weight-sign-branched error update).
+**Joint (mid/side) stereo pairs** — the reference encoder's default
+stereo hybrid coding — are a round-415 black-box pin: the raw `0x0B`
+fold stays in the coded domain (ahead of the §5.4 undo), but the
+shaping filter's two channels are **output** (left/right) channels;
+per frame the coded temps are `t_m = t_l - t_r` and
+`t_s = t_r + ((mid + t_m) >> 1) - (mid >> 1)` on the output-domain
+mid (bracketed samples only), with the effective per-output deltas
+folded back into the error states
+(`decode_packed_samples_stereo_hybrid_lossless_raw` + the
+post-decorrelation shaping leg). Ten pair fixtures reproduce the
+original encoder input bit-exactly across no-shaping / static
+negative / static positive / dynamic-noise-shaping encodes,
+left/right + joint coding, 16- and 24-bit, single- and multi-block
+with silence stretches. The remaining hybrid gaps: `-cc`-style
+`CROSS_DECORR` pairs (the §4.1 pre-decorrelation fold placement) and
+float / int32 hybrid pairs.
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged

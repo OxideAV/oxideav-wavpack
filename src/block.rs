@@ -633,18 +633,31 @@ impl<'a> WavPackBlock<'a> {
     /// pairs across no-shaping / static-shaping / dynamic-noise-shaping
     /// encodes.
     ///
+    /// **Joint (mid/side) stereo pairs** (round 415): the raw `0x0B`
+    /// correction fold stays in the coded (joint) domain — the §5.4
+    /// undo runs after it — but the noise-shaping filter operates per
+    /// **output** channel (left/right) with the same per-channel
+    /// recurrence the mono path pins. Because the side channel's
+    /// applied temp depends on the output-domain mid value
+    /// (`t_s = t_r + ((mid + t_m) >> 1) - (mid >> 1)`, with
+    /// `t_m = t_l - t_r`), which is only known after decorrelation,
+    /// the joint path decodes the unshaped bracket values first
+    /// ([`crate::decode_packed_samples_stereo_hybrid_lossless_raw`]),
+    /// decorrelates, then applies the temps and folds the filter's
+    /// error state with the **effective** per-output deltas — all
+    /// black-box pinned bit-exact against reference joint pairs across
+    /// no / static-positive / dynamic shaping, 16- and 24-bit, single-
+    /// and multi-block.
+    ///
     /// # Errors
     ///
     /// * [`Error::BlockNotHybrid`] — this block's `HYBRID_FLAG` is clear.
-    /// * [`Error::HybridJointCorrectionUnsupported`] — this block is
-    ///   joint-stereo (mid/side): the correction/shaping interplay
-    ///   across the §5.4 transform is a round-408 documented gap.
     /// * [`Error::UnsupportedBlockFeature`] (`FloatData` / `Int32Mode`)
     ///   — the sample-format extension interplay of a paired decode is
     ///   not yet pinned.
     /// * Structural errors as raised by [`Self::decode_samples`].
     ///
-    /// Round 408.
+    /// Round 408; joint-stereo pairs round 415.
     pub fn decode_samples_with_correction(
         &self,
         correction: &WavPackBlock<'_>,
@@ -670,9 +683,6 @@ impl<'a> WavPackBlock<'a> {
             return Err(Error::UnsupportedBlockFeature(
                 UnsupportedBlockFeature::Int32Mode,
             ));
-        }
-        if !flags.is_block_data_mono() && flags.joint_stereo {
-            return Err(Error::HybridJointCorrectionUnsupported);
         }
         // A correction twin without an 0x0B sub-block is legal when the
         // main block spends no bracket bits (e.g. an all-silence block
@@ -712,6 +722,16 @@ impl<'a> WavPackBlock<'a> {
                 crate::samples::AdaptiveMedians::from_seed_values(entropy.medians_right)
                     .ok_or(Error::InvalidEntropyInfoForStereo)?,
             ];
+            if flags.joint_stereo {
+                return self.decode_joint_samples_with_correction(
+                    &packed,
+                    &corr_data,
+                    &mut medians,
+                    count,
+                    &mut hybrid,
+                    &mut shaping,
+                );
+            }
             crate::samples::decode_packed_samples_stereo_hybrid_lossless(
                 &packed,
                 &corr_data,
@@ -752,6 +772,77 @@ impl<'a> WavPackBlock<'a> {
         }
         crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
         Ok(self.expand_false_stereo(out))
+    }
+
+    /// Joint (mid/side) leg of [`Self::decode_samples_with_correction`]
+    /// (round-415 black-box pin — see the public method's docs).
+    ///
+    /// The raw `0x0B` fold stays in the coded domain, but the shaping
+    /// filter runs per **output** channel: per frame, `t_l` / `t_r`
+    /// come from the two [`crate::ShapingState`] channels, the coded
+    /// temps are `t_m = t_l - t_r` (mid) and
+    /// `t_s = t_r + ((mid_out + t_m) >> 1) - (mid_out >> 1)` (side),
+    /// each applied only when its sample was §6.5-bracketed, and the
+    /// error states fold the *effective* per-output deltas
+    /// (`d_r = t_s - ((mid_out + t_m) >> 1) + (mid_out >> 1)`,
+    /// `d_l = t_m + d_r` — equal to `t_l` / `t_r` when both channels
+    /// are bracketed) against the post-undo left/right values.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_joint_samples_with_correction(
+        &self,
+        packed: &crate::PackedSamples<'_>,
+        corr_data: &crate::PackedCorrectionData<'_>,
+        medians: &mut [crate::samples::AdaptiveMedians; 2],
+        count: usize,
+        hybrid: &mut crate::HybridState,
+        shaping: &mut crate::ShapingState,
+    ) -> Result<Vec<i32>> {
+        let (raw, coarse, bracketed) =
+            crate::samples::decode_packed_samples_stereo_hybrid_lossless_raw(
+                packed, corr_data, medians, count, hybrid,
+            )?;
+        // Decorrelate the coarse residuals (the lossy prediction
+        // history) — the §4.1 post-decorrelation placement.
+        let mut decor = coarse.clone();
+        if self.has_decorrelation() {
+            let (terms, weights, samples) = self.decorr_payloads();
+            let mut passes = assemble_stereo_passes(terms, weights, samples)?;
+            decorrelate_stereo(&mut passes, &mut decor)?;
+        }
+        let mut out = Vec::with_capacity(decor.len());
+        for f in 0..count {
+            let i = 2 * f;
+            // Output-domain (still joint-coded) values after the raw
+            // correction fold, before shaping temps.
+            let mid = decor[i].wrapping_add(raw[i].wrapping_sub(coarse[i]));
+            let side = decor[i + 1].wrapping_add(raw[i + 1].wrapping_sub(coarse[i + 1]));
+            let t_l = shaping.advance(0);
+            let t_r = shaping.advance(1);
+            let t_m = if bracketed[i] {
+                t_l.wrapping_sub(t_r)
+            } else {
+                0
+            };
+            let mid_shaped = mid.wrapping_add(t_m);
+            let half_step = (mid_shaped >> 1).wrapping_sub(mid >> 1);
+            let t_s = if bracketed[i + 1] {
+                t_r.wrapping_add(half_step)
+            } else {
+                0
+            };
+            let side_shaped = side.wrapping_add(t_s);
+            // Effective per-output deltas the shaping actually caused.
+            let d_r = t_s.wrapping_sub(half_step);
+            let d_l = t_m.wrapping_add(d_r);
+            let (left, right) = crate::crc::undo_joint_stereo(mid_shaped, side_shaped);
+            let (left_lossy, right_lossy) = crate::crc::undo_joint_stereo(decor[i], decor[i + 1]);
+            shaping.update(0, left, left_lossy, d_l);
+            shaping.update(1, right, right_lossy, d_r);
+            out.push(left);
+            out.push(right);
+        }
+        crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
+        Ok(out)
     }
 
     /// Borrow the first `0x0B` packed-correction-data sub-block, or

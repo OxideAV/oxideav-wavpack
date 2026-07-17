@@ -106,11 +106,6 @@ pub enum Error {
     /// `HYBRID_FLAG` (bit 3) is clear — there is no coarse stream to
     /// correct.
     BlockNotHybrid,
-    /// A hybrid-lossless pair decode was asked for on a joint-stereo
-    /// (mid/side) block: the correction/shaping interplay across the
-    /// §5.4 joint transform is not yet pinned (round-408 documented
-    /// gap; left/right-coded stereo and mono pairs decode bit-exact).
-    HybridJointCorrectionUnsupported,
     /// A float-typed decode (`decode_samples_f32` /
     /// `decode_stream_f32`) was asked to decode a block/stream whose
     /// samples are integers, not IEEE floats (header flag bit 7
@@ -581,10 +576,6 @@ impl core::fmt::Display for Error {
             Error::BlockNotHybrid => write!(
                 f,
                 "oxideav-wavpack: hybrid-lossless pair decode on a non-hybrid block (flag bit 3 clear)"
-            ),
-            Error::HybridJointCorrectionUnsupported => write!(
-                f,
-                "oxideav-wavpack: hybrid-lossless pair decode of a joint-stereo (mid/side) block is not yet supported"
             ),
             Error::ChannelInfoLength(n) => write!(
                 f,

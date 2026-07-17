@@ -17,6 +17,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 415 — **joint (mid/side) stereo hybrid-lossless pair decode,
+  bit-exact against the encoder input.** The reference encoder's
+  *default* stereo hybrid coding no longer refuses a pair decode: the
+  raw `0x0B` correction fold stays in the coded (joint) domain — the
+  §5.4 mid/side undo runs after it — while the `0x07` noise-shaping
+  filter's two channels are **output** (left/right) channels running
+  the exact recurrence the mono path pins. Per frame the coded-domain
+  applied temps are `t_m = t_l - t_r` (mid) and
+  `t_s = t_r + ((mid + t_m) >> 1) - (mid >> 1)` (side, computed on the
+  **output-domain** mid — the decorrelated coarse plus the raw fold),
+  each applied only to §6.5-bracketed samples, and the error states
+  update against the post-undo left/right values with the *effective*
+  per-output deltas (`d_r = t_s - ((mid + t_m) >> 1) + (mid >> 1)`,
+  `d_l = t_m + d_r`; equal to `t_l` / `t_r` when both channels are
+  bracketed — the divergence matters when a zero-run leaves one coded
+  channel unbracketed). Because the side temp needs the decorrelated
+  mid, the joint path decodes the unshaped bracket values first via
+  the new `decode_packed_samples_stereo_hybrid_lossless_raw` (returns
+  `(raw, coarse, bracketed)`), decorrelates, then applies the
+  output-domain shaping. All wire behaviour pinned black-box against
+  reference joint pairs: five new fixtures
+  (`foreign_hybrid_pair_js{,_s0,_sp,_multi,24}`) covering dynamic /
+  off / static-**positive** shaping (a weight regime the round-408 set
+  never exercised — a mono positive-shaping probe confirmed the
+  per-channel recurrence unchanged), 16/24-bit, and multi-block with a
+  silence stretch, every one reproducing the original encoder input
+  bit-exactly. The now-unreachable
+  `Error::HybridJointCorrectionUnsupported` variant is removed.
+
 - Round 408 — **hybrid-lossless (`.wv` + `.wvc`) pair decode — mono and
   left/right stereo, bit-exact against the encoder input.** New
   `WavPackBlock::decode_samples_with_correction` and the stream-level

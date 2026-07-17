@@ -62,6 +62,11 @@
 //! | `foreign_hybrid_pair_mono_sn`  | `-b4 -c -s-0.7` | wv + wvc lossless pair, static negative shaping |
 //! | `foreign_hybrid_pair_multi`    | `-b3 -c`     | wv + wvc lossless pair, 2 blocks + silence stretch |
 //! | `foreign_hybrid_pair_lr`       | `-b4 -c -j0` | wv + wvc lossless STEREO pair, left/right coding |
+//! | `foreign_hybrid_pair_js`       | `-b4 -c`     | wv + wvc lossless JOINT-stereo pair, dynamic noise shaping (round 415) |
+//! | `foreign_hybrid_pair_js_s0`    | `-b4 -c -s0` | joint pair, shaping off (pins the coded-domain fold + §5.4 undo order) |
+//! | `foreign_hybrid_pair_js_sp`    | `-b4 -c -s0.7` | joint pair, static POSITIVE shaping (weight regime the r408 set never hit) |
+//! | `foreign_hybrid_pair_js_multi` | `-b3 -c`     | joint pair, 2+ blocks with a silence stretch (zero-run × shaping-state interplay) |
+//! | `foreign_hybrid_pair_js24`     | `-b4 -c`     | 24-bit joint pair |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -235,6 +240,14 @@ macro_rules! hybrid_pair_fixture {
 }
 
 hybrid_pair_fixture!(hybrid_pair_mono_is_lossless, "foreign_hybrid_pair_mono");
+hybrid_pair_fixture!(hybrid_pair_js_is_lossless, "foreign_hybrid_pair_js");
+hybrid_pair_fixture!(hybrid_pair_js_s0_is_lossless, "foreign_hybrid_pair_js_s0");
+hybrid_pair_fixture!(hybrid_pair_js_sp_is_lossless, "foreign_hybrid_pair_js_sp");
+hybrid_pair_fixture!(
+    hybrid_pair_js_multi_is_lossless,
+    "foreign_hybrid_pair_js_multi"
+);
+hybrid_pair_fixture!(hybrid_pair_js24_is_lossless, "foreign_hybrid_pair_js24");
 hybrid_pair_fixture!(
     hybrid_pair_mono_s0_is_lossless,
     "foreign_hybrid_pair_mono_s0"
@@ -246,23 +259,13 @@ hybrid_pair_fixture!(
 hybrid_pair_fixture!(hybrid_pair_multi_is_lossless, "foreign_hybrid_pair_multi");
 hybrid_pair_fixture!(hybrid_pair_lr_is_lossless, "foreign_hybrid_pair_lr");
 
-/// Pair-decode refusals: a joint-stereo hybrid block (the default
-/// stereo coding) is a typed round-408 gap; a non-hybrid block has
-/// nothing to correct.
+/// Pair-decode refusal: a non-hybrid block has nothing to correct.
+/// (Joint-stereo pairs — the default stereo coding — decode since
+/// round 415; see the `hybrid_pair_js*` fixtures above.)
 #[test]
-fn hybrid_pair_joint_stereo_is_a_typed_refusal() {
-    // foreign_hybrid_stereo_b4 is joint-coded; pair it with a synthetic
-    // twin carrying the mono pair's correction bytes (content is
-    // irrelevant — the refusal fires on the block's own flags first).
-    let wv = include_bytes!("data/foreign_hybrid_stereo_b4.wv");
+fn hybrid_pair_on_non_hybrid_block_is_refused() {
     let wvc = include_bytes!("data/foreign_hybrid_pair_mono.wvc");
-    let (block, _) = oxideav_wavpack::parse_block(wv).expect("parse");
     let (corr, _) = oxideav_wavpack::parse_block(wvc).expect("parse corr");
-    assert_eq!(
-        block.decode_samples_with_correction(&corr),
-        Err(oxideav_wavpack::Error::HybridJointCorrectionUnsupported)
-    );
-
     let lossless = include_bytes!("data/foreign_default_mono16.wv");
     let (plain, _) = oxideav_wavpack::parse_block(lossless).expect("parse");
     assert_eq!(
