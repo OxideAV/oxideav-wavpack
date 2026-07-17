@@ -484,15 +484,20 @@ impl ShapingState {
             .map(|c| crate::logpack::wp_exp2s(i32::from(i16::from_le_bytes([c[0], c[1]]))))
             .collect();
         let g = |i: usize| words.get(i).copied().unwrap_or(0);
+        // The error seed negation wraps: an adversarial log word can
+        // expand to `i32::MIN`, whose two's-complement negation is
+        // itself (round-415 fuzz find; 32-bit-register semantics as
+        // everywhere else in the recurrence).
+        let e = |i: usize| g(i).wrapping_neg();
         if stereo {
             ShapingState {
-                error: [-g(0), -g(2)],
+                error: [e(0), e(2)],
                 acc: [g(1), g(3)],
                 delta: [g(4), g(5)],
             }
         } else {
             ShapingState {
-                error: [-g(0), 0],
+                error: [e(0), 0],
                 acc: [g(1), 0],
                 delta: [g(2), 0],
             }
@@ -501,19 +506,28 @@ impl ShapingState {
 
     /// Advance `channel`'s weight one sample (`acc += delta`) and return
     /// this sample's `temp` term from the pre-update error state.
+    ///
+    /// The accumulator add and the `temp` product/bias arithmetic wrap in
+    /// 32 bits: adversarial `0x07` seeds can drive `acc`/`delta` (and the
+    /// error state) to magnitudes where the canonical 32-bit-register
+    /// arithmetic wraps, and the decoder must follow it rather than
+    /// overflow (round-415 fuzz find; same posture as the round-386
+    /// wrapping-predictor fix).
     pub fn advance(&mut self, channel: usize) -> i32 {
         let ch = channel & 1;
-        self.acc[ch] += self.delta[ch];
+        self.acc[ch] = self.acc[ch].wrapping_add(self.delta[ch]);
         let weight = self.acc[ch] >> 16;
         let err = self.error[ch];
         if err == 0 {
             return 0;
         }
-        let mut temp = -((weight.wrapping_mul(err) + 511) >> 10);
+        let mut temp = -(weight.wrapping_mul(err).wrapping_add(511) >> 10);
         if weight < 0 && temp.unsigned_abs() >= err.unsigned_abs() {
             // The unit-magnitude nudge: |temp| stays strictly below
-            // |error| under a negative weight.
-            temp = temp.signum() * (err.unsigned_abs() as i32 - 1);
+            // |error| under a negative weight. (`|err| - 1` is computed
+            // in u32 so an `i32::MIN` error state cannot overflow the
+            // subtraction; the result always fits `i32`.)
+            temp = temp.signum().wrapping_mul((err.unsigned_abs() - 1) as i32);
         }
         temp
     }
@@ -669,6 +683,49 @@ mod tests {
             // weight stays 0 (acc 0, delta 0) → temp stays 0 even with
             // a non-zero error state.
             assert_eq!(st.advance(0), 0);
+        }
+    }
+
+    #[test]
+    fn shaping_advance_wraps_on_adversarial_seeds() {
+        // Round-415 fuzz find: adversarial 0x07 seed words can drive
+        // `acc` / `delta` to magnitudes where `acc += delta` overflows
+        // an i32 in debug builds, and an `i32::MIN` error state
+        // overflowed the nudge's `|err| - 1`. The recurrence wraps in
+        // 32 bits instead (the same posture as the round-386 wrapping
+        // predictors); each call must simply return.
+        let mut st = ShapingState {
+            error: [i32::MIN, 5],
+            acc: [i32::MAX, i32::MIN],
+            delta: [i32::MAX, i32::MIN],
+        };
+        for _ in 0..8 {
+            let t0 = st.advance(0);
+            let t1 = st.advance(1);
+            st.update(0, i32::MIN, i32::MAX, t0);
+            st.update(1, i32::MAX, i32::MIN, t1);
+        }
+        // Nudge arm specifically: negative weight with err == i32::MIN.
+        let mut nudge = ShapingState {
+            error: [i32::MIN, 0],
+            acc: [i32::MIN, 0],
+            delta: [0, 0],
+        };
+        let t = nudge.advance(0);
+        // |temp| stays strictly below |error|.
+        assert!(t.unsigned_abs() < (i32::MIN).unsigned_abs());
+    }
+
+    #[test]
+    fn shaping_seed_expansion_accepts_every_log_word() {
+        // Round-415 fuzz find: the error-seed negation must wrap (a log
+        // word can expand to i32::MIN). Every 16-bit word — and thus
+        // every possible 0x07 seed byte pair — must construct.
+        for w in i16::MIN..=i16::MAX {
+            let b = w.to_le_bytes();
+            let payload = [b[0], b[1], b[0], b[1], b[0], b[1]];
+            let _ = ShapingState::from_shaping_words(Some(&payload), false);
+            let _ = ShapingState::from_shaping_words(Some(&payload), true);
         }
     }
 

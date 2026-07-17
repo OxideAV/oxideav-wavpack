@@ -66,3 +66,9 @@ name = "seek_surface"
 path = "fuzz_targets/seek_surface.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "correction_pair_decode"
+path = "fuzz_targets/correction_pair_decode.rs"
+test = false
+doc = false
