@@ -329,12 +329,10 @@ fn corrupted_correction_stream_is_muted_or_refused() {
     let mut wvc = clean.to_vec();
     let target = wvc.len() / 2;
     wvc[target] ^= 0x04;
-    match oxideav_wavpack::decode_stream_with_correction_muted(wv, &wvc) {
-        Ok((pcm, all_ok)) => {
-            assert!(!all_ok, "corruption must fail the lossless CRC gate");
-            assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
-        }
-        Err(_) => {} // a structural refusal is equally acceptable
+    // (a structural refusal instead of `Ok` is equally acceptable)
+    if let Ok((pcm, all_ok)) = oxideav_wavpack::decode_stream_with_correction_muted(wv, &wvc) {
+        assert!(!all_ok, "corruption must fail the lossless CRC gate");
+        assert!(pcm.iter().all(|&s| s == 0), "muted block must be zeroed");
     }
     // The unmuted path (no gate) decodes to WRONG samples on the same
     // corruption — demonstrating the gate is what catches it.
