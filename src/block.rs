@@ -7410,7 +7410,9 @@ mod tests {
         let cross = synthesise_block(2, flags_with((1 << 3) | (1 << 5)), &[]);
         let (cblock, _) = parse_block(&cross).unwrap();
         assert_eq!(
-            cblock.split_hybrid_correction(&[11, -22], &[10, -20]).unwrap(),
+            cblock
+                .split_hybrid_correction(&[11, -22], &[10, -20])
+                .unwrap(),
             vec![1, -2]
         );
         // Noise-shaped placement.

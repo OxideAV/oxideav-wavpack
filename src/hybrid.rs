@@ -1016,9 +1016,7 @@ mod tests {
         // Round 415: the raw post-decorrelation fold covers cross-flagged
         // blocks too — current-version reference encoders set the bit
         // decoratively and their pairs are bit-exact under the raw add.
-        assert!(
-            CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG).is_supported_raw_fold()
-        );
+        assert!(CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG).is_supported_raw_fold());
     }
 
     #[test]
