@@ -15,6 +15,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only the stable decode / encode / seek / registry surface. No semantic
   or signature changes.
 
+### Added
+
+- Round 415 — **pair-aware seeking.** `decode_range_with_correction`
+  (+ its §5.6-muted twin) decodes an arbitrary frame window of a
+  hybrid `.wv` losslessly against its `.wvc`: each member set the
+  window touches pairs with the correction chain's counterpart set,
+  matched by frame range on a header-only `StreamIndex::scan` of the
+  correction buffer (partial coverage falls back to the coarse lossy
+  decode, matching the stream walker's posture), and muted windows
+  gate paired members against the `.wvc` header's stored lossless
+  CRC. `StreamReader::new_with_correction` opens the playback-shaped
+  cursor over the same machinery, set-cache included. Pinned by
+  window-vs-whole-stream and chunked-reader-parity tests over joint,
+  multi-block and 5.1 pair fixtures, plus a full-span parity
+  invariant in the `correction_pair_decode` fuzz target (guarded to
+  both-sides-seekable indices, where set-based pairing provably
+  coincides with the stream walker's sequential pairing).
+
 ### Fixed
 
 - Round 415 — **two adversarial-input overflow sites in the `0x07`

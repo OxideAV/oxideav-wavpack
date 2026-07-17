@@ -534,8 +534,16 @@ block instead of emitting wrong samples. Multichannel pairs decode
 through `decode_multichannel_stream_with_correction` (+ muted twin):
 member blocks pair one-to-one across the two files and each decodes
 hybrid-lossless before the set interleave — a 5.1 pair fixture
-reassembles bit-exactly. Every hybrid shape the reference encoder
-produces now decodes: no hybrid gaps remain.
+reassembles bit-exactly. The **seek surface is pair-aware** too:
+`decode_range_with_correction` (+ muted twin) decodes an arbitrary
+frame window losslessly by pairing each touched member set with the
+correction chain's counterpart (matched by frame range on a
+header-only scan of the `.wvc`; uncovered sets fall back lossy), and
+`StreamReader::new_with_correction` is the playback-shaped cursor over
+the same machinery — windows and chunked reads are pinned bit-equal
+to the whole-stream pair decode for joint, multi-block, and 5.1
+shapes. Every hybrid shape the reference encoder produces now
+decodes: no hybrid gaps remain.
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged

@@ -340,6 +340,76 @@ fn hybrid_pair_5dot1_is_lossless() {
     assert_eq!(muted.samples, expected);
 }
 
+/// Seek surface over pairs (round 415): a windowed
+/// `decode_range_with_correction` equals the same slice of the
+/// whole-stream pair decode, the muted twin passes its gates on clean
+/// fixtures, and the pair-aware `StreamReader` reads bit-identically
+/// through seeks — for stereo joint, multi-block, and 5.1 shapes.
+#[test]
+fn pair_window_decode_matches_whole_pair_decode() {
+    use oxideav_wavpack::{
+        decode_range_with_correction, decode_range_with_correction_muted, StreamIndex, StreamReader,
+    };
+    let cases: [(&[u8], &[u8], usize); 3] = [
+        (
+            include_bytes!("data/foreign_hybrid_pair_js.wv"),
+            include_bytes!("data/foreign_hybrid_pair_js.wvc"),
+            2,
+        ),
+        (
+            include_bytes!("data/foreign_hybrid_pair_js_multi.wv"),
+            include_bytes!("data/foreign_hybrid_pair_js_multi.wvc"),
+            2,
+        ),
+        (
+            include_bytes!("data/foreign_hybrid_pair_5dot1.wv"),
+            include_bytes!("data/foreign_hybrid_pair_5dot1.wvc"),
+            6,
+        ),
+    ];
+    for (wv, wvc, channels) in cases {
+        let whole = oxideav_wavpack::decode_multichannel_stream_with_correction(wv, wvc)
+            .expect("whole pair decode");
+        assert_eq!(whole.channels, channels);
+        let frames = whole.samples.len() / channels;
+        let index = StreamIndex::scan(wv).expect("scan");
+
+        // A mid-stream window crossing a set boundary where possible.
+        let start = frames / 3;
+        let len = (frames / 2).max(1) - start / 2;
+        let window = decode_range_with_correction(wv, &index, wvc, start as u64, len as u64)
+            .expect("window pair decode");
+        assert_eq!(
+            window,
+            whole.samples[start * channels..(start + len) * channels].to_vec(),
+            "windowed pair decode must equal the whole-decode slice"
+        );
+        let (muted, all_ok) =
+            decode_range_with_correction_muted(wv, &index, wvc, start as u64, len as u64)
+                .expect("muted window pair decode");
+        assert!(all_ok, "clean fixture windows pass the lossless gate");
+        assert_eq!(muted, window);
+
+        // Pair-aware reader: seek + chunked reads reproduce the same
+        // window; a lossy reader over the same .wv differs.
+        let mut reader = StreamReader::new_with_correction(wv, wvc).expect("pair reader");
+        reader.seek(start as u64).expect("seek");
+        let mut got = Vec::new();
+        while got.len() < len * channels {
+            let chunk = reader
+                .read_frames(97.min(len - got.len() / channels))
+                .expect("read");
+            assert!(!chunk.is_empty());
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, window, "pair reader parity");
+        let mut lossy_reader = StreamReader::new(wv).expect("lossy reader");
+        lossy_reader.seek(start as u64).expect("seek");
+        let lossy = lossy_reader.read_frames(len).expect("read");
+        assert_ne!(lossy, window, "lossy reader must differ on a hybrid stream");
+    }
+}
+
 /// Corrupting the `.wvc` correction payload must trip the round-415
 /// pair mute gate (the `.wvc` header CRC covers the LOSSLESS decode):
 /// the block is zeroed and `all_crc_ok` is false — never silently

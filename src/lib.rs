@@ -888,7 +888,8 @@ pub use crate::metadata::{ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFl
 pub use crate::overflow_bits::PackedOverflowBits;
 pub use crate::packed_samples::PackedSamples;
 pub use crate::seek::{
-    decode_range, decode_range_muted, IndexEntry, SetEntry, StreamIndex, StreamReader,
+    decode_range, decode_range_muted, decode_range_with_correction,
+    decode_range_with_correction_muted, IndexEntry, SetEntry, StreamIndex, StreamReader,
 };
 
 // ---------------------------------------------------------------------------

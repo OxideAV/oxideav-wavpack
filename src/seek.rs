@@ -464,11 +464,137 @@ fn decode_set(
     Ok((out, all_crc_ok))
 }
 
+/// Locate and parse the correction (`.wvc`) counterpart members of the
+/// main-stream set `set`, on the correction buffer's own header-only
+/// index (round 415).
+///
+/// The `.wv` and `.wvc` files have identical block structure, so a main
+/// set's counterpart is the correction set covering the **same frame
+/// range** — found here by `first_frame` / `frames` equality (partial
+/// `.wvc` coverage simply has no counterpart: `Ok(None)`, and the
+/// caller decodes the set lossy). A counterpart with a different member
+/// count, or a member disagreeing on the mono flag, is refused with
+/// [`Error::CorrectionShapeMismatch`] — the same agreement rules
+/// [`crate::pair_correction_stream`] enforces per pair.
+fn correction_set_members<'b>(
+    corr_bytes: &'b [u8],
+    corr_index: &StreamIndex,
+    index: &StreamIndex,
+    set: &SetEntry,
+) -> Result<Option<Vec<crate::WavPackBlock<'b>>>> {
+    let Some(corr_set) = corr_index
+        .sets()
+        .iter()
+        .find(|s| s.first_frame == set.first_frame && s.frames == set.frames)
+    else {
+        return Ok(None);
+    };
+    if corr_set.member_entries().len() != set.member_entries().len() {
+        return Err(Error::CorrectionShapeMismatch(set.first_frame));
+    }
+    let mut members = Vec::with_capacity(corr_set.member_entries().len());
+    for (&corr_member, &main_member) in corr_set.member_entries().iter().zip(set.member_entries()) {
+        let corr_entry = &corr_index.entries()[corr_member];
+        let main_entry = &index.entries()[main_member];
+        if corr_entry.flags.mono != main_entry.flags.mono {
+            return Err(Error::CorrectionShapeMismatch(set.first_frame));
+        }
+        let slice = corr_bytes
+            .get(corr_entry.byte_range())
+            .ok_or(Error::Truncated)?;
+        let (block, _tail) = crate::block::parse_block(slice)?;
+        members.push(block);
+    }
+    Ok(Some(members))
+}
+
+/// [`decode_set`] with an optional `.wvc` correction source (round
+/// 415): when the correction index carries this set's counterpart,
+/// every member decodes hybrid-lossless
+/// ([`crate::WavPackBlock::decode_samples_with_correction`], CRC-gated
+/// against the `.wvc` header's lossless CRC in muted mode); otherwise
+/// the set decodes exactly as [`decode_set`] does.
+fn decode_set_with_correction(
+    bytes: &[u8],
+    index: &StreamIndex,
+    set: &SetEntry,
+    correction: Option<(&[u8], &StreamIndex)>,
+    muted: bool,
+) -> Result<(Vec<i32>, bool)> {
+    let twins = match correction {
+        Some((corr_bytes, corr_index)) => {
+            correction_set_members(corr_bytes, corr_index, index, set)?
+        }
+        None => None,
+    };
+    let Some(twins) = twins else {
+        return decode_set(bytes, index, set, muted);
+    };
+
+    let mut channels: Vec<Vec<i32>> = Vec::with_capacity(set.channels);
+    let mut all_crc_ok = true;
+    for (&member_idx, twin) in set.member_entries().iter().zip(&twins) {
+        let entry = &index.entries()[member_idx];
+        let slice = bytes.get(entry.byte_range()).ok_or(Error::Truncated)?;
+        let (block, _tail) = crate::block::parse_block(slice)?;
+        if block.header().block_samples != set.frames {
+            return Err(Error::MultichannelSampleCountMismatch {
+                expected: set.frames,
+                found: block.header().block_samples,
+            });
+        }
+        let member_channels = if block.flags().mono { 1 } else { 2 };
+        if member_channels != entry.member_channels() {
+            return Err(Error::MultichannelSetMalformed);
+        }
+        let pcm = if muted {
+            let (pcm, crc_ok) = block.decode_samples_with_correction_muted(twin)?;
+            all_crc_ok &= crc_ok;
+            pcm
+        } else {
+            block.decode_samples_with_correction(twin)?
+        };
+        if member_channels == 1 {
+            channels.push(pcm);
+        } else {
+            let frames = pcm.len() / 2;
+            let mut left = Vec::with_capacity(frames);
+            let mut right = Vec::with_capacity(frames);
+            for pair in pcm.chunks_exact(2) {
+                left.push(pair[0]);
+                right.push(pair[1]);
+            }
+            channels.push(left);
+            channels.push(right);
+        }
+    }
+    let frames = set.frames as usize;
+    let mut out = Vec::with_capacity(frames * set.channels);
+    for f in 0..frames {
+        for ch in &channels {
+            out.push(ch[f]);
+        }
+    }
+    Ok((out, all_crc_ok))
+}
+
 /// Shared range-decode core for [`decode_range`] (`muted == false`)
 /// and [`decode_range_muted`].
 fn decode_range_inner(
     bytes: &[u8],
     index: &StreamIndex,
+    start_frame: u64,
+    frames: u64,
+    muted: bool,
+) -> Result<(Vec<i32>, bool)> {
+    decode_range_pair_inner(bytes, index, None, start_frame, frames, muted)
+}
+
+/// Range-decode core with an optional correction source (round 415).
+fn decode_range_pair_inner(
+    bytes: &[u8],
+    index: &StreamIndex,
+    correction: Option<(&[u8], &StreamIndex)>,
     start_frame: u64,
     frames: u64,
     muted: bool,
@@ -506,7 +632,7 @@ fn decode_range_inner(
     let mut cursor = start_frame;
     while cursor < end_frame {
         let set = &index.sets()[set_idx];
-        let (pcm, crc_ok) = decode_set(bytes, index, set, muted)?;
+        let (pcm, crc_ok) = decode_set_with_correction(bytes, index, set, correction, muted)?;
         all_crc_ok &= crc_ok;
         // Overlap of [cursor, end_frame) with this set, in set-local
         // frame offsets.
@@ -565,6 +691,58 @@ pub fn decode_range_muted(
     decode_range_inner(bytes, index, start_frame, frames, true)
 }
 
+/// [`decode_range`] over a hybrid-lossless `.wv` + `.wvc` **pair**
+/// (round 415): the window's member sets decode losslessly by pairing
+/// each set with the correction buffer's counterpart set (matched by
+/// frame range on a header-only [`StreamIndex::scan`] of `correction`,
+/// run internally per call — no audio decode outside the window). Sets
+/// the correction chain does not cover fall back to their coarse lossy
+/// decode, matching [`crate::decode_stream_with_correction`]'s partial
+/// coverage posture. The result is bit-exactly the same window sliced
+/// from [`crate::decode_multichannel_stream_with_correction`]'s
+/// whole-stream output.
+pub fn decode_range_with_correction(
+    bytes: &[u8],
+    index: &StreamIndex,
+    correction: &[u8],
+    start_frame: u64,
+    frames: u64,
+) -> Result<Vec<i32>> {
+    let corr_index = StreamIndex::scan(correction)?;
+    decode_range_pair_inner(
+        bytes,
+        index,
+        Some((correction, &corr_index)),
+        start_frame,
+        frames,
+        false,
+    )
+    .map(|(pcm, _)| pcm)
+}
+
+/// The spec §5.6 CRC-mute twin of [`decode_range_with_correction`]:
+/// every paired member the window touches is gated against its `.wvc`
+/// header's stored **lossless** CRC (round-415 pin), unpaired members
+/// against their own `.wv` header CRC; a failing member contributes
+/// zeros. `all_crc_ok` covers only the members the window touched.
+pub fn decode_range_with_correction_muted(
+    bytes: &[u8],
+    index: &StreamIndex,
+    correction: &[u8],
+    start_frame: u64,
+    frames: u64,
+) -> Result<(Vec<i32>, bool)> {
+    let corr_index = StreamIndex::scan(correction)?;
+    decode_range_pair_inner(
+        bytes,
+        index,
+        Some((correction, &corr_index)),
+        start_frame,
+        frames,
+        true,
+    )
+}
+
 /// A seekable decoding cursor over an indexed WavPack stream.
 ///
 /// Wraps a byte buffer plus its [`StreamIndex`] and exposes the
@@ -585,6 +763,10 @@ pub fn decode_range_muted(
 pub struct StreamReader<'a> {
     bytes: &'a [u8],
     index: StreamIndex,
+    /// Companion `.wvc` correction buffer + its header-only index
+    /// (round 415): when present, every set whose counterpart the
+    /// correction chain carries decodes hybrid-lossless.
+    correction: Option<(&'a [u8], StreamIndex)>,
     /// Absolute frame index of the next frame a read will return.
     position: u64,
     /// Most recently decoded set.
@@ -619,6 +801,20 @@ impl<'a> StreamReader<'a> {
         Self::with_index(bytes, StreamIndex::scan(bytes)?)
     }
 
+    /// Open a cursor over a hybrid-lossless `.wv` + `.wvc` **pair**
+    /// (round 415): reads decode each member set losslessly whenever
+    /// the correction chain carries its counterpart (matched by frame
+    /// range on a header-only scan of `correction`, done once here),
+    /// falling back to the coarse lossy decode for uncovered sets —
+    /// the seek-shaped twin of
+    /// [`crate::decode_stream_with_correction`]. Muted reads gate
+    /// paired members against the `.wvc` header's stored lossless CRC.
+    pub fn new_with_correction(bytes: &'a [u8], correction: &'a [u8]) -> Result<Self> {
+        let mut reader = Self::with_index(bytes, StreamIndex::scan(bytes)?)?;
+        reader.correction = Some((correction, StreamIndex::scan(correction)?));
+        Ok(reader)
+    }
+
     /// Open a cursor over an already-scanned index. `bytes` must be
     /// the buffer `index` was scanned from.
     pub fn with_index(bytes: &'a [u8], index: StreamIndex) -> Result<Self> {
@@ -629,6 +825,7 @@ impl<'a> StreamReader<'a> {
         Ok(Self {
             bytes,
             index,
+            correction: None,
             position,
             cache: None,
         })
@@ -778,8 +975,17 @@ impl<'a> StreamReader<'a> {
                 _ => false,
             };
             if !reusable {
-                let (pcm, crc_ok) =
-                    decode_set(self.bytes, &self.index, &self.index.sets()[set_idx], muted)?;
+                let correction = self
+                    .correction
+                    .as_ref()
+                    .map(|(bytes, index)| (*bytes, index));
+                let (pcm, crc_ok) = decode_set_with_correction(
+                    self.bytes,
+                    &self.index,
+                    &self.index.sets()[set_idx],
+                    correction,
+                    muted,
+                )?;
                 self.cache = Some(CachedSet {
                     set_idx,
                     pcm,
