@@ -656,15 +656,22 @@ impl<'a> WavPackBlock<'a> {
     /// no / static-positive / dynamic shaping, 16- and 24-bit, single-
     /// and multi-block.
     ///
+    /// **Float / int32 pairs** (round 415): the scaled-integer stream
+    /// decodes through the same coarse+correction machinery, and the
+    /// sample-format fixup (staged spec `wavpack-sample-formats.md`
+    /// §2/§3) then reads its `0x0C` extension bits from the
+    /// **correction** block — a pair encode carries `0x07`/`0x0B`/`0x0C`
+    /// there (round-415 structural pin) — falling back to this block's
+    /// own `0x0C` when the correction twin has none. Float PCM comes
+    /// back as IEEE-754 bit patterns in the `i32` slots, as with
+    /// [`Self::decode_samples`].
+    ///
     /// # Errors
     ///
     /// * [`Error::BlockNotHybrid`] — this block's `HYBRID_FLAG` is clear.
-    /// * [`Error::UnsupportedBlockFeature`] (`FloatData` / `Int32Mode`)
-    ///   — the sample-format extension interplay of a paired decode is
-    ///   not yet pinned.
     /// * Structural errors as raised by [`Self::decode_samples`].
     ///
-    /// Round 408; joint-stereo pairs round 415.
+    /// Round 408; joint-stereo + float/int32 pairs round 415.
     pub fn decode_samples_with_correction(
         &self,
         correction: &WavPackBlock<'_>,
@@ -679,16 +686,6 @@ impl<'a> WavPackBlock<'a> {
         if flags.low_latency_block {
             return Err(Error::UnsupportedBlockFeature(
                 UnsupportedBlockFeature::LowLatencyBlock,
-            ));
-        }
-        if flags.float_data {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::FloatData,
-            ));
-        }
-        if flags.int32_mode {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::Int32Mode,
             ));
         }
         // A correction twin without an 0x0B sub-block is legal when the
@@ -730,14 +727,25 @@ impl<'a> WavPackBlock<'a> {
                     .ok_or(Error::InvalidEntropyInfoForStereo)?,
             ];
             if flags.joint_stereo {
-                return self.decode_joint_samples_with_correction(
+                let mut out = self.decode_joint_samples_with_correction(
                     &packed,
                     &corr_data,
                     &mut medians,
                     count,
                     &mut hybrid,
                     &mut shaping,
-                );
+                )?;
+                // Sample-format fixups read the 0x0C extension stream
+                // that a pair encode places in the CORRECTION block
+                // (round-415 structural pin), then the final left shift.
+                self.apply_sample_format_fixups_with(
+                    &mut out,
+                    correction
+                        .packed_overflow_bits()
+                        .or_else(|| self.packed_overflow_bits()),
+                )?;
+                crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
+                return Ok(out);
             }
             crate::samples::decode_packed_samples_stereo_hybrid_lossless(
                 &packed,
@@ -777,6 +785,15 @@ impl<'a> WavPackBlock<'a> {
         for (o, (e, c)) in out.iter_mut().zip(exact.iter().zip(coarse.iter())) {
             *o = o.wrapping_add(e.wrapping_sub(*c));
         }
+        // Sample-format fixups (float / int32) read the 0x0C extension
+        // stream that a pair encode places in the CORRECTION block
+        // (round-415 structural pin), then the final left shift runs.
+        self.apply_sample_format_fixups_with(
+            &mut out,
+            correction
+                .packed_overflow_bits()
+                .or_else(|| self.packed_overflow_bits()),
+        )?;
         crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
         Ok(self.expand_false_stereo(out))
     }
@@ -848,7 +865,8 @@ impl<'a> WavPackBlock<'a> {
             out.push(left);
             out.push(right);
         }
-        crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
+        // Sample-format fixups + the final left shift are applied by the
+        // caller (the 0x0C source differs on a pair decode).
         Ok(out)
     }
 
@@ -1537,10 +1555,24 @@ impl<'a> WavPackBlock<'a> {
     /// [`Error::BlockMissingOverflowBits`], [`Error::Int32InfoLength`],
     /// [`Error::Int32InfoConflict`], [`Error::OverflowBitsTooShort`].
     fn apply_sample_format_fixups(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
+        self.apply_sample_format_fixups_with(pcm, self.packed_overflow_bits())
+    }
+
+    /// [`Self::apply_sample_format_fixups`] with an explicit `0x0C`
+    /// extension-stream source. On a hybrid-lossless pair decode the
+    /// wvx stream rides in the **correction** block alongside `0x0B`
+    /// and `0x07` (round-415 structural pin against reference pair
+    /// encodes), so the pair paths pass the correction block's
+    /// overflow-bits view here instead of this block's own.
+    fn apply_sample_format_fixups_with(
+        &self,
+        pcm: &mut [i32],
+        overflow: Option<crate::PackedOverflowBits<'_>>,
+    ) -> Result<Option<(u32, u32)>> {
         if self.header.flags.float_data {
-            return self.apply_float_fixup(pcm);
+            return self.apply_float_fixup(pcm, overflow);
         }
-        self.apply_int32_fixup(pcm)
+        self.apply_int32_fixup(pcm, overflow)
     }
 
     /// The float half of [`Self::apply_sample_format_fixups`] (staged
@@ -1557,12 +1589,15 @@ impl<'a> WavPackBlock<'a> {
     /// `EXCEPTIONS`-capable block without one is accepted until an
     /// exceptional sample actually needs a payload bit (the per-sample
     /// read then raises [`Error::BlockMissingOverflowBits`]).
-    fn apply_float_fixup(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
+    fn apply_float_fixup(
+        &self,
+        pcm: &mut [i32],
+        overflow: Option<crate::PackedOverflowBits<'_>>,
+    ) -> Result<Option<(u32, u32)>> {
         let info_sub = self
             .find_sub_block(SubBlockId::FloatInfo)
             .ok_or(Error::BlockMissingFloatInfo)?;
         let info = crate::float::expand_float_info(info_sub.payload)?;
-        let overflow = self.packed_overflow_bits();
         if info.requires_extension() && overflow.is_none() {
             // A hybrid (lossy) float block legitimately omits the wvx
             // stream while keeping the profile flags: the dropped low
@@ -1593,7 +1628,11 @@ impl<'a> WavPackBlock<'a> {
 
     /// The int32 half of [`Self::apply_sample_format_fixups`] (staged
     /// spec `wavpack-sample-formats.md` §3).
-    fn apply_int32_fixup(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
+    fn apply_int32_fixup(
+        &self,
+        pcm: &mut [i32],
+        overflow: Option<crate::PackedOverflowBits<'_>>,
+    ) -> Result<Option<(u32, u32)>> {
         if !self.header.flags.int32_mode {
             return Ok(None);
         }
@@ -1602,9 +1641,16 @@ impl<'a> WavPackBlock<'a> {
             .ok_or(Error::BlockMissingInt32Info)?;
         let info = crate::int32::expand_int32_info(info_sub.payload)?;
         if info.requires_extension() {
-            let overflow = self
-                .packed_overflow_bits()
-                .ok_or(Error::BlockMissingOverflowBits)?;
+            if overflow.is_none() && self.header.flags.hybrid {
+                // A hybrid (lossy) int32 block legitimately omits the wvx
+                // stream (a pair encode carries it in the .wvc twin): the
+                // sent_bits window fills with implied zeros, mirroring the
+                // float posture (round-415 black-box pin against the
+                // reference lossy decode of a sent-bits int32 file).
+                crate::int32::reassemble_int32_implied(pcm, &info);
+                return Ok(None);
+            }
+            let overflow = overflow.ok_or(Error::BlockMissingOverflowBits)?;
             let stored = overflow.crc_wvx()?;
             let mut reader = overflow.extension_bit_reader()?;
             let computed = crate::int32::reassemble_int32(pcm, &info, Some(&mut reader))?;
@@ -1615,7 +1661,7 @@ impl<'a> WavPackBlock<'a> {
             // 0x0C stream (decorrelation doc §5.5), so compare only
             // when one is on the wire.
             let computed = crate::int32::reassemble_int32(pcm, &info, None)?;
-            match self.packed_overflow_bits() {
+            match overflow {
                 Some(overflow) => Ok(Some((computed, overflow.crc_wvx()?))),
                 None => Ok(None),
             }
@@ -2599,10 +2645,11 @@ pub fn total_correction_payload_bytes(bytes: &[u8]) -> Result<u64> {
 /// Metadata-only blocks (`block_samples == 0`) on either side are
 /// skipped — they never carry sample words to pair. Parse errors from
 /// either chain surface verbatim. Note this is **structural** pairing
-/// only: folding a pair's `0x0B` correction words into the round-408
-/// coarse (lossy) decode is a separate step (the noise-shaped fold
-/// remains a documented gap), so today's callers use this to locate /
-/// validate / size correction coverage.
+/// only: folding a pair's `0x0B` correction words into the coarse
+/// (lossy) decode is a separate step
+/// ([`WavPackBlock::decode_samples_with_correction`] /
+/// [`decode_stream_with_correction`]), so this is the locate /
+/// validate / size layer of the two-file decode.
 /// Decode a hybrid `.wv` stream **losslessly** against its companion
 /// `.wvc` correction stream (mono / stereo chains, the
 /// [`decode_stream`] shape) — spec §4.1 hybrid-lossless, round 408.
@@ -2628,6 +2675,23 @@ pub fn decode_stream_with_correction(main: &[u8], correction: &[u8]) -> Result<V
         out.extend_from_slice(&pcm);
     }
     Ok(out)
+}
+
+/// Decode a hybrid **float** `.wv` + `.wvc` pair to `f32` PCM — the
+/// typed twin of [`decode_stream_with_correction`] for `FLOAT_DATA`
+/// streams (the `i32` slots carry IEEE-754 bit patterns; this
+/// reinterprets them), mirroring [`decode_stream_f32`]. The stream's
+/// first audio block decides floatness; a non-float stream is refused
+/// with [`Error::BlockNotFloat`]. Round 415.
+pub fn decode_stream_with_correction_f32(main: &[u8], correction: &[u8]) -> Result<Vec<f32>> {
+    match first_audio_block(main)? {
+        Some(block) if block.is_float() => Ok(decode_stream_with_correction(main, correction)?
+            .into_iter()
+            .map(|bits| f32::from_bits(bits as u32))
+            .collect()),
+        Some(_) => Err(Error::BlockNotFloat),
+        None => Ok(Vec::new()),
+    }
 }
 
 pub fn pair_correction_stream<'a, 'b>(

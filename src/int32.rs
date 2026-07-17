@@ -180,6 +180,23 @@ pub fn reassemble_int32(
     Ok(crc_x.value())
 }
 
+/// [`reassemble_int32`] for a **hybrid (lossy) block without a `0x0C`
+/// extension stream**: a pair encode moves the wvx bits to the `.wvc`
+/// twin, so decoding the `.wv` alone has no literal low bits to read —
+/// the reference decoder fills the `sent_bits` window with **zeros**
+/// and still re-inserts the stripped redundancy pattern (round-415
+/// black-box pin: the lossy reference decode of a sent-bits int32
+/// hybrid file is bit-exact under the zero fill). The mirror of
+/// [`crate::float::reassemble_float_implied`] for `INT32_DATA`. No
+/// extension CRC is returned — there is no stored `crc_wvx` to
+/// compare against.
+pub fn reassemble_int32_implied(pcm: &mut [i32], info: &Int32Info) {
+    for slot in pcm.iter_mut() {
+        let value = slot.wrapping_shl(u32::from(info.sent_bits));
+        *slot = info.reinsert_redundancy(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

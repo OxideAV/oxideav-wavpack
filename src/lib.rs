@@ -850,13 +850,14 @@ oxideav_core::register!("wavpack", register);
 pub use crate::block::{
     audio_block_count, block_count, correction_block_count, correction_coverage,
     decode_multichannel_stream, decode_multichannel_stream_muted, decode_stream, decode_stream_f32,
-    decode_stream_muted, decode_stream_with_correction, decoded_sample_count, first_audio_block,
-    first_correction_block, iter_audio_blocks, iter_blocks, iter_correction_blocks,
-    iter_decoded_blocks, metadata_block_count, multichannel_layout, pair_correction_stream,
-    parse_block, parse_blocks, stream_channel_info, stream_sample_rate, stream_total_samples,
-    total_audio_samples, total_block_samples, total_correction_payload_bytes, AudioBlockIter,
-    BlockIter, CorrectionBlockIter, DecodedStream, MultichannelLayout, StreamDecodeIter,
-    UnsupportedBlockFeature, WavPackBlock, MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
+    decode_stream_muted, decode_stream_with_correction, decode_stream_with_correction_f32,
+    decoded_sample_count, first_audio_block, first_correction_block, iter_audio_blocks,
+    iter_blocks, iter_correction_blocks, iter_decoded_blocks, metadata_block_count,
+    multichannel_layout, pair_correction_stream, parse_block, parse_blocks, stream_channel_info,
+    stream_sample_rate, stream_total_samples, total_audio_samples, total_block_samples,
+    total_correction_payload_bytes, AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream,
+    MultichannelLayout, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
+    MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
 };
 pub use crate::block_header::{
     parse_block_header, sample_rate_index_for, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC,
@@ -951,7 +952,10 @@ pub use crate::hybrid::{
 };
 // Internal: INT32_DATA (0x09) profile plumbing behind `decode_stream`.
 #[doc(hidden)]
-pub use crate::int32::{expand_int32_info, reassemble_int32, Int32Info, INT32_INFO_PAYLOAD_BYTES};
+pub use crate::int32::{
+    expand_int32_info, reassemble_int32, reassemble_int32_implied, Int32Info,
+    INT32_INFO_PAYLOAD_BYTES,
+};
 // Internal: integer log2/exp2 wire converters used by the expanders.
 #[doc(hidden)]
 pub use crate::logpack::{

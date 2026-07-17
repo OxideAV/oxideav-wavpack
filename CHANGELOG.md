@@ -17,6 +17,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 415 — **float / int32 hybrid-lossless pairs decode, bit-exact;
+  int32 hybrid lossy decode gains the implied-zeros fill.** A pair
+  encode carries the `0x0C` wvx extension stream in the `.wvc` twin
+  alongside `0x07`/`0x0B` (structural pin against reference pair
+  encodes), so `decode_samples_with_correction` now runs the
+  sample-format fixups with the correction block's `0x0C` (falling
+  back to the main block's own) instead of refusing `FLOAT_DATA` /
+  `INT32_DATA` blocks: four new pair fixtures
+  (`foreign_hybrid_pair_{float,float_js,int32,int32_js}` — mono +
+  joint-stereo of each, the float stereo pair carrying exact ±0
+  samples) reproduce the original encoder input bit-exactly, composing
+  the joint-stereo shaping leg with the §2/§3 reconstruction.
+  `decode_stream_with_correction_f32` is the typed float pair twin of
+  `decode_stream_f32`. On the **lossy** side, decoding a sent-bits
+  int32 hybrid `.wv` alone no longer errors with
+  `BlockMissingOverflowBits`: the missing wvx window fills with
+  implied zeros before redundancy re-insertion
+  (`reassemble_int32_implied`, mirroring the round-408 float
+  posture), pinned bit-exact against the reference lossy decode
+  (`foreign_hybrid_int32_b4`, stored block CRC matching).
+
 - Round 415 — **`CROSS_DECORR` hybrid pairs pinned decorative;
   cross-flagged blocks fold raw.** Reference maximum-compression
   hybrid pairs set flag bit 5 (`CROSS_DECORR`), whose staged-spec §4.1

@@ -70,6 +70,11 @@
 //! | `foreign_hybrid_pair_js_cc`    | `-b4 -cc`    | joint pair, `CROSS_DECORR` flag + dynamic shaping (round 415 — the bit is decorative; post-decorrelation fold is bit-exact) |
 //! | `foreign_hybrid_pair_js_cc_s0` | `-b4 -cc -s0` | joint `CROSS_DECORR` pair, shaping off |
 //! | `foreign_hybrid_pair_lr_cc`    | `-b4 -cc -j0` | left/right `CROSS_DECORR` pair, dynamic shaping |
+//! | `foreign_hybrid_pair_float`    | `-b4 -c`     | 32-bit float mono pair (`0x08` + wvc-carried `0x0C`, round 415) |
+//! | `foreign_hybrid_pair_float_js` | `-b4 -c`     | 32-bit float JOINT-stereo pair with exact ±0 samples |
+//! | `foreign_hybrid_pair_int32`    | `-b4 -c`     | 32-bit int mono pair (`0x09` sent-bits + wvc-carried `0x0C`) |
+//! | `foreign_hybrid_pair_int32_js` | `-b4 -c`     | 32-bit int JOINT-stereo pair |
+//! | `foreign_hybrid_int32_b4`      | `-b4 -c` (wv only) | 32-bit int hybrid LOSSY decode — the pair's `.wv` alone; sent-bits fill with implied zeros |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -197,6 +202,7 @@ foreign_fixture!(
     2
 );
 foreign_fixture!(hybrid_float_b4_is_bit_exact, "foreign_hybrid_float_b4", 1);
+foreign_fixture!(hybrid_int32_b4_is_bit_exact, "foreign_hybrid_int32_b4", 1);
 foreign_fixture!(
     hybrid_false_stereo_b4_is_bit_exact,
     "foreign_hybrid_false_stereo_b4",
@@ -257,6 +263,41 @@ hybrid_pair_fixture!(
     "foreign_hybrid_pair_js_cc_s0"
 );
 hybrid_pair_fixture!(hybrid_pair_lr_cc_is_lossless, "foreign_hybrid_pair_lr_cc");
+hybrid_pair_fixture!(hybrid_pair_float_is_lossless, "foreign_hybrid_pair_float");
+hybrid_pair_fixture!(
+    hybrid_pair_float_js_is_lossless,
+    "foreign_hybrid_pair_float_js"
+);
+hybrid_pair_fixture!(hybrid_pair_int32_is_lossless, "foreign_hybrid_pair_int32");
+hybrid_pair_fixture!(
+    hybrid_pair_int32_js_is_lossless,
+    "foreign_hybrid_pair_int32_js"
+);
+
+/// The typed f32 pair twin: bit patterns reinterpret, ±0 signs survive,
+/// and an integer pair is refused.
+#[test]
+fn hybrid_pair_float_f32_twin_matches_bit_patterns() {
+    let wv = include_bytes!("data/foreign_hybrid_pair_float_js.wv");
+    let wvc = include_bytes!("data/foreign_hybrid_pair_float_js.wvc");
+    let expected = expected_pcm(include_bytes!("data/foreign_hybrid_pair_float_js.pcm32le"));
+    let floats =
+        oxideav_wavpack::decode_stream_with_correction_f32(wv, wvc).expect("f32 pair decode");
+    assert_eq!(floats.len(), expected.len());
+    for (f, bits) in floats.iter().zip(&expected) {
+        assert_eq!(f.to_bits(), *bits as u32, "bit-pattern parity");
+    }
+    // The synthesized source interleaves exact +0.0 and -0.0 samples.
+    assert!(floats.iter().any(|f| *f == 0.0 && f.is_sign_positive()));
+    assert!(floats.iter().any(|f| *f == 0.0 && f.is_sign_negative()));
+
+    let int_wv = include_bytes!("data/foreign_hybrid_pair_int32.wv");
+    let int_wvc = include_bytes!("data/foreign_hybrid_pair_int32.wvc");
+    assert!(matches!(
+        oxideav_wavpack::decode_stream_with_correction_f32(int_wv, int_wvc),
+        Err(oxideav_wavpack::Error::BlockNotFloat)
+    ));
+}
 hybrid_pair_fixture!(
     hybrid_pair_mono_s0_is_lossless,
     "foreign_hybrid_pair_mono_s0"

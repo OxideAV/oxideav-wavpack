@@ -501,8 +501,17 @@ is decorative on current-version files — three cross-flagged fixtures
 bit-exactly under the same post-decorrelation fold, so
 `fold_hybrid_correction` / `split_hybrid_correction` accept the cross
 placement and only the noise-shaped placement still routes through
-the full pair decode. The remaining hybrid gap: float / int32 hybrid
-pairs.
+the full pair decode. **Float and int32 pairs decode losslessly**
+(round 415): a pair encode carries the `0x0C` wvx extension stream in
+the `.wvc` twin alongside `0x07`/`0x0B` (structural pin), so the
+sample-format fixup on a pair decode reads its literal
+mantissa / sent-bits from the correction block —
+`decode_stream_with_correction_f32` is the typed float twin — and the
+**lossy** `.wv`-only decode of a sent-bits int32 hybrid file fills
+the missing wvx window with implied zeros (`reassemble_int32_implied`,
+mirroring the round-408 float posture), pinned bit-exact against the
+reference lossy decode. Every hybrid shape the reference encoder
+produces now decodes: no hybrid gaps remain.
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged
