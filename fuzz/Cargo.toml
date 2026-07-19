@@ -72,3 +72,9 @@ name = "correction_pair_decode"
 path = "fuzz_targets/correction_pair_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "hybrid_encode_roundtrip"
+path = "fuzz_targets/hybrid_encode_roundtrip.rs"
+test = false
+doc = false

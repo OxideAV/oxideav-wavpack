@@ -17,6 +17,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 418 — **`hybrid_encode_roundtrip` fuzz target** — the
+  pair-decode oracle over the origination surface: fuzz bytes become
+  PCM + a control byte sweeping mono/stereo × joint × decorrelation
+  ceiling (raw included) × bitrate words 0..2000 × plain/float/int32
+  formats; every emitted pair must decode back bit-exactly with
+  green CRC gates, every lossy `.wv` must decode and stay within the
+  clamp range. Seeded with a curated starter corpus; a 7-minute
+  opening campaign (~5M runs) plus regression slices over the decode
+  targets came back clean after the clamp-underflow fix.
+
 - Round 418 — **float / int32 hybrid pairs.**
   `encode_block_{mono,stereo}_hybrid_{float,int32}` and their
   `encode_stream_*` twins compose the sample-format deconstructions
@@ -61,6 +71,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   words 0..800 × multi-block × 24-bit × silence).
 
 ### Fixed
+
+- Round 418 — **left-shift underflow in the new hybrid output
+  clamp** (found within minutes by the fuzz battery; the offending
+  input is kept as a corpus regression seed): a hostile header
+  combining a hybrid flag with a left-shift count past the container
+  width underflowed the clamp's effective-bits subtraction in debug
+  builds. The subtraction now saturates (the existing 1..=32 floor
+  keeps the range well-formed).
 
 - Round 418 — **hybrid lossy output clamp** (black-box pin): the
   reference decoder saturates each lossy-path reconstructed sample

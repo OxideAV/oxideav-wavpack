@@ -1638,7 +1638,11 @@ impl<'a> WavPackBlock<'a> {
         if !flags.hybrid {
             return;
         }
-        let mut bits = u32::from(flags.bytes_per_sample()) * 8 - u32::from(flags.left_shift);
+        // Hostile headers can carry a left shift past the container
+        // width; saturate (the clamp-bits floor below keeps the range
+        // well-formed).
+        let mut bits =
+            (u32::from(flags.bytes_per_sample()) * 8).saturating_sub(u32::from(flags.left_shift));
         if flags.int32_mode {
             if let Some(sub) = self.find_sub_block(SubBlockId::Int32Info) {
                 if let Ok(info) = crate::int32::expand_int32_info(sub.payload) {
