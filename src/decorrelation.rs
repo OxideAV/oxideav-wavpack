@@ -1759,6 +1759,278 @@ pub fn serialize_stereo_passes(passes: &[DecorrPass]) -> Result<(Vec<u8>, Vec<u8
     Ok((terms, weights, samples))
 }
 
+// -----------------------------------------------------------------------
+// Per-sample steppers (round 418) — the decoder's §3.2/§3.3/§3.7
+// whole-buffer-per-pass loops re-expressed one sample (mono) / one frame
+// (stereo) at a time, for consumers that need the decoder's running
+// state *mid-stream*. The hybrid (lossy) encoder is the driving use:
+// its quantization feedback loop must know, per sample, the additive
+// prediction offset the decoder will reconstruct from the *coarse*
+// values it has emitted so far.
+//
+// Equivalence: pass `k` at sample `n` reads only pass `k`'s own history
+// (its outputs at samples `< n`) and its input (pass `k-1`'s output at
+// sample `n`), so applying the passes whole-buffer-per-pass and
+// sample-by-sample-through-all-passes produce identical values and
+// identical final pass state — pinned by the parity tests below.
+// -----------------------------------------------------------------------
+
+/// One-sample-at-a-time driver of a **mono** application-ordered pass
+/// list — arithmetic-identical to [`decorrelate_mono`], exposed as a
+/// running state machine (round 418).
+///
+/// Per sample the decoder computes
+/// `out = residual + Σ_j apply_weight(w_j, pred_j)` where every
+/// `pred_j` depends only on *past* outputs, so the additive
+/// [`Self::offset`] is known **before** the sample's residual — the
+/// property the hybrid encoder's feedback loop builds on
+/// (`residual = sample − offset`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonoStepper {
+    passes: Vec<DecorrPass>,
+    /// Samples processed so far — the §3.2 ring cursor `m` shared by
+    /// every fixed-lag pass (each pass's `m` advances once per sample).
+    n: usize,
+}
+
+impl MonoStepper {
+    /// Wrap an application-ordered mono pass list (the list
+    /// [`decorrelate_mono`] consumes). Rejects cross terms
+    /// ([`Error::CrossTermOnMono`]) and over-long lists
+    /// ([`Error::TooManyDecorrelationPasses`]) exactly as the
+    /// whole-buffer loop does.
+    pub fn new(passes: Vec<DecorrPass>) -> Result<Self> {
+        if passes.len() > MAX_NTERMS {
+            return Err(Error::TooManyDecorrelationPasses(passes.len()));
+        }
+        for pass in &passes {
+            if is_cross_term(pass.term) {
+                return Err(Error::CrossTermOnMono(pass.term));
+            }
+        }
+        Ok(MonoStepper { passes, n: 0 })
+    }
+
+    /// The pass list's current state (inspection / serialization).
+    #[must_use]
+    pub fn passes(&self) -> &[DecorrPass] {
+        &self.passes
+    }
+
+    /// The predictor of one pass from its current state.
+    fn pred(pass: &DecorrPass, n: usize) -> i32 {
+        match pass.term {
+            17 => pass.history_a[0]
+                .wrapping_mul(2)
+                .wrapping_sub(pass.history_a[1]),
+            18 => {
+                pass.history_a[0]
+                    .wrapping_mul(3)
+                    .wrapping_sub(pass.history_a[1])
+                    >> 1
+            }
+            _ => pass.history_a[n & (MAX_TERM as usize - 1)],
+        }
+    }
+
+    /// The additive prediction offset the next sample's reconstruction
+    /// will apply: `Σ_j apply_weight(w_j, pred_j)` over the chain, all
+    /// from past state (pure — reads no residual, mutates nothing).
+    #[must_use]
+    pub fn offset(&self) -> i32 {
+        let mut sum = 0i32;
+        for pass in &self.passes {
+            sum = sum.wrapping_add(apply_weight(pass.weight_a, Self::pred(pass, self.n)));
+        }
+        sum
+    }
+
+    /// Advance one sample: reconstruct `residual` through the pass
+    /// chain exactly as [`decorrelate_mono`] does (same weight updates,
+    /// same history pushes) and return the reconstructed sample —
+    /// always `residual + self.offset()` as of entry.
+    pub fn advance(&mut self, residual: i32) -> i32 {
+        let n = self.n;
+        let mut x = residual;
+        for pass in &mut self.passes {
+            let pred = Self::pred(pass, n);
+            let input = x;
+            x = apply_weight(pass.weight_a, pred).wrapping_add(input);
+            pass.weight_a = update_weight(pass.weight_a, pass.delta, pred, input);
+            if pass.term == 17 || pass.term == 18 {
+                pass.history_a[1] = pass.history_a[0];
+                pass.history_a[0] = x;
+            } else {
+                let w = (n + pass.term as usize) & (MAX_TERM as usize - 1);
+                pass.history_a[w] = x;
+            }
+        }
+        self.n = self.n.wrapping_add(1);
+        x
+    }
+}
+
+/// One-frame-at-a-time driver of a **stereo** application-ordered pass
+/// list — arithmetic-identical to [`decorrelate_stereo`], exposed as a
+/// running state machine (round 418).
+///
+/// The per-frame arithmetic keeps channel A's offset independent of
+/// the frame ([`Self::offset_a`] is pure), while channel B's may read
+/// the *same frame's* reconstructed A through the `-1` cross term —
+/// so [`Self::offset_b`] takes A's residual. Term `-2` (A predicted
+/// from the same frame's B) inverts that order and cannot be driven in
+/// the encode direction; the constructor refuses it
+/// ([`Error::EncodeHybridTermUnsupported`]). `-3` reads only past
+/// values on both channels and is accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StereoStepper {
+    passes: Vec<DecorrPass>,
+    /// Frames processed so far (the shared fixed-lag ring cursor).
+    n: usize,
+}
+
+impl StereoStepper {
+    /// Wrap an application-ordered stereo pass list (the list
+    /// [`decorrelate_stereo`] consumes). Rejects term `-2`
+    /// ([`Error::EncodeHybridTermUnsupported`]) and over-long lists
+    /// ([`Error::TooManyDecorrelationPasses`]).
+    pub fn new(passes: Vec<DecorrPass>) -> Result<Self> {
+        if passes.len() > MAX_NTERMS {
+            return Err(Error::TooManyDecorrelationPasses(passes.len()));
+        }
+        for pass in &passes {
+            if pass.term == -2 {
+                return Err(Error::EncodeHybridTermUnsupported(pass.term));
+            }
+        }
+        Ok(StereoStepper { passes, n: 0 })
+    }
+
+    /// The pass list's current state (inspection / serialization).
+    #[must_use]
+    pub fn passes(&self) -> &[DecorrPass] {
+        &self.passes
+    }
+
+    /// Channel-A predictor of one pass from its current state.
+    fn pred_a(pass: &DecorrPass, n: usize) -> i32 {
+        match pass.term {
+            -1 => pass.history_a[0],
+            -3 => pass.history_b[0],
+            17 => pass.history_a[0]
+                .wrapping_mul(2)
+                .wrapping_sub(pass.history_a[1]),
+            18 => {
+                pass.history_a[0]
+                    .wrapping_mul(3)
+                    .wrapping_sub(pass.history_a[1])
+                    >> 1
+            }
+            _ => pass.history_a[n & (MAX_TERM as usize - 1)],
+        }
+    }
+
+    /// Channel-B predictor of one pass; `a_out` is this frame's
+    /// channel-A output of the same pass (consumed by `-1` only).
+    fn pred_b(pass: &DecorrPass, n: usize, a_out: i32) -> i32 {
+        match pass.term {
+            -1 => a_out,
+            -3 => pass.history_a[0],
+            17 => pass.history_b[0]
+                .wrapping_mul(2)
+                .wrapping_sub(pass.history_b[1]),
+            18 => {
+                pass.history_b[0]
+                    .wrapping_mul(3)
+                    .wrapping_sub(pass.history_b[1])
+                    >> 1
+            }
+            _ => pass.history_b[n & (MAX_TERM as usize - 1)],
+        }
+    }
+
+    /// The additive prediction offset the next frame's channel-A
+    /// reconstruction will apply (pure — past state only).
+    #[must_use]
+    pub fn offset_a(&self) -> i32 {
+        let mut sum = 0i32;
+        for pass in &self.passes {
+            sum = sum.wrapping_add(apply_weight(pass.weight_a, Self::pred_a(pass, self.n)));
+        }
+        sum
+    }
+
+    /// The additive prediction offset the next frame's channel-B
+    /// reconstruction will apply, given channel A's residual for the
+    /// same frame (the `-1` cross term reads A's chain outputs). Pure
+    /// with respect to the stepper state.
+    #[must_use]
+    pub fn offset_b(&self, res_a: i32) -> i32 {
+        let mut sum = 0i32;
+        let mut x_a = res_a;
+        for pass in &self.passes {
+            let a_out = apply_weight(pass.weight_a, Self::pred_a(pass, self.n)).wrapping_add(x_a);
+            sum = sum.wrapping_add(apply_weight(
+                pass.weight_b,
+                Self::pred_b(pass, self.n, a_out),
+            ));
+            x_a = a_out;
+        }
+        sum
+    }
+
+    /// Advance one frame: reconstruct `(res_a, res_b)` through the
+    /// pass chain exactly as [`decorrelate_stereo`] does (same
+    /// clipped/unclipped weight updates, same history pushes / swaps)
+    /// and return the reconstructed `(a, b)` — always
+    /// `(res_a + offset_a(), res_b + offset_b(res_a))` as of entry.
+    pub fn advance(&mut self, res_a: i32, res_b: i32) -> (i32, i32) {
+        let n = self.n;
+        let mut x_a = res_a;
+        let mut x_b = res_b;
+        for pass in &mut self.passes {
+            let in_a = x_a;
+            let in_b = x_b;
+            let pred_a = Self::pred_a(pass, n);
+            let a = apply_weight(pass.weight_a, pred_a).wrapping_add(in_a);
+            let pred_b = Self::pred_b(pass, n, a);
+            let b = apply_weight(pass.weight_b, pred_b).wrapping_add(in_b);
+            match pass.term {
+                -1 => {
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, in_a);
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, in_b);
+                    pass.history_a[0] = b;
+                }
+                -3 => {
+                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, in_a);
+                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, in_b);
+                    pass.history_a[0] = a;
+                    pass.history_b[0] = b;
+                }
+                17 | 18 => {
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pred_a, in_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pred_b, in_b);
+                    pass.history_a[1] = pass.history_a[0];
+                    pass.history_a[0] = a;
+                    pass.history_b[1] = pass.history_b[0];
+                    pass.history_b[0] = b;
+                }
+                t => {
+                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pred_a, in_a);
+                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pred_b, in_b);
+                    let w = (n + t as usize) & (MAX_TERM as usize - 1);
+                    pass.history_a[w] = a;
+                    pass.history_b[w] = b;
+                }
+            }
+            x_a = a;
+            x_b = b;
+        }
+        self.n = self.n.wrapping_add(1);
+        (x_a, x_b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3757,6 +4029,126 @@ mod tests {
             let mut fwd = DecorrPass::new(term, 2, 1024, -1024, &seeds, &seeds).unwrap();
             recorrelate_stereo(std::slice::from_mut(&mut fwd), &mut buf).unwrap();
             assert_eq!(buf, [5, -9, 2, 4]);
+        }
+    }
+    // ---- Per-sample steppers (round 418) ----
+
+    fn splitmix_vals(seed: u64, n: usize) -> Vec<i32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(0xd1342543de82ef95).wrapping_add(1);
+                ((x >> 40) as i32) - (1 << 23)
+            })
+            .collect()
+    }
+
+    fn stepper_passes(terms: &[(i8, i32)]) -> Vec<DecorrPass> {
+        terms
+            .iter()
+            .map(|&(t, w)| DecorrPass::new(t, 2, w, w / 2, &[], &[]).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn mono_stepper_matches_whole_buffer_decorrelation() {
+        for terms in [
+            &[(2i8, 64i32)][..],
+            &[(17, 128), (1, 32)][..],
+            &[(18, -96), (5, 240), (2, 16), (17, 0)][..],
+        ] {
+            let passes = stepper_passes(terms);
+            let residuals = splitmix_vals(0x1111 ^ terms.len() as u64, 300);
+
+            let mut whole = passes.clone();
+            let mut buffer = residuals.clone();
+            decorrelate_mono(&mut whole, &mut buffer).unwrap();
+
+            let mut stepper = MonoStepper::new(passes).unwrap();
+            for (i, &r) in residuals.iter().enumerate() {
+                let offset = stepper.offset();
+                let out = stepper.advance(r);
+                assert_eq!(out, buffer[i], "sample {i} terms {terms:?}");
+                assert_eq!(out, r.wrapping_add(offset), "offset identity at {i}");
+            }
+            assert_eq!(stepper.passes(), &whole[..], "final state parity");
+        }
+    }
+
+    #[test]
+    fn stereo_stepper_matches_whole_buffer_decorrelation() {
+        for terms in [
+            &[(2i8, 64i32)][..],
+            &[(-1, 256)][..],
+            &[(-3, 100), (17, 128)][..],
+            &[(18, -64), (-1, 512), (3, 48), (17, 200)][..],
+        ] {
+            let passes = stepper_passes(terms);
+            let residuals = splitmix_vals(0x2222 ^ terms.len() as u64, 400);
+
+            let mut whole = passes.clone();
+            let mut buffer = residuals.clone();
+            decorrelate_stereo(&mut whole, &mut buffer).unwrap();
+
+            let mut stepper = StereoStepper::new(passes).unwrap();
+            for (f, pair) in residuals.chunks_exact(2).enumerate() {
+                let off_a = stepper.offset_a();
+                let off_b = stepper.offset_b(pair[0]);
+                let (a, b) = stepper.advance(pair[0], pair[1]);
+                assert_eq!(a, buffer[2 * f], "frame {f} A, terms {terms:?}");
+                assert_eq!(b, buffer[2 * f + 1], "frame {f} B, terms {terms:?}");
+                assert_eq!(a, pair[0].wrapping_add(off_a), "A offset identity");
+                assert_eq!(b, pair[1].wrapping_add(off_b), "B offset identity");
+            }
+            assert_eq!(stepper.passes(), &whole[..], "final state parity");
+        }
+    }
+
+    #[test]
+    fn stereo_stepper_matches_assembled_reference_shaped_passes() {
+        // Passes assembled from real wire payloads (quantized weights,
+        // seeded histories) must also drive identically.
+        let passes = vec![
+            DecorrPass::new(18, 2, 48, -32, &[100, -50], &[75, 25]).unwrap(),
+            DecorrPass::new(-1, 2, 256, 128, &[7], &[3]).unwrap(),
+        ];
+        let residuals = splitmix_vals(0x3333, 200);
+        let mut whole = passes.clone();
+        let mut buffer = residuals.clone();
+        decorrelate_stereo(&mut whole, &mut buffer).unwrap();
+        let mut stepper = StereoStepper::new(passes).unwrap();
+        let mut out = Vec::new();
+        for pair in residuals.chunks_exact(2) {
+            let (a, b) = stepper.advance(pair[0], pair[1]);
+            out.push(a);
+            out.push(b);
+        }
+        assert_eq!(out, buffer);
+        assert_eq!(stepper.passes(), &whole[..]);
+    }
+
+    #[test]
+    fn mono_stepper_rejects_cross_terms_and_overlong_lists() {
+        let cross = vec![DecorrPass::new(-1, 2, 0, 0, &[], &[]).unwrap()];
+        assert_eq!(MonoStepper::new(cross), Err(Error::CrossTermOnMono(-1)));
+        let long = vec![DecorrPass::new(2, 2, 0, 0, &[], &[]).unwrap(); MAX_NTERMS + 1];
+        assert_eq!(
+            MonoStepper::new(long),
+            Err(Error::TooManyDecorrelationPasses(MAX_NTERMS + 1))
+        );
+    }
+
+    #[test]
+    fn stereo_stepper_rejects_term_minus_two() {
+        let passes = vec![DecorrPass::new(-2, 2, 0, 0, &[], &[]).unwrap()];
+        assert_eq!(
+            StereoStepper::new(passes),
+            Err(Error::EncodeHybridTermUnsupported(-2))
+        );
+        // -1 and -3 stay accepted.
+        for t in [-1i8, -3] {
+            let ok = vec![DecorrPass::new(t, 2, 0, 0, &[], &[]).unwrap()];
+            assert!(StereoStepper::new(ok).is_ok(), "term {t}");
         }
     }
 }

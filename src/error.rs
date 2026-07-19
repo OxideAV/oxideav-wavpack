@@ -408,6 +408,15 @@ pub enum Error {
     /// `delta = (byte >> 5) & 0x7`), so only `0..=7` is representable.
     /// Carries the out-of-range delta.
     EncodeDeltaOutOfRange(i32),
+    /// The hybrid (lossy) encoder was handed a stereo decorrelation
+    /// pass list containing a term whose per-frame arithmetic predicts
+    /// channel A from the *same frame's* channel-B value (term `-2`).
+    /// The hybrid encoder decides channel A's coarse residual before
+    /// channel B's exists in the stream order, so such a pass cannot be
+    /// driven in the encode direction; the derivation filters it out,
+    /// and an explicit caller-supplied list is refused with this typed
+    /// error. Carries the offending term. Round 418.
+    EncodeHybridTermUnsupported(i8),
     /// A multichannel set was malformed: a member block carried the wiki
     /// bit-12 "final block of set" marker without any preceding bit-11
     /// "first block of set" marker having opened a set (or the stream
@@ -708,6 +717,10 @@ impl core::fmt::Display for Error {
             Error::EncodeDeltaOutOfRange(d) => write!(
                 f,
                 "oxideav-wavpack: serialize: pass delta {d} does not fit the 3-bit 0x02 term-byte field (0..=7)"
+            ),
+            Error::EncodeHybridTermUnsupported(t) => write!(
+                f,
+                "oxideav-wavpack: hybrid encode: stereo decorrelation term {t} predicts A from the same frame's B and cannot be driven in the encode direction"
             ),
             Error::MultichannelSetMalformed => f.write_str(
                 "oxideav-wavpack: malformed multichannel set (stray final-block marker or unterminated set; wiki flag bits 11..=12)",

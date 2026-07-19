@@ -921,10 +921,10 @@ pub use crate::decorrelation::{
     partition_decorrelation_samples, quantize_seed_sample, quantize_weight, recorrelate_mono,
     recorrelate_stereo, serialize_mono_passes, serialize_stereo_passes, update_weight,
     update_weight_clip, weights_per_term, DecorrPass, DecorrelationSamples, DecorrelationTerms,
-    DecorrelationWeights, TermKind, MAX_DECORRELATION_SAMPLES_PER_TERM, MAX_DOCUMENTED_TERM,
-    MAX_NTERMS, MAX_TERM, SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES, TERM_BYTE_BIAS,
-    TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, WEIGHT_CLIP,
-    WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
+    DecorrelationWeights, MonoStepper, StereoStepper, TermKind, MAX_DECORRELATION_SAMPLES_PER_TERM,
+    MAX_DOCUMENTED_TERM, MAX_NTERMS, MAX_TERM, SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES,
+    TERM_BYTE_BIAS, TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK,
+    WEIGHT_CLIP, WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
 };
 // Internal: pass-derivation helpers producing internal `DecorrPass` lists
 // (the `encode_block_*` / `encode_stream_*` entry points above are stable).
