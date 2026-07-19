@@ -76,6 +76,11 @@
 //! | `foreign_hybrid_pair_int32_js` | `-b4 -c`     | 32-bit int JOINT-stereo pair |
 //! | `foreign_hybrid_int32_b4`      | `-b4 -c` (wv only) | 32-bit int hybrid LOSSY decode — the pair's `.wv` alone; sent-bits fill with implied zeros |
 //! | `foreign_hybrid_pair_5dot1`    | `-b4 -c`     | 16-bit 5.1 wv + wvc pair (member sets pair one-to-one across the two files) |
+//! | `foreign_hybrid_imbalance_js_b4` | `-b4`      | joint hybrid with side ≈ 0 — the §6.5 delta clamps at `+bitrate` (round 418) |
+//! | `foreign_hybrid_imbalance_mid_b4` | `-b4`     | joint hybrid with mid ≈ 0 — the delta clamps at `-bitrate` (round 418) |
+//! | `foreign_hybrid_clip16_b2`     | `-b2`        | clipping-adjacent 16-bit mono — the lossy output clamps at ±2^15 after the (unclamped) CRC fold (round 418) |
+//! | `foreign_hybrid_int32_ones_b4` | `-b4`        | 32-bit int hybrid, trailing-ones content (`0x09` sent 2 / ones 4) — the lossy fill zero-fills the whole window (round 418) |
+//! | `foreign_hybrid_int32_ones_only_b4` | `-b4`   | 32-bit int hybrid, redundancy-only profile (sent 0 / ones 4) — zero-filled lossy window with no literal bits (round 418) |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -203,6 +208,27 @@ foreign_fixture!(
     2
 );
 foreign_fixture!(hybrid_float_b4_is_bit_exact, "foreign_hybrid_float_b4", 1);
+foreign_fixture!(
+    hybrid_imbalance_js_b4_is_bit_exact,
+    "foreign_hybrid_imbalance_js_b4",
+    2
+);
+foreign_fixture!(
+    hybrid_imbalance_mid_b4_is_bit_exact,
+    "foreign_hybrid_imbalance_mid_b4",
+    2
+);
+foreign_fixture!(hybrid_clip16_b2_is_bit_exact, "foreign_hybrid_clip16_b2", 1);
+foreign_fixture!(
+    hybrid_int32_ones_b4_is_bit_exact,
+    "foreign_hybrid_int32_ones_b4",
+    1
+);
+foreign_fixture!(
+    hybrid_int32_ones_only_b4_is_bit_exact,
+    "foreign_hybrid_int32_ones_only_b4",
+    1
+);
 foreign_fixture!(hybrid_int32_b4_is_bit_exact, "foreign_hybrid_int32_b4", 1);
 foreign_fixture!(
     hybrid_false_stereo_b4_is_bit_exact,
