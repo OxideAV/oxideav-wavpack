@@ -278,6 +278,67 @@ struct BlockConfig<'a> {
     /// layout is one channel-count byte followed by the Microsoft
     /// speaker-mask byte the wiki names, `0` = unassigned.)
     multichannel_info: Option<[u8; 2]>,
+    /// Extended sample-format extras (float `0x08` / int32 `0x09`
+    /// profile + optional `0x0C` extension payload + the header flag
+    /// bit) for a block whose PCM buffer is the pre-fixup
+    /// scaled/reduced integer stream. `None` for plain integer blocks.
+    /// Round 418.
+    format: Option<&'a FormatExtras>,
+}
+
+/// The sample-format extras a `FLOAT_DATA` / `INT32_DATA` block carries
+/// on top of the plain integer pipeline (round 418): the header flag
+/// bit, the 4-byte `0x08` / `0x09` profile payload, and the optional
+/// `0x0C` extension payload (`crc_wvx` + packed extension bits).
+///
+/// Built by [`float_format_extras`] / [`int32_format_extras`] from the
+/// encode-side deconstructions ([`crate::float::deconstruct_float`] /
+/// [`crate::int32::deconstruct_int32`]); consumed by the `*_float` /
+/// `*_int32` block encoders, which feed the deconstructed integer
+/// buffer through the ordinary lossless pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormatExtras {
+    /// The header flag bit (`1 << 7` float / `1 << 8` int32).
+    pub flag_bit: u32,
+    /// The profile sub-block ID byte (`0x08` / `0x09`).
+    pub profile_id: u8,
+    /// The 4-byte profile payload.
+    pub profile_payload: Vec<u8>,
+    /// The complete `0x0C` payload, when the profile moved extension
+    /// bits.
+    pub extension: Option<Vec<u8>>,
+}
+
+/// Wiki flag bit 7 — `FLOAT_DATA`.
+pub(crate) const FLOAT_DATA_FLAG: u32 = 1 << 7;
+/// Wiki flag bit 8 — `INT32_DATA`.
+pub(crate) const INT32_DATA_FLAG: u32 = 1 << 8;
+
+/// [`FormatExtras`] for a float block from its deconstruction.
+pub(crate) fn float_format_extras(d: &crate::float::FloatDeconstruction) -> FormatExtras {
+    let i = &d.info;
+    FormatExtras {
+        flag_bit: FLOAT_DATA_FLAG,
+        profile_id: SubBlockId::FloatInfo.as_id_byte(),
+        profile_payload: vec![
+            i.float_flags,
+            i.float_shift,
+            i.float_max_exp,
+            i.float_norm_exp,
+        ],
+        extension: d.extension.clone(),
+    }
+}
+
+/// [`FormatExtras`] for an int32 block from its deconstruction.
+pub(crate) fn int32_format_extras(d: &crate::int32::Int32Deconstruction) -> FormatExtras {
+    let i = &d.info;
+    FormatExtras {
+        flag_bit: INT32_DATA_FLAG,
+        profile_id: SubBlockId::Int32Info.as_id_byte(),
+        profile_payload: vec![i.sent_bits, i.zeros, i.ones, i.dups],
+        extension: d.extension.clone(),
+    }
 }
 
 /// Assemble one complete `wvpk` block from a container-scaled PCM buffer
@@ -357,6 +418,9 @@ fn encode_block_core(
 
     // Flag word: width bits, grouping marker, then the shape bits.
     let mut flags_raw = with_marker(base_flags(config.bytes_per_sample), config.marker);
+    if let Some(format) = config.format {
+        flags_raw |= format.flag_bit;
+    }
     if config.mono {
         flags_raw |= 1 << 2;
     }
@@ -415,6 +479,13 @@ fn encode_block_core(
         )?;
     }
 
+    // 0x08 / 0x09 sample-format profile ahead of the audio payloads
+    // (round 418; the decoder locates it anywhere, the reference
+    // layout keeps it before 0x0A).
+    if let Some(format) = config.format {
+        append_sub_block(&mut metadata, format.profile_id, &format.profile_payload)?;
+    }
+
     // The three decorrelation sub-blocks, verbatim, in wire order.
     if let Some((terms, weights, samples)) = config.decorr {
         append_sub_block(
@@ -453,6 +524,16 @@ fn encode_block_core(
         &packed,
     )?;
 
+    // 0x0C packed extension bits after the main 0x0A stream (round
+    // 418: the float / int32 literal low bits + their crc_wvx prefix).
+    if let Some(ext) = config.format.and_then(|f| f.extension.as_deref()) {
+        append_sub_block(
+            &mut metadata,
+            SubBlockId::PackedOverflowBits.as_id_byte(),
+            ext,
+        )?;
+    }
+
     let per_channel = if config.mono {
         pcm.len()
     } else {
@@ -481,6 +562,7 @@ fn raw_config(mono: bool, bytes_per_sample: u8) -> BlockConfig<'static> {
         bytes_per_sample,
         marker: 0b11,
         multichannel_info: None,
+        format: None,
     }
 }
 
@@ -1668,6 +1750,419 @@ pub fn encode_block_stereo_smallest(
     } else {
         best
     })
+}
+
+// ---------------------------------------------------------------------
+// Extended sample formats: FLOAT_DATA / INT32_DATA origination (round
+// 418). The deconstructions (`crate::float::deconstruct_float` /
+// `crate::int32::deconstruct_int32`) turn the caller's samples into the
+// pre-fixup integer stream + profile + 0x0C payload; the integers then
+// ride the ordinary lossless pipeline (raw or self-derived
+// decorrelation, plain or joint stereo), with the profile / extension
+// sub-blocks and the header flag bit attached.
+// ---------------------------------------------------------------------
+
+/// The shared mode search for a format-tagged block: raw plus the
+/// derived-decorrelation grid over the deconstructed integer domain
+/// ({plain, joint} × profiles for stereo), keeping the smallest
+/// output. `left_shift` stays 0 — the float / int32 fixups own the
+/// whole width restoration.
+fn encode_block_best_ints(
+    ints: &[i32],
+    mono: bool,
+    profile: DecorrProfile,
+    format: &FormatExtras,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    let mut best: Option<Vec<u8>> = None;
+    let joint_modes: &[bool] = if mono { &[false] } else { &[false, true] };
+    let mut joint_domain = Vec::new();
+    if !mono {
+        joint_domain = ints.to_vec();
+        for pair in joint_domain.chunks_exact_mut(2) {
+            let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
+            pair[0] = mid;
+            pair[1] = side;
+        }
+    }
+    for &joint in joint_modes {
+        keep_smaller(
+            &mut best,
+            encode_block_core(
+                ints,
+                BlockConfig {
+                    joint,
+                    format: Some(format),
+                    ..raw_config(mono, 4)
+                },
+                block_index,
+                total_samples,
+            )?,
+        );
+        let domain = if joint { &joint_domain } else { ints };
+        for &p in profile.search_set() {
+            for iterations in [1u32, 2] {
+                let (terms, weights, samples) = if mono {
+                    let passes = derive_mono_passes_iterated(domain, p, iterations)?;
+                    serialize_mono_passes(&passes)?
+                } else {
+                    let passes = derive_stereo_passes_iterated(domain, p, iterations)?;
+                    serialize_stereo_passes(&passes)?
+                };
+                keep_smaller(
+                    &mut best,
+                    encode_block_core(
+                        ints,
+                        BlockConfig {
+                            joint,
+                            decorr: Some((&terms, &weights, &samples)),
+                            format: Some(format),
+                            ..raw_config(mono, 4)
+                        },
+                        block_index,
+                        total_samples,
+                    )?,
+                );
+            }
+        }
+    }
+    Ok(best.expect("format mode search produced no candidate"))
+}
+
+/// Encode a mono `f32` buffer into one complete `FLOAT_DATA` `wvpk`
+/// block (staged spec `wavpack-sample-formats.md` §2, forward
+/// direction): the buffer is deconstructed into its scaled-integer
+/// stream + `0x08` profile + optional `0x0C` extension payload
+/// ([`crate::float::deconstruct_float`]) and the integers ride the raw
+/// (no-decorrelation) lossless pipeline in a 32-bit container.
+///
+/// Bit-exactly lossless over IEEE-754 bit patterns — `-0.0`, denormals,
+/// `±inf` and NaN payloads included:
+/// `decode_stream_f32(&out)?.iter().map(f32::to_bits) == pcm.iter().map(f32::to_bits)`.
+pub fn encode_block_mono_float(
+    pcm: &[f32],
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let d = crate::float::deconstruct_float(pcm);
+    let format = float_format_extras(&d);
+    encode_block_core(
+        &d.integers,
+        BlockConfig {
+            format: Some(&format),
+            ..raw_config(true, 4)
+        },
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode an interleaved stereo `f32` buffer into one complete
+/// `FLOAT_DATA` `wvpk` block via the raw lossless pipeline — the
+/// stereo twin of [`encode_block_mono_float`] (one shared `0x08`
+/// profile; the extension bits interleave in output order exactly as
+/// the decoder's fixup consumes them).
+pub fn encode_block_stereo_float(
+    pcm: &[f32],
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let d = crate::float::deconstruct_float(pcm);
+    let format = float_format_extras(&d);
+    encode_block_core(
+        &d.integers,
+        BlockConfig {
+            format: Some(&format),
+            ..raw_config(false, 4)
+        },
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode a mono `f32` buffer into the smallest `FLOAT_DATA` block
+/// this encoder can produce: the raw candidate raced against the
+/// derived-decorrelation grid ([`DecorrProfile::search_set`] ceiling,
+/// single-sweep + twice-iterated) over the scaled-integer domain.
+/// Every candidate decodes back bit-exactly, so the choice is
+/// size-only.
+pub fn encode_block_mono_float_best(
+    pcm: &[f32],
+    profile: DecorrProfile,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let d = crate::float::deconstruct_float(pcm);
+    let format = float_format_extras(&d);
+    encode_block_best_ints(
+        &d.integers,
+        true,
+        profile,
+        &format,
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode an interleaved stereo `f32` buffer into the smallest
+/// `FLOAT_DATA` block this encoder can produce — the stereo twin of
+/// [`encode_block_mono_float_best`] ({plain, joint mid/side} × {raw,
+/// derived decorrelation} over the scaled-integer domain).
+pub fn encode_block_stereo_float_best(
+    pcm: &[f32],
+    profile: DecorrProfile,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let d = crate::float::deconstruct_float(pcm);
+    let format = float_format_extras(&d);
+    encode_block_best_ints(
+        &d.integers,
+        false,
+        profile,
+        &format,
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode a mono `f32` buffer into a multi-block `FLOAT_DATA` `.wv`
+/// stream, each chunk carrying its own derived `0x08` profile and its
+/// own mode-searched block ([`encode_block_mono_float_best`]). The
+/// chunking / header contract matches [`encode_stream_mono`].
+/// `decode_stream_f32(&out)?` reproduces `pcm` bit-exactly.
+pub fn encode_stream_mono_float(
+    pcm: &[f32],
+    block_samples: usize,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    let chunk = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(chunk) {
+        let block = encode_block_mono_float_best(window, profile, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add(window.len() as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
+/// Encode an interleaved stereo `f32` buffer into a multi-block
+/// `FLOAT_DATA` `.wv` stream — the stereo twin of
+/// [`encode_stream_mono_float`] (`block_samples` is a per-channel pair
+/// count).
+pub fn encode_stream_stereo_float(
+    pcm: &[f32],
+    block_samples: usize,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let pairs = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(pairs * 2) {
+        let block = encode_block_stereo_float_best(window, profile, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add((window.len() / 2) as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
+/// Encode a mono wide-integer buffer into one complete `INT32_DATA`
+/// `wvpk` block (staged spec `wavpack-sample-formats.md` §3, forward
+/// direction): the buffer is deconstructed into its reduced integer
+/// stream + `0x09` profile + optional `0x0C` extension payload
+/// ([`crate::int32::deconstruct_int32`]) — free redundancy stripping
+/// (`zeros` / `ones` / `dups`) plus literal `sent_bits` — and the
+/// reduced integers ride the raw lossless pipeline in a 32-bit
+/// container. `decode_stream(&out)? == pcm` exactly, full `i32` range.
+pub fn encode_block_mono_int32(
+    pcm: &[i32],
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let d = crate::int32::deconstruct_int32(pcm);
+    let format = int32_format_extras(&d);
+    encode_block_core(
+        &d.reduced,
+        BlockConfig {
+            format: Some(&format),
+            ..raw_config(true, 4)
+        },
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode an interleaved stereo wide-integer buffer into one complete
+/// `INT32_DATA` `wvpk` block via the raw lossless pipeline — the
+/// stereo twin of [`encode_block_mono_int32`].
+pub fn encode_block_stereo_int32(
+    pcm: &[i32],
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let d = crate::int32::deconstruct_int32(pcm);
+    let format = int32_format_extras(&d);
+    encode_block_core(
+        &d.reduced,
+        BlockConfig {
+            format: Some(&format),
+            ..raw_config(false, 4)
+        },
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode a mono wide-integer buffer into the smallest `INT32_DATA`
+/// block this encoder can produce (raw ∪ derived-decorrelation grid
+/// over the reduced integer domain).
+pub fn encode_block_mono_int32_best(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    let d = crate::int32::deconstruct_int32(pcm);
+    let format = int32_format_extras(&d);
+    encode_block_best_ints(
+        &d.reduced,
+        true,
+        profile,
+        &format,
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode an interleaved stereo wide-integer buffer into the smallest
+/// `INT32_DATA` block this encoder can produce — the stereo twin of
+/// [`encode_block_mono_int32_best`].
+pub fn encode_block_stereo_int32_best(
+    pcm: &[i32],
+    profile: DecorrProfile,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<Vec<u8>> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let d = crate::int32::deconstruct_int32(pcm);
+    let format = int32_format_extras(&d);
+    encode_block_best_ints(
+        &d.reduced,
+        false,
+        profile,
+        &format,
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode a mono wide-integer buffer into a multi-block `INT32_DATA`
+/// `.wv` stream, each chunk carrying its own derived `0x09` profile
+/// and mode-searched block. `decode_stream(&out)? == pcm` exactly.
+pub fn encode_stream_mono_int32(
+    pcm: &[i32],
+    block_samples: usize,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    let chunk = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(chunk) {
+        let block = encode_block_mono_int32_best(window, profile, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add(window.len() as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
+}
+
+/// Encode an interleaved stereo wide-integer buffer into a multi-block
+/// `INT32_DATA` `.wv` stream — the stereo twin of
+/// [`encode_stream_mono_int32`].
+pub fn encode_stream_stereo_int32(
+    pcm: &[i32],
+    block_samples: usize,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let pairs = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut out = Vec::new();
+    let mut index: u32 = 0;
+    for window in pcm.chunks(pairs * 2) {
+        let block = encode_block_stereo_int32_best(window, profile, index, total)?;
+        out.extend_from_slice(&block);
+        index = index
+            .checked_add((window.len() / 2) as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(out)
 }
 
 /// Default per-block sample count the stream encoders split a long PCM
@@ -3760,5 +4255,245 @@ mod tests {
             assert!(ok, "CRC gate must still pass at rate {rate}");
             assert_eq!(crate::stream_sample_rate(&stamped).unwrap(), Some(rate));
         }
+    }
+
+    // ---- FLOAT_DATA / INT32_DATA origination (round 418) --------------
+
+    fn splitmix(seed: u64, n: usize) -> Vec<i64> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(0xd1342543de82ef95).wrapping_add(1);
+                x as i64
+            })
+            .collect()
+    }
+
+    /// A music-shaped float test signal with silence, denormal-free
+    /// smooth stretches and full-precision noise.
+    fn float_signal(n: usize) -> Vec<f32> {
+        splitmix(0x9e3779b9, n)
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| {
+                if i % 37 == 0 {
+                    0.0
+                } else {
+                    let t = i as f32 * 0.037;
+                    t.sin() * 0.7 + (r as f32 / i64::MAX as f32) * 0.01
+                }
+            })
+            .collect()
+    }
+
+    fn bits_of(pcm: &[f32]) -> Vec<u32> {
+        pcm.iter().map(|s| s.to_bits()).collect()
+    }
+
+    #[test]
+    fn float_mono_block_round_trips_bit_exactly() {
+        let pcm = float_signal(500);
+        let block = encode_block_mono_float(&pcm, 0, 500).unwrap();
+        let decoded = crate::decode_stream_f32(&block).unwrap();
+        assert_eq!(bits_of(&decoded), bits_of(&pcm));
+        // The block advertises the float container shape.
+        let (parsed, _) = crate::parse_block(&block).unwrap();
+        assert!(parsed.is_float());
+        assert_eq!(parsed.flags().bytes_per_sample(), 4);
+        // Both CRC gates hold (main §5 + extension §5.5).
+        assert!(parsed.verify_decoded_crc().unwrap());
+    }
+
+    #[test]
+    fn float_stereo_block_round_trips_bit_exactly() {
+        let mono = float_signal(400);
+        let pcm: Vec<f32> = mono.iter().flat_map(|&s| [s, -s * 0.5 + 0.001]).collect();
+        let block = encode_block_stereo_float(&pcm, 0, 400).unwrap();
+        let decoded = crate::decode_stream_f32(&block).unwrap();
+        assert_eq!(bits_of(&decoded), bits_of(&pcm));
+        let (parsed, _) = crate::parse_block(&block).unwrap();
+        assert!(parsed.verify_decoded_crc().unwrap());
+    }
+
+    #[test]
+    fn float_best_search_round_trips_and_never_loses_to_raw() {
+        let pcm = float_signal(600);
+        let raw = encode_block_mono_float(&pcm, 0, 600).unwrap();
+        let best = encode_block_mono_float_best(&pcm, DecorrProfile::High, 0, 600).unwrap();
+        assert!(best.len() <= raw.len(), "best must never lose to raw");
+        assert_eq!(
+            bits_of(&crate::decode_stream_f32(&best).unwrap()),
+            bits_of(&pcm)
+        );
+
+        let stereo: Vec<f32> = pcm.iter().flat_map(|&s| [s, s * 0.9]).collect();
+        let sraw = encode_block_stereo_float(&stereo, 0, 600).unwrap();
+        let sbest = encode_block_stereo_float_best(&stereo, DecorrProfile::High, 0, 600).unwrap();
+        assert!(sbest.len() <= sraw.len());
+        assert_eq!(
+            bits_of(&crate::decode_stream_f32(&sbest).unwrap()),
+            bits_of(&stereo)
+        );
+    }
+
+    #[test]
+    fn float_special_values_round_trip_through_a_block() {
+        let pcm = [
+            0.0f32,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7f95_5555),
+            f32::from_bits(0xffc0_0001),
+            f32::from_bits(0x0000_0123),
+            f32::MIN_POSITIVE,
+            1.0,
+            -1.0e-30,
+            0.5,
+        ];
+        let block = encode_block_mono_float(&pcm, 0, pcm.len() as u32).unwrap();
+        let decoded = crate::decode_stream_f32(&block).unwrap();
+        assert_eq!(bits_of(&decoded), bits_of(&pcm));
+        let (parsed, _) = crate::parse_block(&block).unwrap();
+        assert!(parsed.verify_decoded_crc().unwrap());
+    }
+
+    #[test]
+    fn float_stream_chunks_round_trip() {
+        let pcm = float_signal(1000);
+        let wv = encode_stream_mono_float(&pcm, 256, DecorrProfile::Normal).unwrap();
+        assert_eq!(crate::audio_block_count(&wv).unwrap(), 4);
+        assert_eq!(
+            bits_of(&crate::decode_stream_f32(&wv).unwrap()),
+            bits_of(&pcm)
+        );
+        let (_, all_ok) = crate::decode_stream_muted(&wv).unwrap();
+        assert!(all_ok, "every chunk passes both CRC gates");
+
+        let stereo: Vec<f32> = pcm.iter().flat_map(|&s| [s, s * -0.25]).collect();
+        let wv = encode_stream_stereo_float(&stereo, 300, DecorrProfile::Normal).unwrap();
+        assert_eq!(
+            bits_of(&crate::decode_stream_f32(&wv).unwrap()),
+            bits_of(&stereo)
+        );
+    }
+
+    #[test]
+    fn float_extension_crc_corruption_trips_the_mute_gate() {
+        let pcm = float_signal(300);
+        let block = encode_block_mono_float(&pcm, 0, 300).unwrap();
+        let (_, ok) = crate::parse_block(&block)
+            .unwrap()
+            .0
+            .decode_samples_muted()
+            .unwrap();
+        assert!(ok);
+        // Flip a bit inside the 0x0C payload region (past the header),
+        // which must flip either the extension bits or its stored CRC —
+        // the §5.5 verdict then mutes the block.
+        let mut broken = block.clone();
+        let pos = broken.len() - 3;
+        broken[pos] ^= 0x40;
+        let parsed = crate::parse_block(&broken).unwrap().0;
+        if let Ok((muted, ok)) = parsed.decode_samples_muted() {
+            if !ok {
+                assert!(muted.iter().all(|&s| s == 0), "muted buffer is zeroed");
+            }
+        }
+    }
+
+    fn int32_signal(n: usize) -> Vec<i32> {
+        splitmix(0xfeed, n).iter().map(|&r| r as i32).collect()
+    }
+
+    #[test]
+    fn int32_mono_block_round_trips_full_range() {
+        let pcm = int32_signal(400);
+        let block = encode_block_mono_int32(&pcm, 0, 400).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+        let (parsed, _) = crate::parse_block(&block).unwrap();
+        assert!(parsed.flags().int32_mode);
+        assert!(parsed.verify_decoded_crc().unwrap());
+    }
+
+    #[test]
+    fn int32_stereo_block_round_trips_full_range() {
+        let pcm: Vec<i32> = int32_signal(300)
+            .iter()
+            .flat_map(|&v| [v, v.wrapping_mul(3) ^ 0x55])
+            .collect();
+        let block = encode_block_stereo_int32(&pcm, 0, 300).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+        assert!(crate::parse_block(&block)
+            .unwrap()
+            .0
+            .verify_decoded_crc()
+            .unwrap());
+    }
+
+    #[test]
+    fn int32_trailing_zero_profile_needs_no_extension() {
+        // 24-bit audio scaled << 8 into the 32-bit container: pure
+        // zeros redundancy, no 0x0C sub-block on the wire.
+        let pcm: Vec<i32> = int32_signal(300).iter().map(|&v| (v >> 8) << 8).collect();
+        let block = encode_block_mono_int32(&pcm, 0, 300).unwrap();
+        assert_eq!(decode_stream(&block).unwrap(), pcm);
+        let (parsed, _) = crate::parse_block(&block).unwrap();
+        assert!(!parsed.has_packed_overflow_bits());
+    }
+
+    #[test]
+    fn int32_best_search_round_trips() {
+        // Correlated wide data so the decorrelation grid has something
+        // to win on.
+        let mut acc = 0i64;
+        let pcm: Vec<i32> = splitmix(0xabc, 500)
+            .iter()
+            .map(|&r| {
+                acc += (r >> 48) << 9;
+                acc as i32
+            })
+            .collect();
+        let raw = encode_block_mono_int32(&pcm, 0, 500).unwrap();
+        let best = encode_block_mono_int32_best(&pcm, DecorrProfile::High, 0, 500).unwrap();
+        assert!(best.len() <= raw.len());
+        assert_eq!(decode_stream(&best).unwrap(), pcm);
+
+        let stereo: Vec<i32> = pcm.iter().flat_map(|&v| [v, v ^ 0xFF]).collect();
+        let sbest = encode_block_stereo_int32_best(&stereo, DecorrProfile::High, 0, 500).unwrap();
+        assert_eq!(decode_stream(&sbest).unwrap(), stereo);
+    }
+
+    #[test]
+    fn int32_stream_chunks_round_trip() {
+        let pcm = int32_signal(900);
+        let wv = encode_stream_mono_int32(&pcm, 256, DecorrProfile::Normal).unwrap();
+        assert_eq!(decode_stream(&wv).unwrap(), pcm);
+        let (_, all_ok) = crate::decode_stream_muted(&wv).unwrap();
+        assert!(all_ok);
+
+        let stereo: Vec<i32> = pcm.iter().flat_map(|&v| [v, !v]).collect();
+        let wv = encode_stream_stereo_int32(&stereo, 200, DecorrProfile::Normal).unwrap();
+        assert_eq!(decode_stream(&wv).unwrap(), stereo);
+    }
+
+    #[test]
+    fn format_blocks_refuse_empty_and_odd_stereo() {
+        assert_eq!(
+            encode_block_mono_float(&[], 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        );
+        assert_eq!(
+            encode_block_stereo_float(&[1.0], 0, 1),
+            Err(Error::EncodeStereoOddLength(1))
+        );
+        assert_eq!(
+            encode_block_mono_int32(&[], 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        );
+        assert_eq!(
+            encode_block_stereo_int32(&[1], 0, 1),
+            Err(Error::EncodeStereoOddLength(1))
+        );
     }
 }

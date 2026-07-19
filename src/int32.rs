@@ -34,7 +34,7 @@
 //! `wavpack-decorrelation.md` §4.2).
 
 use crate::error::{Error, Result};
-use crate::samples::BitReader;
+use crate::samples::{BitReader, BitWriter};
 
 /// On-wire byte length of the `0x09` int32-info payload (staged spec
 /// `wavpack-sample-formats.md` §3: "payload is **4 bytes**, one per
@@ -197,6 +197,145 @@ pub fn reassemble_int32_implied(pcm: &mut [i32], info: &Int32Info) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Encode side (round 418): int32 **origination** — the exact forward
+// inverse of `reassemble_int32`.
+// ---------------------------------------------------------------------
+
+/// Ceiling on the post-reduction magnitude bit-length the int32
+/// deconstruction targets. The staged spec §3 frames the reduction as
+/// letting "25–32-bit integer data pass through the ≤24-bit magnitude
+/// entropy core"; reference-encoded int32 blocks carry a
+/// `max_magnitude` of 23, so the origination reduces until the
+/// sign-folded magnitudes fit 23 bits.
+pub const INT32_TARGET_MAGNITUDE_BITS: u32 = 23;
+
+/// The encode-side deconstruction of a wide-integer buffer into the
+/// on-wire pieces an `INT32_DATA` block carries: the `0x09` profile,
+/// the reduced integer stream the entropy coder compresses, and (when
+/// literal bits were sent) the `0x0C` extension payload.
+///
+/// Produced by [`deconstruct_int32`]; the exact forward inverse of
+/// [`reassemble_int32`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int32Deconstruction {
+    /// The derived `0x09` profile.
+    pub info: Int32Info,
+    /// The reduced integer stream, one `i32` per input sample in the
+    /// same order — the buffer the entropy/decorrelation pipeline
+    /// compresses and the §5 block CRC folds over.
+    pub reduced: Vec<i32>,
+    /// The complete `0x0C` sub-block payload — the 32-bit little-endian
+    /// `crc_wvx` (the §5.5 halfword fold over the input values)
+    /// followed by the packed `sent_bits` literal bits — or `None`
+    /// when `sent_bits == 0`.
+    pub extension: Option<Vec<u8>>,
+}
+
+/// Deconstruct a wide-integer buffer into its reduced + `0x09` +
+/// `0x0C` wire form (staged spec `wavpack-sample-formats.md` §3,
+/// forward direction).
+///
+/// Derivation:
+///
+/// 1. **Redundancy** — the largest low-bit pattern *every* sample
+///    shares is stripped for free (no wire bits): trailing zeros
+///    (`zeros`), trailing ones (`ones`), or low bits duplicating the
+///    bit above them (`dups`); ties prefer `zeros`, then `ones` (the
+///    spec's mutually-exclusive fields). Counts are capped at 24.
+/// 2. **Sent bits** — whatever magnitude width remains above
+///    [`INT32_TARGET_MAGNITUDE_BITS`] is moved to per-sample literal
+///    low bits in the `0x0C` extension stream.
+///
+/// Infallible: every `i32` buffer has an exact wire form (an
+/// already-narrow buffer derives the all-zero profile and passes
+/// through unchanged).
+#[must_use]
+pub fn deconstruct_int32(pcm: &[i32]) -> Int32Deconstruction {
+    // Per-sample trailing-pattern floors across the whole buffer.
+    let mut min_zeros = 32u32;
+    let mut min_ones = 32u32;
+    let mut min_dups = 32u32;
+    for &v in pcm {
+        let tz = v.trailing_zeros();
+        let to = v.trailing_ones();
+        min_zeros = min_zeros.min(tz);
+        min_ones = min_ones.min(to);
+        // Trailing run of identical bits; `dups` strips run-1 bits
+        // (the survivor's low bit regenerates them).
+        let run = tz.max(to);
+        min_dups = min_dups.min(run.saturating_sub(1));
+    }
+    if pcm.is_empty() {
+        min_zeros = 0;
+        min_ones = 0;
+        min_dups = 0;
+    }
+    let cap = 24u32;
+    let (min_zeros, min_ones, min_dups) =
+        (min_zeros.min(cap), min_ones.min(cap), min_dups.min(cap));
+
+    let (zeros, ones, dups) = if min_zeros >= min_ones && min_zeros >= min_dups {
+        (min_zeros, 0, 0)
+    } else if min_ones >= min_dups {
+        (0, min_ones, 0)
+    } else {
+        (0, 0, min_dups)
+    };
+    let redundancy = zeros | ones | dups;
+
+    // Magnitude width after the free reduction decides the sent bits.
+    let mut max_bits = 0u32;
+    for &v in pcm {
+        let r = v >> redundancy;
+        let (mag, _) = crate::samples::split_sign(r);
+        max_bits = max_bits.max(32 - mag.leading_zeros());
+    }
+    let sent_bits = max_bits.saturating_sub(INT32_TARGET_MAGNITUDE_BITS);
+
+    let info = Int32Info {
+        sent_bits: sent_bits as u8,
+        zeros: zeros as u8,
+        ones: ones as u8,
+        dups: dups as u8,
+    };
+
+    let mut crc = crate::crc::ExtensionCrc::new();
+    let mut wvx = BitWriter::new();
+    let mut reduced = Vec::with_capacity(pcm.len());
+    let mask = if sent_bits == 0 {
+        0u32
+    } else {
+        (1u32 << sent_bits) - 1
+    };
+    for &v in pcm {
+        crc.push(v);
+        let r = v >> redundancy;
+        if sent_bits > 0 {
+            wvx.write_bits(r as u32 & mask, sent_bits);
+        }
+        reduced.push(r >> sent_bits);
+    }
+
+    let extension = if sent_bits > 0 {
+        let mut payload = crc.value().to_le_bytes().to_vec();
+        payload.extend_from_slice(&wvx.finish());
+        // Even byte count, like the 0x0A main bitstream (round-418
+        // black-box pin — see `deconstruct_float`).
+        if payload.len() % 2 != 0 {
+            payload.push(0);
+        }
+        Some(payload)
+    } else {
+        None
+    };
+    Int32Deconstruction {
+        info,
+        reduced,
+        extension,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +476,113 @@ mod tests {
             reassemble_int32(&mut pcm, &info, None),
             Err(Error::BlockMissingOverflowBits)
         );
+    }
+
+    // ---- encode side: deconstruct_int32 (round 418) -------------------
+
+    /// Push a deconstruction back through the decoder's fixup and
+    /// assert bit-exactness plus the crc_wvx agreement.
+    fn assert_deconstruction_round_trips(pcm: &[i32]) -> Int32Info {
+        let d = deconstruct_int32(pcm);
+        // The mutually-exclusive redundancy rule must hold.
+        expand_int32_info(&[d.info.sent_bits, d.info.zeros, d.info.ones, d.info.dups]).unwrap();
+        let mut slots = d.reduced.clone();
+        match &d.extension {
+            Some(payload) => {
+                let stored = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                let mut reader = BitReader::new(&payload[4..]);
+                let crc = reassemble_int32(&mut slots, &d.info, Some(&mut reader)).unwrap();
+                assert_eq!(crc, stored, "crc_wvx must match the decoder's fold");
+            }
+            None => {
+                reassemble_int32(&mut slots, &d.info, None).unwrap();
+            }
+        }
+        assert_eq!(slots, pcm, "values must survive the round trip");
+        d.info
+    }
+
+    fn splitmix(seed: u64, n: usize) -> Vec<i32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(0xd1342543de82ef95).wrapping_add(1);
+                (x >> 32) as i32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deconstruct_full_range_uses_sent_bits() {
+        let pcm = splitmix(7, 300);
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.redundancy_bits(), 0, "random data has no redundancy");
+        assert_eq!(u32::from(info.sent_bits), 31 - INT32_TARGET_MAGNITUDE_BITS);
+    }
+
+    #[test]
+    fn deconstruct_trailing_zeros_are_free() {
+        // 16-bit data scaled << 8: pure zeros redundancy, no extension.
+        let pcm: Vec<i32> = splitmix(11, 300).iter().map(|&v| (v >> 16) << 8).collect();
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.zeros, 8);
+        assert_eq!(info.sent_bits, 0);
+        assert!(deconstruct_int32(&pcm).extension.is_none());
+    }
+
+    #[test]
+    fn deconstruct_trailing_ones_are_free() {
+        let pcm: Vec<i32> = splitmix(13, 200)
+            .iter()
+            .map(|&v| ((v >> 16) << 4) | 0xF)
+            .collect();
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.ones, 4);
+        assert_eq!(info.sent_bits, 0);
+    }
+
+    #[test]
+    fn deconstruct_duplicated_low_bits_are_free() {
+        // Low 3 bits duplicate bit 3 in every sample: the dups profile.
+        let pcm: Vec<i32> = splitmix(17, 200)
+            .iter()
+            .map(|&v| {
+                let hi = (v >> 16) << 4;
+                if hi & 0x10 != 0 {
+                    hi | 0xF
+                } else {
+                    hi
+                }
+            })
+            .collect();
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert!(
+            info.dups >= 3,
+            "dups {} should cover the low bits",
+            info.dups
+        );
+        assert_eq!(info.sent_bits, 0);
+    }
+
+    #[test]
+    fn deconstruct_narrow_data_derives_the_zero_profile() {
+        let pcm: Vec<i32> = splitmix(19, 100).iter().map(|&v| v >> 16).collect();
+        let d = deconstruct_int32(&pcm);
+        // Narrow data may still detect stray redundancy, but must not
+        // send literal bits and must round-trip exactly.
+        assert_eq!(d.info.sent_bits, 0);
+        assert_deconstruction_round_trips(&pcm);
+    }
+
+    #[test]
+    fn deconstruct_extremes_round_trip() {
+        let pcm = [i32::MIN, i32::MAX, 0, -1, 1, i32::MIN + 1, i32::MAX - 1];
+        assert_deconstruction_round_trips(&pcm);
+    }
+
+    #[test]
+    fn deconstruct_all_zero_buffer_round_trips() {
+        assert_deconstruction_round_trips(&[0i32; 64]);
     }
 
     #[test]

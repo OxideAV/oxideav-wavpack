@@ -871,15 +871,19 @@ pub use crate::block_header::{
 pub use crate::correction::PackedCorrectionData;
 pub use crate::encode::{
     detect_left_shift, encode_block_mono, encode_block_mono_auto, encode_block_mono_best,
-    encode_block_mono_searched, encode_block_mono_shifted, encode_block_mono_smallest,
-    encode_block_mono_with_decorr, encode_block_stereo, encode_block_stereo_auto,
-    encode_block_stereo_best, encode_block_stereo_joint, encode_block_stereo_joint_auto,
+    encode_block_mono_float, encode_block_mono_float_best, encode_block_mono_int32,
+    encode_block_mono_int32_best, encode_block_mono_searched, encode_block_mono_shifted,
+    encode_block_mono_smallest, encode_block_mono_with_decorr, encode_block_stereo,
+    encode_block_stereo_auto, encode_block_stereo_best, encode_block_stereo_float,
+    encode_block_stereo_float_best, encode_block_stereo_int32, encode_block_stereo_int32_best,
+    encode_block_stereo_joint, encode_block_stereo_joint_auto,
     encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
     encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
     encode_multichannel_stream, encode_multichannel_stream_at, encode_stream_mono,
-    encode_stream_mono_best, encode_stream_mono_smallest, encode_stream_stereo,
-    encode_stream_stereo_best, encode_stream_stereo_smallest, set_stream_sample_rate,
-    DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
+    encode_stream_mono_best, encode_stream_mono_float, encode_stream_mono_int32,
+    encode_stream_mono_smallest, encode_stream_stereo, encode_stream_stereo_best,
+    encode_stream_stereo_float, encode_stream_stereo_int32, encode_stream_stereo_smallest,
+    set_stream_sample_rate, DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
 };
 pub use crate::entropy::EntropyInfo;
 pub use crate::error::{Error, Result};
@@ -938,11 +942,13 @@ pub use crate::entropy::{
 // Internal: left-shift fixup applied by `decode_samples` itself.
 #[doc(hidden)]
 pub use crate::fixup::{apply_left_shift, apply_left_shift_buffer};
-// Internal: FLOAT_DATA (0x08) profile plumbing behind `decode_stream_f32`.
+// Internal: FLOAT_DATA (0x08) profile plumbing behind `decode_stream_f32`
+// and the `encode_*_float` origination entry points.
 #[doc(hidden)]
 pub use crate::float::{
-    expand_float_info, reassemble_float, FloatInfo, FLOAT_EXCEPTIONS, FLOAT_INFO_PAYLOAD_BYTES,
-    FLOAT_NEG_ZEROS, FLOAT_SHIFT_ONES, FLOAT_SHIFT_SAME, FLOAT_SHIFT_SENT, FLOAT_ZEROS_SENT,
+    deconstruct_float, expand_float_info, reassemble_float, FloatDeconstruction, FloatInfo,
+    FLOAT_EXCEPTIONS, FLOAT_INFO_PAYLOAD_BYTES, FLOAT_NEG_ZEROS, FLOAT_SHIFT_ONES,
+    FLOAT_SHIFT_SAME, FLOAT_SHIFT_SENT, FLOAT_ZEROS_SENT,
 };
 // Internal: hybrid-mode fold/split plumbing behind the pair decode APIs.
 #[doc(hidden)]
@@ -953,11 +959,12 @@ pub use crate::hybrid::{
     HYBRID_LIMIT_ARG_CEILING, HYBRID_LIMIT_BIAS, HYBRID_PROFILE_MONO_BYTES,
     HYBRID_PROFILE_STEREO_BYTES, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
 };
-// Internal: INT32_DATA (0x09) profile plumbing behind `decode_stream`.
+// Internal: INT32_DATA (0x09) profile plumbing behind `decode_stream`
+// and the `encode_*_int32` origination entry points.
 #[doc(hidden)]
 pub use crate::int32::{
-    expand_int32_info, reassemble_int32, reassemble_int32_implied, Int32Info,
-    INT32_INFO_PAYLOAD_BYTES,
+    deconstruct_int32, expand_int32_info, reassemble_int32, reassemble_int32_implied,
+    Int32Deconstruction, Int32Info, INT32_INFO_PAYLOAD_BYTES, INT32_TARGET_MAGNITUDE_BITS,
 };
 // Internal: integer log2/exp2 wire converters used by the expanders.
 #[doc(hidden)]

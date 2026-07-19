@@ -17,6 +17,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 418 — **float / int32 origination.** The encoder now
+  *originates* `FLOAT_DATA` and `INT32_DATA` streams instead of only
+  decoding them. `deconstruct_float` derives the `0x08` profile from
+  the data itself — the `float_max_exp` anchor (raised one for the
+  `SHIFT_SAME` carrier shape), the static `float_shift` from shared
+  trailing zeros, the vacated-window fill mode (zero / `SHIFT_ONES` /
+  `SHIFT_SAME` / `SHIFT_SENT`), `ZEROS_SENT`+`NEG_ZEROS` literals for
+  `-0.0` / denormals / below-range values, and the `EXCEPTIONS`
+  bit-length-25 sentinel for inf/NaN (exact payload bits preserved) —
+  and emits the scaled integers plus the `0x0C` extension payload
+  (`crc_wvx` + packed bits). `deconstruct_int32` is the §3 twin:
+  free redundancy stripping (`zeros`/`ones`/`dups`, mutually
+  exclusive, whichever pattern every sample shares) plus literal
+  `sent_bits` down to the 23-bit entropy magnitude target. Public
+  entry points: `encode_block_{mono,stereo}_{float,int32}` (raw),
+  `..._best` (raw ∪ derived-decorrelation grid, {plain, joint} on
+  stereo, over the deconstructed integer domain) and
+  `encode_stream_{mono,stereo}_{float,int32}` (per-chunk profiles).
+  Every emitted stream decodes bit-exactly through this crate's own
+  decoder (both CRC gates green) **and** through the reference
+  decoder binary (black-box: 10-case battery — full-precision /
+  int16-shaped / special-value / wide-range float, mono + stereo +
+  multi-block; full-range / trailing-zero / correlated int32 —
+  byte-identical raw output). One wire pin fell out: the **`0x0C`
+  extension payload must occupy an even byte count** like the `0x0A`
+  main stream — the reference decoder rejects an odd-size-flagged
+  `0x0C` sub-block outright ("not compatible"), so the packed
+  extension bits are padded to even length.
+
 - Round 415 — **pair-aware seeking.** `decode_range_with_correction`
   (+ its §5.6-muted twin) decodes an arbitrary frame window of a
   hybrid `.wv` losslessly against its `.wvc`: each member set the

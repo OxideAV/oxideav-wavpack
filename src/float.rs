@@ -92,7 +92,7 @@
 //! docs erratum ask.
 
 use crate::error::{Error, Result};
-use crate::samples::BitReader;
+use crate::samples::{BitReader, BitWriter};
 
 /// On-wire byte length of the `0x08` float-info payload (staged spec
 /// `wavpack-sample-formats.md` §2: "payload is **4 bytes**, one per
@@ -352,6 +352,251 @@ fn reassemble_one(
     Ok(sign | ((exponent as u32) << 23) | (mantissa24 & 0x007f_ffff))
 }
 
+// ---------------------------------------------------------------------
+// Encode side (round 418): float **origination** — the exact forward
+// inverse of `reassemble_float`.
+// ---------------------------------------------------------------------
+
+/// The encode-side deconstruction of an `f32` buffer into the on-wire
+/// pieces a `FLOAT_DATA` block carries: the `0x08` profile, the
+/// scaled-integer stream the entropy coder compresses, and (when the
+/// profile calls for it) the `0x0C` extension payload.
+///
+/// Produced by [`deconstruct_float`]; the exact forward inverse of
+/// [`reassemble_float`] — feeding `integers` + `info` + the extension
+/// bitstream back through the decoder's fixup reproduces the input
+/// bit patterns exactly, and the extension payload's leading `crc_wvx`
+/// equals the decoder's accumulated `crc_x` fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatDeconstruction {
+    /// The derived `0x08` profile (see [`deconstruct_float`] for how
+    /// the fill mode / anchor / shift are chosen).
+    pub info: FloatInfo,
+    /// The scaled-integer stream, one `i32` per input sample in the
+    /// same order — the buffer the entropy/decorrelation pipeline
+    /// compresses and the §5 block CRC folds over.
+    pub integers: Vec<i32>,
+    /// The complete `0x0C` sub-block payload — the 32-bit little-endian
+    /// `crc_wvx` (the module-doc float extension fold over the input
+    /// bit patterns) followed by the packed extension bitstream — or
+    /// `None` when the profile moves no extension bits at all.
+    pub extension: Option<Vec<u8>>,
+}
+
+/// Deconstruct an `f32` buffer into its scaled-integer + `0x08` +
+/// `0x0C` wire form (staged spec `wavpack-sample-formats.md` §2,
+/// §2.1–§2.3, mirrored from the decode pins of rounds 405/408).
+///
+/// Profile derivation, in the order the decode-side precedence
+/// (`SENT` > `ONES` > `SAME` > zero fill) makes cheapest-first:
+///
+/// 1. `float_max_exp` anchors at the largest finite exponent present
+///    (the round-408 pin: exceptional samples ride the bit-length-25
+///    sentinel instead of the anchor). Samples whose exponent sits
+///    more than 23 below the anchor — denormals included — cannot ride
+///    the scaled-integer stream and are sent as `ZEROS_SENT` literals.
+/// 2. The vacated low-mantissa windows (`d = anchor − exponent` bits
+///    per sample) pick the fill: all-zero windows need nothing;
+///    all-ones windows use `SHIFT_ONES`; per-sample-uniform windows
+///    (checked at an anchor one above the largest exponent, the
+///    round-408 `SHIFT_SAME` shape where every non-zero sample has a
+///    non-empty window) use the one-carrier-bit `SHIFT_SAME`; anything
+///    else sends the window bits literally via `SHIFT_SENT`.
+/// 3. `float_shift` strips the trailing zero bits **every** scaled
+///    integer shares, shrinking the entropy-coded magnitudes.
+/// 4. `NEG_ZEROS` (and thus `ZEROS_SENT`) is set only when a `-0.0`
+///    actually occurs; `EXCEPTIONS` only when an inf/NaN occurs.
+///
+/// Infallible: every `f32` bit pattern has an exact wire form.
+#[must_use]
+pub fn deconstruct_float(pcm: &[f32]) -> FloatDeconstruction {
+    let bits: Vec<u32> = pcm.iter().map(|s| s.to_bits()).collect();
+    let mut has_neg_zero = false;
+    let mut has_exception = false;
+    let mut has_denormal = false;
+    let mut max_e: Option<u32> = None;
+    for &b in &bits {
+        let exp = (b >> 23) & 0xFF;
+        let man = b & 0x007f_ffff;
+        match (exp, man) {
+            (0, 0) => has_neg_zero |= b >> 31 == 1,
+            (0, _) => has_denormal = true,
+            (0xFF, _) => has_exception = true,
+            _ => max_e = Some(max_e.map_or(exp, |m| m.max(exp))),
+        }
+    }
+    let anchor_plain = max_e.unwrap_or(126);
+
+    // Survey the vacated windows at a candidate anchor: are they all
+    // zeros / all ones / per-sample uniform, and does any finite
+    // sample fall out of the integer range (d > 23)?
+    let survey = |anchor: u32| {
+        let (mut all_zero, mut all_ones, mut uniform) = (true, true, true);
+        let mut any_window = false;
+        let mut any_literal = false;
+        for &b in &bits {
+            let exp = (b >> 23) & 0xFF;
+            if exp == 0 || exp == 0xFF {
+                continue;
+            }
+            let d = anchor - exp;
+            if d > 23 {
+                any_literal = true;
+                continue;
+            }
+            if d == 0 {
+                continue;
+            }
+            any_window = true;
+            let mask = (1u32 << d) - 1;
+            let w = (0x0080_0000 | (b & 0x007f_ffff)) & mask;
+            all_zero &= w == 0;
+            all_ones &= w == mask;
+            uniform &= w == 0 || w == mask;
+        }
+        (all_zero, any_window && all_ones, uniform, any_literal)
+    };
+
+    let (w_zero, w_ones, _, _) = survey(anchor_plain);
+    let (fill, anchor) = if w_zero {
+        (0u8, anchor_plain)
+    } else if w_ones {
+        (FLOAT_SHIFT_ONES, anchor_plain)
+    } else {
+        // The round-408 `SHIFT_SAME` shape anchors one above the
+        // largest exponent so every integer-path sample has a window.
+        let (_, _, uniform_up, _) = survey(anchor_plain + 1);
+        if uniform_up {
+            (FLOAT_SHIFT_SAME, anchor_plain + 1)
+        } else {
+            (FLOAT_SHIFT_SENT, anchor_plain)
+        }
+    };
+    let (_, _, _, any_literal) = survey(anchor);
+
+    // Common trailing zeros of the post-window scaled integers.
+    let mut shift_min: Option<u32> = None;
+    for &b in &bits {
+        let exp = (b >> 23) & 0xFF;
+        if exp == 0 || exp == 0xFF {
+            continue;
+        }
+        let d = anchor - exp;
+        if d > 23 {
+            continue;
+        }
+        let v = (0x0080_0000 | (b & 0x007f_ffff)) >> d;
+        let tz = v.trailing_zeros();
+        shift_min = Some(shift_min.map_or(tz, |m| m.min(tz)));
+    }
+    let float_shift = shift_min.unwrap_or(0).min(23);
+
+    let mut flags = fill;
+    if any_literal || has_denormal || has_neg_zero {
+        flags |= FLOAT_ZEROS_SENT;
+    }
+    if has_neg_zero {
+        flags |= FLOAT_NEG_ZEROS;
+    }
+    if has_exception {
+        flags |= FLOAT_EXCEPTIONS;
+    }
+    let info = FloatInfo {
+        float_flags: flags,
+        float_shift: float_shift as u8,
+        float_max_exp: anchor.min(0xFF) as u8,
+        float_norm_exp: 127,
+    };
+
+    let zeros_sent = flags & FLOAT_ZEROS_SENT != 0;
+    let mut wvx = BitWriter::new();
+    let mut crc = crate::crc::CRC_INIT;
+    let mut integers = Vec::with_capacity(bits.len());
+    for &b in &bits {
+        crc = update_float_extension(crc, b);
+        let neg = b >> 31 == 1;
+        let exp = (b >> 23) & 0xFF;
+        let man = b & 0x007f_ffff;
+        let integer: i32 = if exp == 0xFF {
+            // Exceptional sample: the bit-length-25 sentinel integer;
+            // wvx carries the marker (+ NaN mantissa payload).
+            if man == 0 {
+                wvx.write_bit(0);
+            } else {
+                wvx.write_bit(1);
+                wvx.write_bits(man, 23);
+            }
+            let mag = 1i32 << (24 - float_shift);
+            if neg {
+                -mag
+            } else {
+                mag
+            }
+        } else if exp == 0 || anchor - exp > 23 {
+            if exp == 0 && man == 0 {
+                // True ±0: integer 0; marker + optional sign under
+                // ZEROS_SENT.
+                if zeros_sent {
+                    wvx.write_bit(0);
+                    if flags & FLOAT_NEG_ZEROS != 0 {
+                        wvx.write_bit(u32::from(neg));
+                    }
+                }
+                0
+            } else {
+                // Too small for the scaled-integer stream (denormals
+                // included): literal mantissa + exponent + sign.
+                wvx.write_bit(1);
+                wvx.write_bits(man, 23);
+                wvx.write_bits(exp, 8);
+                wvx.write_bit(u32::from(neg));
+                0
+            }
+        } else {
+            let d = anchor - exp;
+            let mantissa24 = 0x0080_0000 | man;
+            if d > 0 {
+                let mask = (1u32 << d) - 1;
+                let w = mantissa24 & mask;
+                if fill == FLOAT_SHIFT_SENT {
+                    wvx.write_bits(w, d);
+                } else if fill == FLOAT_SHIFT_SAME {
+                    wvx.write_bit(u32::from(w != 0));
+                }
+            }
+            let mag = ((mantissa24 >> d) >> float_shift) as i32;
+            if neg {
+                -mag
+            } else {
+                mag
+            }
+        };
+        integers.push(integer);
+    }
+
+    let wrote_bits = !wvx.is_empty();
+    let extension = if info.requires_extension() || wrote_bits {
+        let mut payload = crc.to_le_bytes().to_vec();
+        payload.extend_from_slice(&wvx.finish());
+        // The extension payload must occupy an even byte count, like
+        // the 0x0A main bitstream (round-418 black-box pin: the
+        // reference decoder rejects a 0x0C sub-block framed with the
+        // odd-size pad flag as "not compatible"; every reference-
+        // encoded 0x0C payload is even).
+        if payload.len() % 2 != 0 {
+            payload.push(0);
+        }
+        Some(payload)
+    } else {
+        None
+    };
+    FloatDeconstruction {
+        info,
+        integers,
+        extension,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +840,134 @@ mod tests {
             reassemble_float(&mut pcm, &fi, None),
             Err(Error::FloatMagnitudeOverflow((1u32 << 22) << 9))
         );
+    }
+
+    // ---- encode side: deconstruct_float (round 418) -------------------
+
+    /// Push a deconstruction back through the decoder's fixup and
+    /// assert bit-exactness plus the crc_wvx agreement.
+    fn assert_deconstruction_round_trips(pcm: &[f32]) -> FloatInfo {
+        let d = deconstruct_float(pcm);
+        let mut slots = d.integers.clone();
+        match &d.extension {
+            Some(payload) => {
+                let stored = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                let mut reader = BitReader::new(&payload[4..]);
+                let crc = reassemble_float(&mut slots, &d.info, Some(&mut reader)).unwrap();
+                assert_eq!(crc, stored, "crc_wvx must match the decoder's fold");
+            }
+            None => {
+                reassemble_float(&mut slots, &d.info, None).unwrap();
+            }
+        }
+        let got: Vec<u32> = slots.iter().map(|&s| s as u32).collect();
+        let want: Vec<u32> = pcm.iter().map(|s| s.to_bits()).collect();
+        assert_eq!(got, want, "bit patterns must survive the round trip");
+        d.info
+    }
+
+    #[test]
+    fn deconstruct_integer_valued_floats_needs_no_extension() {
+        // Scaled-integer content: all vacated windows are zero, so the
+        // profile needs neither fill bits nor an extension stream.
+        let pcm = [0.5f32, -0.5, 0.25, 0.0, 0.125];
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.float_flags, 0);
+        assert_eq!(info.float_max_exp, 126);
+        assert!(deconstruct_float(&pcm).extension.is_none());
+    }
+
+    #[test]
+    fn deconstruct_full_precision_floats_uses_shift_sent() {
+        // Noisy mantissas: the windows are non-uniform, so the literal
+        // SHIFT_SENT profile carries them in the extension stream.
+        let mut pcm = Vec::new();
+        let mut x = 0x9e3779b97f4a7c15u64;
+        for _ in 0..200 {
+            x = x.wrapping_mul(0xd1342543de82ef95).wrapping_add(1);
+            let exp = 120 + ((x >> 58) as u32 & 7); // exponent spread
+            let sign = ((x & 1) as u32) << 31;
+            let bits = sign | (exp << 23) | ((x >> 40) as u32 & 0x007f_ffff);
+            pcm.push(f32::from_bits(bits));
+        }
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.float_flags & FLOAT_SHIFT_SENT, FLOAT_SHIFT_SENT);
+    }
+
+    #[test]
+    fn deconstruct_uniform_windows_uses_shift_same_with_raised_anchor() {
+        // Windows all-ones or all-zeros per sample (but mixed across
+        // samples): the SHIFT_SAME carrier applies, anchored one above
+        // the largest exponent (the round-408 reference shape).
+        let pcm = [
+            0.5f32,                      // exp 126: window all zeros
+            0.25f32,                     // exp 125, mantissa 0: zeros
+            f32::from_bits(0x3EFF_FFFF), // exp 125, mantissa 0x7fffff: ones
+            -0.5f32,
+            0.0f32,
+        ];
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.float_flags & FLOAT_SHIFT_SAME, FLOAT_SHIFT_SAME);
+        assert_eq!(info.float_max_exp, 127, "anchor one above the largest e");
+    }
+
+    #[test]
+    fn deconstruct_zeros_and_denormals_use_the_literal_path() {
+        let pcm = [
+            1.0f32,
+            0.0,
+            -0.0,
+            f32::from_bits(0x0000_0123), // denormal
+            f32::from_bits(0x8000_4567), // negative denormal
+            1.0e-30,                     // far below the anchor: literal
+        ];
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(
+            info.float_flags & (FLOAT_ZEROS_SENT | FLOAT_NEG_ZEROS),
+            FLOAT_ZEROS_SENT | FLOAT_NEG_ZEROS
+        );
+    }
+
+    #[test]
+    fn deconstruct_exceptions_ride_the_sentinel() {
+        let pcm = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7f95_5555), // NaN with a payload
+            f32::from_bits(0xffc0_0001), // negative NaN
+            0.75,
+            -0.375,
+        ];
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.float_flags & FLOAT_EXCEPTIONS, FLOAT_EXCEPTIONS);
+    }
+
+    #[test]
+    fn deconstruct_all_zero_buffer_is_trivial() {
+        let pcm = [0.0f32; 16];
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.float_flags, 0);
+        assert!(deconstruct_float(&pcm).integers.iter().all(|&i| i == 0));
+    }
+
+    #[test]
+    fn deconstruct_common_trailing_zeros_become_float_shift() {
+        // int16-shaped: every scaled integer shares trailing zeros,
+        // which the static shift strips (the reference int16 profile
+        // shape: flags 0, non-zero shift).
+        let pcm: Vec<f32> = (1..=64).map(|k| k as f32 / 32768.0).collect();
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.float_flags, 0);
+        assert!(info.float_shift > 0, "shared trailing zeros stripped");
+    }
+
+    #[test]
+    fn deconstruct_wide_dynamic_range_round_trips() {
+        // Exponents spanning more than the 23-bit window: the low ones
+        // fall out of the integer range and ride the literal path.
+        let pcm = [1.0e30f32, 1.0, 1.0e-30, -1.0e-38, 3.5e28, -7.0];
+        let info = assert_deconstruction_round_trips(&pcm);
+        assert_eq!(info.float_flags & FLOAT_ZEROS_SENT, FLOAT_ZEROS_SENT);
     }
 
     #[test]
