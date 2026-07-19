@@ -819,6 +819,7 @@ mod error;
 mod fixup;
 mod float;
 mod hybrid;
+mod hybrid_encode;
 mod int32;
 mod logpack;
 mod metadata;
@@ -888,6 +889,10 @@ pub use crate::encode::{
 pub use crate::entropy::EntropyInfo;
 pub use crate::error::{Error, Result};
 pub use crate::hybrid::CorrectionFold;
+pub use crate::hybrid_encode::{
+    encode_block_mono_hybrid, encode_block_stereo_hybrid, encode_stream_mono_hybrid,
+    encode_stream_stereo_hybrid, HybridEncoded, HybridOptions,
+};
 pub use crate::metadata::{ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId};
 pub use crate::overflow_bits::PackedOverflowBits;
 pub use crate::packed_samples::PackedSamples;

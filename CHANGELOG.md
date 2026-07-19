@@ -17,6 +17,57 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 418 — **hybrid origination (lossy `.wv` + lossless
+  `.wv`+`.wvc` pairs).** The encoder now originates the §6.5
+  `error_limit` model it learned to decode in rounds 408/415:
+  `encode_block_{mono,stereo}_hybrid` / `encode_stream_*_hybrid`
+  produce a lossy `.wv` at a caller-chosen bitrate word
+  (`HybridOptions::from_bits_per_sample` maps the reference `-b`
+  scale, `bits*256 - 568`) plus, on request, the `.wvc` correction
+  twin that restores the input **bit-exactly** through the pair
+  decode. The write side mirrors every decode pin: the bracketing
+  binary search emits `exact_mag >= mid` decision bits and the
+  `0x0B` stream carries the exact in-bracket offset with the
+  lossless phase-in code; the encoder tracks the decoder's
+  coarse-value state through the new per-sample steppers (prediction
+  offsets from coarse history, weight updates on coarse residuals);
+  the `0x06` profile is data-derived (running `slow_level` packed as
+  log words, carried across stream blocks; balance 256 on joint /
+  0 elsewhere; flag bits 9/10 mirrored from the reference shape);
+  the `.wvc` header stores the lossless decode's §5 CRC. No `0x07`
+  shaping is emitted (the raw §4.1 fold — the reference's
+  shaping-off shape). Hybrid decorrelation stacks are cross-free
+  (see the erratum below). Validated black-box on an 18-case
+  battery: every pair reproduces the original through the reference
+  decoder binary byte-exactly, and every lossy `.wv` decodes
+  identically through this crate's decoder and the reference
+  (mono/stereo × raw/derived stacks × joint/left-right × bitrate
+  words 0..800 × multi-block × 24-bit × silence).
+
+### Fixed
+
+- Round 418 — **§6.5 stereo redistribution erratum: `delta` clamps
+  to `±bitrate`.** The round-408 pin derived
+  `delta = (ema0 - ema1 - balance) >> 1` from near-balanced
+  fixtures, where the clamp is invisible; extreme-imbalance joint
+  probes (side ≈ 0 or mid ≈ 0, unclamped delta past ±900) decode
+  wrongly from sample 0 under the unclamped model. A round-418
+  black-box constraint-mining pass (recover the reference's coarse
+  residuals by inverting the decorrelation, replay the bitstream,
+  bound each bracketed word's `error_limit` by its stopping width)
+  solved the effective delta to exactly `+bitrate` / `-bitrate`
+  across the `-b3`/`-b4`/`-b5` range — `HybridState::frame_limits`
+  now applies the clamp, and the extreme-imbalance probes decode
+  bit-exactly. Two more reference-decoder pins fell out of the
+  encode battery: a **zero-length `0x0B` sub-block is rejected**
+  (an all-run block's empty correction payload must be omitted;
+  the pair decode already treats a missing `0x0B` as an empty
+  stream), and **hybrid decorrelation stacks are cross-free** —
+  reference hybrid encodes never carry cross terms and a `-1`
+  cross pass in a hybrid block decodes differently under the
+  reference decoder than under the lossless-identical model, so
+  the originator filters cross terms out.
+
 - Round 418 — **float / int32 origination.** The encoder now
   *originates* `FLOAT_DATA` and `INT32_DATA` streams instead of only
   decoding them. `deconstruct_float` derives the `0x08` profile from

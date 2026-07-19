@@ -88,7 +88,7 @@ const MEDIAN_WORD_BYTES: usize = 2;
 ///
 /// Returns [`Error::EncodeBlockTooLarge`] when the payload's word count
 /// overflows the 24-bit large-size field — far beyond any real block.
-fn append_sub_block(out: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<()> {
+pub(crate) fn append_sub_block(out: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<()> {
     let odd = payload.len() % 2 == 1;
     // Word count rounds the (possibly padded) byte length up to a whole
     // number of 16-bit words.
@@ -148,7 +148,7 @@ fn pack_median_word(value: i32) -> Option<[u8; MEDIAN_WORD_BYTES]> {
 /// Every seed must be exactly log-word-representable so
 /// [`pack_median_word`] round-trips it; this encoder always passes the
 /// zero seed.
-fn pack_entropy_info(seeds: &[[i32; 3]]) -> Vec<u8> {
+pub(crate) fn pack_entropy_info(seeds: &[[i32; 3]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(seeds.len() * 3 * MEDIAN_WORD_BYTES);
     for set in seeds {
         for &m in set {
@@ -175,7 +175,7 @@ fn pack_entropy_info(seeds: &[[i32; 3]]) -> Vec<u8> {
 /// `24 + metadata.len()` (the wiki "total block size not counting this
 /// field or 'wvpk'": the 24 fixed bytes after `ck_size` plus the
 /// metadata region).
-fn build_block(
+pub(crate) fn build_block(
     metadata: Vec<u8>,
     block_index: u32,
     total_samples: u32,
@@ -212,7 +212,7 @@ fn build_block(
 ///
 /// `bytes_per_sample` is clamped to `1..=4` and stored minus one in
 /// bits 0..=1 per the wiki "bytes per sample minus one" entry.
-fn base_flags(bytes_per_sample: u8) -> u32 {
+pub(crate) fn base_flags(bytes_per_sample: u8) -> u32 {
     let bps = bytes_per_sample.clamp(1, 4);
     u32::from(bps - 1) | STANDALONE_MULTICHANNEL_MARKER
 }
@@ -222,7 +222,7 @@ fn base_flags(bytes_per_sample: u8) -> u32 {
 /// first-of-set, `0b00` continuation, `0b10` final-of-set). Used by the
 /// multichannel-member encoders to override the default standalone marker
 /// [`base_flags`] sets. Round 378.
-fn with_marker(flags: u32, marker: u32) -> u32 {
+pub(crate) fn with_marker(flags: u32, marker: u32) -> u32 {
     (flags & !(0b11 << 11)) | ((marker & 0b11) << 11)
 }
 
@@ -243,7 +243,7 @@ fn with_marker(flags: u32, marker: u32) -> u32 {
 /// truncation cancels exactly and the transform is bit-reversible for
 /// every `(left, right)` pair — `undo_joint_stereo(forward_joint_stereo(l,
 /// r)) == (l, r)`.
-fn forward_joint_stereo(left: i32, right: i32) -> (i32, i32) {
+pub(crate) fn forward_joint_stereo(left: i32, right: i32) -> (i32, i32) {
     let mid = left.wrapping_sub(right);
     let side = right.wrapping_add(mid >> 1);
     (mid, side)
@@ -659,7 +659,7 @@ fn with_left_shift(flags_raw: u32, left_shift: u8) -> u32 {
 /// (`-v - 1`), so `-1` folds to `0` and `i32::MIN` to `2^31 - 1`.
 /// All-zero (silence) input yields `0`, matching the reference
 /// encoder's observed zero-for-silence field.
-fn magnitude_bits(values: &[i32]) -> u32 {
+pub(crate) fn magnitude_bits(values: &[i32]) -> u32 {
     values
         .iter()
         .map(|&v| {

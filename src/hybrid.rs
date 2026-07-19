@@ -377,6 +377,16 @@ impl HybridState {
     /// (pre-frame) states. Index 0 is the mono limit / stereo channel
     /// 0; index 1 is stereo channel 1 (0 for mono states — a mono
     /// frame is one sample).
+    ///
+    /// **Round-418 erratum to the round-408 pin:** the stereo
+    /// redistribution `delta` is **clamped to `±bitrate`**. The
+    /// round-408 fixtures all carried near-balanced channels (small
+    /// `|delta|`), leaving the clamp invisible; a round-418 black-box
+    /// probe battery over extreme-imbalance joint content (side ≈ 0
+    /// or mid ≈ 0, so the unclamped delta reaches ±1000) pinned the
+    /// effective delta at exactly `+bitrate` / `−bitrate` across the
+    /// `-b3`/`-b4`/`-b5` word range (9000+ per-word bracket-width
+    /// constraints per file, each solving to a single value).
     #[must_use]
     pub fn frame_limits(&self) -> [u32; 2] {
         let ema0 = ((self.slow_level[0] + 128) >> 8) as i32;
@@ -387,7 +397,10 @@ impl HybridState {
             ];
         }
         let ema1 = ((self.slow_level[1] + 128) >> 8) as i32;
-        let delta = (ema0 - ema1 - self.balance) >> 1;
+        // A hostile profile can carry a negative bitrate word; the
+        // clamp bound floors at 0 so the range stays well-formed.
+        let bound = self.bitrate.max(0);
+        let delta = ((ema0 - ema1 - self.balance) >> 1).clamp(-bound, bound);
         [
             Self::limit_from_arg(ema0 - delta - self.bitrate + HYBRID_LIMIT_BIAS),
             Self::limit_from_arg(ema1 + delta - self.bitrate + HYBRID_LIMIT_BIAS),
@@ -889,6 +902,62 @@ mod tests {
         let expect0 = crate::logpack::wp_exp2s(ema0 - delta - 456 + 256) as u32;
         let expect1 = crate::logpack::wp_exp2s(ema1 + delta - 456 + 256) as u32;
         assert_eq!(state.frame_limits(), [expect0, expect1]);
+    }
+
+    #[test]
+    fn stereo_delta_clamps_to_plus_minus_bitrate() {
+        // Round-418 black-box pin: extreme channel imbalance drives
+        // the unclamped delta far past the bitrate word, and the
+        // reference decode resolves to delta == ±bitrate exactly (the
+        // per-word bracket-width constraints solve to a single value
+        // across the -b3/-b4/-b5 range). Probe file imb_a_b4: level
+        // words [5113, 0], bitrate 456, balance 256 → ema (2008, 0),
+        // unclamped delta 876 → clamped 456.
+        let mut payload = Vec::new();
+        for w in [5113i16, 0] {
+            payload.extend_from_slice(&w.to_le_bytes());
+        }
+        payload.extend_from_slice(&456i16.to_le_bytes());
+        payload.extend_from_slice(&256i16.to_le_bytes());
+        let p = expand_hybrid_profile(&payload, true).unwrap();
+        let state = HybridState::from_profile(&p);
+        let ema0 = ((state.slow_level(0) + 128) >> 8) as i32;
+        assert_eq!(ema0, 2008);
+        assert_eq!(state.slow_level(1), 0);
+        // delta_eff = +456: arg0 = 2008 - 456 - 456 + 256 = 1352,
+        // arg1 = 0 + 456 - 456 + 256 = 256.
+        assert_eq!(
+            state.frame_limits(),
+            [
+                crate::logpack::wp_exp2s(1352) as u32,
+                crate::logpack::wp_exp2s(256) as u32
+            ]
+        );
+        // The mirrored case (side loud, mid quiet) clamps at -bitrate.
+        let mut payload = Vec::new();
+        for w in [0i16, 5113] {
+            payload.extend_from_slice(&w.to_le_bytes());
+        }
+        payload.extend_from_slice(&456i16.to_le_bytes());
+        payload.extend_from_slice(&256i16.to_le_bytes());
+        let p = expand_hybrid_profile(&payload, true).unwrap();
+        let state = HybridState::from_profile(&p);
+        // unclamped (0 - 2008 - 256) >> 1 = -1132 → clamped -456:
+        // arg0 = 0 + 456 - 456 + 256 = 256, arg1 = 2008 - 456 - 200 = 1352.
+        assert_eq!(
+            state.frame_limits(),
+            [
+                crate::logpack::wp_exp2s(256) as u32,
+                crate::logpack::wp_exp2s(1352) as u32
+            ]
+        );
+        // A hostile negative bitrate floors the clamp bound at 0.
+        let mut payload = Vec::new();
+        for w in [5113i16, 0, -100, 256] {
+            payload.extend_from_slice(&w.to_le_bytes());
+        }
+        let p = expand_hybrid_profile(&payload, true).unwrap();
+        let _ = HybridState::from_profile(&p).frame_limits();
     }
 
     #[test]
