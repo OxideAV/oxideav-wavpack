@@ -582,7 +582,11 @@ pub(crate) fn encode_hybrid_block_ints(
     };
 
     // The lossy decode output the .wv header CRC covers (post joint
-    // undo for joint blocks).
+    // undo for joint blocks). The round-418 output clamp does NOT
+    // participate here: the reference folds the §5 CRC over the
+    // UNCLAMPED reconstruction and saturates afterwards (pinned by
+    // the clamp battery — a clamped-CRC stream is reported as a CRC
+    // error by the reference decoder).
     let mut lossy_out = streams.coarse_out;
     if joint {
         for pair in lossy_out.chunks_exact_mut(2) {
@@ -922,6 +926,291 @@ pub fn encode_stream_stereo_hybrid(
     })
 }
 
+// ---------------------------------------------------------------------
+// Float / int32 hybrid origination (round 418): the sample-format
+// deconstruction feeds the hybrid integer pipeline; the 0x0C extension
+// payload rides the .wvc twin (round-415 structural pin), so the lossy
+// .wv decodes with the implied-zero fill and the pair decode restores
+// the exact input.
+// ---------------------------------------------------------------------
+
+/// Shared body of the float-hybrid block encoders. The float shape
+/// uses the **raised** exponent anchor (`deconstruct_float_raised`) so
+/// the coarse magnitudes keep head-room under the 24-bit mantissa
+/// window; the emitted `.wv` is then verified through this crate's own
+/// lossy decode, surfacing the (pathological-bitrate) corner where a
+/// coarse value still overflows the window as the decoder's typed
+/// error instead of shipping an undecodable stream.
+fn encode_hybrid_block_float(
+    pcm: &[f32],
+    mono: bool,
+    opts: &HybridOptions,
+    level_words: Option<[i16; 2]>,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<HybridBlock> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if !mono && pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let d = crate::float::deconstruct_float_raised(pcm);
+    let format = crate::encode::float_format_extras(&d);
+    let level = match level_words {
+        Some(words) => words,
+        None => hybrid_seed(&d.integers, mono, opts)?,
+    };
+    let (wv, wvc, sl) = encode_hybrid_block_ints(
+        &d.integers,
+        mono,
+        4,
+        opts,
+        level,
+        Some(&format),
+        block_index,
+        total_samples,
+    )?;
+    // Verify the lossy stream reconstructs (the implied-zero float
+    // fixup can refuse a coarse magnitude past the mantissa window).
+    crate::block::decode_stream(&wv)?;
+    Ok((wv, wvc, sl))
+}
+
+/// Shared body of the int32-hybrid block encoders.
+fn encode_hybrid_block_int32(
+    pcm: &[i32],
+    mono: bool,
+    opts: &HybridOptions,
+    level_words: Option<[i16; 2]>,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<HybridBlock> {
+    if pcm.is_empty() {
+        return Err(Error::EncodeEmptyAudio);
+    }
+    if !mono && pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let d = crate::int32::deconstruct_int32(pcm);
+    let format = crate::encode::int32_format_extras(&d);
+    let level = match level_words {
+        Some(words) => words,
+        None => hybrid_seed(&d.reduced, mono, opts)?,
+    };
+    encode_hybrid_block_ints(
+        &d.reduced,
+        mono,
+        4,
+        opts,
+        level,
+        Some(&format),
+        block_index,
+        total_samples,
+    )
+}
+
+/// Encode a mono `f32` buffer into one hybrid `FLOAT_DATA` block: a
+/// lossy `.wv` (implied-zero mantissa fill on a `.wv`-only decode)
+/// plus — when [`HybridOptions::correction`] — the `.wvc` twin whose
+/// `0x0B` correction and `0x0C` extension streams restore the input
+/// bit patterns exactly
+/// (`decode_stream_with_correction_f32(&wv, &wvc)?` == input).
+pub fn encode_block_mono_hybrid_float(
+    pcm: &[f32],
+    opts: &HybridOptions,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<HybridEncoded> {
+    let (wv, wvc, _) =
+        encode_hybrid_block_float(pcm, true, opts, None, block_index, total_samples)?;
+    Ok(HybridEncoded { wv, wvc })
+}
+
+/// Encode an interleaved stereo `f32` buffer into one hybrid
+/// `FLOAT_DATA` block — the stereo twin of
+/// [`encode_block_mono_hybrid_float`].
+pub fn encode_block_stereo_hybrid_float(
+    pcm: &[f32],
+    opts: &HybridOptions,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<HybridEncoded> {
+    let (wv, wvc, _) =
+        encode_hybrid_block_float(pcm, false, opts, None, block_index, total_samples)?;
+    Ok(HybridEncoded { wv, wvc })
+}
+
+/// Encode a mono wide-integer buffer into one hybrid `INT32_DATA`
+/// block: the `0x09` reduction (redundancy + `sent_bits`) feeds the
+/// hybrid pipeline, the extension bits ride the `.wvc` twin, and the
+/// lossy `.wv` decodes with the implied-zero `sent_bits` fill
+/// (round-415 pins). `decode_stream_with_correction(&wv, &wvc)? ==
+/// pcm` exactly, full `i32` range.
+pub fn encode_block_mono_hybrid_int32(
+    pcm: &[i32],
+    opts: &HybridOptions,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<HybridEncoded> {
+    let (wv, wvc, _) =
+        encode_hybrid_block_int32(pcm, true, opts, None, block_index, total_samples)?;
+    Ok(HybridEncoded { wv, wvc })
+}
+
+/// Encode an interleaved stereo wide-integer buffer into one hybrid
+/// `INT32_DATA` block — the stereo twin of
+/// [`encode_block_mono_hybrid_int32`].
+pub fn encode_block_stereo_hybrid_int32(
+    pcm: &[i32],
+    opts: &HybridOptions,
+    block_index: u32,
+    total_samples: u32,
+) -> Result<HybridEncoded> {
+    let (wv, wvc, _) =
+        encode_hybrid_block_int32(pcm, false, opts, None, block_index, total_samples)?;
+    Ok(HybridEncoded { wv, wvc })
+}
+
+/// Multi-block hybrid `FLOAT_DATA` stream (mono) — per-chunk `0x08`
+/// profiles, running level state carried across blocks.
+pub fn encode_stream_mono_hybrid_float(
+    pcm: &[f32],
+    block_samples: usize,
+    opts: &HybridOptions,
+) -> Result<HybridEncoded> {
+    let chunk = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut wv = Vec::new();
+    let mut wvc_all = Vec::new();
+    let mut index: u32 = 0;
+    let mut level: Option<[i16; 2]> = None;
+    for window in pcm.chunks(chunk) {
+        let (blk, cblk, sl) = encode_hybrid_block_float(window, true, opts, level, index, total)?;
+        wv.extend_from_slice(&blk);
+        if let Some(cblk) = cblk {
+            wvc_all.extend_from_slice(&cblk);
+        }
+        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
+        index = index
+            .checked_add(window.len() as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(HybridEncoded {
+        wv,
+        wvc: opts.correction.then_some(wvc_all),
+    })
+}
+
+/// Multi-block hybrid `FLOAT_DATA` stream (interleaved stereo).
+pub fn encode_stream_stereo_hybrid_float(
+    pcm: &[f32],
+    block_samples: usize,
+    opts: &HybridOptions,
+) -> Result<HybridEncoded> {
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let pairs = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut wv = Vec::new();
+    let mut wvc_all = Vec::new();
+    let mut index: u32 = 0;
+    let mut level: Option<[i16; 2]> = None;
+    for window in pcm.chunks(pairs * 2) {
+        let (blk, cblk, sl) = encode_hybrid_block_float(window, false, opts, level, index, total)?;
+        wv.extend_from_slice(&blk);
+        if let Some(cblk) = cblk {
+            wvc_all.extend_from_slice(&cblk);
+        }
+        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
+        index = index
+            .checked_add((window.len() / 2) as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(HybridEncoded {
+        wv,
+        wvc: opts.correction.then_some(wvc_all),
+    })
+}
+
+/// Multi-block hybrid `INT32_DATA` stream (mono).
+pub fn encode_stream_mono_hybrid_int32(
+    pcm: &[i32],
+    block_samples: usize,
+    opts: &HybridOptions,
+) -> Result<HybridEncoded> {
+    let chunk = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len()).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut wv = Vec::new();
+    let mut wvc_all = Vec::new();
+    let mut index: u32 = 0;
+    let mut level: Option<[i16; 2]> = None;
+    for window in pcm.chunks(chunk) {
+        let (blk, cblk, sl) = encode_hybrid_block_int32(window, true, opts, level, index, total)?;
+        wv.extend_from_slice(&blk);
+        if let Some(cblk) = cblk {
+            wvc_all.extend_from_slice(&cblk);
+        }
+        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
+        index = index
+            .checked_add(window.len() as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(HybridEncoded {
+        wv,
+        wvc: opts.correction.then_some(wvc_all),
+    })
+}
+
+/// Multi-block hybrid `INT32_DATA` stream (interleaved stereo).
+pub fn encode_stream_stereo_hybrid_int32(
+    pcm: &[i32],
+    block_samples: usize,
+    opts: &HybridOptions,
+) -> Result<HybridEncoded> {
+    if pcm.len() % 2 != 0 {
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let pairs = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let total = u32::try_from(pcm.len() / 2).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut wv = Vec::new();
+    let mut wvc_all = Vec::new();
+    let mut index: u32 = 0;
+    let mut level: Option<[i16; 2]> = None;
+    for window in pcm.chunks(pairs * 2) {
+        let (blk, cblk, sl) = encode_hybrid_block_int32(window, false, opts, level, index, total)?;
+        wv.extend_from_slice(&blk);
+        if let Some(cblk) = cblk {
+            wvc_all.extend_from_slice(&cblk);
+        }
+        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
+        index = index
+            .checked_add((window.len() / 2) as u32)
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(HybridEncoded {
+        wv,
+        wvc: opts.correction.then_some(wvc_all),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,5 +1481,220 @@ mod tests {
         assert_eq!(wvc_blk.crc(), crate::crc::crc_mono(&pcm), "lossless CRC");
         assert_ne!(wv_blk.crc(), wvc_blk.crc(), "lossy vs lossless CRCs differ");
         assert!(wvc_blk.has_packed_correction_data());
+    }
+
+    // ---- float / int32 hybrid pairs ----------------------------------
+
+    fn float_signal(n: usize, seed: u64) -> Vec<f32> {
+        splitmix(seed, n)
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| {
+                if i % 41 == 0 {
+                    0.0
+                } else {
+                    let t = i as f32 * 0.037;
+                    t.sin() * 0.6 + (r as f32 / i64::MAX as f32) * 0.02
+                }
+            })
+            .collect()
+    }
+
+    fn bits_of(pcm: &[f32]) -> Vec<u32> {
+        pcm.iter().map(|s| s.to_bits()).collect()
+    }
+
+    #[test]
+    fn float_hybrid_pair_is_bit_exact_and_lossy_decodes() {
+        let pcm = float_signal(2000, 0x5eed);
+        for (joint, profile) in [(false, None), (true, Some(DecorrProfile::Normal))] {
+            let enc =
+                encode_block_mono_hybrid_float(&pcm, &opts(456, joint, profile), 0, 2000).unwrap();
+            let wvc = enc.wvc.as_ref().unwrap();
+            let exact = crate::block::decode_stream_with_correction_f32(&enc.wv, wvc).unwrap();
+            assert_eq!(bits_of(&exact), bits_of(&pcm), "pair decode bit patterns");
+            let (_, ok) = crate::block::decode_stream_with_correction_muted(&enc.wv, wvc).unwrap();
+            assert!(ok, "pair CRC gate (incl. extension crc_x)");
+            // Lossy-only decode succeeds (implied-zero fill) and is close.
+            let lossy = crate::block::decode_stream_f32(&enc.wv).unwrap();
+            let max_err = lossy
+                .iter()
+                .zip(&pcm)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err > 0.0 && max_err < 0.2,
+                "float noise bounded ({max_err})"
+            );
+            let (parsed, _) = crate::parse_block(&enc.wv).unwrap();
+            assert!(parsed.is_float());
+            assert!(!parsed.has_packed_overflow_bits(), "wvx rides the wvc twin");
+            let (cblk, _) = crate::parse_block(wvc).unwrap();
+            assert!(cblk.has_packed_overflow_bits());
+        }
+    }
+
+    #[test]
+    fn float_hybrid_stereo_pair_with_specials_is_bit_exact() {
+        let mut pcm: Vec<f32> = float_signal(1200, 0x77)
+            .iter()
+            .flat_map(|&s| [s, -s * 0.5])
+            .collect();
+        pcm[100] = f32::INFINITY;
+        pcm[101] = f32::from_bits(0x7f95_5555);
+        pcm[200] = -0.0;
+        pcm[201] = f32::from_bits(0x0000_0123);
+        let enc = encode_block_stereo_hybrid_float(
+            &pcm,
+            &opts(456, true, Some(DecorrProfile::Fast)),
+            0,
+            1200,
+        )
+        .unwrap();
+        let wvc = enc.wvc.as_ref().unwrap();
+        let exact = crate::block::decode_stream_with_correction_f32(&enc.wv, wvc).unwrap();
+        assert_eq!(bits_of(&exact), bits_of(&pcm));
+    }
+
+    #[test]
+    fn float_hybrid_streams_round_trip() {
+        let pcm = float_signal(3000, 0x31);
+        let enc = encode_stream_mono_hybrid_float(
+            &pcm,
+            800,
+            &opts(456, false, Some(DecorrProfile::Normal)),
+        )
+        .unwrap();
+        let wvc = enc.wvc.as_ref().unwrap();
+        assert_eq!(crate::audio_block_count(&enc.wv).unwrap(), 4);
+        let exact = crate::block::decode_stream_with_correction_f32(&enc.wv, wvc).unwrap();
+        assert_eq!(bits_of(&exact), bits_of(&pcm));
+
+        let stereo: Vec<f32> = pcm.iter().flat_map(|&s| [s, s * 0.9]).collect();
+        let enc = encode_stream_stereo_hybrid_float(
+            &stereo,
+            700,
+            &opts(456, true, Some(DecorrProfile::Normal)),
+        )
+        .unwrap();
+        let exact =
+            crate::block::decode_stream_with_correction_f32(&enc.wv, enc.wvc.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(bits_of(&exact), bits_of(&stereo));
+    }
+
+    #[test]
+    fn int32_hybrid_pair_is_bit_exact_full_range() {
+        let pcm: Vec<i32> = splitmix(0xfeed, 1500).iter().map(|&r| r as i32).collect();
+        let enc = encode_block_mono_hybrid_int32(&pcm, &opts(456, false, None), 0, 1500).unwrap();
+        let wvc = enc.wvc.as_ref().unwrap();
+        assert_eq!(
+            decode_stream_with_correction(&enc.wv, wvc).unwrap(),
+            pcm,
+            "full-range int32 pair decode"
+        );
+        let (_, ok) = decode_stream_with_correction_muted(&enc.wv, wvc).unwrap();
+        assert!(ok);
+        // Lossy-only decode succeeds with the implied-zero fill.
+        let (lossy, ok) = decode_stream_muted(&enc.wv).unwrap();
+        assert!(ok);
+        assert_eq!(lossy.len(), pcm.len());
+    }
+
+    #[test]
+    fn int32_hybrid_stereo_stream_round_trips() {
+        // Correlated wide data across multiple blocks.
+        let mut acc = 0i64;
+        let base: Vec<i32> = splitmix(0xabc, 2600)
+            .iter()
+            .map(|&r| {
+                acc += (r >> 48) << 9;
+                acc as i32
+            })
+            .collect();
+        let pcm: Vec<i32> = base.iter().flat_map(|&v| [v, v ^ 0x1FF]).collect();
+        let enc = encode_stream_stereo_hybrid_int32(
+            &pcm,
+            800,
+            &opts(456, true, Some(DecorrProfile::Normal)),
+        )
+        .unwrap();
+        let wvc = enc.wvc.as_ref().unwrap();
+        assert_eq!(decode_stream_with_correction(&enc.wv, wvc).unwrap(), pcm);
+    }
+
+    #[test]
+    fn clipping_adjacent_content_clamps_the_lossy_decode_only() {
+        // Round-418 pin: the lossy reconstruction saturates to the
+        // effective bit-depth range AFTER the (unclamped) §5 CRC fold;
+        // the pair stays bit-exact.
+        let pcm: Vec<i32> = (0..3000)
+            .map(|i| {
+                let t = f64::from(i) * 0.03;
+                ((t.sin() * 32300.0) as i32 + (i % 997) - 498).clamp(-32768, 32767)
+            })
+            .collect();
+        let enc = encode_block_mono_hybrid(
+            &pcm,
+            2,
+            &opts(0, false, Some(DecorrProfile::Normal)),
+            0,
+            3000,
+        )
+        .unwrap();
+        let lossy = assert_pair_round_trip(&pcm, &enc);
+        assert!(
+            lossy.iter().all(|&s| (-32768..=32767).contains(&s)),
+            "lossy output clamps to the 16-bit range"
+        );
+        // The coarse bitrate (word 0) on clipping content guarantees
+        // some samples actually hit the clamp.
+        assert!(
+            lossy.iter().any(|&s| s == 32767 || s == -32768),
+            "clamp exercised"
+        );
+    }
+
+    #[test]
+    fn redundancy_only_int32_hybrid_pair_restores_the_pattern() {
+        // Trailing-ones content narrow enough that sent_bits == 0: the
+        // pair decode re-inserts the ones pattern, the lossy decode
+        // zero-fills the window (round-418 pins).
+        let pcm: Vec<i32> = splitmix(0x0e5, 1500)
+            .iter()
+            .map(|&r| (((r >> 44) as i32) & !0xF) | 0xF)
+            .collect();
+        let enc = encode_block_mono_hybrid_int32(&pcm, &opts(456, false, None), 0, 1500).unwrap();
+        let (parsed, _) = crate::parse_block(&enc.wv).unwrap();
+        let info_sub = parsed.find_sub_block(crate::SubBlockId::Int32Info).unwrap();
+        let info = crate::int32::expand_int32_info(info_sub.payload).unwrap();
+        assert_eq!(info.sent_bits, 0, "redundancy-only profile");
+        assert_eq!(info.ones, 4);
+        let lossy = assert_pair_round_trip(&pcm, &enc);
+        assert!(
+            lossy.iter().all(|&s| s & 0xF == 0),
+            "lossy window zero-fills"
+        );
+    }
+
+    #[test]
+    fn format_hybrid_refuses_empty_and_odd_stereo() {
+        let o = HybridOptions::default();
+        assert!(matches!(
+            encode_block_mono_hybrid_float(&[], &o, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_hybrid_float(&[1.0], &o, 0, 1),
+            Err(Error::EncodeStereoOddLength(1))
+        ));
+        assert!(matches!(
+            encode_block_mono_hybrid_int32(&[], &o, 0, 0),
+            Err(Error::EncodeEmptyAudio)
+        ));
+        assert!(matches!(
+            encode_block_stereo_hybrid_int32(&[1], &o, 0, 1),
+            Err(Error::EncodeStereoOddLength(1))
+        ));
     }
 }

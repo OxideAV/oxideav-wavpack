@@ -17,6 +17,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 418 — **float / int32 hybrid pairs.**
+  `encode_block_{mono,stereo}_hybrid_{float,int32}` and their
+  `encode_stream_*` twins compose the sample-format deconstructions
+  with the hybrid pipeline: the `0x0C` extension payload rides the
+  `.wvc` twin (round-415 structural pin), the lossy `.wv` decodes
+  with the implied-zero fill, and the pair decode restores the exact
+  input — IEEE-754 bit patterns (inf / NaN / `-0.0` / denormals
+  included) and full-range `i32` alike. The hybrid float shape
+  raises the `0x08` exponent anchor one above the largest finite
+  exponent (23-bit integer magnitudes leave head-room for the
+  coarse overshoot) and routes exceptional samples through the
+  `ZEROS_SENT` literal path instead of the bit-length-25 sentinel
+  (whose wvx marker only exists in the `.wvc`, which the lossy
+  stream doesn't have — as literals they decode to an implied
+  `+0.0` lossy and the exact pattern through the pair).
+
 - Round 418 — **hybrid origination (lossy `.wv` + lossless
   `.wv`+`.wvc` pairs).** The encoder now originates the §6.5
   `error_limit` model it learned to decode in rounds 408/415:
@@ -45,6 +61,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   words 0..800 × multi-block × 24-bit × silence).
 
 ### Fixed
+
+- Round 418 — **hybrid lossy output clamp** (black-box pin): the
+  reference decoder saturates each lossy-path reconstructed sample
+  to the signed range of the effective pre-fixup bit depth — 16-bit
+  content clamps at exactly ±2^15, an int32 `sent+redundancy = 8`
+  reduction clamps its pre-fixup values at ±2^23 — as a final pass
+  over the pre-fixup buffer: the clamp does **not** feed back into
+  the prediction state, and the §5 block CRC folds over the
+  **unclamped** reconstruction (a clamped-CRC stream is reported as
+  a CRC error). `WavPackBlock` now applies the clamp between the
+  CRC fold and the sample-format fixups on every decode path (the
+  pair fold included, where it is the identity for in-range
+  samples). Pinned by clipping-adjacent probe batteries at `-b2`.
+
+- Round 418 — **implied int32 fill covers the redundancy too**
+  (erratum to the round-415 sent-bits pin): the `.wv`-only lossy
+  decode of an `INT32_DATA` block shifts by the **total** reduction
+  and zero-fills the whole window — the `ones` / `dups` patterns
+  are *not* re-inserted (reference-encoded trailing-ones and
+  duplicated-low-bit profiles decode with all-zero low windows,
+  `sent_bits = 0` profiles included), while the pair decode still
+  restores the exact pattern. `reassemble_int32_implied` now
+  zero-shifts by `total_shift()`, and the fixup plumbing carries a
+  `pair` flag so a two-file decode never selects the lossy fills.
 
 - Round 418 — **§6.5 stereo redistribution erratum: `delta` clamps
   to `±bitrate`.** The round-408 pin derived

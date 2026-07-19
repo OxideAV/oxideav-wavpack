@@ -183,17 +183,20 @@ pub fn reassemble_int32(
 /// [`reassemble_int32`] for a **hybrid (lossy) block without a `0x0C`
 /// extension stream**: a pair encode moves the wvx bits to the `.wvc`
 /// twin, so decoding the `.wv` alone has no literal low bits to read —
-/// the reference decoder fills the `sent_bits` window with **zeros**
-/// and still re-inserts the stripped redundancy pattern (round-415
-/// black-box pin: the lossy reference decode of a sent-bits int32
-/// hybrid file is bit-exact under the zero fill). The mirror of
-/// [`crate::float::reassemble_float_implied`] for `INT32_DATA`. No
-/// extension CRC is returned — there is no stored `crc_wvx` to
+/// the reference decoder shifts each value left by the **total**
+/// reduction (`sent_bits` plus the redundancy count) and fills the
+/// whole vacated window with **zeros**, without re-inserting the
+/// `ones` / `dups` redundancy pattern (round-415 pin for the
+/// sent-bits zero fill; round-418 black-box pin for the redundancy
+/// half — the reference lossy decode of trailing-ones and
+/// duplicated-low-bit profiles carries all-zero low windows, while
+/// the lossless pair decode re-inserts the exact pattern). The mirror
+/// of [`crate::float::reassemble_float_implied`] for `INT32_DATA`.
+/// No extension CRC is returned — there is no stored `crc_wvx` to
 /// compare against.
 pub fn reassemble_int32_implied(pcm: &mut [i32], info: &Int32Info) {
     for slot in pcm.iter_mut() {
-        let value = slot.wrapping_shl(u32::from(info.sent_bits));
-        *slot = info.reinsert_redundancy(value);
+        *slot = slot.wrapping_shl(info.total_shift());
     }
 }
 
@@ -583,6 +586,26 @@ mod tests {
     #[test]
     fn deconstruct_all_zero_buffer_round_trips() {
         assert_deconstruction_round_trips(&[0i32; 64]);
+    }
+
+    #[test]
+    fn implied_fill_zeroes_the_whole_window() {
+        // Round-418 pin: the lossy (implied) path shifts by the TOTAL
+        // reduction and zero-fills — the ones / dups patterns are NOT
+        // re-inserted (the pair path restores them via
+        // `reassemble_int32`).
+        let ones = expand_int32_info(&[2, 0, 4, 0]).unwrap();
+        let mut pcm = [1i32, -1, 5];
+        reassemble_int32_implied(&mut pcm, &ones);
+        assert_eq!(pcm, [1 << 6, -(1 << 6), 5 << 6], "no ones pattern");
+        let dups = expand_int32_info(&[0, 0, 0, 3]).unwrap();
+        let mut pcm = [0b101i32, -1];
+        reassemble_int32_implied(&mut pcm, &dups);
+        assert_eq!(pcm, [0b101_000, -8], "no dup pattern");
+        let zeros = expand_int32_info(&[8, 8, 0, 0]).unwrap();
+        let mut pcm = [3i32];
+        reassemble_int32_implied(&mut pcm, &zeros);
+        assert_eq!(pcm, [3 << 16]);
     }
 
     #[test]

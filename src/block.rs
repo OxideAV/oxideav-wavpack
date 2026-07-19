@@ -685,6 +685,7 @@ impl<'a> WavPackBlock<'a> {
             correction
                 .packed_overflow_bits()
                 .or_else(|| self.packed_overflow_bits()),
+            true,
         )?;
         crate::fixup::apply_left_shift_buffer(&mut out, self.header.flags.left_shift);
         Ok(self.expand_false_stereo(out))
@@ -800,6 +801,9 @@ impl<'a> WavPackBlock<'a> {
         for (o, (e, c)) in out.iter_mut().zip(exact.iter().zip(coarse.iter())) {
             *o = o.wrapping_add(e.wrapping_sub(*c));
         }
+        // Round-418 hybrid output clamp — the identity for any
+        // losslessly-recovered sample (see `clamp_hybrid_output`).
+        self.clamp_hybrid_output(&mut out);
         Ok(out)
     }
 
@@ -830,7 +834,7 @@ impl<'a> WavPackBlock<'a> {
                 .packed_overflow_bits()
                 .or_else(|| self.packed_overflow_bits());
             if let Some((computed, stored)) =
-                self.apply_sample_format_fixups_with(&mut pcm, overflow)?
+                self.apply_sample_format_fixups_with(&mut pcm, overflow, true)?
             {
                 crc_ok = computed == stored;
             }
@@ -911,6 +915,9 @@ impl<'a> WavPackBlock<'a> {
             out.push(left);
             out.push(right);
         }
+        // Round-418 hybrid output clamp — the identity for any
+        // losslessly-recovered sample (see `clamp_hybrid_output`).
+        self.clamp_hybrid_output(&mut out);
         // Sample-format fixups + the final left shift are applied by the
         // caller (the 0x0C source differs on a pair decode).
         Ok(out)
@@ -1172,6 +1179,9 @@ impl<'a> WavPackBlock<'a> {
     /// the pre-shift buffer to compare against the stored header CRC.
     pub fn decode_samples(&self) -> Result<Vec<i32>> {
         let mut pcm = self.decode_samples_preshift()?;
+        // Round 418: the hybrid output clamp runs after the CRC-domain
+        // reconstruction, before the sample-format fixups.
+        self.clamp_hybrid_output(&mut pcm);
         // Round 405: the int32 sample-format fixup (0x0C extension bits
         // + redundancy re-insertion) runs between the CRC fold and the
         // final left shift. The plain decode does not enforce the
@@ -1496,6 +1506,8 @@ impl<'a> WavPackBlock<'a> {
     /// that does. Round 378.
     pub fn decode_member_samples(&self) -> Result<Vec<i32>> {
         let mut pcm = self.decode_member_preshift()?;
+        // Round 418: hybrid output clamp (post-CRC-domain, pre-fixup).
+        self.clamp_hybrid_output(&mut pcm);
         // Round 405: int32 sample-format fixup (see
         // `apply_int32_fixup`), verdict unenforced on the plain path.
         self.apply_sample_format_fixups(&mut pcm)?;
@@ -1516,6 +1528,8 @@ impl<'a> WavPackBlock<'a> {
     pub fn decode_member_samples_muted(&self) -> Result<(Vec<i32>, bool)> {
         let mut pcm = self.decode_member_preshift()?;
         let mut crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        // Round 418: clamp after the CRC fold (see decode_samples_muted).
+        self.clamp_hybrid_output(&mut pcm);
         if crc_ok {
             // Round 405: extension-CRC verdict joins the §5.6 gate.
             if let Some((computed, stored)) = self.apply_sample_format_fixups(&mut pcm)? {
@@ -1560,6 +1574,8 @@ impl<'a> WavPackBlock<'a> {
         // sub-byte-depth blocks (non-zero `left_shift`).
         let mut pcm = self.decode_samples_preshift()?;
         let main_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        // Round 418: clamp between the CRC fold and the fixups.
+        self.clamp_hybrid_output(&mut pcm);
         // Spec §5.6: when a 0x0C extension stream participated, the
         // accumulated crc_x must also match its stored crc_wvx.
         let ext_ok = match self.apply_sample_format_fixups(&mut pcm)? {
@@ -1600,8 +1616,49 @@ impl<'a> WavPackBlock<'a> {
     /// refusals: [`Error::BlockMissingInt32Info`],
     /// [`Error::BlockMissingOverflowBits`], [`Error::Int32InfoLength`],
     /// [`Error::Int32InfoConflict`], [`Error::OverflowBitsTooShort`].
+    /// The round-418 **hybrid output clamp**: the reference decoder
+    /// saturates each *lossy-path* reconstructed sample to the signed
+    /// range of the block's effective pre-fixup bit depth — pinned
+    /// black-box on clipping-adjacent content (16-bit at `-b2` clamps
+    /// at exactly ±2^15, and a `sent_bits = 8` int32 reduction clamps
+    /// its pre-fixup values at ±2^23, i.e. container bits minus the
+    /// `0x09` total shift). Neighbouring samples are unaffected, so
+    /// the clamp does **not** feed back into the prediction state, and
+    /// the §5 block CRC folds over the **unclamped** reconstruction
+    /// (a clamped-CRC stream is reported as a CRC error by the
+    /// reference decoder) — so the clamp runs *after* the CRC fold,
+    /// before the sample-format fixups. The pair decode applies it
+    /// after the correction fold, where it is the identity for any
+    /// losslessly-recovered (in-range) sample. The `left_shift` term
+    /// extends the same "effective depth" reading to shifted blocks
+    /// (untested corner: reference hybrid encodes do not combine
+    /// left-shift with clipping-adjacent content).
+    fn clamp_hybrid_output(&self, pcm: &mut [i32]) {
+        let flags = &self.header.flags;
+        if !flags.hybrid {
+            return;
+        }
+        let mut bits = u32::from(flags.bytes_per_sample()) * 8 - u32::from(flags.left_shift);
+        if flags.int32_mode {
+            if let Some(sub) = self.find_sub_block(SubBlockId::Int32Info) {
+                if let Ok(info) = crate::int32::expand_int32_info(sub.payload) {
+                    bits = bits.saturating_sub(info.total_shift());
+                }
+            }
+        }
+        let bits = bits.clamp(1, 32);
+        if bits == 32 {
+            return;
+        }
+        let hi = (1i32 << (bits - 1)) - 1;
+        let lo = -(1i32 << (bits - 1));
+        for s in pcm.iter_mut() {
+            *s = (*s).clamp(lo, hi);
+        }
+    }
+
     fn apply_sample_format_fixups(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
-        self.apply_sample_format_fixups_with(pcm, self.packed_overflow_bits())
+        self.apply_sample_format_fixups_with(pcm, self.packed_overflow_bits(), false)
     }
 
     /// [`Self::apply_sample_format_fixups`] with an explicit `0x0C`
@@ -1610,15 +1667,21 @@ impl<'a> WavPackBlock<'a> {
     /// and `0x07` (round-415 structural pin against reference pair
     /// encodes), so the pair paths pass the correction block's
     /// overflow-bits view here instead of this block's own.
+    /// `pair` marks a two-file (`.wv` + `.wvc`) decode: the recovered
+    /// values are lossless, so a missing extension stream must never
+    /// select the implied-zero *lossy* fills (round-418 pin: the
+    /// redundancy-only int32 pattern IS re-inserted on the pair path,
+    /// while the `.wv`-only lossy decode zero-fills the whole window).
     fn apply_sample_format_fixups_with(
         &self,
         pcm: &mut [i32],
         overflow: Option<crate::PackedOverflowBits<'_>>,
+        pair: bool,
     ) -> Result<Option<(u32, u32)>> {
         if self.header.flags.float_data {
             return self.apply_float_fixup(pcm, overflow);
         }
-        self.apply_int32_fixup(pcm, overflow)
+        self.apply_int32_fixup(pcm, overflow, pair)
     }
 
     /// The float half of [`Self::apply_sample_format_fixups`] (staged
@@ -1678,6 +1741,7 @@ impl<'a> WavPackBlock<'a> {
         &self,
         pcm: &mut [i32],
         overflow: Option<crate::PackedOverflowBits<'_>>,
+        pair: bool,
     ) -> Result<Option<(u32, u32)>> {
         if !self.header.flags.int32_mode {
             return Ok(None);
@@ -1687,12 +1751,12 @@ impl<'a> WavPackBlock<'a> {
             .ok_or(Error::BlockMissingInt32Info)?;
         let info = crate::int32::expand_int32_info(info_sub.payload)?;
         if info.requires_extension() {
-            if overflow.is_none() && self.header.flags.hybrid {
+            if overflow.is_none() && self.header.flags.hybrid && !pair {
                 // A hybrid (lossy) int32 block legitimately omits the wvx
                 // stream (a pair encode carries it in the .wvc twin): the
-                // sent_bits window fills with implied zeros, mirroring the
-                // float posture (round-415 black-box pin against the
-                // reference lossy decode of a sent-bits int32 file).
+                // whole reduced window — sent_bits AND redundancy — fills
+                // with implied zeros (round-415 pin for the sent-bits
+                // fill; round-418 pin for the redundancy half).
                 crate::int32::reassemble_int32_implied(pcm, &info);
                 return Ok(None);
             }
@@ -1701,9 +1765,19 @@ impl<'a> WavPackBlock<'a> {
             let mut reader = overflow.extension_bit_reader()?;
             let computed = crate::int32::reassemble_int32(pcm, &info, Some(&mut reader))?;
             Ok(Some((computed, stored)))
+        } else if overflow.is_none() && self.header.flags.hybrid && !pair {
+            // Redundancy-only reduction on the lossy path: the pattern
+            // is NOT re-inserted — the reference decoder zero-fills the
+            // whole window exactly as in the sent-bits case (round-418
+            // black-box pin: trailing-ones and duplicated-low-bit
+            // profiles decode with all-zero low windows in the lossy
+            // stream, while the pair decode restores the pattern).
+            crate::int32::reassemble_int32_implied(pcm, &info);
+            Ok(None)
         } else {
-            // Redundancy-only reduction: no literal bits to read. The
-            // spec ties the crc_x accumulation to the presence of a
+            // Redundancy-only reduction (lossless / pair path): no
+            // literal bits to read; the stripped pattern is re-inserted.
+            // The spec ties the crc_x accumulation to the presence of a
             // 0x0C stream (decorrelation doc §5.5), so compare only
             // when one is on the wire.
             let computed = crate::int32::reassemble_int32(pcm, &info, None)?;
@@ -1739,6 +1813,9 @@ impl<'a> WavPackBlock<'a> {
         // buffer, then apply the left-shift fixup to whatever PCM we emit.
         let mut pcm = self.decode_samples_preshift()?;
         let mut crc_ok = self.crc_of_decoded(&pcm) == self.header.crc();
+        // Round 418: the §5 CRC covers the UNCLAMPED reconstruction;
+        // the hybrid output clamp applies after the fold.
+        self.clamp_hybrid_output(&mut pcm);
         if crc_ok {
             // Round 405: run the int32 sample-format fixup and fold its
             // §5.5 extension-CRC verdict into the gate (spec §5.6: the

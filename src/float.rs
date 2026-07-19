@@ -410,6 +410,31 @@ pub struct FloatDeconstruction {
 /// Infallible: every `f32` bit pattern has an exact wire form.
 #[must_use]
 pub fn deconstruct_float(pcm: &[f32]) -> FloatDeconstruction {
+    deconstruct_float_impl(pcm, false)
+}
+
+/// [`deconstruct_float`] in the **hybrid** shape (round 418):
+///
+/// * the exponent anchor is **raised one above** the largest finite
+///   exponent, so every integer-path sample has a non-empty vacated
+///   window and the scaled-integer magnitudes stay within 23 bits —
+///   a coarse residual can overshoot the exact magnitude by up to
+///   the §6.5 `error_limit`, and the head-room keeps the lossy
+///   reconstruction inside the 24-bit mantissa window;
+/// * exceptional samples (inf / NaN) ride the **`ZEROS_SENT`
+///   literal path** instead of the bit-length-25 sentinel: the
+///   sentinel's wvx marker only exists in the extension stream,
+///   which a pair encode moves to the `.wvc` twin, so a
+///   sentinel-coded exceptional sample would make the lossy `.wv`
+///   undecodable on its own. As a zero-integer literal the sample
+///   decodes to an implied `+0.0` in the lossy stream and to the
+///   exact 32-bit pattern (NaN payload included) through the pair.
+#[must_use]
+pub(crate) fn deconstruct_float_raised(pcm: &[f32]) -> FloatDeconstruction {
+    deconstruct_float_impl(pcm, true)
+}
+
+fn deconstruct_float_impl(pcm: &[f32], raised: bool) -> FloatDeconstruction {
     let bits: Vec<u32> = pcm.iter().map(|s| s.to_bits()).collect();
     let mut has_neg_zero = false;
     let mut has_exception = false;
@@ -421,6 +446,9 @@ pub fn deconstruct_float(pcm: &[f32]) -> FloatDeconstruction {
         match (exp, man) {
             (0, 0) => has_neg_zero |= b >> 31 == 1,
             (0, _) => has_denormal = true,
+            // The hybrid shape sends exceptional values as ZEROS_SENT
+            // literals (see `deconstruct_float_raised`).
+            (0xFF, _) if raised => has_denormal = true,
             (0xFF, _) => has_exception = true,
             _ => max_e = Some(max_e.map_or(exp, |m| m.max(exp))),
         }
@@ -457,19 +485,28 @@ pub fn deconstruct_float(pcm: &[f32]) -> FloatDeconstruction {
         (all_zero, any_window && all_ones, uniform, any_literal)
     };
 
-    let (w_zero, w_ones, _, _) = survey(anchor_plain);
+    let base = anchor_plain + u32::from(raised);
+    let (w_zero, w_ones, w_uniform, _) = survey(base);
     let (fill, anchor) = if w_zero {
-        (0u8, anchor_plain)
+        (0u8, base)
     } else if w_ones {
-        (FLOAT_SHIFT_ONES, anchor_plain)
+        (FLOAT_SHIFT_ONES, base)
+    } else if raised {
+        // The raised anchor already gives every integer-path sample a
+        // window, so the SHIFT_SAME carrier applies at `base` itself.
+        if w_uniform {
+            (FLOAT_SHIFT_SAME, base)
+        } else {
+            (FLOAT_SHIFT_SENT, base)
+        }
     } else {
         // The round-408 `SHIFT_SAME` shape anchors one above the
         // largest exponent so every integer-path sample has a window.
-        let (_, _, uniform_up, _) = survey(anchor_plain + 1);
+        let (_, _, uniform_up, _) = survey(base + 1);
         if uniform_up {
-            (FLOAT_SHIFT_SAME, anchor_plain + 1)
+            (FLOAT_SHIFT_SAME, base + 1)
         } else {
-            (FLOAT_SHIFT_SENT, anchor_plain)
+            (FLOAT_SHIFT_SENT, base)
         }
     };
     let (_, _, _, any_literal) = survey(anchor);
@@ -517,7 +554,14 @@ pub fn deconstruct_float(pcm: &[f32]) -> FloatDeconstruction {
         let neg = b >> 31 == 1;
         let exp = (b >> 23) & 0xFF;
         let man = b & 0x007f_ffff;
-        let integer: i32 = if exp == 0xFF {
+        let integer: i32 = if exp == 0xFF && raised {
+            // Hybrid shape: full literal via the ZEROS_SENT path.
+            wvx.write_bit(1);
+            wvx.write_bits(man, 23);
+            wvx.write_bits(exp, 8);
+            wvx.write_bit(u32::from(neg));
+            0
+        } else if exp == 0xFF {
             // Exceptional sample: the bit-length-25 sentinel integer;
             // wvx carries the marker (+ NaN mantissa payload).
             if man == 0 {
