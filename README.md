@@ -16,8 +16,17 @@ integer, 32-bit float (every documented `0x08` profile shape, inf/NaN
 included), mono / stereo (left-right and joint) / false-stereo /
 multichannel, every standard encoder effort mode, the hybrid `-b`
 bitrate range, and the `-c`/`-cc` correction-file modes — validated
-black-box against the reference decoder on a 54-fixture battery
-committed under `tests/data/`.
+black-box against the reference decoder on a 59-fixture battery
+committed under `tests/data/`. Since round 418 the encoder
+**originates every axis it decodes**: `FLOAT_DATA` and `INT32_DATA`
+streams (data-derived `0x08`/`0x09` profiles + `0x0C` extension
+streams), and **hybrid encoding** — a lossy `.wv` at a caller-chosen
+§6.5 bitrate word plus the `.wvc` correction twin that restores the
+input bit-exactly — every emitted stream/pair decoding byte-identically
+through this crate's own decoder *and* the reference decoder binary
+(35-case black-box battery: mono/stereo × joint/left-right ×
+raw/derived prediction × bitrate words 0..2000 × int/float/int32 ×
+multi-block × silence × clipping-adjacent content).
 
 Working surface:
 
@@ -434,6 +443,19 @@ let pcm = decode_stream_with_correction(wv_bytes, wvc_bytes)?;   // bit-exact or
 let (pcm, all_crc_ok) = decode_stream_with_correction_muted(wv_bytes, wvc_bytes)?;
 let surround = decode_multichannel_stream_with_correction(wv_51, wvc_51)?; // 5.1 pairs
 
+// Originate the formats you used to only decode (round 418) — all
+// bit-exact through this decoder AND the reference decoder binary:
+use oxideav_wavpack::{
+    encode_block_stereo_float_best, encode_stream_mono_int32, encode_stream_stereo_hybrid,
+    HybridOptions,
+};
+let wv = encode_block_stereo_float_best(&f32_pcm, DecorrProfile::High, 0, frames)?;
+let wv = encode_stream_mono_int32(&wide_pcm, 0, DecorrProfile::Normal)?;
+// Hybrid: lossy .wv at ~4 bits/sample + the .wvc twin that restores
+// the input exactly through the pair decode:
+let pair = encode_stream_stereo_hybrid(&pcm, 0, 2, &HybridOptions::from_bits_per_sample(4.0))?;
+assert_eq!(decode_stream_with_correction(&pair.wv, pair.wvc.as_ref().unwrap())?, pcm);
+
 // Seek: index the stream once (header-only), then decode windows —
 // or drive the playback-shaped cursor (frame- or time-addressed):
 use oxideav_wavpack::{decode_range, StreamIndex, StreamReader};
@@ -543,7 +565,16 @@ header-only scan of the `.wvc`; uncovered sets fall back lossy), and
 the same machinery — windows and chunked reads are pinned bit-equal
 to the whole-stream pair decode for joint, multi-block, and 5.1
 shapes. Every hybrid shape the reference encoder produces now
-decodes: no hybrid gaps remain.
+decodes: no hybrid gaps remain. Three round-418 conformance pins
+harden the §6.5 model further, each backed by a committed edge-probe
+fixture: the stereo redistribution **delta clamps to `±bitrate`**
+(extreme-imbalance joint content; erratum to the round-408 pin, which
+never left the near-balanced regime), the lossy reconstruction
+**saturates to the effective bit-depth range** (±2^15 on 16-bit,
+container-minus-total-shift on int32) as a final pass *after* the
+unclamped §5 CRC fold, and the `.wv`-only int32 fill **zero-fills the
+whole reduced window** (`ones`/`dups` patterns are only restored on
+the pair path).
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged
@@ -555,9 +586,31 @@ the `register` entry point, and the direct `decoder::make_decoder` /
 `encoder::make_encoder` factory endpoints; the registry encoder stamps
 the caller-declared sample rate into every emitted chain.
 
-**Float / int32 encode** stays out of scope for the write side (the
-encoder emits integer PCM at 1..=4-byte container widths; it does not
-originate `FLOAT_DATA` / `INT32_DATA` reductions).
+**Float / int32 / hybrid origination** (round 418): the write side
+now covers the full sample-format and hybrid surface. `deconstruct_float`
+derives the `0x08` profile from the data itself (fill-mode selection
+across zero / `SHIFT_ONES` / `SHIFT_SAME` / `SHIFT_SENT`, the raised
+`SHIFT_SAME` anchor, `ZEROS_SENT`+`NEG_ZEROS` literals for `-0.0` /
+denormals / below-range values, the `EXCEPTIONS` sentinel with exact
+NaN payloads, the static shift from shared trailing zeros) and
+`deconstruct_int32` its §3 twin (free `zeros`/`ones`/`dups` redundancy
+stripping plus literal `sent_bits` to the 23-bit entropy target);
+`encode_block_{mono,stereo}_{float,int32}[_best]` and the
+`encode_stream_*` twins ride the ordinary lossless pipeline with the
+profile / `0x0C` sub-blocks attached. `encode_block_{mono,stereo}_hybrid`
+(+ `_float` / `_int32` variants and `encode_stream_*` twins) originate
+the §6.5 model: the bracketing search emits `exact_mag >= mid` decision
+bits, the `0x0B` stream carries the exact in-bracket offset with the
+lossless phase-in code, the per-sample steppers track the decoder's
+coarse-value prediction state, the `0x06` profile is data-derived with
+the running `slow_level` carried across stream blocks, and the `.wvc`
+twin stores the lossless §5 CRC. A hybrid float encode raises the
+exponent anchor one (coarse-overshoot head-room) and sends inf/NaN
+through the `ZEROS_SENT` literal path so the lossy `.wv` stays
+decodable alone; a pair encode moves the `0x0C` extension stream to
+the `.wvc`. Hybrid decorrelation stacks are cross-free (the reference
+shape — a cross pass in a hybrid block decodes differently under the
+reference decoder). No `0x07` shaping is emitted (the raw §4.1 fold).
 
 ## Provenance
 
@@ -590,7 +643,13 @@ included), and a round-415 `correction_pair_decode` **differential**
 target over the two-file pair surface (plain/muted parity, the
 empty-correction identity against the lossy decode, and
 plain/multichannel walker parity, at a fuzz-chosen `(main,
-correction)` split). A round-386 campaign
+correction)` split), plus a round-418 `hybrid_encode_roundtrip`
+**pair-decode oracle** over the origination surface (fuzz PCM +
+control byte sweeping mono/stereo × joint × decorrelation ceiling ×
+bitrate word × plain/float/int32; every emitted pair must decode back
+bit-exactly with green CRC gates and every lossy `.wv` must decode
+within the clamp range — an opening ~5M-run campaign found, and the
+fix pinned, a clamp-bits underflow on hostile left-shift headers). A round-386 campaign
 found (and the fix pinned) an adversarial-history overflow in the
 term-17/18 extrapolator predictors — all twelve predictor sites are
 now 32-bit wrapping, matching the wrapping reconstruction adds around
@@ -598,10 +657,11 @@ them, with the minimized input kept as a corpus regression seed; a
 round-415 campaign did the same for two overflow sites in the `0x07`
 shaping-state recurrence (accumulator add / temp bias / seed
 negation, all now 32-bit wrapping);
-1054 unit tests plus a 68-test
-foreign-decode integration battery (54 reference-encoded fixtures
-under `tests/data/` — including 18 hybrid-lossless `wv+wvc` pairs —
-all pinned bit-exact with matching stored CRCs,
+1107 unit tests plus a 74-test
+foreign-decode integration battery (59 reference-encoded fixtures
+under `tests/data/` — including 18 hybrid-lossless `wv+wvc` pairs and
+the round-418 hybrid edge probes (delta clamp / output clamp /
+implied-fill) — all pinned bit-exact with matching stored CRCs,
 plus corruption trip-wires through both CRC gates) synthesise
 minimal valid headers /
 sub-blocks / bitstreams and poison each field to exercise the accept /
