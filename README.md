@@ -22,11 +22,18 @@ committed under `tests/data/`. Since round 418 the encoder
 streams (data-derived `0x08`/`0x09` profiles + `0x0C` extension
 streams), and **hybrid encoding** — a lossy `.wv` at a caller-chosen
 §6.5 bitrate word plus the `.wvc` correction twin that restores the
-input bit-exactly — every emitted stream/pair decoding byte-identically
-through this crate's own decoder *and* the reference decoder binary
-(35-case black-box battery: mono/stereo × joint/left-right ×
-raw/derived prediction × bitrate words 0..2000 × int/float/int32 ×
-multi-block × silence × clipping-adjacent content).
+input bit-exactly. Round 420 adds **noise-shaping origination**
+(`0x07` emission: static and ramping weights, per-output-channel
+joint transform, quantized state carried across blocks) and wires
+**float / hybrid encoding through the framework registry** (typed
+options: `mode`, `bits_per_sample`, `shaping`, `joint`; `F32` and
+full-range `S32` input, lossless). Every emitted stream/pair decodes
+byte-identically through this crate's own decoder *and* the reference
+decoder binary (30-case round-420 black-box battery on top of the
+round-418 35-case one: mono/stereo × joint/left-right × shaping
+off/static ±/full-scale/ramp × bitrate words 0..2000 × int/float/int32
+× multi-block × silence × delta-clamp imbalance × clipping-adjacent
+content).
 
 Working surface:
 
@@ -114,9 +121,9 @@ Working surface:
   twin): the encoded block parses, passes its own §5.6 CRC mute gate, and
   reconstructs the exact input PCM. These two are the raw (no-decorrelation)
   path; the decorrelated / joint / shifted / multi-block variants below
-  cover the rest. Hybrid / float / int32 / multichannel block emission stay
-  out of scope (the decoder refuses them; their wire layout is a documented
-  spec gap). Exported: `ENCODE_VERSION`.
+  cover the rest, and the float / int32 / hybrid origination surface
+  (rounds 418/420, including `0x07` noise shaping) is described under
+  "Not yet supported" -> origination. Exported: `ENCODE_VERSION`.
 * **Lossless-with-decorrelation encode** —
   `encode_block_mono_with_decorr` / `encode_block_stereo_with_decorr` take
   the raw `0x02`/`0x03`/`0x04` metadata payloads, assemble + validate the
@@ -610,7 +617,35 @@ through the `ZEROS_SENT` literal path so the lossy `.wv` stays
 decodable alone; a pair encode moves the `0x0C` extension stream to
 the `.wvc`. Hybrid decorrelation stacks are cross-free (the reference
 shape — a cross pass in a hybrid block decodes differently under the
-reference decoder). No `0x07` shaping is emitted (the raw §4.1 fold).
+reference decoder).
+
+**Noise-shaping origination + registry float/hybrid wiring**
+(round 420): `HybridOptions::shaping` selects the `0x07` axis
+(`HybridShaping::Off` / `Static` weight in 1/1024 units / `Ramp` with
+a per-sample accumulator delta; `from_weight` maps the fractional
+scale). A shaped encode brackets the **shaped** residual
+`exact - temp` — the staged spec §4.1 error-feedback term computed in
+exact decoder lockstep through `ShapingState` — so the lossy noise
+spectrum tilts with the weight while the pair decode stays bit-exact;
+the `.wvc` twin leads with the block's `0x07` seed
+(`ShapingState::to_shaping_words`, short static / long delta-bearing
+layouts), header bits 6/29 mirror the reference shaped-block flag
+combination, and multi-block streams re-seed from the quantized
+payload each block (the level-word carry pattern). Joint blocks run
+the filter per **output** channel via the round-415 temp transform
+(half-step term + effective per-output error deltas); zero-run and
+lossless-dispatch words apply no temp and reset the error state,
+mirroring the pinned decode paths. The framework registry encoder
+accepts `F32` (float deconstruction) and routes `S32` through the
+int32 deconstruction, and `WavPackEncoderOptions` exposes
+`mode=lossless|hybrid`, `bits_per_sample`, `shaping` and `joint` —
+hybrid packets carry the level/shaping state across packet
+boundaries; the `.wvc` twin remains a crate-API-only feature
+(`correction=true` is refused: the framework packet contract is
+single-stream). Black-box: 30 originated round-420 variants decode
+bit-exactly (lossy) and losslessly (pair) under the reference
+decoder, confirming the emitted `0x07` seeds drive the reference's
+own shaping arithmetic identically.
 
 ## Provenance
 

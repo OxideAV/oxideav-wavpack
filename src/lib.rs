@@ -840,7 +840,7 @@ pub mod decoder {
 /// `<crate>::encoder::make_encoder` convention), alongside the
 /// registry path installed by [`register`].
 pub mod encoder {
-    pub use crate::registry::{make_encoder, WavPackEncoder};
+    pub use crate::registry::{make_encoder, WavPackEncoder, WavPackEncoderOptions};
 }
 
 pub use crate::registry::{register, CODEC_ID};
