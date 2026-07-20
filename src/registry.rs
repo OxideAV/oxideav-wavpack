@@ -646,13 +646,14 @@ fn encode_hybrid_lossy_block(
         return Ok(wv);
     }
     let level = carry.level_words(window, mono, opts)?;
+    let shaping = carry.payload_for_block(window.len() / if mono { 1 } else { 2 });
     let (wv, _, sl, shape) = encode_hybrid_block_ints(
         window,
         mono,
         bytes_per_sample,
         opts,
         level,
-        carry.shaping_payload(),
+        shaping.as_deref(),
         None,
         index,
         TOTAL_SAMPLES_UNKNOWN,

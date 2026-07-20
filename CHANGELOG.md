@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 420 — **shaping ramps rail-saturate at full scale.** A
+  264-point black-box sweep over ramp trajectories (start weight ×
+  delta × content, two block lengths) found that trajectories crossing
+  **below** weight `-1024` can decode differently under the reference
+  decoder — the staged spec names an IIR variant for negative shaping
+  weights (bit 29) whose exact past-full-scale recurrence is an open
+  docs gap — while every static weight across the full `±1024` range,
+  every in-range ramp, and even far-past-full-scale **positive**
+  trajectories are bit-exact under it. The encoder now keeps every
+  emitted `0x07` inside the validated envelope: per block the delta
+  word is shrunk (down to 0) so the accumulator cannot leave
+  `±(1024 << 16)` within the block — the ramp runs to the rail and
+  holds — and the re-packed accumulator words are clamped against
+  log-quantization overshoot at the rail. The re-swept battery is
+  clean: 264/264 sweep points at both block lengths plus the 36-case
+  named battery (shaping sweep, ramp-overrun probes, 24-bit shaped
+  joint, delta-clamp imbalance, clip16, int32-ones, float hybrid,
+  registry lossless paths) all decode bit-exactly (lossy) and
+  losslessly (pair) under the reference decoder.
+
 - Round 420 — **forward-direction edge-probe battery.** The round-418
   hybrid-conformance pins re-validated in the encode direction:
   extreme-imbalance joint content (side- and mid-collapsing, bitrate

@@ -565,6 +565,14 @@ impl ShapingState {
         self.error[channel & 1]
     }
 
+    /// The current weight accumulator of `channel` (test /
+    /// introspection; the applied weight is `acc >> 16`). Round 420 —
+    /// used by the encode side to rail-saturate ramp deltas.
+    #[must_use]
+    pub fn acc(&self, channel: usize) -> i32 {
+        self.acc[channel & 1]
+    }
+
     /// Pack the current state into a `0x07` payload — the encode-side
     /// inverse of [`Self::from_shaping_words`] (round 420).
     ///

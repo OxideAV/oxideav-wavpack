@@ -138,7 +138,17 @@ pub enum HybridShaping {
         weight: i32,
         /// Raw per-sample accumulator increment (`acc` domain — the
         /// weight moves by `delta / 65536` thousand-twenty-fourths per
-        /// sample).
+        /// sample). The emitted per-block delta words are
+        /// **rail-saturated**: each block's delta is shrunk (down to
+        /// `0`) so the accumulator can never leave the full-scale
+        /// `±1024` weight range inside the block — the ramp runs to
+        /// the rail and holds there. Black-box finding behind the
+        /// rail: trajectories that cross **below** `-1024` can decode
+        /// differently under the reference decoder (the staged spec
+        /// names an IIR variant for negative weights whose exact
+        /// out-of-range recurrence is an open docs gap), while the
+        /// validated envelope — every static weight in `±1024` and
+        /// every in-range ramp — is bit-exact under it.
         delta: i32,
     },
 }
@@ -1100,19 +1110,28 @@ fn hybrid_seed(pcm: &[i32], mono: bool, opts: &HybridOptions) -> Result<[i16; 2]
     seed_level_words(&coded, mono, passes)
 }
 
+/// The full-scale weight accumulator rail: `±1024 << 16` (weight
+/// `±1.0`). Emitted ramps saturate here — the black-box-validated
+/// envelope (see [`HybridShaping::Ramp`]).
+const SHAPING_ACC_RAIL: i64 = 1024 << 16;
+
 /// Cross-block hybrid encoder state: the packed `0x06` level words and
-/// the packed `0x07` shaping payload for the **next** block — always
-/// the on-wire (log-quantized) forms, so the encoder-side state can
-/// never drift from what the decoder reconstructs. Used by the stream
-/// encoders and the registry [`crate::registry`] encoder (which spans
-/// blocks across packets).
+/// the `0x07` shaping filter state for the **next** block — always
+/// derived from the on-wire (log-quantized) forms, so the encoder-side
+/// state can never drift from what the decoder reconstructs. Used by
+/// the stream encoders and the registry [`crate::registry`] encoder
+/// (which spans blocks across packets).
 #[derive(Debug, Clone)]
 pub(crate) struct HybridCarry {
     /// The next block's `0x06` level words; `None` until the first
     /// block seeds them from the §6.5 pre-pass.
     level: Option<[i16; 2]>,
-    /// The next block's `0x07` payload (`None` = shaping off).
-    shaping: Option<Vec<u8>>,
+    /// The running shaping filter state (`None` = shaping off). The
+    /// per-block `0x07` payload is packed from it on demand.
+    shaping: Option<crate::ShapingState>,
+    /// The caller-requested per-sample accumulator delta (`0` for
+    /// static shaping; per-block emissions rail-saturate it).
+    requested_delta: i64,
     /// Whether the `0x07` layout carries delta words.
     with_delta: bool,
     /// Whether the shaping payloads use the stereo word interleave.
@@ -1124,9 +1143,17 @@ impl HybridCarry {
     /// channel shape.
     pub(crate) fn new(opts: &HybridOptions, mono: bool) -> Self {
         let stereo = !mono;
+        let requested_delta = match opts.shaping {
+            HybridShaping::Ramp { delta, .. } => i64::from(delta),
+            _ => 0,
+        };
         HybridCarry {
             level: None,
-            shaping: opts.shaping.initial_payload(stereo),
+            shaping: opts
+                .shaping
+                .initial_payload(stereo)
+                .map(|p| crate::ShapingState::from_shaping_words(Some(&p), stereo)),
+            requested_delta,
             with_delta: opts.shaping.with_delta(),
             stereo,
         }
@@ -1146,9 +1173,74 @@ impl HybridCarry {
         }
     }
 
-    /// The next block's `0x07` payload.
-    pub(crate) fn shaping_payload(&self) -> Option<&[u8]> {
-        self.shaping.as_deref()
+    /// The largest log-word-representable per-sample delta of the
+    /// requested sign that keeps `acc` inside the full-scale rail for
+    /// `frames` advances (`0` once the rail is reached).
+    fn rail_saturated_delta(&self, acc: i64, frames: usize) -> i32 {
+        let frames = frames.max(1) as i64;
+        let room = if self.requested_delta >= 0 {
+            (SHAPING_ACC_RAIL - acc).max(0)
+        } else {
+            (-SHAPING_ACC_RAIL - acc).min(0)
+        };
+        let mut delta = self
+            .requested_delta
+            .clamp(-(room.abs() / frames), room.abs() / frames) as i32;
+        // The log pack rounds within its table precision; step the
+        // quantized value toward zero until the whole-block excursion
+        // provably stays inside the rail.
+        loop {
+            let q = crate::logpack::quantize_log_value(delta);
+            let end = acc + i64::from(q) * frames;
+            if end.abs() <= SHAPING_ACC_RAIL || q == 0 {
+                return q;
+            }
+            // Shrink ~1% per step (at least 1); terminates at 0.
+            delta = if delta > 0 {
+                (delta - 1 - delta / 128).max(0)
+            } else {
+                (delta + 1 - delta / 128).min(0)
+            };
+        }
+    }
+
+    /// The next block's exact on-wire `0x07` payload for a block of
+    /// `frames` per-channel samples (`None` = shaping off): the
+    /// running error/acc state log-packed, plus — for ramps — the
+    /// rail-saturated per-channel delta words.
+    ///
+    /// The re-packed accumulator words are themselves clamped to the
+    /// rail: the log pack rounds within its table precision, so an
+    /// end-of-block state sitting *at* the rail could otherwise
+    /// re-quantize a hair past it and seed the next block outside the
+    /// validated envelope.
+    pub(crate) fn payload_for_block(&self, frames: usize) -> Option<Vec<u8>> {
+        let state = self.shaping.as_ref()?;
+        let mut payload = state.to_shaping_words(self.stereo, false);
+        let channels = if self.stereo { 2 } else { 1 };
+        let mut accs = [0i64; 2];
+        for (ch, acc) in accs.iter_mut().enumerate().take(channels) {
+            // Acc word position in the layout: mono [e, a]; stereo
+            // [e0, a0, e1, a1].
+            let idx = 2 * (2 * ch + 1);
+            let mut word = i16::from_le_bytes([payload[idx], payload[idx + 1]]);
+            loop {
+                let val = i64::from(crate::logpack::wp_exp2s(i32::from(word)));
+                if val.abs() <= SHAPING_ACC_RAIL || word == 0 {
+                    *acc = val;
+                    break;
+                }
+                word -= word.signum();
+            }
+            payload[idx..idx + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        if self.with_delta {
+            for &acc in accs.iter().take(channels) {
+                let delta = self.rail_saturated_delta(acc, frames);
+                payload.extend_from_slice(&crate::logpack::pack_log_word(delta));
+            }
+        }
+        Some(payload)
     }
 
     /// Fold one encoded block's end state back into the carry.
@@ -1158,7 +1250,7 @@ impl HybridCarry {
             pack_level_word(slow_level[1]),
         ]);
         if self.shaping.is_some() {
-            self.shaping = Some(shaping.to_shaping_words(self.stereo, self.with_delta));
+            self.shaping = Some(*shaping);
         }
     }
 }
@@ -1181,13 +1273,14 @@ pub fn encode_block_mono_hybrid(
     }
     let carry = HybridCarry::new(opts, true);
     let level = carry.level_words(pcm, true, opts)?;
+    let shaping = carry.payload_for_block(pcm.len());
     let (wv, wvc, _, _) = encode_hybrid_block_ints(
         pcm,
         true,
         bytes_per_sample,
         opts,
         level,
-        carry.shaping_payload(),
+        shaping.as_deref(),
         None,
         block_index,
         total_samples,
@@ -1213,13 +1306,14 @@ pub fn encode_block_stereo_hybrid(
     }
     let carry = HybridCarry::new(opts, false);
     let level = carry.level_words(pcm, false, opts)?;
+    let shaping = carry.payload_for_block(pcm.len() / 2);
     let (wv, wvc, _, _) = encode_hybrid_block_ints(
         pcm,
         false,
         bytes_per_sample,
         opts,
         level,
-        carry.shaping_payload(),
+        shaping.as_deref(),
         None,
         block_index,
         total_samples,
@@ -1252,13 +1346,14 @@ pub fn encode_stream_mono_hybrid(
     let mut carry = HybridCarry::new(opts, true);
     for window in pcm.chunks(chunk) {
         let level_words = carry.level_words(window, true, opts)?;
+        let shaping = carry.payload_for_block(window.len());
         let (blk, cblk, sl, shape) = encode_hybrid_block_ints(
             window,
             true,
             bytes_per_sample,
             opts,
             level_words,
-            carry.shaping_payload(),
+            shaping.as_deref(),
             None,
             index,
             total,
@@ -1303,13 +1398,14 @@ pub fn encode_stream_stereo_hybrid(
     let mut carry = HybridCarry::new(opts, false);
     for window in pcm.chunks(pairs * 2) {
         let level_words = carry.level_words(window, false, opts)?;
+        let shaping = carry.payload_for_block(window.len() / 2);
         let (blk, cblk, sl, shape) = encode_hybrid_block_ints(
             window,
             false,
             bytes_per_sample,
             opts,
             level_words,
-            carry.shaping_payload(),
+            shaping.as_deref(),
             None,
             index,
             total,
@@ -1361,13 +1457,14 @@ pub(crate) fn encode_hybrid_block_float(
     let d = crate::float::deconstruct_float_raised(pcm);
     let format = crate::encode::float_format_extras(&d);
     let level = carry.level_words(&d.integers, mono, opts)?;
+    let shaping = carry.payload_for_block(pcm.len() / if mono { 1 } else { 2 });
     let (wv, wvc, sl, shape) = encode_hybrid_block_ints(
         &d.integers,
         mono,
         4,
         opts,
         level,
-        carry.shaping_payload(),
+        shaping.as_deref(),
         Some(&format),
         block_index,
         total_samples,
@@ -1397,13 +1494,14 @@ pub(crate) fn encode_hybrid_block_int32(
     let d = crate::int32::deconstruct_int32(pcm);
     let format = crate::encode::int32_format_extras(&d);
     let level = carry.level_words(&d.reduced, mono, opts)?;
+    let shaping = carry.payload_for_block(pcm.len() / if mono { 1 } else { 2 });
     let (wv, wvc, sl, shape) = encode_hybrid_block_ints(
         &d.reduced,
         mono,
         4,
         opts,
         level,
-        carry.shaping_payload(),
+        shaping.as_deref(),
         Some(&format),
         block_index,
         total_samples,
@@ -2225,6 +2323,56 @@ mod tests {
         let (cblk, _) = crate::parse_block(enc.wvc.as_ref().unwrap()).unwrap();
         let sp = cblk.find_noise_shaping_profile_sub_block().unwrap();
         assert_eq!(sp.payload.len(), 12, "stereo dynamic layout: 6 log words");
+    }
+
+    #[test]
+    fn ramp_delta_words_saturate_at_the_full_scale_rail() {
+        // Black-box-anchored envelope (round 420): trajectories that
+        // cross below weight -1024 can decode differently under the
+        // reference decoder (its negative-weight IIR arm past full
+        // scale is an open docs gap), so every emitted block's 0x07
+        // must keep the accumulator inside ±(1024 << 16) — the ramp
+        // runs to the rail and holds.
+        let rail = i64::from(1024i32 << 16);
+        let pcm = signal16(6000, 0x420);
+        for (w0, d) in [
+            (-1000, -60_000),
+            (1000, 60_000),
+            (-1024, -600),
+            (0, 600_000),
+        ] {
+            let sh = HybridShaping::Ramp {
+                weight: w0,
+                delta: d,
+            };
+            let enc = encode_stream_mono_hybrid(&pcm, 750, 2, &shaped(sh, false)).unwrap();
+            assert_pair_round_trip(&pcm, &enc);
+            let mut rest: &[u8] = enc.wvc.as_ref().unwrap();
+            let mut last_delta = i32::MAX;
+            while !rest.is_empty() {
+                let (blk, next) = crate::parse_block(rest).unwrap();
+                let sp = blk.find_noise_shaping_profile_sub_block().unwrap();
+                let word = |i: usize| {
+                    i32::from(i16::from_le_bytes([
+                        sp.payload[2 * i],
+                        sp.payload[2 * i + 1],
+                    ]))
+                };
+                let acc = i64::from(crate::logpack::wp_exp2s(word(1)));
+                let delta = i64::from(crate::logpack::wp_exp2s(word(2)));
+                let frames = i64::from(blk.block_samples());
+                assert!(acc.abs() <= rail, "block seed acc {acc} within the rail");
+                assert!(
+                    (acc + delta * frames).abs() <= rail,
+                    "whole-block excursion within the rail (acc {acc}, delta {delta}, n {frames})"
+                );
+                last_delta = delta as i32;
+                rest = next;
+            }
+            // The final block of every one of these ramps has hit the
+            // rail: its delta word saturates to zero.
+            assert_eq!(last_delta, 0, "w0={w0} d={d}: ramp holds at the rail");
+        }
     }
 
     #[test]
