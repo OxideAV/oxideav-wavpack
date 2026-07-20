@@ -8,6 +8,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 420 — **forward-direction edge-probe battery.** The round-418
+  hybrid-conformance pins re-validated in the encode direction:
+  extreme-imbalance joint content (side- and mid-collapsing, bitrate
+  words 200/456/800 — the §6.5 delta-clamp regime), clipping-adjacent
+  16-bit content at the coarsest word (unclamped-CRC / post-clamp
+  contract, shaped and unshaped), trailing-ones int32 hybrid pairs
+  (implied-fill window, shaped joint) and shaped float hybrid pairs.
+  Black-box tally: 30 originated streams (the 20-variant shaping sweep
+  plus these 10 edge probes) all reproduce their lossy PCM bit-exactly
+  under the reference decoder and recover the original losslessly from
+  the `.wv`+`.wvc` pair; the registry's float / int32 lossless block
+  paths were reference-verified the same way.
+
 - Round 420 — **registry float / hybrid wiring.** The framework
   encoder now accepts interleaved `F32` (through the `0x08` float
   deconstruction) and routes `S32` through the `0x09` int32

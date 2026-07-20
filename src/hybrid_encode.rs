@@ -2303,6 +2303,74 @@ mod tests {
     }
 
     #[test]
+    fn extreme_imbalance_joint_content_round_trips_across_bitrate_words() {
+        // Forward direction of the round-418 §6.5 delta-clamp probes:
+        // joint content whose side (R = -L + 3) or mid (R = L + 3)
+        // channel collapses drives the stereo redistribution delta far
+        // past ±bitrate; the encoder and decoder share the clamped
+        // frame-limit derivation, so the pair must stay bit-exact
+        // across the probed word range (black-box: the reference
+        // decoder reproduces these streams' lossy PCM and recovers the
+        // original from the pair, all six variants).
+        let l = signal16(2600, 0x1338);
+        for mk in [0, 1] {
+            let pcm: Vec<i32> = l
+                .iter()
+                .flat_map(|&s| if mk == 0 { [s, -s + 3] } else { [s, s + 3] })
+                .collect();
+            for word in [200, 456, 800] {
+                let enc =
+                    encode_block_stereo_hybrid(&pcm, 2, &opts(word, true, None), 0, 2600).unwrap();
+                assert_pair_round_trip(&pcm, &enc);
+            }
+        }
+    }
+
+    #[test]
+    fn shaped_clipping_content_keeps_the_unclamped_crc_contract() {
+        // Round-418 output-clamp pin, shaped variant: the lossy §5 CRC
+        // folds over the UNCLAMPED reconstruction and the output
+        // saturates afterwards; shaping must not disturb either side.
+        let pcm: Vec<i32> = (0..3000)
+            .map(|i| {
+                let t = f64::from(i) * 0.03;
+                (((t.sin() * 32300.0) as i32) + (i % 997) - 498).clamp(-32768, 32767)
+            })
+            .collect();
+        let mut o =
+            opts(0, false, Some(DecorrProfile::Normal)).with_shaping(HybridShaping::Static(717));
+        o.bitrate_word = 0;
+        let enc = encode_block_mono_hybrid(&pcm, 2, &o, 0, 3000).unwrap();
+        let lossy = assert_pair_round_trip(&pcm, &enc);
+        assert!(lossy.iter().all(|&s| (-32768..=32767).contains(&s)));
+        assert!(lossy.iter().any(|&s| s == 32767 || s == -32768));
+    }
+
+    #[test]
+    fn shaped_trailing_ones_int32_pair_restores_the_pattern() {
+        // Round-418 implied-fill pin, shaped joint variant.
+        let pcm: Vec<i32> = splitmix(0x0e5e, 2000)
+            .iter()
+            .map(|&r| (((r >> 40) as i32) & !0xF) | 0xF)
+            .collect();
+        let enc = encode_block_stereo_hybrid_int32(
+            &pcm,
+            &shaped(HybridShaping::Static(-717), true),
+            0,
+            1000,
+        )
+        .unwrap();
+        let wvc = enc.wvc.as_ref().unwrap();
+        assert_eq!(decode_stream_with_correction(&enc.wv, wvc).unwrap(), pcm);
+        let (lossy, ok) = decode_stream_muted(&enc.wv).unwrap();
+        assert!(ok);
+        assert!(
+            lossy.iter().all(|&s| s & 0xF == 0),
+            "lossy window zero-fills"
+        );
+    }
+
+    #[test]
     fn shaping_from_weight_maps_the_reference_scale() {
         assert_eq!(HybridShaping::from_weight(0.0), HybridShaping::Off);
         assert_eq!(HybridShaping::from_weight(0.7), HybridShaping::Static(717));
