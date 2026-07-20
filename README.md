@@ -459,8 +459,12 @@ use oxideav_wavpack::{
 let wv = encode_block_stereo_float_best(&f32_pcm, DecorrProfile::High, 0, frames)?;
 let wv = encode_stream_mono_int32(&wide_pcm, 0, DecorrProfile::Normal)?;
 // Hybrid: lossy .wv at ~4 bits/sample + the .wvc twin that restores
-// the input exactly through the pair decode:
-let pair = encode_stream_stereo_hybrid(&pcm, 0, 2, &HybridOptions::from_bits_per_sample(4.0))?;
+// the input exactly through the pair decode; optional 0x07 noise
+// shaping tilts the lossy noise spectrum (round 420):
+use oxideav_wavpack::HybridShaping;
+let opts = HybridOptions::from_bits_per_sample(4.0)
+    .with_shaping(HybridShaping::from_weight(0.7));
+let pair = encode_stream_stereo_hybrid(&pcm, 0, 2, &opts)?;
 assert_eq!(decode_stream_with_correction(&pair.wv, pair.wvc.as_ref().unwrap())?, pcm);
 
 // Seek: index the stream once (header-only), then decode windows —
