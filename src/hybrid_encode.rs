@@ -40,9 +40,19 @@
 //!   blocks / `0` otherwise (the round-408 observation).
 //! * **Header flags.** `HYBRID_FLAG` (bit 3) plus the bits-9/10
 //!   hybrid-profile sub-flags as observed on every reference hybrid
-//!   block (bit 9 always, bit 10 on stereo). No shaping is emitted
-//!   (bits 6/29 clear, no `0x07`) — the raw §4.1 fold, the shape the
+//!   block (bit 9 always, bit 10 on stereo). With shaping off (bits
+//!   6/29 clear, no `0x07`) the raw §4.1 fold applies — the shape the
 //!   reference's shaping-off mode produces.
+//! * **Noise shaping** ([`HybridShaping`], round 420). When selected,
+//!   every §6.5-bracketed word targets the **shaped** residual
+//!   `exact - temp` (the spec §4.1 error-feedback term, recomputed in
+//!   exact decoder lockstep via [`crate::ShapingState`]), tilting the
+//!   lossy stream's quantization-noise spectrum by the weight; the
+//!   `.wvc` twin leads with the block's `0x07` seed so the pair decode
+//!   re-derives the same temps and stays bit-exact. Joint (mid/side)
+//!   blocks run the filter per **output** channel with the round-415
+//!   coded-domain temp transform. Header bits 6/29 are both set,
+//!   matching every reference shaped block.
 //! * **The `.wvc` twin.** Same 32-byte header fields as the `.wv`
 //!   block except the CRC, which stores the §5 running CRC of the
 //!   **lossless** decode (round-415 pin), then the `0x0B` correction
@@ -92,6 +102,93 @@ const JOINT_BALANCE_WORD: i32 = 256;
 /// degenerate limit).
 const BITRATE_WORD_BIAS: i32 = 568;
 
+/// Noise-shaping selection for a hybrid encode (round 420) — the
+/// encode side of the `0x07` `ID_SHAPING_WEIGHTS` filter whose decode
+/// recurrence was pinned in rounds 408/415 ([`crate::ShapingState`]).
+///
+/// When shaping is on, each §6.5-bracketed word targets the **shaped**
+/// residual `exact - temp` instead of the exact residual, where `temp`
+/// is the error-feedback term of the staged spec §4.1 recurrence
+/// (`shaping_acc += shaping_delta; weight = acc >> 16;
+/// temp = -apply_weight(weight, error)`). The lossy decode then
+/// carries quantization noise whose spectrum is tilted by the weight
+/// (positive weights push noise upward — the reference `-s0.7` shape;
+/// negative weights the other way), while the `.wvc` pair decode stays
+/// bit-exact: the correction stream stores the shaped in-bracket value
+/// and the decoder re-derives the same `temp` from its `0x07` seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridShaping {
+    /// No shaping (the reference `-s0` shape): no `0x07` sub-block, no
+    /// shape flag bits, raw §4.1 correction fold.
+    Off,
+    /// Constant shaping weight in 1/1024 units (`±1024` = `±1.0`,
+    /// clamped; the reference `-s<w>` static shape). The `0x07`
+    /// payload carries the short (delta-free) per-channel layout.
+    Static(i32),
+    /// Linearly ramping weight: `weight` (1/1024 units) seeds the
+    /// accumulator and `delta` is the raw per-sample accumulator
+    /// increment (`acc += delta` each sample, `weight = acc >> 16`).
+    /// The `0x07` payload carries the long (delta-bearing) layout.
+    /// The accumulator carries across blocks, so a non-zero `delta`
+    /// keeps ramping for the whole stream — callers pick deltas sized
+    /// to the stream length (the pair decode is lossless regardless;
+    /// only the lossy noise spectrum follows the weight).
+    Ramp {
+        /// Starting weight in 1/1024 units (clamped to `±1024`).
+        weight: i32,
+        /// Raw per-sample accumulator increment (`acc` domain — the
+        /// weight moves by `delta / 65536` thousand-twenty-fourths per
+        /// sample).
+        delta: i32,
+    },
+}
+
+impl HybridShaping {
+    /// Shaping selection from a fractional weight (the reference `-s`
+    /// scale, `-1.0..=1.0`): `0.0` is [`Self::Off`], anything else a
+    /// [`Self::Static`] weight of `round(w * 1024)`.
+    #[must_use]
+    pub fn from_weight(weight: f64) -> Self {
+        let units = (weight.clamp(-1.0, 1.0) * 1024.0).round() as i32;
+        if units == 0 {
+            HybridShaping::Off
+        } else {
+            HybridShaping::Static(units)
+        }
+    }
+
+    /// The initial `0x07` payload for this selection (`None` when
+    /// shaping is off). The accumulator seed is the clamped weight
+    /// shifted into the `acc` domain and log-word quantized; the error
+    /// seed is zero.
+    fn initial_payload(self, stereo: bool) -> Option<Vec<u8>> {
+        let (weight, delta) = match self {
+            HybridShaping::Off => return None,
+            HybridShaping::Static(w) => (w, None),
+            HybridShaping::Ramp { weight, delta } => (weight, Some(delta)),
+        };
+        let acc = weight.clamp(-1024, 1024) << 16;
+        let mut payload = Vec::with_capacity(12);
+        let channels = if stereo { 2 } else { 1 };
+        for _ in 0..channels {
+            payload.extend_from_slice(&crate::logpack::pack_log_word(0));
+            payload.extend_from_slice(&crate::logpack::pack_log_word(acc));
+        }
+        if let Some(delta) = delta {
+            for _ in 0..channels {
+                payload.extend_from_slice(&crate::logpack::pack_log_word(delta));
+            }
+        }
+        Some(payload)
+    }
+
+    /// Whether the on-wire `0x07` layout carries the per-channel
+    /// `delta` words.
+    fn with_delta(self) -> bool {
+        matches!(self, HybridShaping::Ramp { .. })
+    }
+}
+
 /// Options for one hybrid encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HybridOptions {
@@ -109,12 +206,18 @@ pub struct HybridOptions {
     /// Self-derived decorrelation search ceiling for the coded domain;
     /// `None` encodes raw (no prediction).
     pub profile: Option<DecorrProfile>,
+    /// Noise shaping for the lossy stream (round 420). [`Off`]
+    /// (`HybridShaping::Off`) reproduces the raw unshaped fold.
+    ///
+    /// [`Off`]: HybridShaping::Off
+    pub shaping: HybridShaping,
 }
 
 impl HybridOptions {
     /// Options for a bits-per-sample target (the reference `-b` scale:
     /// ~2.0 aggressive … 6.0+ near-lossless), with a correction twin,
-    /// joint stereo coding and the `Normal` decorrelation ceiling.
+    /// joint stereo coding, the `Normal` decorrelation ceiling and no
+    /// noise shaping.
     #[must_use]
     pub fn from_bits_per_sample(bits: f64) -> Self {
         let word = (bits * 256.0).round() as i32 - BITRATE_WORD_BIAS;
@@ -123,7 +226,15 @@ impl HybridOptions {
             correction: true,
             joint: true,
             profile: Some(DecorrProfile::Normal),
+            shaping: HybridShaping::Off,
         }
+    }
+
+    /// This option set with the given [`HybridShaping`] selection.
+    #[must_use]
+    pub fn with_shaping(mut self, shaping: HybridShaping) -> Self {
+        self.shaping = shaping;
+        self
     }
 }
 
@@ -340,11 +451,22 @@ struct HybridStreams {
 }
 
 /// The §6.5 bracketed entropy encode of a whole **mono** buffer.
+///
+/// `shaping` is the `0x07`-seeded noise-shaping filter, advanced /
+/// updated in exact decoder lockstep
+/// ([`crate::decode_packed_samples_mono_hybrid_lossless`]): every
+/// sample advances the weight, bracketed words target the **shaped**
+/// residual `exact - temp` (the value the correction stream stores and
+/// the pair decode adds `temp` back onto), and zero-run / lossless
+/// dispatches apply no temp and fold `exact == coarse` into the error
+/// state. A zero (absent-`0x07`) state makes every temp zero — the
+/// bitstream is then bit-identical to the unshaped encode.
 fn hybrid_entropy_mono(
     coded: &[i32],
     hybrid: &mut HybridState,
     stepper: &mut MonoStepper,
     correction: bool,
+    shaping: &mut crate::ShapingState,
 ) -> Result<HybridStreams> {
     let mut writer = BitWriter::new();
     let mut wvc = correction.then(BitWriter::new);
@@ -357,8 +479,19 @@ fn hybrid_entropy_mono(
     let n = coded.len();
     let mut i = 0usize;
     while i < n {
+        // Decoder per-sample order: limit from the pre-sample state,
+        // weight advance, then the word dispatch.
+        let limit = hybrid.frame_limits()[0];
+        let temp = shaping.advance(0);
         let exact = coded[i].wrapping_sub(stepper.offset());
-        let (mag, _) = split_sign(exact);
+        // The wire word's value: bracketed words target the shaped
+        // residual; the lossless dispatch writes the exact residual.
+        let wire = if limit == 0 {
+            exact
+        } else {
+            exact.wrapping_sub(temp)
+        };
+        let (mag, _) = split_sign(wire);
         max_res_bits = max_res_bits.max(32 - mag.leading_zeros());
         if let Some(p) = pending.take() {
             emit_pending(&mut writer, &mut run, p, Some((mag, medians.get_med(0))))?;
@@ -366,10 +499,18 @@ fn hybrid_entropy_mono(
         if run_break {
             run_break = false;
         } else if medians.values[0] <= 1 && !run.last_one && !run.last_zero {
-            // §4.2 step 1: the maximal run of zero exact residuals.
+            // §4.2 step 1: the maximal run of zero exact residuals
+            // (run members decode exact == coarse == 0, so membership
+            // keys on the exact residual even under shaping).
             let mut run_len = 0u32;
             let mut exact_i = exact;
+            let mut advanced = true; // the entry sample already advanced
             while i < n && exact_i == 0 {
+                if !advanced {
+                    let _ = shaping.advance(0);
+                }
+                advanced = false;
+                shaping.update(0, 0, 0, 0);
                 hybrid.update_signed(0, 0);
                 coarse_out.push(stepper.advance(0));
                 run_len += 1;
@@ -385,15 +526,19 @@ fn hybrid_entropy_mono(
                 continue;
             }
         }
-        let limit = hybrid.frame_limits()[0];
         let zone = medians.zone_for_magnitude(mag);
         let interval = medians.sample_interval_for_ones_count(zone);
         medians.adapt(Zone::from_ones_count(zone));
-        let (word, coarse_res) = plan_word(&interval, zone, exact, limit, wvc.as_mut())?;
+        let (word, coarse_res) = plan_word(&interval, zone, wire, limit, wvc.as_mut())?;
         pending = Some(word);
         let (cmag, _) = split_sign(coarse_res);
         max_res_bits = max_res_bits.max(32 - cmag.leading_zeros());
         hybrid.update_signed(0, coarse_res);
+        if limit == 0 {
+            shaping.update(0, exact, exact, 0);
+        } else {
+            shaping.update(0, exact, coarse_res, temp);
+        }
         coarse_out.push(stepper.advance(coarse_res));
         i += 1;
     }
@@ -408,14 +553,53 @@ fn hybrid_entropy_mono(
     })
 }
 
+/// How the noise-shaping filter maps onto an interleaved stereo encode
+/// (round 420, mirroring the two decode-side placements).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StereoShapingMode {
+    /// Left/right-coded blocks: the shaping channels coincide with the
+    /// coded channels and the temps fold per slot, exactly as in the
+    /// mono loop ([`crate::decode_packed_samples_stereo_hybrid_lossless`]).
+    PerChannel,
+    /// Joint (mid/side) blocks: the shaping channels are the **output**
+    /// (left/right) channels; both weights advance once per frame and
+    /// the coded-domain temps are the round-415 transform
+    /// (`t_m = t_l - t_r`;
+    /// `t_s = t_r + ((mid_out + t_m) >> 1) - (mid_out >> 1)`), with the
+    /// error states folded against the post-undo left/right values —
+    /// see `WavPackBlock::decode_joint_samples_with_correction`.
+    JointOutput,
+}
+
+/// Per-frame bookkeeping of the joint-output shaping transform: what
+/// the even (mid) slot decided, consumed by the odd (side) slot.
+#[derive(Debug, Clone, Copy, Default)]
+struct JointFrame {
+    /// The frame's left/right weight advances (`t_l`, `t_r`).
+    t_l: i32,
+    t_r: i32,
+    /// The exact coded-domain mid target (`coded[2f]`).
+    m_exact: i32,
+    /// The applied mid temp: `t_l - t_r` when the mid slot was
+    /// bracketed, `0` otherwise.
+    t_m_applied: i32,
+}
+
 /// The §6.5 bracketed entropy encode of a whole interleaved **stereo**
 /// buffer (frame-start limit snapshots, stream-level zero runs,
 /// shared holding state).
+///
+/// `shaping` + `mode` thread the `0x07` noise-shaping filter through
+/// the encode in exact decoder lockstep; a zero (absent-`0x07`) state
+/// leaves the bitstream bit-identical to the unshaped encode in either
+/// mode.
 fn hybrid_entropy_stereo(
     coded: &[i32],
     hybrid: &mut HybridState,
     stepper: &mut StereoStepper,
     correction: bool,
+    shaping: &mut crate::ShapingState,
+    mode: StereoShapingMode,
 ) -> Result<HybridStreams> {
     let mut writer = BitWriter::new();
     let mut wvc = correction.then(BitWriter::new);
@@ -433,18 +617,70 @@ fn hybrid_entropy_stereo(
     // The current frame's channel-A coarse residual (set at every even
     // slot, consumed by the odd slot's offset and the frame advance).
     let mut frame_res_a = 0i32;
+    let mut frame = JointFrame::default();
+    // Completes one frame at its odd slot: stepper advance, joint
+    // error-state fold (the round-415 effective per-output deltas
+    // against the post-undo left/right values), coarse output push.
+    let complete_frame = |shaping: &mut crate::ShapingState,
+                          stepper: &mut StereoStepper,
+                          coarse_out: &mut Vec<i32>,
+                          frame: &JointFrame,
+                          res_a: i32,
+                          res_b: i32,
+                          s_exact: i32,
+                          t_s_applied: i32,
+                          half_step: i32| {
+        let (a, b) = stepper.advance(res_a, res_b);
+        if mode == StereoShapingMode::JointOutput {
+            let d_r = t_s_applied.wrapping_sub(half_step);
+            let d_l = frame.t_m_applied.wrapping_add(d_r);
+            let (left, right) = crate::crc::undo_joint_stereo(frame.m_exact, s_exact);
+            let (left_lossy, right_lossy) = crate::crc::undo_joint_stereo(a, b);
+            shaping.update(0, left, left_lossy, d_l);
+            shaping.update(1, right, right_lossy, d_r);
+        }
+        coarse_out.push(a);
+        coarse_out.push(b);
+    };
+    // The joint half-step of the current frame's side slot:
+    // `(mid_shaped >> 1) - (mid >> 1)` with `mid_shaped == m_exact`
+    // and `mid == m_exact - t_m_applied` (both known exactly on the
+    // encode side because the mid slot was constructed to reach its
+    // target).
+    let joint_half_step = |frame: &JointFrame| {
+        (frame.m_exact >> 1).wrapping_sub(frame.m_exact.wrapping_sub(frame.t_m_applied) >> 1)
+    };
     let mut i = 0usize;
     while i < slots {
         let ch = i & 1;
         if ch == 0 {
             limits = hybrid.frame_limits();
+            if mode == StereoShapingMode::JointOutput {
+                frame.t_l = shaping.advance(0);
+                frame.t_r = shaping.advance(1);
+            }
         }
+        let temp = match mode {
+            StereoShapingMode::PerChannel => shaping.advance(ch),
+            // The candidate coded-domain temp of this slot, applied
+            // only when the slot ends up bracketed.
+            StereoShapingMode::JointOutput if ch == 0 => frame.t_l.wrapping_sub(frame.t_r),
+            StereoShapingMode::JointOutput => frame.t_r.wrapping_add(joint_half_step(&frame)),
+        };
         let exact = if ch == 0 {
             coded[i].wrapping_sub(stepper.offset_a())
         } else {
             coded[i].wrapping_sub(stepper.offset_b(frame_res_a))
         };
-        let (mag, _) = split_sign(exact);
+        if mode == StereoShapingMode::JointOutput && ch == 0 {
+            frame.m_exact = coded[i];
+        }
+        let wire = if limits[ch] == 0 {
+            exact
+        } else {
+            exact.wrapping_sub(temp)
+        };
+        let (mag, _) = split_sign(wire);
         max_res_bits = max_res_bits.max(32 - mag.leading_zeros());
         if let Some(p) = pending.take() {
             emit_pending(
@@ -461,18 +697,48 @@ fn hybrid_entropy_stereo(
             && !run.last_one
             && !run.last_zero
         {
-            // Stream-level zero run across both channels.
+            // Stream-level zero run across both channels (membership
+            // keys on the exact residual: run members decode
+            // exact == coarse == 0).
             let mut run_len = 0u32;
             let mut exact_i = exact;
+            let mut advanced = true; // the entry slot already advanced
             while i < slots && exact_i == 0 {
                 let chx = i & 1;
+                match mode {
+                    StereoShapingMode::PerChannel => {
+                        if !advanced {
+                            let _ = shaping.advance(chx);
+                        }
+                        shaping.update(chx, 0, 0, 0);
+                    }
+                    StereoShapingMode::JointOutput => {
+                        if chx == 0 {
+                            if !advanced {
+                                frame.t_l = shaping.advance(0);
+                                frame.t_r = shaping.advance(1);
+                            }
+                            frame.m_exact = coded[i];
+                            frame.t_m_applied = 0;
+                        }
+                    }
+                }
+                advanced = false;
                 hybrid.update_signed(chx, 0);
                 if chx == 0 {
                     frame_res_a = 0;
                 } else {
-                    let (a, b) = stepper.advance(frame_res_a, 0);
-                    coarse_out.push(a);
-                    coarse_out.push(b);
+                    complete_frame(
+                        shaping,
+                        stepper,
+                        &mut coarse_out,
+                        &frame,
+                        frame_res_a,
+                        0,
+                        coded[i],
+                        0,
+                        joint_half_step(&frame),
+                    );
                 }
                 run_len += 1;
                 i += 1;
@@ -496,17 +762,45 @@ fn hybrid_entropy_stereo(
         let zone = medians[ch].zone_for_magnitude(mag);
         let interval = medians[ch].sample_interval_for_ones_count(zone);
         medians[ch].adapt(Zone::from_ones_count(zone));
-        let (word, coarse_res) = plan_word(&interval, zone, exact, limits[ch], wvc.as_mut())?;
+        let (word, coarse_res) = plan_word(&interval, zone, wire, limits[ch], wvc.as_mut())?;
         pending = Some(word);
+        let bracketed = limits[ch] != 0;
         let (cmag, _) = split_sign(coarse_res);
         max_res_bits = max_res_bits.max(32 - cmag.leading_zeros());
         hybrid.update_signed(ch, coarse_res);
+        match mode {
+            StereoShapingMode::PerChannel => {
+                if bracketed {
+                    shaping.update(ch, exact, coarse_res, temp);
+                } else {
+                    shaping.update(ch, exact, exact, 0);
+                }
+            }
+            StereoShapingMode::JointOutput => {
+                if ch == 0 {
+                    frame.t_m_applied = if bracketed { temp } else { 0 };
+                }
+            }
+        }
         if ch == 0 {
             frame_res_a = coarse_res;
         } else {
-            let (a, b) = stepper.advance(frame_res_a, coarse_res);
-            coarse_out.push(a);
-            coarse_out.push(b);
+            let (t_s_applied, half_step) = if mode == StereoShapingMode::JointOutput {
+                (if bracketed { temp } else { 0 }, joint_half_step(&frame))
+            } else {
+                (0, 0)
+            };
+            complete_frame(
+                shaping,
+                stepper,
+                &mut coarse_out,
+                &frame,
+                frame_res_a,
+                coarse_res,
+                coded[i],
+                t_s_applied,
+                half_step,
+            );
         }
         i += 1;
     }
@@ -522,12 +816,20 @@ fn hybrid_entropy_stereo(
 }
 
 /// One encoded hybrid block: the `.wv` bytes, the optional `.wvc`
-/// twin, and the final per-channel `slow_level` state (carried across
-/// blocks by the stream encoders).
-pub(crate) type HybridBlock = (Vec<u8>, Option<Vec<u8>>, [u32; 2]);
+/// twin, the final per-channel `slow_level` state, and the final
+/// noise-shaping filter state (both carried across blocks by the
+/// stream encoders).
+pub(crate) type HybridBlock = (Vec<u8>, Option<Vec<u8>>, [u32; 2], crate::ShapingState);
 
 /// One hybrid block's `.wv` (+ optional `.wvc`) assembly from the
 /// pre-format integer buffer.
+///
+/// `shaping_payload` is the block's exact on-wire `0x07` payload
+/// (`None` = shaping off): it seeds this block's encoder-side filter
+/// state via the same expansion the decoder uses, is emitted verbatim
+/// into the `.wvc` twin, and turns on the `HYBRID_SHAPE` /
+/// `NEW_SHAPING` header bits (both set on every reference shaped
+/// block — round-408/415 fixture flag observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_hybrid_block_ints(
     pcm: &[i32],
@@ -535,6 +837,7 @@ pub(crate) fn encode_hybrid_block_ints(
     bytes_per_sample: u8,
     opts: &HybridOptions,
     level_words: [i16; 2],
+    shaping_payload: Option<&[u8]>,
     format: Option<&FormatExtras>,
     block_index: u32,
     total_samples: u32,
@@ -572,13 +875,33 @@ pub(crate) fn encode_hybrid_block_ints(
         stereo,
     };
     let mut hybrid = HybridState::from_profile(&profile);
+    // The 0x07-seeded shaping filter, in exact decoder lockstep (an
+    // absent payload seeds the all-zero no-op state).
+    let mut shaping = crate::ShapingState::from_shaping_words(shaping_payload, stereo);
 
     let streams = if mono {
         let mut stepper = MonoStepper::new(passes)?;
-        hybrid_entropy_mono(&coded, &mut hybrid, &mut stepper, opts.correction)?
+        hybrid_entropy_mono(
+            &coded,
+            &mut hybrid,
+            &mut stepper,
+            opts.correction,
+            &mut shaping,
+        )?
     } else {
         let mut stepper = StereoStepper::new(passes)?;
-        hybrid_entropy_stereo(&coded, &mut hybrid, &mut stepper, opts.correction)?
+        hybrid_entropy_stereo(
+            &coded,
+            &mut hybrid,
+            &mut stepper,
+            opts.correction,
+            &mut shaping,
+            if joint {
+                StereoShapingMode::JointOutput
+            } else {
+                StereoShapingMode::PerChannel
+            },
+        )?
     };
 
     // The lossy decode output the .wv header CRC covers (post joint
@@ -611,6 +934,11 @@ pub(crate) fn encode_hybrid_block_ints(
     // Header flag word.
     let mut flags_raw = with_marker(base_flags(bytes_per_sample), 0b11);
     flags_raw |= HYBRID_FLAG | HYBRID_PROFILE_FLAG_9;
+    if shaping_payload.is_some() {
+        // Both shape bits are set on every reference shaped block —
+        // static and dynamic weights alike (fixture flag observation).
+        flags_raw |= crate::hybrid::HYBRID_SHAPE_FLAG | crate::hybrid::NEW_SHAPING_FLAG;
+    }
     if mono {
         flags_raw |= 1 << 2;
     } else {
@@ -693,10 +1021,17 @@ pub(crate) fn encode_hybrid_block_ints(
         lossy_crc,
     )?;
 
-    // The .wvc twin: same header fields, lossless CRC, 0x0B (+ 0x0C).
+    // The .wvc twin: same header fields, lossless CRC, 0x07 + 0x0B
+    // (+ 0x0C).
     let wvc = match streams.wvc {
         Some(correction_payload) => {
             let mut cmeta = Vec::new();
+            // The 0x07 shaping seed leads the correction chain (the
+            // wiki routes it to the wvc file; reference pair encodes
+            // place it ahead of 0x0B — round-415/420 observation).
+            if let Some(sp) = shaping_payload {
+                append_sub_block(&mut cmeta, SubBlockId::NoiseShapingProfile.as_id_byte(), sp)?;
+            }
             // An all-run block spends no bracket bits; the reference
             // decoder rejects a zero-length 0x0B sub-block outright
             // (round-418 black-box pin), so an empty correction
@@ -724,7 +1059,12 @@ pub(crate) fn encode_hybrid_block_ints(
         None => None,
     };
 
-    Ok((wv, wvc, [hybrid.slow_level(0), hybrid.slow_level(1)]))
+    Ok((
+        wv,
+        wvc,
+        [hybrid.slow_level(0), hybrid.slow_level(1)],
+        shaping,
+    ))
 }
 
 /// Seed level words for the first block of a stream: a §6.5 pre-pass
@@ -760,6 +1100,69 @@ fn hybrid_seed(pcm: &[i32], mono: bool, opts: &HybridOptions) -> Result<[i16; 2]
     seed_level_words(&coded, mono, passes)
 }
 
+/// Cross-block hybrid encoder state: the packed `0x06` level words and
+/// the packed `0x07` shaping payload for the **next** block — always
+/// the on-wire (log-quantized) forms, so the encoder-side state can
+/// never drift from what the decoder reconstructs. Used by the stream
+/// encoders and the registry [`crate::registry`] encoder (which spans
+/// blocks across packets).
+#[derive(Debug, Clone)]
+pub(crate) struct HybridCarry {
+    /// The next block's `0x06` level words; `None` until the first
+    /// block seeds them from the §6.5 pre-pass.
+    level: Option<[i16; 2]>,
+    /// The next block's `0x07` payload (`None` = shaping off).
+    shaping: Option<Vec<u8>>,
+    /// Whether the `0x07` layout carries delta words.
+    with_delta: bool,
+    /// Whether the shaping payloads use the stereo word interleave.
+    stereo: bool,
+}
+
+impl HybridCarry {
+    /// Fresh carry for a stream encode under `opts` with the given
+    /// channel shape.
+    pub(crate) fn new(opts: &HybridOptions, mono: bool) -> Self {
+        let stereo = !mono;
+        HybridCarry {
+            level: None,
+            shaping: opts.shaping.initial_payload(stereo),
+            with_delta: opts.shaping.with_delta(),
+            stereo,
+        }
+    }
+
+    /// The level words for the next block, seeding from `window` (the
+    /// pre-format integer buffer) when this is the first block.
+    pub(crate) fn level_words(
+        &self,
+        window: &[i32],
+        mono: bool,
+        opts: &HybridOptions,
+    ) -> Result<[i16; 2]> {
+        match self.level {
+            Some(words) => Ok(words),
+            None => hybrid_seed(window, mono, opts),
+        }
+    }
+
+    /// The next block's `0x07` payload.
+    pub(crate) fn shaping_payload(&self) -> Option<&[u8]> {
+        self.shaping.as_deref()
+    }
+
+    /// Fold one encoded block's end state back into the carry.
+    pub(crate) fn absorb(&mut self, slow_level: [u32; 2], shaping: &crate::ShapingState) {
+        self.level = Some([
+            pack_level_word(slow_level[0]),
+            pack_level_word(slow_level[1]),
+        ]);
+        if self.shaping.is_some() {
+            self.shaping = Some(shaping.to_shaping_words(self.stereo, self.with_delta));
+        }
+    }
+}
+
 /// Encode a mono PCM buffer into one hybrid `wvpk` block: a lossy
 /// `.wv` at the [`HybridOptions::bitrate_word`] noise target, plus —
 /// when [`HybridOptions::correction`] — the `.wvc` twin that restores
@@ -776,13 +1179,15 @@ pub fn encode_block_mono_hybrid(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    let level = hybrid_seed(pcm, true, opts)?;
-    let (wv, wvc, _) = encode_hybrid_block_ints(
+    let carry = HybridCarry::new(opts, true);
+    let level = carry.level_words(pcm, true, opts)?;
+    let (wv, wvc, _, _) = encode_hybrid_block_ints(
         pcm,
         true,
         bytes_per_sample,
         opts,
         level,
+        carry.shaping_payload(),
         None,
         block_index,
         total_samples,
@@ -806,13 +1211,15 @@ pub fn encode_block_stereo_hybrid(
     if pcm.len() % 2 != 0 {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
-    let level = hybrid_seed(pcm, false, opts)?;
-    let (wv, wvc, _) = encode_hybrid_block_ints(
+    let carry = HybridCarry::new(opts, false);
+    let level = carry.level_words(pcm, false, opts)?;
+    let (wv, wvc, _, _) = encode_hybrid_block_ints(
         pcm,
         false,
         bytes_per_sample,
         opts,
         level,
+        carry.shaping_payload(),
         None,
         block_index,
         total_samples,
@@ -842,18 +1249,16 @@ pub fn encode_stream_mono_hybrid(
     let mut wv = Vec::new();
     let mut wvc_all = Vec::new();
     let mut index: u32 = 0;
-    let mut level: Option<[i16; 2]> = None;
+    let mut carry = HybridCarry::new(opts, true);
     for window in pcm.chunks(chunk) {
-        let level_words = match level {
-            Some(words) => words,
-            None => hybrid_seed(window, true, opts)?,
-        };
-        let (blk, cblk, sl) = encode_hybrid_block_ints(
+        let level_words = carry.level_words(window, true, opts)?;
+        let (blk, cblk, sl, shape) = encode_hybrid_block_ints(
             window,
             true,
             bytes_per_sample,
             opts,
             level_words,
+            carry.shaping_payload(),
             None,
             index,
             total,
@@ -862,7 +1267,7 @@ pub fn encode_stream_mono_hybrid(
         if let Some(cblk) = cblk {
             wvc_all.extend_from_slice(&cblk);
         }
-        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
+        carry.absorb(sl, &shape);
         index = index
             .checked_add(window.len() as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
@@ -895,18 +1300,16 @@ pub fn encode_stream_stereo_hybrid(
     let mut wv = Vec::new();
     let mut wvc_all = Vec::new();
     let mut index: u32 = 0;
-    let mut level: Option<[i16; 2]> = None;
+    let mut carry = HybridCarry::new(opts, false);
     for window in pcm.chunks(pairs * 2) {
-        let level_words = match level {
-            Some(words) => words,
-            None => hybrid_seed(window, false, opts)?,
-        };
-        let (blk, cblk, sl) = encode_hybrid_block_ints(
+        let level_words = carry.level_words(window, false, opts)?;
+        let (blk, cblk, sl, shape) = encode_hybrid_block_ints(
             window,
             false,
             bytes_per_sample,
             opts,
             level_words,
+            carry.shaping_payload(),
             None,
             index,
             total,
@@ -915,7 +1318,7 @@ pub fn encode_stream_stereo_hybrid(
         if let Some(cblk) = cblk {
             wvc_all.extend_from_slice(&cblk);
         }
-        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
+        carry.absorb(sl, &shape);
         index = index
             .checked_add((window.len() / 2) as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
@@ -941,14 +1344,14 @@ pub fn encode_stream_stereo_hybrid(
 /// lossy decode, surfacing the (pathological-bitrate) corner where a
 /// coarse value still overflows the window as the decoder's typed
 /// error instead of shipping an undecodable stream.
-fn encode_hybrid_block_float(
+pub(crate) fn encode_hybrid_block_float(
     pcm: &[f32],
     mono: bool,
     opts: &HybridOptions,
-    level_words: Option<[i16; 2]>,
+    carry: &mut HybridCarry,
     block_index: u32,
     total_samples: u32,
-) -> Result<HybridBlock> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
@@ -957,16 +1360,14 @@ fn encode_hybrid_block_float(
     }
     let d = crate::float::deconstruct_float_raised(pcm);
     let format = crate::encode::float_format_extras(&d);
-    let level = match level_words {
-        Some(words) => words,
-        None => hybrid_seed(&d.integers, mono, opts)?,
-    };
-    let (wv, wvc, sl) = encode_hybrid_block_ints(
+    let level = carry.level_words(&d.integers, mono, opts)?;
+    let (wv, wvc, sl, shape) = encode_hybrid_block_ints(
         &d.integers,
         mono,
         4,
         opts,
         level,
+        carry.shaping_payload(),
         Some(&format),
         block_index,
         total_samples,
@@ -974,18 +1375,19 @@ fn encode_hybrid_block_float(
     // Verify the lossy stream reconstructs (the implied-zero float
     // fixup can refuse a coarse magnitude past the mantissa window).
     crate::block::decode_stream(&wv)?;
-    Ok((wv, wvc, sl))
+    carry.absorb(sl, &shape);
+    Ok((wv, wvc))
 }
 
 /// Shared body of the int32-hybrid block encoders.
-fn encode_hybrid_block_int32(
+pub(crate) fn encode_hybrid_block_int32(
     pcm: &[i32],
     mono: bool,
     opts: &HybridOptions,
-    level_words: Option<[i16; 2]>,
+    carry: &mut HybridCarry,
     block_index: u32,
     total_samples: u32,
-) -> Result<HybridBlock> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
@@ -994,20 +1396,20 @@ fn encode_hybrid_block_int32(
     }
     let d = crate::int32::deconstruct_int32(pcm);
     let format = crate::encode::int32_format_extras(&d);
-    let level = match level_words {
-        Some(words) => words,
-        None => hybrid_seed(&d.reduced, mono, opts)?,
-    };
-    encode_hybrid_block_ints(
+    let level = carry.level_words(&d.reduced, mono, opts)?;
+    let (wv, wvc, sl, shape) = encode_hybrid_block_ints(
         &d.reduced,
         mono,
         4,
         opts,
         level,
+        carry.shaping_payload(),
         Some(&format),
         block_index,
         total_samples,
-    )
+    )?;
+    carry.absorb(sl, &shape);
+    Ok((wv, wvc))
 }
 
 /// Encode a mono `f32` buffer into one hybrid `FLOAT_DATA` block: a
@@ -1022,8 +1424,9 @@ pub fn encode_block_mono_hybrid_float(
     block_index: u32,
     total_samples: u32,
 ) -> Result<HybridEncoded> {
-    let (wv, wvc, _) =
-        encode_hybrid_block_float(pcm, true, opts, None, block_index, total_samples)?;
+    let mut carry = HybridCarry::new(opts, true);
+    let (wv, wvc) =
+        encode_hybrid_block_float(pcm, true, opts, &mut carry, block_index, total_samples)?;
     Ok(HybridEncoded { wv, wvc })
 }
 
@@ -1036,8 +1439,9 @@ pub fn encode_block_stereo_hybrid_float(
     block_index: u32,
     total_samples: u32,
 ) -> Result<HybridEncoded> {
-    let (wv, wvc, _) =
-        encode_hybrid_block_float(pcm, false, opts, None, block_index, total_samples)?;
+    let mut carry = HybridCarry::new(opts, false);
+    let (wv, wvc) =
+        encode_hybrid_block_float(pcm, false, opts, &mut carry, block_index, total_samples)?;
     Ok(HybridEncoded { wv, wvc })
 }
 
@@ -1053,8 +1457,9 @@ pub fn encode_block_mono_hybrid_int32(
     block_index: u32,
     total_samples: u32,
 ) -> Result<HybridEncoded> {
-    let (wv, wvc, _) =
-        encode_hybrid_block_int32(pcm, true, opts, None, block_index, total_samples)?;
+    let mut carry = HybridCarry::new(opts, true);
+    let (wv, wvc) =
+        encode_hybrid_block_int32(pcm, true, opts, &mut carry, block_index, total_samples)?;
     Ok(HybridEncoded { wv, wvc })
 }
 
@@ -1067,8 +1472,9 @@ pub fn encode_block_stereo_hybrid_int32(
     block_index: u32,
     total_samples: u32,
 ) -> Result<HybridEncoded> {
-    let (wv, wvc, _) =
-        encode_hybrid_block_int32(pcm, false, opts, None, block_index, total_samples)?;
+    let mut carry = HybridCarry::new(opts, false);
+    let (wv, wvc) =
+        encode_hybrid_block_int32(pcm, false, opts, &mut carry, block_index, total_samples)?;
     Ok(HybridEncoded { wv, wvc })
 }
 
@@ -1088,14 +1494,13 @@ pub fn encode_stream_mono_hybrid_float(
     let mut wv = Vec::new();
     let mut wvc_all = Vec::new();
     let mut index: u32 = 0;
-    let mut level: Option<[i16; 2]> = None;
+    let mut carry = HybridCarry::new(opts, true);
     for window in pcm.chunks(chunk) {
-        let (blk, cblk, sl) = encode_hybrid_block_float(window, true, opts, level, index, total)?;
+        let (blk, cblk) = encode_hybrid_block_float(window, true, opts, &mut carry, index, total)?;
         wv.extend_from_slice(&blk);
         if let Some(cblk) = cblk {
             wvc_all.extend_from_slice(&cblk);
         }
-        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
         index = index
             .checked_add(window.len() as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
@@ -1124,14 +1529,13 @@ pub fn encode_stream_stereo_hybrid_float(
     let mut wv = Vec::new();
     let mut wvc_all = Vec::new();
     let mut index: u32 = 0;
-    let mut level: Option<[i16; 2]> = None;
+    let mut carry = HybridCarry::new(opts, false);
     for window in pcm.chunks(pairs * 2) {
-        let (blk, cblk, sl) = encode_hybrid_block_float(window, false, opts, level, index, total)?;
+        let (blk, cblk) = encode_hybrid_block_float(window, false, opts, &mut carry, index, total)?;
         wv.extend_from_slice(&blk);
         if let Some(cblk) = cblk {
             wvc_all.extend_from_slice(&cblk);
         }
-        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
         index = index
             .checked_add((window.len() / 2) as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
@@ -1157,14 +1561,13 @@ pub fn encode_stream_mono_hybrid_int32(
     let mut wv = Vec::new();
     let mut wvc_all = Vec::new();
     let mut index: u32 = 0;
-    let mut level: Option<[i16; 2]> = None;
+    let mut carry = HybridCarry::new(opts, true);
     for window in pcm.chunks(chunk) {
-        let (blk, cblk, sl) = encode_hybrid_block_int32(window, true, opts, level, index, total)?;
+        let (blk, cblk) = encode_hybrid_block_int32(window, true, opts, &mut carry, index, total)?;
         wv.extend_from_slice(&blk);
         if let Some(cblk) = cblk {
             wvc_all.extend_from_slice(&cblk);
         }
-        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
         index = index
             .checked_add(window.len() as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
@@ -1193,14 +1596,13 @@ pub fn encode_stream_stereo_hybrid_int32(
     let mut wv = Vec::new();
     let mut wvc_all = Vec::new();
     let mut index: u32 = 0;
-    let mut level: Option<[i16; 2]> = None;
+    let mut carry = HybridCarry::new(opts, false);
     for window in pcm.chunks(pairs * 2) {
-        let (blk, cblk, sl) = encode_hybrid_block_int32(window, false, opts, level, index, total)?;
+        let (blk, cblk) = encode_hybrid_block_int32(window, false, opts, &mut carry, index, total)?;
         wv.extend_from_slice(&blk);
         if let Some(cblk) = cblk {
             wvc_all.extend_from_slice(&cblk);
         }
-        level = Some([pack_level_word(sl[0]), pack_level_word(sl[1])]);
         index = index
             .checked_add((window.len() / 2) as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
@@ -1252,6 +1654,7 @@ mod tests {
             correction: true,
             joint,
             profile,
+            shaping: HybridShaping::Off,
         }
     }
 
@@ -1675,6 +2078,255 @@ mod tests {
             lossy.iter().all(|&s| s & 0xF == 0),
             "lossy window zero-fills"
         );
+    }
+
+    // ---- noise shaping (round 420) -----------------------------------
+
+    fn shaped(sh: HybridShaping, joint: bool) -> HybridOptions {
+        opts(456, joint, Some(DecorrProfile::Normal)).with_shaping(sh)
+    }
+
+    /// Lag-1 autocorrelation sign proxy of the lossy quantization
+    /// noise: positive shaping weights tilt the noise spectrum upward
+    /// (negative lag-1 correlation), negative weights downward.
+    fn noise_autocorr1(lossy: &[i32], orig: &[i32]) -> f64 {
+        let n: Vec<i64> = lossy
+            .iter()
+            .zip(orig)
+            .map(|(&a, &b)| i64::from(a) - i64::from(b))
+            .collect();
+        let num: i64 = n.windows(2).map(|w| w[0] * w[1]).sum();
+        let den: i64 = n.iter().map(|&v| v * v).sum();
+        num as f64 / den.max(1) as f64
+    }
+
+    #[test]
+    fn shaped_mono_pair_is_lossless_and_flags_the_shape() {
+        let pcm = signal16(3000, 0x420);
+        let enc =
+            encode_block_mono_hybrid(&pcm, 2, &shaped(HybridShaping::Static(717), false), 0, 3000)
+                .unwrap();
+        assert_pair_round_trip(&pcm, &enc);
+        let (wv_blk, _) = crate::parse_block(&enc.wv).unwrap();
+        let flags = wv_blk.flags().raw;
+        assert_ne!(flags & crate::hybrid::HYBRID_SHAPE_FLAG, 0, "bit 6");
+        assert_ne!(flags & crate::hybrid::NEW_SHAPING_FLAG, 0, "bit 29");
+        assert!(
+            wv_blk.find_noise_shaping_profile_sub_block().is_none(),
+            "0x07 rides the wvc twin, not the lossy stream"
+        );
+        let wvc = enc.wvc.as_ref().unwrap();
+        let (wvc_blk, _) = crate::parse_block(wvc).unwrap();
+        assert_eq!(wvc_blk.flags().raw, flags, "twin mirrors the flag word");
+        let sp = wvc_blk
+            .find_noise_shaping_profile_sub_block()
+            .expect("0x07 in the correction block");
+        // Mono static layout: [error, acc] (2 log words), zero error
+        // seed, acc = quantized 717 << 16.
+        assert_eq!(sp.payload.len(), 4);
+        let st = crate::ShapingState::from_shaping_words(Some(sp.payload), false);
+        assert_eq!(st.error(0), 0);
+        // The 0x07 sub-block leads the correction chain (reference
+        // pair-encode placement): first metadata id byte after the
+        // 32-byte header.
+        assert_eq!(wvc[32] & 0x3f, 0x07);
+        // The unshaped encode keeps bits 6/29 clear and emits no 0x07.
+        let plain = encode_block_mono_hybrid(
+            &pcm,
+            2,
+            &opts(456, false, Some(DecorrProfile::Normal)),
+            0,
+            3000,
+        )
+        .unwrap();
+        let (pb, _) = crate::parse_block(&plain.wv).unwrap();
+        assert_eq!(
+            pb.flags().raw & (crate::hybrid::HYBRID_SHAPE_FLAG | crate::hybrid::NEW_SHAPING_FLAG),
+            0
+        );
+        let (pc, _) = crate::parse_block(plain.wvc.as_ref().unwrap()).unwrap();
+        assert!(pc.find_noise_shaping_profile_sub_block().is_none());
+    }
+
+    #[test]
+    fn shaped_noise_spectrum_tilts_with_the_weight() {
+        let pcm = signal16(4000, 0x7171);
+        let mut corr = Vec::new();
+        for sh in [
+            HybridShaping::Static(717),
+            HybridShaping::Off,
+            HybridShaping::Static(-717),
+        ] {
+            let enc = encode_block_mono_hybrid(&pcm, 2, &shaped(sh, false), 0, 4000).unwrap();
+            let lossy = assert_pair_round_trip(&pcm, &enc);
+            corr.push(noise_autocorr1(&lossy, &pcm));
+        }
+        assert!(
+            corr[0] < corr[1] && corr[1] < corr[2],
+            "lag-1 noise autocorrelation orders with the weight: {corr:?}"
+        );
+        assert!(corr[0] < -0.2, "positive weight pushes noise upward");
+        assert!(corr[2] > 0.2, "negative weight pushes noise downward");
+    }
+
+    #[test]
+    fn shaped_stereo_pairs_are_lossless_lr_and_joint() {
+        let mono = signal16(2400, 0xbeef);
+        let pcm: Vec<i32> = mono
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &s)| [s, s / 2 + (i as i32 % 37) - 18])
+            .collect();
+        for joint in [false, true] {
+            for sh in [
+                HybridShaping::Static(717),
+                HybridShaping::Static(-717),
+                HybridShaping::Static(1024),
+            ] {
+                let enc = encode_block_stereo_hybrid(&pcm, 2, &shaped(sh, joint), 0, 2400).unwrap();
+                assert_pair_round_trip(&pcm, &enc);
+                let (blk, _) = crate::parse_block(&enc.wv).unwrap();
+                assert_eq!(blk.flags().joint_stereo, joint);
+                let (cblk, _) = crate::parse_block(enc.wvc.as_ref().unwrap()).unwrap();
+                let sp = cblk.find_noise_shaping_profile_sub_block().unwrap();
+                assert_eq!(sp.payload.len(), 8, "stereo static layout: 4 log words");
+            }
+        }
+    }
+
+    #[test]
+    fn ramp_shaping_carries_delta_words_and_state_across_blocks() {
+        let pcm = signal16(5000, 0x9a);
+        let sh = HybridShaping::Ramp {
+            weight: -512,
+            delta: 9000,
+        };
+        let enc = encode_stream_mono_hybrid(&pcm, 1000, 2, &shaped(sh, false)).unwrap();
+        assert_pair_round_trip(&pcm, &enc);
+        // Every block's 0x07 carries the 3-word mono dynamic layout and
+        // the accumulator moves across blocks.
+        let wvc = enc.wvc.as_ref().unwrap();
+        let mut payloads = Vec::new();
+        let mut rest: &[u8] = wvc;
+        while !rest.is_empty() {
+            let (blk, next) = crate::parse_block(rest).unwrap();
+            let sp = blk.find_noise_shaping_profile_sub_block().unwrap();
+            assert_eq!(sp.payload.len(), 6, "mono dynamic layout: 3 log words");
+            payloads.push(sp.payload.to_vec());
+            rest = next;
+        }
+        assert_eq!(payloads.len(), 5);
+        assert_ne!(payloads[0], payloads[4], "acc state ramps across blocks");
+
+        // Stereo joint ramp: the 6-word layout, still lossless.
+        let stereo: Vec<i32> = pcm.iter().flat_map(|&s| [s, s / 3 - 7]).collect();
+        let enc = encode_stream_stereo_hybrid(&stereo, 900, 2, &shaped(sh, true)).unwrap();
+        assert_pair_round_trip(&stereo, &enc);
+        let (cblk, _) = crate::parse_block(enc.wvc.as_ref().unwrap()).unwrap();
+        let sp = cblk.find_noise_shaping_profile_sub_block().unwrap();
+        assert_eq!(sp.payload.len(), 12, "stereo dynamic layout: 6 log words");
+    }
+
+    #[test]
+    fn shaped_silence_and_lossless_dispatch_paths_stay_exact() {
+        // Zero runs under shaping: run members decode exact == coarse
+        // == 0 and reset the error state — the pair stays lossless
+        // through silence stretches.
+        let mut pcm = vec![0i32; 700];
+        pcm.extend(signal16(900, 0x51).iter());
+        pcm.extend(std::iter::repeat_n(0i32, 600));
+        let n = pcm.len() as u32;
+        for joint in [false, true] {
+            let stereo: Vec<i32> = pcm.iter().flat_map(|&s| [s, s / 2]).collect();
+            let enc = encode_block_stereo_hybrid(
+                &stereo,
+                2,
+                &shaped(HybridShaping::Static(717), joint),
+                0,
+                n,
+            )
+            .unwrap();
+            assert_pair_round_trip(&stereo, &enc);
+        }
+        // A degenerate-lossless bitrate word (every limit argument
+        // non-positive) under shaping: the lossless dispatch applies no
+        // temp and the lossy stream is already exact.
+        let enc =
+            encode_block_mono_hybrid(&pcm, 2, &shaped(HybridShaping::Static(717), false), 0, n)
+                .unwrap();
+        assert_pair_round_trip(&pcm, &enc);
+        let mut o = shaped(HybridShaping::Static(-717), false);
+        o.bitrate_word = 8000;
+        let enc = encode_block_mono_hybrid(&pcm, 2, &o, 0, n).unwrap();
+        let lossy = assert_pair_round_trip(&pcm, &enc);
+        assert_eq!(lossy, pcm, "degenerate lossless words under shaping");
+    }
+
+    #[test]
+    fn shaped_float_and_int32_pairs_are_bit_exact() {
+        let pcm = float_signal(1600, 0x420f);
+        let enc = encode_block_mono_hybrid_float(
+            &pcm,
+            &shaped(HybridShaping::Static(717), false),
+            0,
+            1600,
+        )
+        .unwrap();
+        let wvc = enc.wvc.as_ref().unwrap();
+        let exact = crate::block::decode_stream_with_correction_f32(&enc.wv, wvc).unwrap();
+        assert_eq!(bits_of(&exact), bits_of(&pcm));
+
+        let stereo: Vec<f32> = pcm.iter().flat_map(|&s| [s, -s * 0.4]).collect();
+        let enc = encode_stream_stereo_hybrid_float(
+            &stereo,
+            700,
+            &shaped(HybridShaping::Static(-717), true),
+        )
+        .unwrap();
+        let exact =
+            crate::block::decode_stream_with_correction_f32(&enc.wv, enc.wvc.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(bits_of(&exact), bits_of(&stereo));
+
+        let wide: Vec<i32> = splitmix(0x32, 1400).iter().map(|&r| r as i32).collect();
+        let enc = encode_block_mono_hybrid_int32(
+            &wide,
+            &shaped(HybridShaping::Static(717), false),
+            0,
+            1400,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_stream_with_correction(&enc.wv, enc.wvc.as_ref().unwrap()).unwrap(),
+            wide
+        );
+    }
+
+    #[test]
+    fn shaping_from_weight_maps_the_reference_scale() {
+        assert_eq!(HybridShaping::from_weight(0.0), HybridShaping::Off);
+        assert_eq!(HybridShaping::from_weight(0.7), HybridShaping::Static(717));
+        assert_eq!(
+            HybridShaping::from_weight(-0.7),
+            HybridShaping::Static(-717)
+        );
+        assert_eq!(HybridShaping::from_weight(3.0), HybridShaping::Static(1024));
+        assert_eq!(
+            HybridShaping::from_weight(-3.0),
+            HybridShaping::Static(-1024)
+        );
+        // Out-of-range static weights clamp at payload build time; the
+        // pair decode stays lossless.
+        let pcm = signal16(1200, 0x5);
+        let enc = encode_block_mono_hybrid(
+            &pcm,
+            2,
+            &shaped(HybridShaping::Static(30000), false),
+            0,
+            1200,
+        )
+        .unwrap();
+        assert_pair_round_trip(&pcm, &enc);
     }
 
     #[test]

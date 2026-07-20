@@ -21,14 +21,17 @@
 //! lossless-degenerate regime), and the plain / float / int32 sample
 //! formats — so the §6.5 bracketing writer, the per-sample stepper
 //! feedback, the zero-run interleaves, the delta clamp and the
-//! format deconstructions all face adversarial PCM.
+//! format deconstructions all face adversarial PCM. A second control
+//! byte sweeps the round-420 noise-shaping axis (off / static ± /
+//! extreme static / ramping weights, including out-of-range values the
+//! payload build clamps).
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_wavpack::{
     decode_stream_muted, decode_stream_with_correction, decode_stream_with_correction_muted,
     encode_block_mono_hybrid, encode_block_mono_hybrid_float, encode_block_mono_hybrid_int32,
     encode_block_stereo_hybrid, encode_block_stereo_hybrid_float, encode_block_stereo_hybrid_int32,
-    DecorrProfile, HybridEncoded, HybridOptions,
+    DecorrProfile, HybridEncoded, HybridOptions, HybridShaping,
 };
 
 fn check_pair(pcm: &[i32], enc: &HybridEncoded) {
@@ -62,11 +65,28 @@ fuzz_target!(|data: &[u8]| {
         _ => 2000,
     };
     let format = (control >> 6) & 0x03; // 0/1 plain, 2 float, 3 int32
+    let shape_control = data[1];
+    let shaping = match shape_control & 0x07 {
+        0 | 1 => HybridShaping::Off,
+        2 => HybridShaping::Static(717),
+        3 => HybridShaping::Static(-717),
+        4 => HybridShaping::Static(i32::from(shape_control as i8) * 300),
+        5 => HybridShaping::Ramp {
+            weight: 512,
+            delta: -(i32::from(shape_control >> 3)) * 500,
+        },
+        6 => HybridShaping::Ramp {
+            weight: -1024,
+            delta: i32::from(shape_control >> 3) * 900,
+        },
+        _ => HybridShaping::Static(1024),
+    };
     let opts = HybridOptions {
         bitrate_word,
         correction: true,
         joint,
         profile,
+        shaping,
     };
 
     match format {
@@ -75,7 +95,7 @@ fuzz_target!(|data: &[u8]| {
             // normalising exponents into a plausible audio range while
             // keeping some specials (the deconstruction must take any
             // pattern).
-            let mut pcm: Vec<f32> = data[1..]
+            let mut pcm: Vec<f32> = data[2..]
                 .chunks_exact(4)
                 .take(256)
                 .map(|c| {
@@ -113,7 +133,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         3 => {
-            let mut pcm: Vec<i32> = data[1..]
+            let mut pcm: Vec<i32> = data[2..]
                 .chunks_exact(4)
                 .take(256)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -137,7 +157,7 @@ fuzz_target!(|data: &[u8]| {
         }
         _ => {
             // Plain 16-bit-container integers.
-            let mut pcm: Vec<i32> = data[1..]
+            let mut pcm: Vec<i32> = data[2..]
                 .chunks_exact(2)
                 .take(512)
                 .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))

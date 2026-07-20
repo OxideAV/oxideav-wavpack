@@ -6,6 +6,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 420 — **noise-shaping origination (`0x07` emission).**
+  [`HybridOptions`] gains a `shaping` axis ([`HybridShaping`]: `Off` /
+  `Static` weight in 1/1024 units / `Ramp` with a per-sample
+  accumulator delta; `HybridShaping::from_weight` maps the fractional
+  `-1.0..=1.0` scale). When selected, every §6.5-bracketed word
+  targets the **shaped** residual `exact - temp` — the staged spec
+  §4.1 error-feedback term, computed in exact decoder lockstep through
+  `ShapingState` — so the lossy stream's quantization-noise spectrum
+  tilts with the weight while the `.wv` + `.wvc` pair decode stays
+  bit-exact. The `.wvc` twin leads its metadata chain with the block's
+  `0x07` seed (short static / long delta-bearing layouts, log-word
+  packed via the new `ShapingState::to_shaping_words`), header bits
+  6/29 are both set (the flag combination observed on every reference
+  shaped block), and multi-block streams carry the quantized filter
+  state across block boundaries exactly as the level words are
+  carried. Joint (mid/side) blocks run the filter per **output**
+  channel with the round-415 coded-domain temp transform (including
+  the half-step term and the effective per-output error-state deltas);
+  left/right and mono blocks fold temps per coded channel. Zero-run
+  and lossless-dispatch words apply no temp and reset the error state,
+  mirroring the pinned decode paths. Float / int32 hybrid encodes
+  inherit the axis unchanged. Black-box validated: 20 originated
+  variants (mono / left-right / joint × off / ±0.7 / full-scale /
+  ramping weights × single- and multi-block) all reproduce their lossy
+  PCM bit-exactly under the reference decoder and recover the original
+  losslessly from the pair — confirming the emitted `0x07` seeds drive
+  the reference's own shaping arithmetic identically. The
+  `hybrid_encode_roundtrip` fuzz target now sweeps the shaping axis
+  from a second control byte (clean 120 s / 344 k-run opening
+  campaign).
+
 ### Changed
 
 - Internal plumbing re-exports (entropy-ladder primitives, decorrelation /

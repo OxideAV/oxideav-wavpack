@@ -564,6 +564,40 @@ impl ShapingState {
     pub fn error(&self, channel: usize) -> i32 {
         self.error[channel & 1]
     }
+
+    /// Pack the current state into a `0x07` payload — the encode-side
+    /// inverse of [`Self::from_shaping_words`] (round 420).
+    ///
+    /// Each word is the 16-bit log pack of its state value
+    /// ([`crate::logpack::pack_log_word`], a quantizer), with the error
+    /// seed negated on the wire exactly as the expansion expects.
+    /// `with_delta` selects the long (dynamic) layout that carries the
+    /// per-channel `delta` words; the short layout implies `delta == 0`.
+    ///
+    /// The pack is **lossy** (log-word quantization), so an encoder
+    /// carrying shaping state across blocks must re-seed its own state
+    /// from the packed payload (`from_shaping_words(Some(&payload))`)
+    /// rather than keep the unquantized values — otherwise it drifts
+    /// from the state the decoder reconstructs.
+    #[must_use]
+    pub fn to_shaping_words(&self, stereo: bool, with_delta: bool) -> Vec<u8> {
+        let pack = |v: i32| crate::logpack::pack_log_word(v);
+        let mut out = Vec::with_capacity(12);
+        let channels = if stereo { 2 } else { 1 };
+        for ch in 0..channels {
+            // Wire convention: `error = -wp_exp2s(word)`, so the word
+            // packs the negated error (wrapping: `i32::MIN` is its own
+            // negation, exactly as the expansion side wraps).
+            out.extend_from_slice(&pack(self.error[ch].wrapping_neg()));
+            out.extend_from_slice(&pack(self.acc[ch]));
+        }
+        if with_delta {
+            for ch in 0..channels {
+                out.extend_from_slice(&pack(self.delta[ch]));
+            }
+        }
+        out
+    }
 }
 
 /// `true` when the flag word selects the **noise-shaped** correction fold
@@ -800,6 +834,66 @@ mod tests {
         let mut neg = ShapingState::from_shaping_words(Some(&p), false);
         neg.update(0, 100, 60, 7);
         assert_eq!(neg.error(0), 40);
+    }
+
+    #[test]
+    fn shaping_pack_expand_round_trips_quantized_state() {
+        // Encode-side pack (round 420): expanding the packed payload
+        // must reproduce the packed state exactly once the values are
+        // log-word representable (the quantized fixed point).
+        let mut st = ShapingState::from_shaping_words(None, true);
+        st.update(0, 100, 37, 5);
+        st.update(1, -80, -80, 0);
+        for (stereo, with_delta, words) in [
+            (false, false, 2),
+            (false, true, 3),
+            (true, false, 4),
+            (true, true, 6),
+        ] {
+            let payload = st.to_shaping_words(stereo, with_delta);
+            assert_eq!(
+                payload.len(),
+                words * 2,
+                "stereo={stereo} delta={with_delta}"
+            );
+            let seeded = ShapingState::from_shaping_words(Some(&payload), stereo);
+            // Idempotence: pack(expand(pack(x))) == pack(x).
+            assert_eq!(seeded.to_shaping_words(stereo, with_delta), payload);
+        }
+    }
+
+    #[test]
+    fn shaping_pack_layout_matches_the_wire_pin() {
+        // The reference static-positive stereo seed observed on a pair
+        // fixture: words [0, 0x1a7d, 0, 0x1a7d] (error 0, identical
+        // per-channel acc). Packing a state seeded from those words
+        // reproduces the bytes.
+        let mut payload = Vec::new();
+        for w in [0i16, 0x1a7d, 0, 0x1a7d] {
+            payload.extend_from_slice(&w.to_le_bytes());
+        }
+        let st = ShapingState::from_shaping_words(Some(&payload), true);
+        assert_eq!(st.to_shaping_words(true, false), payload);
+        // The negated-error convention survives the pack: a state whose
+        // error expands from word -1825 (value 70) packs back to -1825.
+        let mut payload = Vec::new();
+        for w in [-1825i16, -6716, -1825, -6716] {
+            payload.extend_from_slice(&w.to_le_bytes());
+        }
+        let st = ShapingState::from_shaping_words(Some(&payload), true);
+        assert_eq!(st.error(0), 70);
+        assert_eq!(st.to_shaping_words(true, false), payload);
+    }
+
+    #[test]
+    fn shaping_pack_wraps_extreme_error_states() {
+        // An i32::MIN error state must pack without overflow (the
+        // negation wraps, mirroring the expansion side).
+        let mut st = ShapingState::from_shaping_words(None, false);
+        st.update(0, i32::MIN, 0, 0);
+        assert_eq!(st.error(0), i32::MIN);
+        let payload = st.to_shaping_words(false, true);
+        let _ = ShapingState::from_shaping_words(Some(&payload), false);
     }
 
     // ---- 0x06 profile expansion (round 408) ---------------------------
