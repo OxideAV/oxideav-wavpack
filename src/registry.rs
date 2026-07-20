@@ -24,19 +24,47 @@
 //! matching interleaved format — [`SampleFormat::S8`] /
 //! [`SampleFormat::S16`] / [`SampleFormat::S24`] /
 //! [`SampleFormat::S32`] — with the decoded values verbatim (no
-//! rescaling), so the PCM bytes are lossless round-trip material. The
-//! encoder accepts those same four interleaved formats (from
-//! `CodecParameters::sample_format`, default [`SampleFormat::S16`])
-//! and refuses float / planar layouts as unsupported.
+//! rescaling), so the PCM bytes are lossless round-trip material;
+//! `FLOAT_DATA` streams decode to their IEEE-754 bit patterns in the
+//! 4-byte slots (byte-identical to interleaved [`SampleFormat::F32`]),
+//! and hybrid `.wv` streams decode to their coarse (lossy) PCM —
+//! rounds 408..418 wired the full lossy / float / int32 decode paths
+//! underneath this surface.
 //!
-//! Hybrid (lossy), float and int32 WavPack streams stay refused by the
-//! underlying decode layer (documented docs gaps — see the crate
-//! README); the registry decoder surfaces those as invalid-data
-//! errors.
+//! The encoder accepts the four signed interleaved widths (from
+//! `CodecParameters::sample_format`, default [`SampleFormat::S16`])
+//! plus [`SampleFormat::F32`] since round 420: `S32` input routes
+//! through the `0x09` int32 deconstruction and `F32` through the
+//! `0x08` float deconstruction, both lossless. Planar layouts stay
+//! refused.
+//!
+//! # Encoder options (round 420)
+//!
+//! Declared via [`WavPackEncoderOptions`] and parsed from
+//! [`CodecParameters::options`]:
+//!
+//! * `mode` — `"lossless"` (default) or `"hybrid"` (lossy `.wv` at a
+//!   bits-per-sample noise target).
+//! * `bits_per_sample` — hybrid noise target on the reference `-b`
+//!   scale (default 4.0; ~2.0 aggressive … 6.0+ near-lossless).
+//! * `shaping` — hybrid noise-shaping weight in `-1.0..=1.0`
+//!   (default 0.0 = off; positive tilts the quantization noise
+//!   upward). See [`crate::HybridShaping`].
+//! * `joint` — hybrid stereo joint (mid/side) coding (default true).
+//! * `correction` — requesting the `.wvc` twin is **refused**: the
+//!   framework packet contract is single-stream, so two-file hybrid
+//!   pairs are only available through the crate-level
+//!   [`crate::encode_stream_mono_hybrid`]-family APIs
+//!   ([`crate::HybridOptions::correction`]).
+//!
+//! Hybrid mode spans blocks across packets with the same running
+//! `0x06` level-word / `0x07` shaping-state carry the crate's stream
+//! encoders use, so concatenated packets form one conformant chain.
 
 use std::collections::VecDeque;
 
 use oxideav_core::{
+    options::{parse_options, CodecOptionsStruct, OptionField, OptionKind, OptionValue},
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecTag, Decoder, Encoder,
     Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, SampleFormat,
     TimeBase,
@@ -44,9 +72,14 @@ use oxideav_core::{
 
 use crate::block_header::TOTAL_SAMPLES_UNKNOWN;
 use crate::encode::{
-    encode_block_mono_best, encode_block_stereo_best, encode_multichannel_stream_at, DecorrProfile,
-    DEFAULT_BLOCK_SAMPLES,
+    encode_block_mono_best, encode_block_mono_float_best, encode_block_mono_int32_best,
+    encode_block_stereo_best, encode_block_stereo_float_best, encode_block_stereo_int32_best,
+    encode_multichannel_stream_at, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
 };
+use crate::hybrid_encode::{
+    encode_hybrid_block_float, encode_hybrid_block_int32, encode_hybrid_block_ints, HybridCarry,
+};
+use crate::{HybridOptions, HybridShaping};
 
 /// The registry identifier this crate registers under.
 pub const CODEC_ID: &str = "wavpack";
@@ -113,15 +146,16 @@ fn widen_bytes(bytes: &[u8], bytes_per_sample: u8) -> Vec<i32> {
 
 /// The WavPack container width for a supported interleaved
 /// [`SampleFormat`] (the wiki flags bits 0..=1 "bytes per sample minus
-/// one" field, plus one).
+/// one" field, plus one). `F32` maps to the 4-byte `FLOAT_DATA`
+/// container.
 fn width_for_format(format: SampleFormat) -> CoreResult<u8> {
     match format {
         SampleFormat::S8 => Ok(1),
         SampleFormat::S16 => Ok(2),
         SampleFormat::S24 => Ok(3),
-        SampleFormat::S32 => Ok(4),
+        SampleFormat::S32 | SampleFormat::F32 => Ok(4),
         other => Err(CoreError::unsupported(format!(
-            "wavpack: sample format {other:?} not supported (signed interleaved S8/S16/S24/S32 only)"
+            "wavpack: sample format {other:?} not supported (signed interleaved S8/S16/S24/S32 or F32)"
         ))),
     }
 }
@@ -193,6 +227,97 @@ pub fn make_decoder(_params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
 
 // ───────────────────────── encoder ─────────────────────────
 
+/// Typed encoder options (see the module docs for the schema).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WavPackEncoderOptions {
+    /// `"lossless"` (default) or `"hybrid"`.
+    pub mode: String,
+    /// Hybrid bits-per-sample noise target (the reference `-b` scale).
+    pub bits_per_sample: f32,
+    /// Hybrid noise-shaping weight, `-1.0..=1.0` (`0.0` = off).
+    pub shaping: f32,
+    /// Hybrid stereo joint (mid/side) coding.
+    pub joint: bool,
+    /// Request the `.wvc` correction twin — always refused here (the
+    /// packet contract is single-stream); use the crate-level pair
+    /// APIs instead.
+    pub correction: bool,
+}
+
+impl Default for WavPackEncoderOptions {
+    fn default() -> Self {
+        WavPackEncoderOptions {
+            mode: "lossless".into(),
+            bits_per_sample: 4.0,
+            shaping: 0.0,
+            joint: true,
+            correction: false,
+        }
+    }
+}
+
+impl CodecOptionsStruct for WavPackEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "mode",
+            kind: OptionKind::Enum(&["lossless", "hybrid"]),
+            default: OptionValue::String(String::new()),
+            help: "encode mode: lossless (default) or hybrid (lossy .wv at a noise target)",
+        },
+        OptionField {
+            name: "bits_per_sample",
+            kind: OptionKind::F32,
+            default: OptionValue::F32(4.0),
+            help: "hybrid noise target in bits per sample (~2.0 aggressive .. 6.0+ near-lossless)",
+        },
+        OptionField {
+            name: "shaping",
+            kind: OptionKind::F32,
+            default: OptionValue::F32(0.0),
+            help:
+                "hybrid noise-shaping weight in -1.0..=1.0 (0 = off, positive tilts noise upward)",
+        },
+        OptionField {
+            name: "joint",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "hybrid stereo joint (mid/side) coding",
+        },
+        OptionField {
+            name: "correction",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "emit the .wvc correction twin (unsupported here; use the crate pair APIs)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
+        match key {
+            "mode" => self.mode = value.as_str()?.to_string(),
+            "bits_per_sample" => self.bits_per_sample = value.as_f32()?,
+            "shaping" => self.shaping = value.as_f32()?,
+            "joint" => self.joint = value.as_bool()?,
+            "correction" => self.correction = value.as_bool()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// The encoder's per-stream mode state.
+#[derive(Debug)]
+enum EncodeMode {
+    /// Lossless mode-searched blocks (the historical behaviour).
+    Lossless,
+    /// Hybrid lossy `.wv` blocks with the cross-packet level / shaping
+    /// carry (`HybridCarry` is created on the first frame, once the
+    /// channel shape is known to be mono or stereo).
+    Hybrid {
+        opts: HybridOptions,
+        carry: Option<HybridCarry>,
+    },
+}
+
 /// Framework [`Encoder`] over the crate's self-deriving `*_best`
 /// entry points.
 ///
@@ -214,6 +339,11 @@ pub struct WavPackEncoder {
     params: CodecParameters,
     channels: usize,
     bytes_per_sample: u8,
+    /// `true` when the input format is [`SampleFormat::F32`] (the
+    /// 4-byte samples are IEEE-754 bit patterns, encoded through the
+    /// `0x08` float deconstruction).
+    float: bool,
+    mode: EncodeMode,
     /// Running absolute frame offset across packets (the wiki
     /// `block_index` header word of the next block).
     next_index: u32,
@@ -225,12 +355,52 @@ impl WavPackEncoder {
     fn new(params: &CodecParameters) -> CoreResult<Self> {
         let format = params.sample_format.unwrap_or(SampleFormat::S16);
         let bytes_per_sample = width_for_format(format)?;
+        let float = format == SampleFormat::F32;
         let channels = usize::from(params.channels.unwrap_or(2));
         if channels == 0 || channels > crate::block::MAX_MULTICHANNEL_CHANNELS {
             return Err(CoreError::invalid(format!(
                 "wavpack: unsupported channel count {channels}"
             )));
         }
+        if (float || format == SampleFormat::S32) && channels > 2 {
+            return Err(CoreError::unsupported(format!(
+                "wavpack: {format:?} encoding supports mono/stereo only (multichannel is 8/16/24-bit)"
+            )));
+        }
+        let o: WavPackEncoderOptions = parse_options(&params.options)?;
+        if o.correction {
+            return Err(CoreError::unsupported(
+                "wavpack: the .wvc correction twin is a second stream; the registry packet \
+                 contract is single-stream — use the crate-level hybrid pair APIs \
+                 (HybridOptions::correction) instead",
+            ));
+        }
+        let mode = if o.mode == "hybrid" {
+            if channels > 2 {
+                return Err(CoreError::unsupported(
+                    "wavpack: hybrid mode supports mono/stereo only",
+                ));
+            }
+            let mut hopts = HybridOptions::from_bits_per_sample(f64::from(o.bits_per_sample));
+            hopts.correction = false;
+            hopts.joint = o.joint;
+            hopts.shaping = HybridShaping::from_weight(f64::from(o.shaping));
+            EncodeMode::Hybrid {
+                opts: hopts,
+                carry: None,
+            }
+        } else {
+            // Hybrid-only knobs set without hybrid mode are a caller
+            // mistake — surface it instead of silently ignoring them.
+            for key in ["bits_per_sample", "shaping", "joint"] {
+                if params.options.get(key).is_some() {
+                    return Err(CoreError::invalid(format!(
+                        "wavpack: option '{key}' requires mode=hybrid"
+                    )));
+                }
+            }
+            EncodeMode::Lossless
+        };
         let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID));
         out_params.sample_rate = params.sample_rate;
         out_params.channels = Some(channels as u16);
@@ -240,6 +410,8 @@ impl WavPackEncoder {
             params: out_params,
             channels,
             bytes_per_sample,
+            float,
+            mode,
             next_index: 0,
             queue: VecDeque::new(),
             eof: false,
@@ -299,26 +471,32 @@ impl Encoder for WavPackEncoder {
             1 | 2 => {
                 // Chunk into blocks with the running index; the full
                 // mode-search block encoders handle joint / decorr /
-                // shift decisions per block.
+                // shift decisions per block, and hybrid mode carries
+                // its level / shaping state across blocks and packets.
+                let mono = self.channels == 1;
                 let chunk_values = DEFAULT_BLOCK_SAMPLES * self.channels;
                 let mut index = self.next_index;
                 for window in pcm.chunks(chunk_values) {
-                    let block = if self.channels == 1 {
-                        encode_block_mono_best(
+                    let block = match &mut self.mode {
+                        EncodeMode::Lossless => encode_lossless_block(
                             window,
-                            DecorrProfile::Normal,
+                            mono,
+                            self.float,
                             self.bytes_per_sample,
                             index,
-                            TOTAL_SAMPLES_UNKNOWN,
-                        )
-                    } else {
-                        encode_block_stereo_best(
-                            window,
-                            DecorrProfile::Normal,
-                            self.bytes_per_sample,
-                            index,
-                            TOTAL_SAMPLES_UNKNOWN,
-                        )
+                        ),
+                        EncodeMode::Hybrid { opts, carry } => {
+                            let carry = carry.get_or_insert_with(|| HybridCarry::new(opts, mono));
+                            encode_hybrid_lossy_block(
+                                window,
+                                mono,
+                                self.float,
+                                self.bytes_per_sample,
+                                opts,
+                                carry,
+                                index,
+                            )
+                        }
                     }
                     .map_err(invalid)?;
                     data.extend_from_slice(&block);
@@ -381,6 +559,106 @@ impl Encoder for WavPackEncoder {
         self.eof = true;
         Ok(())
     }
+}
+
+/// Reinterpret container-scaled 4-byte samples as their IEEE-754 bit
+/// patterns (the `F32` input path).
+fn as_f32_bits(pcm: &[i32]) -> Vec<f32> {
+    pcm.iter().map(|&v| f32::from_bits(v as u32)).collect()
+}
+
+/// One lossless mode-searched block for the registry chunk loop:
+/// plain widths through the historical mode search, `S32` through the
+/// `0x09` int32 deconstruction, `F32` through the `0x08` float
+/// deconstruction.
+fn encode_lossless_block(
+    window: &[i32],
+    mono: bool,
+    float: bool,
+    bytes_per_sample: u8,
+    index: u32,
+) -> crate::Result<Vec<u8>> {
+    if float {
+        let f = as_f32_bits(window);
+        return if mono {
+            encode_block_mono_float_best(&f, DecorrProfile::Normal, index, TOTAL_SAMPLES_UNKNOWN)
+        } else {
+            encode_block_stereo_float_best(&f, DecorrProfile::Normal, index, TOTAL_SAMPLES_UNKNOWN)
+        };
+    }
+    if bytes_per_sample == 4 {
+        return if mono {
+            encode_block_mono_int32_best(
+                window,
+                DecorrProfile::Normal,
+                index,
+                TOTAL_SAMPLES_UNKNOWN,
+            )
+        } else {
+            encode_block_stereo_int32_best(
+                window,
+                DecorrProfile::Normal,
+                index,
+                TOTAL_SAMPLES_UNKNOWN,
+            )
+        };
+    }
+    if mono {
+        encode_block_mono_best(
+            window,
+            DecorrProfile::Normal,
+            bytes_per_sample,
+            index,
+            TOTAL_SAMPLES_UNKNOWN,
+        )
+    } else {
+        encode_block_stereo_best(
+            window,
+            DecorrProfile::Normal,
+            bytes_per_sample,
+            index,
+            TOTAL_SAMPLES_UNKNOWN,
+        )
+    }
+}
+
+/// One hybrid lossy block for the registry chunk loop, with the
+/// cross-block `0x06` level / `0x07` shaping carry (`opts.correction`
+/// is false here, so no `.wvc` twin is produced).
+fn encode_hybrid_lossy_block(
+    window: &[i32],
+    mono: bool,
+    float: bool,
+    bytes_per_sample: u8,
+    opts: &HybridOptions,
+    carry: &mut HybridCarry,
+    index: u32,
+) -> crate::Result<Vec<u8>> {
+    if float {
+        let f = as_f32_bits(window);
+        let (wv, _) =
+            encode_hybrid_block_float(&f, mono, opts, carry, index, TOTAL_SAMPLES_UNKNOWN)?;
+        return Ok(wv);
+    }
+    if bytes_per_sample == 4 {
+        let (wv, _) =
+            encode_hybrid_block_int32(window, mono, opts, carry, index, TOTAL_SAMPLES_UNKNOWN)?;
+        return Ok(wv);
+    }
+    let level = carry.level_words(window, mono, opts)?;
+    let (wv, _, sl, shape) = encode_hybrid_block_ints(
+        window,
+        mono,
+        bytes_per_sample,
+        opts,
+        level,
+        carry.shaping_payload(),
+        None,
+        index,
+        TOTAL_SAMPLES_UNKNOWN,
+    )?;
+    carry.absorb(sl, &shape);
+    Ok(wv)
 }
 
 /// Direct encoder factory (the historical `encoder::make_encoder`
@@ -592,9 +870,9 @@ mod tests {
 
     #[test]
     fn encoder_refusals() {
-        // Float input format.
+        // Interleaved float input is supported since round 420.
         let mut p = audio_params(2, SampleFormat::F32, None);
-        assert!(make_encoder(&p).is_err());
+        assert!(make_encoder(&p).is_ok());
         // Planar input format.
         p.sample_format = Some(SampleFormat::S16P);
         assert!(make_encoder(&p).is_err());
@@ -615,6 +893,211 @@ mod tests {
             }))
             .unwrap_err();
         assert!(matches!(err, CoreError::Unsupported(_)), "{err:?}");
+    }
+
+    // ---- round 420: options, hybrid mode, float / int32 wiring ------
+
+    #[test]
+    fn encoder_options_reject_misuse() {
+        // correction twin: two streams, refused with a pointer at the
+        // crate pair APIs.
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("mode", "hybrid");
+        p.options.insert("correction", "true");
+        let Err(err) = make_encoder(&p) else {
+            panic!("correction=true must be refused");
+        };
+        assert!(matches!(err, CoreError::Unsupported(_)), "{err:?}");
+        // Hybrid-only knobs without mode=hybrid.
+        for key in ["bits_per_sample", "shaping", "joint"] {
+            let mut p = audio_params(2, SampleFormat::S16, None);
+            p.options
+                .insert(key, if key == "joint" { "true" } else { "3.5" });
+            let Err(err) = make_encoder(&p) else {
+                panic!("{key} without mode=hybrid must be refused");
+            };
+            assert!(matches!(err, CoreError::InvalidData(_)), "{key}: {err:?}");
+        }
+        // Unknown key / malformed enum value.
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("bogus", "1");
+        assert!(make_encoder(&p).is_err());
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("mode", "psychic");
+        assert!(make_encoder(&p).is_err());
+        // Hybrid multichannel is not an encode shape.
+        let mut p = audio_params(6, SampleFormat::S16, None);
+        p.options.insert("mode", "hybrid");
+        let Err(err) = make_encoder(&p) else {
+            panic!("hybrid multichannel must be refused");
+        };
+        assert!(matches!(err, CoreError::Unsupported(_)), "{err:?}");
+        // Planar float stays refused.
+        let p = audio_params(2, SampleFormat::F32P, None);
+        assert!(make_encoder(&p).is_err());
+    }
+
+    #[test]
+    fn hybrid_mode_packets_are_lossy_shaped_and_contiguous() {
+        let mut params = audio_params(2, SampleFormat::S16, Some(44_100));
+        params.options.insert("mode", "hybrid");
+        params.options.insert("bits_per_sample", "4.0");
+        params.options.insert("shaping", "0.7");
+        let mut enc = make_encoder(&params).unwrap();
+
+        let pcm: Vec<i32> = (0..2 * 2200)
+            .map(|i| {
+                let t = f64::from(i / 2) * 0.045;
+                ((t.sin() * 9000.0) as i32) + (i % 61) - 30
+            })
+            .collect();
+        let split = 2 * 900;
+        enc.send_frame(&frame_from_pcm(&pcm[..split], 2, Some(0)))
+            .unwrap();
+        enc.send_frame(&frame_from_pcm(&pcm[split..], 2, Some(900)))
+            .unwrap();
+        enc.flush().unwrap();
+        let mut wv = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            wv.extend_from_slice(&p.data);
+        }
+
+        // The chain decodes standalone (lossy), is seekable, and the
+        // noise stays bounded by the b4 target.
+        let (lossy, ok) = crate::block::decode_stream_muted(&wv).unwrap();
+        assert!(ok, "lossy CRC gate across packets");
+        assert_eq!(lossy.len(), pcm.len());
+        let max_err = lossy
+            .iter()
+            .zip(&pcm)
+            .map(|(&a, &b)| (i64::from(a) - i64::from(b)).abs())
+            .max()
+            .unwrap();
+        assert!(max_err > 0, "hybrid mode is genuinely lossy");
+        assert!(max_err < 4096, "noise bounded ({max_err})");
+        let index = crate::seek::StreamIndex::scan(&wv).unwrap();
+        assert!(index.is_seekable());
+        assert_eq!(index.frame_count(), 2200);
+        // Every block flags hybrid + both shape bits; the lossy chain
+        // carries no 0x07 (it rides the wvc twin, which this mode does
+        // not produce).
+        let mut rest: &[u8] = &wv;
+        while !rest.is_empty() {
+            let (blk, next) = crate::parse_block(rest).unwrap();
+            assert!(blk.flags().hybrid);
+            assert_ne!(blk.flags().raw & crate::hybrid::HYBRID_SHAPE_FLAG, 0);
+            assert_ne!(blk.flags().raw & crate::hybrid::NEW_SHAPING_FLAG, 0);
+            assert!(blk.find_noise_shaping_profile_sub_block().is_none());
+            assert!(!blk.has_packed_correction_data());
+            rest = next;
+        }
+        // The registry decoder consumes its own hybrid packets.
+        let mut dec = make_decoder(&params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 44_100), wv))
+            .unwrap();
+        let Frame::Audio(frame) = dec.receive_frame().unwrap() else {
+            panic!("audio frame expected");
+        };
+        assert_eq!(widen_bytes(&frame.data[0], 2), lossy);
+    }
+
+    #[test]
+    fn float_input_round_trips_bit_patterns() {
+        let params = audio_params(2, SampleFormat::F32, Some(48_000));
+        let mut enc = make_encoder(&params).unwrap();
+        let pcm: Vec<f32> = (0..2 * 1500)
+            .map(|i| {
+                if i % 37 == 0 {
+                    0.0
+                } else {
+                    ((i as f32) * 0.021).sin() * 0.8
+                }
+            })
+            .collect();
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_bits().to_le_bytes()).collect();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: 0,
+            pts: None,
+            data: vec![bytes.clone()],
+        }))
+        .unwrap();
+        let packet = enc.receive_packet().unwrap();
+        let decoded = crate::block::decode_stream_f32(&packet.data).unwrap();
+        let got: Vec<u32> = decoded.iter().map(|s| s.to_bits()).collect();
+        let want: Vec<u32> = pcm.iter().map(|s| s.to_bits()).collect();
+        assert_eq!(got, want, "float lossless bit patterns");
+        // Through the registry decoder the raw plane bytes come back
+        // verbatim (f32 bit patterns in the 4-byte slots).
+        let mut dec = make_decoder(&params).unwrap();
+        dec.send_packet(&packet).unwrap();
+        let Frame::Audio(frame) = dec.receive_frame().unwrap() else {
+            panic!("audio frame expected");
+        };
+        assert_eq!(frame.data[0], bytes);
+
+        // Hybrid float: lossy but decodable and close.
+        let mut hp = audio_params(1, SampleFormat::F32, None);
+        hp.options.insert("mode", "hybrid");
+        hp.options.insert("shaping", "-0.5");
+        let mut enc = make_encoder(&hp).unwrap();
+        let mono: Vec<f32> = pcm.iter().step_by(2).copied().collect();
+        let bytes: Vec<u8> = mono
+            .iter()
+            .flat_map(|s| s.to_bits().to_le_bytes())
+            .collect();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: 0,
+            pts: None,
+            data: vec![bytes],
+        }))
+        .unwrap();
+        let packet = enc.receive_packet().unwrap();
+        let lossy = crate::block::decode_stream_f32(&packet.data).unwrap();
+        let max_err = lossy
+            .iter()
+            .zip(&mono)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err > 0.0 && max_err < 0.2,
+            "float noise bounded ({max_err})"
+        );
+    }
+
+    #[test]
+    fn s32_input_uses_the_int32_path_full_range() {
+        let params = audio_params(1, SampleFormat::S32, None);
+        let mut enc = make_encoder(&params).unwrap();
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let pcm: Vec<i32> = (0..1400)
+            .map(|_| {
+                x = x.wrapping_mul(0xd1342543de82ef95).wrapping_add(1);
+                (x >> 32) as i32
+            })
+            .collect();
+        enc.send_frame(&frame_from_pcm(&pcm, 4, None)).unwrap();
+        let packet = enc.receive_packet().unwrap();
+        assert_eq!(
+            crate::block::decode_stream(&packet.data).unwrap(),
+            pcm,
+            "full-range i32 lossless"
+        );
+        let (blk, _) = crate::parse_block(&packet.data).unwrap();
+        assert!(
+            blk.find_sub_block(crate::SubBlockId::Int32Info).is_some(),
+            "0x09 int32 profile emitted"
+        );
+
+        // Hybrid S32: decodable, implied-fill lossy.
+        let mut hp = audio_params(1, SampleFormat::S32, None);
+        hp.options.insert("mode", "hybrid");
+        hp.options.insert("bits_per_sample", "5.0");
+        let mut enc = make_encoder(&hp).unwrap();
+        enc.send_frame(&frame_from_pcm(&pcm, 4, None)).unwrap();
+        let packet = enc.receive_packet().unwrap();
+        let (lossy, ok) = crate::block::decode_stream_muted(&packet.data).unwrap();
+        assert!(ok);
+        assert_eq!(lossy.len(), pcm.len());
     }
 
     #[test]

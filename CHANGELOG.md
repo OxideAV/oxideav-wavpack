@@ -8,6 +8,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 420 — **registry float / hybrid wiring.** The framework
+  encoder now accepts interleaved `F32` (through the `0x08` float
+  deconstruction) and routes `S32` through the `0x09` int32
+  deconstruction — both lossless and both reference-validated
+  black-box. A typed options schema (`WavPackEncoderOptions`, parsed
+  from `CodecParameters::options`) adds `mode=lossless|hybrid`,
+  `bits_per_sample` (the reference `-b` noise-target scale, default
+  4.0), `shaping` (fractional noise-shaping weight, default 0 = off)
+  and `joint` (hybrid mid/side coding, default true); hybrid mode
+  emits lossy `.wv` packets whose blocks carry the running `0x06`
+  level / `0x07` shaping-state carry across packet boundaries, so the
+  concatenated packets stay one seekable conformant chain. Requesting
+  the `.wvc` twin (`correction=true`) is refused with a pointer at the
+  crate-level pair APIs — the framework packet contract is
+  single-stream. Hybrid-only knobs without `mode=hybrid`, hybrid
+  multichannel, and `F32`/`S32` multichannel are typed refusals. The
+  stale registry module note claiming hybrid / float / int32 decodes
+  are refused is gone: the decoder surface has decoded all three since
+  rounds 408..418 (float PCM returns as IEEE-754 bit patterns in the
+  4-byte slots, byte-identical to interleaved `F32`).
+
 - Round 420 — **noise-shaping origination (`0x07` emission).**
   [`HybridOptions`] gains a `shaping` axis ([`HybridShaping`]: `Off` /
   `Static` weight in 1/1024 units / `Ramp` with a per-sample
