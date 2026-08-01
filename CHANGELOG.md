@@ -29,7 +29,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `decode_stream_with_correction_bounded` (+ `_muted` / `_f32` and
   multichannel twins) charge each `.wv` block's header-declared output
   size before its decode — the `.wvc` twin refines the same samples
-  and adds no output of its own. A
+  and adds no output of its own.
+
+- Round 436 — **registry per-packet decode budget.** The framework
+  decoder routes every packet through the bounded multichannel decode
+  with a per-packet decoded-sample budget: the new typed
+  `WavPackDecoderOptions` schema exposes `max_packet_samples`
+  (default `DEFAULT_PACKET_SAMPLE_BUDGET` = `2^28` emitted values,
+  ~1 GiB of packed i32; `0` disables), so a hostile packet whose
+  block headers demand more surfaces an invalid-data refusal before
+  any amplified frame allocation. Decoder params commonly carry the
+  encoder's option bag (one `CodecParameters` for both directions of
+  a loop), so encoder-owned keys are tolerated and ignored by
+  `make_decoder`; keys neither schema owns are refused. A
   264-point black-box sweep over ramp trajectories (start weight ×
   delta × content, two block lengths) found that trajectories crossing
   **below** weight `-1024` can decode differently under the reference

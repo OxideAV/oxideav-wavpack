@@ -833,7 +833,9 @@ mod seek;
 /// `<crate>::decoder::make_decoder` convention), alongside the
 /// registry path installed by [`register`].
 pub mod decoder {
-    pub use crate::registry::{make_decoder, WavPackDecoder};
+    pub use crate::registry::{
+        make_decoder, WavPackDecoder, WavPackDecoderOptions, DEFAULT_PACKET_SAMPLE_BUDGET,
+    };
 }
 
 /// Direct encoder factory endpoint (the workspace's historical

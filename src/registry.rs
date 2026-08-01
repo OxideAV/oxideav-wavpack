@@ -60,6 +60,17 @@
 //! Hybrid mode spans blocks across packets with the same running
 //! `0x06` level-word / `0x07` shaping-state carry the crate's stream
 //! encoders use, so concatenated packets form one conformant chain.
+//!
+//! # Decoder options (round 436)
+//!
+//! Declared via [`WavPackDecoderOptions`]:
+//!
+//! * `max_packet_samples` — per-packet decoded-sample budget (total
+//!   emitted values across all channels; the spec §4.2 zero-run path
+//!   makes a block's output unbounded by its payload bytes, so this is
+//!   the registry surface of [`crate::decode_stream_bounded`]'s
+//!   anti-amplification guard). Default
+//!   [`DEFAULT_PACKET_SAMPLE_BUDGET`]; `0` disables the budget.
 
 use std::collections::VecDeque;
 
@@ -92,23 +103,83 @@ fn invalid(e: crate::Error) -> CoreError {
 
 // ───────────────────────── decoder ─────────────────────────
 
-/// Framework [`Decoder`] over [`crate::decode_multichannel_stream`].
+/// Default per-packet decoded-sample budget for [`WavPackDecoder`]:
+/// `2^28` emitted sample values (~1 GiB of packed `i32` slots).
+///
+/// The spec §4.2 step 1 zero-run fast path makes a block's output
+/// unbounded by its payload bytes, so without a budget a few hundred
+/// hostile packet bytes could demand gigabytes of frame allocation
+/// (round 436 — see [`crate::decode_stream_bounded`]). One packet is
+/// one frame's worth of blocks, so `2^28` values (over 25 minutes of
+/// 44.1 kHz stereo in a single packet) is far beyond any plausible
+/// real frame while keeping the worst-case allocation bounded. A
+/// defensive engineering bound, not a spec limit — override it (or
+/// disable it with `0`) via the `max_packet_samples` decoder option.
+pub const DEFAULT_PACKET_SAMPLE_BUDGET: u32 = 1 << 28;
+
+/// Typed decoder options (parsed from [`CodecParameters::options`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WavPackDecoderOptions {
+    /// Per-packet decoded-sample budget (total emitted sample values
+    /// across all channels). `0` disables the budget. Default
+    /// [`DEFAULT_PACKET_SAMPLE_BUDGET`].
+    pub max_packet_samples: u32,
+}
+
+impl Default for WavPackDecoderOptions {
+    fn default() -> Self {
+        WavPackDecoderOptions {
+            max_packet_samples: DEFAULT_PACKET_SAMPLE_BUDGET,
+        }
+    }
+}
+
+impl CodecOptionsStruct for WavPackDecoderOptions {
+    const SCHEMA: &'static [OptionField] = &[OptionField {
+        name: "max_packet_samples",
+        kind: OptionKind::U32,
+        default: OptionValue::U32(DEFAULT_PACKET_SAMPLE_BUDGET),
+        help: "per-packet decoded-sample budget (anti-amplification guard; 0 = unlimited)",
+    }];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
+        match key {
+            "max_packet_samples" => self.max_packet_samples = value.as_u32()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// Framework [`Decoder`] over
+/// [`crate::decode_multichannel_stream_bounded`].
 ///
 /// Each packet must carry complete `wvpk` blocks (whole member sets).
 /// One [`oxideav_core::AudioFrame`] is produced per packet, with the
 /// per-frame channel count taken from the decoded member-set grouping
-/// and the sample bytes packed at the stream's container width.
+/// and the sample bytes packed at the stream's container width. Every
+/// packet's decode is bounded by the per-packet sample budget
+/// ([`WavPackDecoderOptions::max_packet_samples`], default
+/// [`DEFAULT_PACKET_SAMPLE_BUDGET`]) — a hostile packet whose block
+/// headers demand more surfaces an invalid-data error before any
+/// amplified allocation.
 #[derive(Debug)]
 pub struct WavPackDecoder {
     codec_id: CodecId,
+    /// Per-packet decoded-sample budget (`u64::MAX` = disabled).
+    packet_budget: u64,
     queue: VecDeque<oxideav_core::AudioFrame>,
     eof: bool,
 }
 
 impl WavPackDecoder {
-    fn new() -> Self {
+    fn new(opts: &WavPackDecoderOptions) -> Self {
         Self {
             codec_id: CodecId::new(CODEC_ID),
+            packet_budget: match opts.max_packet_samples {
+                0 => u64::MAX,
+                n => u64::from(n),
+            },
             queue: VecDeque::new(),
             eof: false,
         }
@@ -179,7 +250,9 @@ impl Decoder for WavPackDecoder {
             return Ok(());
         };
         let bytes_per_sample = first_audio.flags().bytes_per_sample();
-        let stream = crate::block::decode_multichannel_stream(&packet.data).map_err(invalid)?;
+        let stream =
+            crate::block::decode_multichannel_stream_bounded(&packet.data, self.packet_budget)
+                .map_err(invalid)?;
         let Some(frames) = stream.samples.len().checked_div(stream.channels) else {
             // channels == 0: no audio sets survived (nothing to emit).
             return Ok(());
@@ -219,10 +292,24 @@ impl Decoder for WavPackDecoder {
 /// endpoint; also the factory [`register`] installs).
 ///
 /// WavPack blocks are self-describing, so no `extradata` or up-front
-/// parameter agreement is required — the parameters are accepted for
-/// signature compatibility and future options.
-pub fn make_decoder(_params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
-    Ok(Box::new(WavPackDecoder::new()))
+/// parameter agreement is required. The optional typed
+/// [`WavPackDecoderOptions`] schema (`max_packet_samples`) is parsed
+/// from [`CodecParameters::options`]. A decoder is commonly built from
+/// the *same* `CodecParameters` an encoder was (one parameter set for
+/// both directions of a loop), so keys owned by the
+/// [`WavPackEncoderOptions`] schema are tolerated and ignored here;
+/// keys neither schema owns are refused.
+pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
+    let mut decoder_bag = oxideav_core::options::CodecOptions::new();
+    for (k, v) in params.options.iter() {
+        if WavPackDecoderOptions::SCHEMA.iter().any(|f| f.name == k) {
+            decoder_bag.insert(k, v);
+        } else if !WavPackEncoderOptions::SCHEMA.iter().any(|f| f.name == k) {
+            return Err(CoreError::invalid(format!("wavpack: unknown option '{k}'")));
+        }
+    }
+    let opts: WavPackDecoderOptions = parse_options(&decoder_bag)?;
+    Ok(Box::new(WavPackDecoder::new(&opts)))
 }
 
 // ───────────────────────── encoder ─────────────────────────
@@ -1099,6 +1186,128 @@ mod tests {
         let (lossy, ok) = crate::block::decode_stream_muted(&packet.data).unwrap();
         assert!(ok);
         assert_eq!(lossy.len(), pcm.len());
+    }
+
+    // ---- round 436: per-packet decoded-sample budget ----------------
+
+    /// Synthesise a hostile packet: eight ~44-byte blocks each claiming
+    /// the per-block decode ceiling, so the headers demand 8 × 2^26
+    /// samples (2 GiB of i32 — over the default 2^28 packet budget)
+    /// from ~350 bytes of input.
+    fn hostile_amplification_packet() -> Vec<u8> {
+        let mut payload = Vec::new();
+        // 0x05 entropy info (all-zero mono seed).
+        payload.extend_from_slice(&[0x05, 0x03, 0, 0, 0, 0, 0, 0]);
+        // 0x0A packed samples (2 garbage bytes).
+        payload.extend_from_slice(&[0x0A, 0x01, 0xFF, 0xFF]);
+        let mut block = Vec::new();
+        block.extend_from_slice(crate::block_header::MAGIC);
+        block.extend_from_slice(&((24 + payload.len()) as u32).to_le_bytes());
+        block.extend_from_slice(&0x0410u16.to_le_bytes());
+        block.extend_from_slice(&[0, 0]);
+        block.extend_from_slice(&0u32.to_le_bytes()); // total_samples
+        block.extend_from_slice(&0u32.to_le_bytes()); // block_index
+        block.extend_from_slice(&crate::MAX_DECODE_SAMPLES_PER_BLOCK.to_le_bytes());
+        // Flags: mono + standalone set markers (bits 11..=12).
+        block.extend_from_slice(&((0b11u32 << 11) | (1 << 2)).to_le_bytes());
+        block.extend_from_slice(&0u32.to_le_bytes()); // crc
+        block.extend_from_slice(&payload);
+        let mut bytes = Vec::new();
+        for _ in 0..8 {
+            bytes.extend_from_slice(&block);
+        }
+        bytes
+    }
+
+    #[test]
+    fn decoder_refuses_hostile_amplification_packet_before_decoding() {
+        let bytes = hostile_amplification_packet();
+        let input_len = bytes.len();
+        assert!(input_len < 500, "hostile input is tiny ({input_len} bytes)");
+        // With a budget below one block's claim the refusal fires on
+        // the FIRST block's header — before any decode work — so the
+        // surfaced error is the budget refusal, not the truncation the
+        // garbage payload would produce if the per-sample loop ran.
+        // (The default 2^28 budget takes the same path; it just permits
+        // the first four 2^26-sample charges — each individually capped
+        // by the per-block ceiling — before refusing, bounding the
+        // worst-case per-packet allocation instead of leaving it
+        // unbounded.)
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("max_packet_samples", "1000000");
+        let mut dec = make_decoder(&p).unwrap();
+        let err = dec
+            .send_packet(&Packet::new(0, TimeBase::new(1, 1), bytes))
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidData(_)), "{err:?}");
+        assert!(
+            format!("{err}").contains("budget"),
+            "budget refusal expected, got: {err}"
+        );
+        // The default budget is the documented constant.
+        assert_eq!(
+            WavPackDecoderOptions::default().max_packet_samples,
+            DEFAULT_PACKET_SAMPLE_BUDGET
+        );
+    }
+
+    #[test]
+    fn decoder_packet_budget_option_is_honored_and_zero_disables() {
+        let pcm: Vec<i32> = (0..400).map(|i| (i * 31) % 1000 - 500).collect();
+        let wv = crate::encode::encode_stream_stereo(&pcm, 100, 2).unwrap();
+
+        // A budget below the packet's 400 emitted values refuses it.
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("max_packet_samples", "399");
+        let mut dec = make_decoder(&p).unwrap();
+        let err = dec
+            .send_packet(&Packet::new(0, TimeBase::new(1, 1), wv.clone()))
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidData(_)), "{err:?}");
+        assert!(format!("{err}").contains("budget"), "{err}");
+
+        // An exact budget decodes bit-identically.
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("max_packet_samples", "400");
+        let mut dec = make_decoder(&p).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), wv.clone()))
+            .unwrap();
+        let Frame::Audio(frame) = dec.receive_frame().unwrap() else {
+            panic!("audio frame expected");
+        };
+        assert_eq!(widen_bytes(&frame.data[0], 2), pcm);
+
+        // `0` disables the budget entirely — even the hostile packet's
+        // charge passes (its garbage payload then fails the real
+        // decode, which is the pre-round-436 behaviour).
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("max_packet_samples", "0");
+        let mut dec = make_decoder(&p).unwrap();
+        let err = dec
+            .send_packet(&Packet::new(
+                0,
+                TimeBase::new(1, 1),
+                hostile_amplification_packet(),
+            ))
+            .unwrap_err();
+        assert!(
+            !format!("{err}").contains("budget"),
+            "budget disabled, expected a decode error instead: {err}"
+        );
+
+        // A malformed value and an unknown key are refused; the
+        // encoder-owned keys are tolerated (a decoder is commonly built
+        // from the encoder's parameter set).
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("max_packet_samples", "many");
+        assert!(make_decoder(&p).is_err());
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("bogus_key", "1");
+        assert!(make_decoder(&p).is_err());
+        let mut p = audio_params(2, SampleFormat::S16, None);
+        p.options.insert("mode", "hybrid");
+        p.options.insert("shaping", "0.5");
+        assert!(make_decoder(&p).is_ok());
     }
 
     #[test]
