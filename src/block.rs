@@ -2789,18 +2789,71 @@ pub fn total_correction_payload_bytes(bytes: &[u8]) -> Result<u64> {
 /// correction file ends early. Errors from pairing or decode propagate
 /// verbatim.
 pub fn decode_stream_with_correction(main: &[u8], correction: &[u8]) -> Result<Vec<i32>> {
+    let (out, _all_ok) =
+        decode_stream_pair_inner(main, correction, false, &mut SampleBudget::unlimited())?;
+    Ok(out)
+}
+
+/// Shared audio-block walk for [`decode_stream_with_correction`] /
+/// [`decode_stream_with_correction_muted`] and their `*_bounded`
+/// twins: pair each `.wv` audio block with its `.wvc` twin, charge the
+/// block's declared output size against `budget` **before** decoding
+/// it, decode (hybrid-lossless when paired; CRC-mute-gated when
+/// `muted`), and concatenate the PCM. Returns `(pcm, all_crc_ok)`;
+/// `all_crc_ok` is only meaningful to the muted callers.
+fn decode_stream_pair_inner(
+    main: &[u8],
+    correction: &[u8],
+    muted: bool,
+    budget: &mut SampleBudget,
+) -> Result<(Vec<i32>, bool)> {
     let pairs = pair_correction_stream(main, correction)?;
     let mut out = Vec::new();
+    let mut all_ok = true;
     for (block, twin) in &pairs {
         if !block.header.is_audio_block() {
             continue;
         }
-        let pcm = match twin {
-            Some(corr) => block.decode_samples_with_correction(corr)?,
-            None => block.decode_samples()?,
-        };
-        out.extend_from_slice(&pcm);
+        // Anti-amplification: charge the block's declared output size
+        // (a header-only quantity) before decoding it.
+        budget.charge(block.decoded_sample_count())?;
+        if muted {
+            let (pcm, ok) = match twin {
+                Some(corr) => block.decode_samples_with_correction_muted(corr)?,
+                None => block.decode_samples_muted()?,
+            };
+            all_ok &= ok;
+            out.extend_from_slice(&pcm);
+        } else {
+            let pcm = match twin {
+                Some(corr) => block.decode_samples_with_correction(corr)?,
+                None => block.decode_samples()?,
+            };
+            out.extend_from_slice(&pcm);
+        }
     }
+    Ok((out, all_ok))
+}
+
+/// [`decode_stream_with_correction`] with a caller-supplied cumulative
+/// decoded-sample budget — the hostile-input-hardened twin of the
+/// two-file pair decode. See [`decode_stream_bounded`] for the budget
+/// contract: each `.wv` audio block's declared output size
+/// ([`WavPackBlock::decoded_sample_count`], a header-only quantity) is
+/// charged against `max_samples` *before* the block is decoded, so a
+/// pair whose main-stream headers demand more surfaces the typed
+/// [`Error::DecodeBudgetExceeded`] ahead of any amplified allocation.
+/// (The `.wvc` twin adds no output of its own — correction blocks
+/// refine the same samples — so the charge is the main stream's.)
+/// Within the budget the result is bit-identical to
+/// [`decode_stream_with_correction`].
+pub fn decode_stream_with_correction_bounded(
+    main: &[u8],
+    correction: &[u8],
+    max_samples: u64,
+) -> Result<Vec<i32>> {
+    let (out, _all_ok) =
+        decode_stream_pair_inner(main, correction, false, &mut SampleBudget::new(max_samples))?;
     Ok(out)
 }
 
@@ -2819,21 +2872,22 @@ pub fn decode_stream_with_correction_muted(
     main: &[u8],
     correction: &[u8],
 ) -> Result<(Vec<i32>, bool)> {
-    let pairs = pair_correction_stream(main, correction)?;
-    let mut out = Vec::new();
-    let mut all_ok = true;
-    for (block, twin) in &pairs {
-        if !block.header.is_audio_block() {
-            continue;
-        }
-        let (pcm, ok) = match twin {
-            Some(corr) => block.decode_samples_with_correction_muted(corr)?,
-            None => block.decode_samples_muted()?,
-        };
-        all_ok &= ok;
-        out.extend_from_slice(&pcm);
-    }
-    Ok((out, all_ok))
+    decode_stream_pair_inner(main, correction, true, &mut SampleBudget::unlimited())
+}
+
+/// [`decode_stream_with_correction_muted`] with a caller-supplied
+/// cumulative decoded-sample budget — the hostile-input-hardened twin.
+/// See [`decode_stream_with_correction_bounded`] for the budget
+/// contract; the spec §5.6 per-block CRC mute gate (against the `.wvc`
+/// header's lossless CRC for paired blocks) and the `(pcm,
+/// all_crc_ok)` return shape are exactly
+/// [`decode_stream_with_correction_muted`]'s.
+pub fn decode_stream_with_correction_muted_bounded(
+    main: &[u8],
+    correction: &[u8],
+    max_samples: u64,
+) -> Result<(Vec<i32>, bool)> {
+    decode_stream_pair_inner(main, correction, true, &mut SampleBudget::new(max_samples))
 }
 
 /// Decode a hybrid **float** `.wv` + `.wvc` pair to `f32` PCM — the
@@ -2848,6 +2902,32 @@ pub fn decode_stream_with_correction_f32(main: &[u8], correction: &[u8]) -> Resu
             .into_iter()
             .map(|bits| f32::from_bits(bits as u32))
             .collect()),
+        Some(_) => Err(Error::BlockNotFloat),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// [`decode_stream_with_correction_f32`] with a caller-supplied
+/// cumulative decoded-sample budget — the hostile-input-hardened twin
+/// for `FLOAT_DATA` pairs. See [`decode_stream_with_correction_bounded`]
+/// for the budget contract (`max_samples` bounds the returned
+/// `Vec<f32>`'s final length). The stream's first audio block decides
+/// floatness; a non-float stream is refused with
+/// [`Error::BlockNotFloat`].
+pub fn decode_stream_with_correction_f32_bounded(
+    main: &[u8],
+    correction: &[u8],
+    max_samples: u64,
+) -> Result<Vec<f32>> {
+    match first_audio_block(main)? {
+        Some(block) if block.is_float() => {
+            Ok(
+                decode_stream_with_correction_bounded(main, correction, max_samples)?
+                    .into_iter()
+                    .map(|bits| f32::from_bits(bits as u32))
+                    .collect(),
+            )
+        }
         Some(_) => Err(Error::BlockNotFloat),
         None => Ok(Vec::new()),
     }
@@ -3401,6 +3481,43 @@ pub fn decode_multichannel_stream_with_correction_muted(
     correction: &[u8],
 ) -> Result<(DecodedStream, bool)> {
     decode_multichannel_pair_inner(main, correction, true, &mut SampleBudget::unlimited())
+}
+
+/// [`decode_multichannel_stream_with_correction`] with a
+/// caller-supplied cumulative decoded-sample budget — the
+/// hostile-input-hardened twin. See
+/// [`decode_multichannel_stream_bounded`] for the budget contract
+/// (each `.wv` member's header-declared output size is charged before
+/// its decode; the `.wvc` twin adds no output of its own). Within the
+/// budget the result is bit-identical to
+/// [`decode_multichannel_stream_with_correction`].
+pub fn decode_multichannel_stream_with_correction_bounded(
+    main: &[u8],
+    correction: &[u8],
+    max_samples: u64,
+) -> Result<DecodedStream> {
+    let (stream, _all_crc_ok) = decode_multichannel_pair_inner(
+        main,
+        correction,
+        false,
+        &mut SampleBudget::new(max_samples),
+    )?;
+    Ok(stream)
+}
+
+/// [`decode_multichannel_stream_with_correction_muted`] with a
+/// caller-supplied cumulative decoded-sample budget — the
+/// hostile-input-hardened twin. See
+/// [`decode_multichannel_stream_bounded`] for the budget contract; the
+/// spec §5.6 per-member CRC mute gate and the `(stream, all_crc_ok)`
+/// return shape are exactly
+/// [`decode_multichannel_stream_with_correction_muted`]'s.
+pub fn decode_multichannel_stream_with_correction_muted_bounded(
+    main: &[u8],
+    correction: &[u8],
+    max_samples: u64,
+) -> Result<(DecodedStream, bool)> {
+    decode_multichannel_pair_inner(main, correction, true, &mut SampleBudget::new(max_samples))
 }
 
 /// Shared grouping-walk core for [`decode_multichannel_stream`] (plain,
@@ -4486,6 +4603,113 @@ mod tests {
         // Empty input: no audio, empty output (budget untouched).
         assert_eq!(
             decode_stream_f32_bounded(&[], 0).expect("empty"),
+            Vec::<f32>::new()
+        );
+    }
+
+    #[test]
+    fn decode_stream_with_correction_bounded_matches_and_refuses() {
+        // A stereo hybrid pair (two blocks of 300 frames): the pair
+        // decode's budget is charged from the `.wv` headers (the `.wvc`
+        // refines the same samples, adding no output of its own).
+        let pcm: Vec<i32> = (0..2 * 600)
+            .map(|i| {
+                let t = f64::from(i / 2) * 0.05;
+                ((t.sin() * 6000.0) as i32) + (i % 17) - 8
+            })
+            .collect();
+        let opts = crate::HybridOptions::from_bits_per_sample(3.0);
+        let pair =
+            crate::hybrid_encode::encode_stream_stereo_hybrid(&pcm, 300, 2, &opts).expect("pair");
+        let wvc = pair.wvc.as_deref().expect("correction twin");
+
+        // Exact budget: bit-identical to the unbounded pair decode
+        // (which reproduces the original input exactly).
+        let want = decode_stream_with_correction(&pair.wv, wvc).expect("unbounded");
+        assert_eq!(want, pcm, "pair decode is lossless");
+        assert_eq!(
+            decode_stream_with_correction_bounded(&pair.wv, wvc, 1200).expect("exact"),
+            want
+        );
+        // One below: typed refusal at the final block's charge.
+        assert_eq!(
+            decode_stream_with_correction_bounded(&pair.wv, wvc, 1199),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 1199,
+                needed: 1200
+            })
+        );
+
+        // Muted twin: parity + the same refusal.
+        let (want_m, want_ok) =
+            decode_stream_with_correction_muted(&pair.wv, wvc).expect("unbounded muted");
+        let (got_m, got_ok) =
+            decode_stream_with_correction_muted_bounded(&pair.wv, wvc, 1200).expect("exact muted");
+        assert_eq!(got_m, want_m);
+        assert_eq!(got_ok, want_ok);
+        assert!(got_ok);
+        assert!(matches!(
+            decode_stream_with_correction_muted_bounded(&pair.wv, wvc, 1199),
+            Err(Error::DecodeBudgetExceeded { budget: 1199, .. })
+        ));
+
+        // Multichannel pair twins on the same (stereo) pair: parity and
+        // the same per-member charge.
+        let mc = decode_multichannel_stream_with_correction_bounded(&pair.wv, wvc, 1200)
+            .expect("exact multichannel");
+        assert_eq!(mc.channels, 2);
+        assert_eq!(mc.samples, pcm);
+        assert!(matches!(
+            decode_multichannel_stream_with_correction_bounded(&pair.wv, wvc, 1199),
+            Err(Error::DecodeBudgetExceeded { budget: 1199, .. })
+        ));
+        let (mc_m, mc_ok) =
+            decode_multichannel_stream_with_correction_muted_bounded(&pair.wv, wvc, 1200)
+                .expect("exact multichannel muted");
+        assert_eq!(mc_m.samples, pcm);
+        assert!(mc_ok);
+        assert!(matches!(
+            decode_multichannel_stream_with_correction_muted_bounded(&pair.wv, wvc, 1199),
+            Err(Error::DecodeBudgetExceeded { budget: 1199, .. })
+        ));
+    }
+
+    #[test]
+    fn decode_stream_with_correction_f32_bounded_matches_and_refuses() {
+        // A mono float hybrid pair: the f32 pair twin applies the same
+        // pre-decode budget and keeps the lossless pair guarantee.
+        let f: Vec<f32> = (0..400).map(|i| ((i as f32) * 0.045).sin() * 0.6).collect();
+        let opts = crate::HybridOptions::from_bits_per_sample(4.0);
+        let pair = crate::hybrid_encode::encode_stream_mono_hybrid_float(&f, 200, &opts)
+            .expect("float pair");
+        let wvc = pair.wvc.as_deref().expect("correction twin");
+        let want = decode_stream_with_correction_f32(&pair.wv, wvc).expect("unbounded");
+        let got = decode_stream_with_correction_f32_bounded(&pair.wv, wvc, 400).expect("exact");
+        assert_eq!(
+            got.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            f.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            "float pair decode is lossless"
+        );
+        assert!(matches!(
+            decode_stream_with_correction_f32_bounded(&pair.wv, wvc, 399),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 399,
+                needed: 400
+            })
+        ));
+        // Non-float pair input is refused with the typed error.
+        let ints = crate::encode::encode_stream_mono(&[5, 6, 7], 0, 2).expect("int encode");
+        assert_eq!(
+            decode_stream_with_correction_f32_bounded(&ints, &[], 100),
+            Err(Error::BlockNotFloat)
+        );
+        // Empty input: empty output.
+        assert_eq!(
+            decode_stream_with_correction_f32_bounded(&[], &[], 0).expect("empty"),
             Vec::<f32>::new()
         );
     }

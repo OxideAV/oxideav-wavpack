@@ -24,7 +24,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   new typed `Error::DecodeBudgetExceeded { budget, needed }` ahead of
   any amplified allocation. Within the budget the results are
   bit-identical to the unbounded decoders (which are unchanged, and
-  now share one walker with the bounded twins). A
+  now share one walker with the bounded twins). The two-file pair
+  surface gets the same hardening:
+  `decode_stream_with_correction_bounded` (+ `_muted` / `_f32` and
+  multichannel twins) charge each `.wv` block's header-declared output
+  size before its decode — the `.wvc` twin refines the same samples
+  and adds no output of its own. A
   264-point black-box sweep over ramp trajectories (start weight ×
   delta × content, two block lengths) found that trajectories crossing
   **below** weight `-1024` can decode differently under the reference
