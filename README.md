@@ -247,6 +247,28 @@ Working surface:
   decoding whole sets, caching the most recent one per decode mode
   (cross-mode reuse only when the CRC verdict was clean), and
   restoring the cursor on a failed read (all-or-nothing).
+* **Hostile-input decode budgets (`*_bounded` twins)** — the spec §4.2
+  step 1 zero-run fast path makes a block's decoded output unbounded
+  by its payload bytes (silence compresses enormously), so beyond the
+  per-block anti-amplification ceiling (`MAX_DECODE_SAMPLES_PER_BLOCK`)
+  every eager decode surface has a budgeted twin for untrusted input
+  (round 436): `decode_stream_bounded` / `decode_stream_muted_bounded`
+  / `decode_stream_f32_bounded`, the multichannel twins, the
+  `.wv`+`.wvc` pair twins (`decode_stream_with_correction_bounded`
+  family — the `.wvc` refines the same samples and adds no output),
+  and the seek-surface twins (`decode_range_bounded` family, which
+  charge each touched set **whole** since a range decode materializes
+  whole sets before slicing the window). Each charges every audio
+  block's header-declared output size (`decoded_sample_count`) against
+  a caller budget **before** decoding it, surfacing the typed
+  `Error::DecodeBudgetExceeded { budget, needed }` ahead of any
+  amplified allocation; within the budget the results are bit-identical
+  to the unbounded twins. `StreamReader::with_max_set_samples` bounds
+  the largest set a read will materialize (per set — a reader
+  legitimately streams a whole file), and the framework decoder applies
+  a per-packet budget (`max_packet_samples` option, default `2^28`
+  emitted values, `0` disables). Two differential fuzz targets pin the
+  gates as pure budget filters (see Provenance).
 * **Reference-decoder conformance (black-box cross-validated)** — the
   encoder's output is **byte-conformant with real WavPack decoders**:
   a round-393 cross-validation battery against `wvunpack` 5.9 (used
@@ -351,7 +373,11 @@ Working surface:
   `block_index`** (mono / stereo through the `encode_block_*_best`
   mode search; wider layouts through the mono-member grouping via the
   new offset-aware `encode_multichannel_stream_at`), so concatenated
-  packet payloads form one contiguous, seekable `.wv` chain.
+  packet payloads form one contiguous, seekable `.wv` chain. The
+  decoder applies a per-packet decoded-sample budget
+  (`WavPackDecoderOptions::max_packet_samples`, default `2^28` emitted
+  values; `0` disables) so a hostile packet is refused before any
+  amplified frame allocation (round 436).
 * **`.wvc` correction-file pairing plumbing** —
   `pair_correction_stream` aligns a main `.wv` buffer's audio blocks
   with its companion `.wvc` buffer's by the `block_index` header word
@@ -466,6 +492,17 @@ let opts = HybridOptions::from_bits_per_sample(4.0)
     .with_shaping(HybridShaping::from_weight(0.7));
 let pair = encode_stream_stereo_hybrid(&pcm, 0, 2, &opts)?;
 assert_eq!(decode_stream_with_correction(&pair.wv, pair.wvc.as_ref().unwrap())?, pcm);
+
+// Untrusted input? Every eager decode has a budgeted twin that
+// refuses (typed) before any amplified allocation — bit-identical to
+// the unbounded call within the budget:
+use oxideav_wavpack::decode_stream_bounded;
+let budget = 10 * 60 * 44_100 * 2; // e.g. ten minutes of 44.1 kHz stereo
+match decode_stream_bounded(untrusted_bytes, budget) {
+    Ok(pcm) => { /* == decode_stream(untrusted_bytes)? */ }
+    Err(oxideav_wavpack::Error::DecodeBudgetExceeded { budget, needed }) => { /* refused */ }
+    Err(e) => { /* malformed stream */ }
+}
 
 // Seek: index the stream once (header-only), then decode windows —
 // or drive the playback-shaped cursor (frame- or time-addressed):
@@ -688,7 +725,13 @@ control byte sweeping mono/stereo × joint × decorrelation ceiling ×
 bitrate word × plain/float/int32; every emitted pair must decode back
 bit-exactly with green CRC gates and every lossy `.wv` must decode
 within the clamp range — an opening ~5M-run campaign found, and the
-fix pinned, a clamp-bits underflow on hostile left-shift headers). A round-386 campaign
+fix pinned, a clamp-bits underflow on hostile left-shift headers),
+plus a round-436 `bounded_decode_differential` target pinning every
+`*_bounded` twin as a pure budget gate (unlimited-budget parity with
+the unbounded decoders, exact-budget parity with a one-below refusal,
+and fuzz-chosen-budget soundness — `needed > budget`, never a
+refusal below a successful decode's size; the `seek_surface` target
+gained the same differential over `decode_range_bounded`). A round-386 campaign
 found (and the fix pinned) an adversarial-history overflow in the
 term-17/18 extrapolator predictors — all twelve predictor sites are
 now 32-bit wrapping, matching the wrapping reconstruction adds around
@@ -696,7 +739,7 @@ them, with the minimized input kept as a corpus regression seed; a
 round-415 campaign did the same for two overflow sites in the `0x07`
 shaping-state recurrence (accumulator add / temp bias / seed
 negation, all now 32-bit wrapping);
-1107 unit tests plus a 74-test
+1139 unit tests plus a 74-test
 foreign-decode integration battery (59 reference-encoded fixtures
 under `tests/data/` — including 18 hybrid-lossless `wv+wvc` pairs and
 the round-418 hybrid edge probes (delta clamp / output clamp /
