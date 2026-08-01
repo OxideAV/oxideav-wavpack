@@ -70,7 +70,10 @@ fuzz_target!(|data: &[u8]| {
 
     // Empty-correction identity: every block pairs None and falls back
     // to its lossy decode.
-    match (decode_stream_with_correction(main, &[]), decode_stream(main)) {
+    match (
+        decode_stream_with_correction(main, &[]),
+        decode_stream(main),
+    ) {
         (Ok(pair), Ok(lossy)) => {
             assert_eq!(pair, lossy, "empty correction must be the lossy decode");
         }
