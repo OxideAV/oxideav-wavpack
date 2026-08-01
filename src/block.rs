@@ -3073,12 +3073,147 @@ pub fn iter_decoded_blocks(bytes: &[u8]) -> StreamDecodeIter<'_> {
 ///
 /// Round 224.
 pub fn decode_stream(bytes: &[u8]) -> Result<Vec<i32>> {
-    let mut out: Vec<i32> = Vec::new();
-    for chunk in iter_decoded_blocks(bytes) {
-        let pcm = chunk?;
-        out.extend_from_slice(&pcm);
-    }
+    let (out, _all_crc_ok) = decode_stream_inner(bytes, false, &mut SampleBudget::unlimited())?;
     Ok(out)
+}
+
+/// Running decoded-sample budget for the `*_bounded` stream decoders.
+///
+/// The per-block ceiling ([`MAX_DECODE_SAMPLES_PER_BLOCK`]) bounds what
+/// one block may claim, but a stream is a chain of blocks: the spec
+/// §4.2 step 1 zero-run fast path lets each ~50-byte block legally
+/// expand to millions of zero samples, so a tiny hostile buffer can
+/// still demand a multi-gigabyte concatenated output by chaining such
+/// blocks. Every audio block's declared output size
+/// ([`WavPackBlock::decoded_sample_count`] — a header-only quantity) is
+/// charged against the budget **before** the block is decoded, so the
+/// refusal fires ahead of any amplified allocation.
+///
+/// `unlimited()` (a `u64::MAX` budget) can never trip: `charge`
+/// saturates, and a saturated `needed` is not greater than `u64::MAX`.
+#[derive(Debug, Clone, Copy)]
+struct SampleBudget {
+    /// Maximum total emitted sample values (`i32` / `f32` slots across
+    /// all channels).
+    max: u64,
+    /// Cumulative values charged so far.
+    charged: u64,
+}
+
+impl SampleBudget {
+    fn new(max: u64) -> Self {
+        SampleBudget { max, charged: 0 }
+    }
+
+    fn unlimited() -> Self {
+        SampleBudget::new(u64::MAX)
+    }
+
+    /// Charge `values` emitted sample values, refusing with the typed
+    /// [`Error::DecodeBudgetExceeded`] when the cumulative demand would
+    /// exceed the budget. Saturating: an overflowing demand reports
+    /// `needed == u64::MAX`.
+    fn charge(&mut self, values: u64) -> Result<()> {
+        let needed = self.charged.saturating_add(values);
+        if needed > self.max {
+            return Err(Error::DecodeBudgetExceeded {
+                budget: self.max,
+                needed,
+            });
+        }
+        self.charged = needed;
+        Ok(())
+    }
+}
+
+/// Shared audio-block walk for [`decode_stream`] /
+/// [`decode_stream_muted`] and their `*_bounded` twins: skip
+/// metadata-only blocks, charge each audio block's declared output size
+/// against `budget` **before** decoding it, decode (CRC-mute-gated when
+/// `muted`), and concatenate the PCM. Returns `(pcm, all_crc_ok)`;
+/// `all_crc_ok` is only meaningful to the muted callers.
+fn decode_stream_inner(
+    bytes: &[u8],
+    muted: bool,
+    budget: &mut SampleBudget,
+) -> Result<(Vec<i32>, bool)> {
+    let mut out: Vec<i32> = Vec::new();
+    let mut all_crc_ok = true;
+    for parsed in iter_blocks(bytes) {
+        let block = parsed?;
+        // Skip metadata-only / zero-sample blocks — they carry no PCM
+        // (the wiki "Block structure" allowance for block_samples == 0).
+        if !block.header.is_audio_block() {
+            continue;
+        }
+        // Anti-amplification: charge the block's declared output size
+        // (a header-only quantity) before decoding it.
+        budget.charge(block.decoded_sample_count())?;
+        if muted {
+            let (pcm, crc_ok) = block.decode_samples_muted()?;
+            all_crc_ok &= crc_ok;
+            out.extend_from_slice(&pcm);
+        } else {
+            let pcm = block.decode_samples()?;
+            out.extend_from_slice(&pcm);
+        }
+    }
+    Ok((out, all_crc_ok))
+}
+
+/// [`decode_stream`] with a caller-supplied cumulative decoded-sample
+/// budget — the hostile-input-hardened twin.
+///
+/// `max_samples` bounds the **total emitted sample values** (`i32`
+/// slots across all channels, i.e. the returned `Vec`'s final length):
+/// each audio block's declared output size
+/// ([`WavPackBlock::decoded_sample_count`], `block_samples × emitted
+/// channels` — a header-only quantity) is charged against the budget
+/// *before* the block is decoded, so a stream whose headers demand more
+/// than `max_samples` values surfaces the typed
+/// [`Error::DecodeBudgetExceeded`] ahead of any amplified allocation.
+///
+/// Rationale: the per-block ceiling ([`MAX_DECODE_SAMPLES_PER_BLOCK`],
+/// round 296) bounds a *single* block's amplification, but the spec
+/// §4.2 step 1 zero-run fast path lets every ~50-byte block in a chain
+/// legally expand to millions of zero samples — so a few kilobytes of
+/// hostile input can still demand gigabytes of concatenated output from
+/// the unbounded [`decode_stream`]. Callers decoding untrusted input
+/// should use this twin with a budget sized to their use case (e.g.
+/// `duration_limit × sample_rate × channels`). Within the budget the
+/// result is bit-identical to [`decode_stream`].
+pub fn decode_stream_bounded(bytes: &[u8], max_samples: u64) -> Result<Vec<i32>> {
+    let (out, _all_crc_ok) =
+        decode_stream_inner(bytes, false, &mut SampleBudget::new(max_samples))?;
+    Ok(out)
+}
+
+/// [`decode_stream_muted`] with a caller-supplied cumulative
+/// decoded-sample budget — the hostile-input-hardened twin. See
+/// [`decode_stream_bounded`] for the budget contract (charged per audio
+/// block from header fields, before decoding; typed
+/// [`Error::DecodeBudgetExceeded`] refusal). The spec §5.6 per-block
+/// CRC mute gate and the `(pcm, all_crc_ok)` return shape are exactly
+/// [`decode_stream_muted`]'s.
+pub fn decode_stream_muted_bounded(bytes: &[u8], max_samples: u64) -> Result<(Vec<i32>, bool)> {
+    decode_stream_inner(bytes, true, &mut SampleBudget::new(max_samples))
+}
+
+/// [`decode_stream_f32`] with a caller-supplied cumulative
+/// decoded-sample budget — the hostile-input-hardened twin for
+/// `FLOAT_DATA` streams. See [`decode_stream_bounded`] for the budget
+/// contract (`max_samples` bounds the returned `Vec<f32>`'s final
+/// length). The stream's first audio block decides floatness; a
+/// non-float stream is refused with [`Error::BlockNotFloat`].
+pub fn decode_stream_f32_bounded(bytes: &[u8], max_samples: u64) -> Result<Vec<f32>> {
+    match first_audio_block(bytes)? {
+        Some(block) if block.is_float() => Ok(decode_stream_bounded(bytes, max_samples)?
+            .into_iter()
+            .map(|bits| f32::from_bits(bits as u32))
+            .collect()),
+        Some(_) => Err(Error::BlockNotFloat),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Decode every audio block in a WavPack byte buffer with the spec §5.6
@@ -3106,20 +3241,7 @@ pub fn decode_stream(bytes: &[u8]) -> Result<Vec<i32>> {
 /// failure is. Metadata-only blocks contribute nothing and do not affect
 /// `all_crc_ok`.
 pub fn decode_stream_muted(bytes: &[u8]) -> Result<(Vec<i32>, bool)> {
-    let mut out: Vec<i32> = Vec::new();
-    let mut all_crc_ok = true;
-    for parsed in iter_blocks(bytes) {
-        let block = parsed?;
-        // Skip metadata-only / zero-sample blocks — they carry no PCM and
-        // have no CRC to gate (decode_samples would raise BlockHasNoAudio).
-        if !block.header.is_audio_block() {
-            continue;
-        }
-        let (pcm, crc_ok) = block.decode_samples_muted()?;
-        all_crc_ok &= crc_ok;
-        out.extend_from_slice(&pcm);
-    }
-    Ok((out, all_crc_ok))
+    decode_stream_inner(bytes, true, &mut SampleBudget::unlimited())
 }
 
 /// Decoded shape of a WavPack stream: the interleaved PCM plus the
@@ -3210,6 +3332,39 @@ pub fn decode_multichannel_stream_muted(bytes: &[u8]) -> Result<(DecodedStream, 
     decode_multichannel_inner(bytes, true)
 }
 
+/// [`decode_multichannel_stream`] with a caller-supplied cumulative
+/// decoded-sample budget — the hostile-input-hardened twin.
+///
+/// `max_samples` bounds the total emitted sample values across all
+/// member blocks (the returned [`DecodedStream::samples`] final
+/// length): each audio member's declared output size
+/// ([`WavPackBlock::decoded_sample_count`] — a header-only quantity) is
+/// charged against the budget *before* the member is decoded, so a
+/// stream whose headers demand more surfaces the typed
+/// [`Error::DecodeBudgetExceeded`] ahead of any amplified allocation.
+/// See [`decode_stream_bounded`] for the rationale (the spec §4.2
+/// zero-run path makes per-block output unbounded by payload bytes).
+/// Within the budget the result is bit-identical to
+/// [`decode_multichannel_stream`].
+pub fn decode_multichannel_stream_bounded(bytes: &[u8], max_samples: u64) -> Result<DecodedStream> {
+    let (stream, _all_crc_ok) =
+        decode_multichannel_pair_inner(bytes, &[], false, &mut SampleBudget::new(max_samples))?;
+    Ok(stream)
+}
+
+/// [`decode_multichannel_stream_muted`] with a caller-supplied
+/// cumulative decoded-sample budget — the hostile-input-hardened twin.
+/// See [`decode_multichannel_stream_bounded`] for the budget contract;
+/// the spec §5.6 per-member CRC mute gate and the `(stream,
+/// all_crc_ok)` return shape are exactly
+/// [`decode_multichannel_stream_muted`]'s.
+pub fn decode_multichannel_stream_muted_bounded(
+    bytes: &[u8],
+    max_samples: u64,
+) -> Result<(DecodedStream, bool)> {
+    decode_multichannel_pair_inner(bytes, &[], true, &mut SampleBudget::new(max_samples))
+}
+
 /// Decode a hybrid **multichannel** `.wv` stream losslessly against its
 /// companion `.wvc` correction stream — the multichannel twin of
 /// [`decode_stream_with_correction`] (round 415).
@@ -3229,7 +3384,8 @@ pub fn decode_multichannel_stream_with_correction(
     main: &[u8],
     correction: &[u8],
 ) -> Result<DecodedStream> {
-    let (stream, _all_crc_ok) = decode_multichannel_pair_inner(main, correction, false)?;
+    let (stream, _all_crc_ok) =
+        decode_multichannel_pair_inner(main, correction, false, &mut SampleBudget::unlimited())?;
     Ok(stream)
 }
 
@@ -3244,7 +3400,7 @@ pub fn decode_multichannel_stream_with_correction_muted(
     main: &[u8],
     correction: &[u8],
 ) -> Result<(DecodedStream, bool)> {
-    decode_multichannel_pair_inner(main, correction, true)
+    decode_multichannel_pair_inner(main, correction, true, &mut SampleBudget::unlimited())
 }
 
 /// Shared grouping-walk core for [`decode_multichannel_stream`] (plain,
@@ -3257,7 +3413,7 @@ fn decode_multichannel_inner(bytes: &[u8], muted: bool) -> Result<(DecodedStream
     // An empty correction chain pairs every member with `None`, making
     // the pair walker decode each member standalone — bit-identical to
     // the historical single-file walk.
-    decode_multichannel_pair_inner(bytes, &[], muted)
+    decode_multichannel_pair_inner(bytes, &[], muted, &mut SampleBudget::unlimited())
 }
 
 /// Grouping-walk core shared by the single-file and `.wv` + `.wvc` pair
@@ -3270,6 +3426,7 @@ fn decode_multichannel_pair_inner(
     bytes: &[u8],
     correction: &[u8],
     muted: bool,
+    budget: &mut SampleBudget,
 ) -> Result<(DecodedStream, bool)> {
     // Per-set accumulator: the decoded per-member channel buffers of the
     // currently-open set, plus the set's agreed frame count.
@@ -3319,6 +3476,10 @@ fn decode_multichannel_pair_inner(
                 found: block_samples,
             });
         }
+
+        // Anti-amplification: charge this member's declared output size
+        // (a header-only quantity) against the budget before decoding it.
+        budget.charge(block.decoded_sample_count())?;
 
         // Decode this member's own 1 or 2 channels (the grouping marker is
         // accepted, not refused), then split the interleaved buffer into
@@ -4114,6 +4275,219 @@ mod tests {
         let (block, _) = parse_block(&bytes).expect("parse block");
         let err = block.decode_samples();
         assert_eq!(err, Err(Error::BlockSamplesTooLarge(0x2100_0001)));
+    }
+
+    // ---- round 436: stream-level decode budget (`*_bounded` twins) ----
+
+    #[test]
+    fn sample_budget_charges_saturating_and_unlimited_never_trips() {
+        let mut b = SampleBudget::new(10);
+        assert!(b.charge(4).is_ok());
+        assert!(b.charge(6).is_ok()); // exactly the budget is fine
+        assert_eq!(
+            b.charge(1),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 10,
+                needed: 11
+            })
+        );
+        // A failed charge does not consume budget: retrying a smaller
+        // charge after the refusal still sees `charged == 10`.
+        assert_eq!(
+            b.charge(u64::MAX),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 10,
+                needed: u64::MAX // saturated demand
+            })
+        );
+        // The unlimited budget saturates instead of overflowing and can
+        // never trip.
+        let mut u = SampleBudget::unlimited();
+        assert!(u.charge(u64::MAX).is_ok());
+        assert!(u.charge(u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn decode_stream_bounded_matches_unbounded_and_refuses_one_below() {
+        // Sparse (zero-run heavy) mono content: the encoder compresses
+        // long silence into tiny blocks, so the byte→sample
+        // amplification is large — exactly the regime the budget
+        // exists for.
+        let mut pcm = vec![0i32; 30_000];
+        pcm[7] = 41;
+        pcm[29_001] = -3;
+        let wv = crate::encode::encode_stream_mono(&pcm, 10_000, 2).expect("encode");
+        assert!(
+            wv.len() < pcm.len() / 10,
+            "sparse stream must amplify ({} bytes -> {} samples)",
+            wv.len(),
+            pcm.len()
+        );
+
+        // Exact budget: bit-identical to the unbounded decode.
+        assert_eq!(decode_stream_bounded(&wv, 30_000).expect("exact"), pcm);
+        assert_eq!(
+            decode_stream_bounded(&wv, u64::MAX).expect("unlimited"),
+            decode_stream(&wv).expect("unbounded")
+        );
+
+        // One below: typed refusal. The charge is per block (three
+        // 10_000-sample blocks), so the failing (final) block reports
+        // the full cumulative demand.
+        assert_eq!(
+            decode_stream_bounded(&wv, 29_999),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 29_999,
+                needed: 30_000
+            })
+        );
+    }
+
+    #[test]
+    fn decode_stream_bounded_charges_stereo_blocks_at_both_channels() {
+        // A stereo block emits 2 × block_samples values; the budget
+        // must be charged at the emitted width, not the frame count.
+        let pcm: Vec<i32> = (0..2 * 600).map(|i| (i * 17) % 512 - 256).collect();
+        let wv = crate::encode::encode_stream_stereo(&pcm, 300, 2).expect("encode");
+        assert_eq!(decode_stream_bounded(&wv, 1200).expect("exact"), pcm);
+        assert_eq!(
+            decode_stream_bounded(&wv, 1199),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 1199,
+                needed: 1200
+            })
+        );
+    }
+
+    #[test]
+    fn decode_stream_muted_bounded_matches_muted_and_refuses() {
+        let pcm: Vec<i32> = (0..900).map(|i| (i * 7) % 200 - 100).collect();
+        let wv = crate::encode::encode_stream_mono(&pcm, 300, 2).expect("encode");
+        let (want, want_ok) = decode_stream_muted(&wv).expect("unbounded muted");
+        let (got, got_ok) = decode_stream_muted_bounded(&wv, 900).expect("exact");
+        assert_eq!(got, want);
+        assert_eq!(got_ok, want_ok);
+        assert!(got_ok);
+        assert_eq!(
+            decode_stream_muted_bounded(&wv, 899),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 899,
+                needed: 900
+            })
+        );
+    }
+
+    #[test]
+    fn decode_stream_bounded_refuses_hostile_chain_before_decoding() {
+        // Three ~50-byte blocks each claiming the per-block ceiling:
+        // the headers demand 3 × 2^26 samples (~768 MiB of i32) from
+        // ~150 bytes of input. The refusal must fire on the FIRST
+        // block's header — before any decode work — so the surfaced
+        // error is the typed budget refusal, not the `Truncated` /
+        // `EndOfStream` the garbage 0x0A payload would produce if the
+        // per-sample loop ever ran.
+        let mut payload = Vec::new();
+        append_entropy_info_mono_zero(&mut payload);
+        append_packed_samples(&mut payload, &[0xFF, 0xFF]);
+        let flags = flags_with(1 << 2); // mono
+        let one = synthesise_block(MAX_DECODE_SAMPLES_PER_BLOCK, flags, &payload);
+        let mut bytes = Vec::new();
+        for _ in 0..3 {
+            bytes.extend_from_slice(&one);
+        }
+        let expected = Error::DecodeBudgetExceeded {
+            budget: 1_000_000,
+            needed: u64::from(MAX_DECODE_SAMPLES_PER_BLOCK),
+        };
+        assert_eq!(
+            decode_stream_bounded(&bytes, 1_000_000),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            decode_stream_muted_bounded(&bytes, 1_000_000).unwrap_err(),
+            expected
+        );
+        // The multichannel twins apply the same pre-decode gate (each
+        // synthesised block carries the standalone set marker).
+        assert!(matches!(
+            decode_multichannel_stream_bounded(&bytes, 1_000_000),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 1_000_000,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_multichannel_stream_muted_bounded(&bytes, 1_000_000),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 1_000_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_multichannel_stream_bounded_matches_unbounded_and_refuses() {
+        let channels = 4usize;
+        let pcm: Vec<i32> = (0..channels * 60).map(|i| i as i32 % 256 - 128).collect();
+        let wv = crate::encode::encode_multichannel_stream(&pcm, channels, 25, 2).expect("encode");
+        let want = decode_multichannel_stream(&wv).expect("unbounded");
+        let got = decode_multichannel_stream_bounded(&wv, 240).expect("exact");
+        assert_eq!(got.channels, want.channels);
+        assert_eq!(got.samples, want.samples);
+        // One below: the walker charges per member (25- and 10-sample
+        // mono members), so the final member's charge crosses the line
+        // and reports the full cumulative demand.
+        assert_eq!(
+            decode_multichannel_stream_bounded(&wv, 239).unwrap_err(),
+            Error::DecodeBudgetExceeded {
+                budget: 239,
+                needed: 240
+            }
+        );
+        // Muted twin: parity + the same refusal.
+        let (want_m, want_ok) = decode_multichannel_stream_muted(&wv).expect("unbounded muted");
+        let (got_m, got_ok) =
+            decode_multichannel_stream_muted_bounded(&wv, 240).expect("exact muted");
+        assert_eq!(got_m.samples, want_m.samples);
+        assert_eq!(got_ok, want_ok);
+        assert!(matches!(
+            decode_multichannel_stream_muted_bounded(&wv, 239),
+            Err(Error::DecodeBudgetExceeded { budget: 239, .. })
+        ));
+    }
+
+    #[test]
+    fn decode_stream_f32_bounded_matches_refuses_and_types() {
+        // Float parity + refusal.
+        let f: Vec<f32> = (0..500).map(|i| ((i as f32) * 0.03).sin() * 0.75).collect();
+        let wv =
+            crate::encode::encode_stream_mono_float(&f, 250, crate::encode::DecorrProfile::Fast)
+                .expect("float encode");
+        let want = decode_stream_f32(&wv).expect("unbounded");
+        let got = decode_stream_f32_bounded(&wv, 500).expect("exact");
+        assert_eq!(
+            got.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            decode_stream_f32_bounded(&wv, 499),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 499,
+                needed: 500
+            })
+        ));
+        // A non-float stream is refused with the same typed error the
+        // unbounded twin uses.
+        let ints = crate::encode::encode_stream_mono(&[1, 2, 3], 0, 2).expect("int encode");
+        assert_eq!(
+            decode_stream_f32_bounded(&ints, 100),
+            Err(Error::BlockNotFloat)
+        );
+        // Empty input: no audio, empty output (budget untouched).
+        assert_eq!(
+            decode_stream_f32_bounded(&[], 0).expect("empty"),
+            Vec::<f32>::new()
+        );
     }
 
     /// Append a `0x0A` packed-samples sub-block whose walker-returned

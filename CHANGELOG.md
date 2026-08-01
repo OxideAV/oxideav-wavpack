@@ -8,7 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Round 420 — **shaping ramps rail-saturate at full scale.** A
+- Round 436 — **stream-level decode budget (`*_bounded` twins).** The
+  per-block anti-amplification ceiling (round 296) bounds what one
+  block may claim, but the spec §4.2 step 1 zero-run fast path lets
+  *every* ~50-byte block in a chain legally expand to millions of zero
+  samples — a few kilobytes of hostile input could still demand
+  gigabytes of concatenated output from `decode_stream`. New
+  hostile-input-hardened twins `decode_stream_bounded`,
+  `decode_stream_muted_bounded`, `decode_stream_f32_bounded`,
+  `decode_multichannel_stream_bounded` and
+  `decode_multichannel_stream_muted_bounded` take a caller-supplied
+  budget on the **total emitted sample values**, charge each audio
+  block's declared output size (`decoded_sample_count`, a header-only
+  quantity) against it **before** decoding the block, and surface the
+  new typed `Error::DecodeBudgetExceeded { budget, needed }` ahead of
+  any amplified allocation. Within the budget the results are
+  bit-identical to the unbounded decoders (which are unchanged, and
+  now share one walker with the bounded twins). A
   264-point black-box sweep over ramp trajectories (start weight ×
   delta × content, two block lengths) found that trajectories crossing
   **below** weight `-1024` can decode differently under the reference

@@ -293,6 +293,33 @@ pub enum Error {
     /// anti-amplification guard, not a spec-mandated limit. The
     /// contained value is the offending `block_samples` field verbatim.
     BlockSamplesTooLarge(u32),
+    /// A `*_bounded` stream decoder's cumulative decoded-sample budget
+    /// was exhausted before the stream's audio blocks were all decoded.
+    ///
+    /// The per-block ceiling
+    /// ([`Error::BlockSamplesTooLarge`]) bounds what one block may
+    /// claim, but a *stream* is a chain of blocks: the spec §4.2 step 1
+    /// zero-run fast path lets each ~50-byte block legally expand to
+    /// millions of zero samples, so a tiny hostile buffer can still
+    /// demand a multi-gigabyte concatenated output by chaining such
+    /// blocks. The `*_bounded` decode surface
+    /// ([`crate::decode_stream_bounded`] and its twins) charges every
+    /// audio block's declared output size
+    /// ([`crate::WavPackBlock::decoded_sample_count`]) against a
+    /// caller-supplied budget **before** decoding the block, surfacing
+    /// this typed refusal instead of attempting the allocation.
+    ///
+    /// * `budget` — the caller-supplied maximum (total emitted `i32` /
+    ///   `f32` values across all channels).
+    /// * `needed` — the cumulative count the stream had demanded when
+    ///   the budget check failed (the first value to exceed `budget`;
+    ///   saturating, so `u64::MAX` means "overflowed").
+    DecodeBudgetExceeded {
+        /// Caller-supplied budget (total emitted sample values).
+        budget: u64,
+        /// Cumulative demand at the failing block (saturating).
+        needed: u64,
+    },
     /// A decorrelation pass list carried a term value outside the
     /// clean-room spec's valid set `{1..8, 17, 18, -1, -2, -3}`
     /// (`docs/audio/wavpack/spec/wavpack-decorrelation.md` §2 / §2.1: a
@@ -656,6 +683,12 @@ impl core::fmt::Display for Error {
             Error::BlockSamplesTooLarge(n) => write!(
                 f,
                 "oxideav-wavpack: block_samples {n} exceeds the per-block decode ceiling \
+                 (anti-amplification guard)"
+            ),
+            Error::DecodeBudgetExceeded { budget, needed } => write!(
+                f,
+                "oxideav-wavpack: stream decode budget exhausted: the stream demands {needed} \
+                 decoded sample values but the caller-supplied budget is {budget} \
                  (anti-amplification guard)"
             ),
             Error::InvalidDecorrelationTerm(t) => write!(

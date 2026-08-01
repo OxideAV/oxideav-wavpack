@@ -850,9 +850,11 @@ oxideav_core::register!("wavpack", register);
 
 pub use crate::block::{
     audio_block_count, block_count, correction_block_count, correction_coverage,
-    decode_multichannel_stream, decode_multichannel_stream_muted,
+    decode_multichannel_stream, decode_multichannel_stream_bounded,
+    decode_multichannel_stream_muted, decode_multichannel_stream_muted_bounded,
     decode_multichannel_stream_with_correction, decode_multichannel_stream_with_correction_muted,
-    decode_stream, decode_stream_f32, decode_stream_muted, decode_stream_with_correction,
+    decode_stream, decode_stream_bounded, decode_stream_f32, decode_stream_f32_bounded,
+    decode_stream_muted, decode_stream_muted_bounded, decode_stream_with_correction,
     decode_stream_with_correction_f32, decode_stream_with_correction_muted, decoded_sample_count,
     first_audio_block, first_correction_block, iter_audio_blocks, iter_blocks,
     iter_correction_blocks, iter_decoded_blocks, metadata_block_count, multichannel_layout,
