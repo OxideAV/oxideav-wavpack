@@ -41,7 +41,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   any amplified frame allocation. Decoder params commonly carry the
   encoder's option bag (one `CodecParameters` for both directions of
   a loop), so encoder-owned keys are tolerated and ignored by
-  `make_decoder`; keys neither schema owns are refused. A
+  `make_decoder`; keys neither schema owns are refused.
+
+- Round 436 — **`bounded_decode_differential` fuzz target.** A
+  differential oracle over the whole `*_bounded` surface: unlimited
+  budgets must be bit-identical to the unbounded twins (Ok payloads
+  and Err values alike), an exact budget must succeed identically
+  with a one-below refusal, and a fuzz-chosen budget must either
+  reproduce the unbounded result within its bound or surface
+  `DecodeBudgetExceeded` with `needed > budget` — never a spurious
+  refusal below a successful decode's size. An opening ~950k-run
+  campaign is clean; the grown corpus is committed. A
   264-point black-box sweep over ramp trajectories (start weight ×
   delta × content, two block lengths) found that trajectories crossing
   **below** weight `-1024` can decode differently under the reference
