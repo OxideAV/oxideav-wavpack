@@ -51,7 +51,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reproduce the unbounded result within its bound or surface
   `DecodeBudgetExceeded` with `needed > budget` — never a spurious
   refusal below a successful decode's size. An opening ~950k-run
-  campaign is clean; the grown corpus is committed. A
+  campaign is clean; the grown corpus is committed.
+
+- Round 436 — **seek-surface decode budget.** A range decode touches
+  only the sets its window overlaps but materializes each touched set
+  **whole**, so a one-frame window over a hostile set could still
+  demand a near-gigabyte allocation. `decode_range_bounded` (+
+  `_muted` and `with_correction` twins) charge each touched set's
+  header-declared output (`frames × channels`, off the index) against
+  a caller budget before decoding it — note the charge covers the
+  materialized sets, which can exceed the returned window's size —
+  and `StreamReader::with_max_set_samples` bounds the largest set a
+  read will materialize (per set, not cumulative: a reader
+  legitimately streams a whole file), with the failed read leaving
+  the cursor unchanged as usual. A
   264-point black-box sweep over ramp trajectories (start weight ×
   delta × content, two block lengths) found that trajectories crossing
   **below** weight `-1024` can decode differently under the reference

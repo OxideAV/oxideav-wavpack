@@ -3172,7 +3172,7 @@ pub fn decode_stream(bytes: &[u8]) -> Result<Vec<i32>> {
 /// `unlimited()` (a `u64::MAX` budget) can never trip: `charge`
 /// saturates, and a saturated `needed` is not greater than `u64::MAX`.
 #[derive(Debug, Clone, Copy)]
-struct SampleBudget {
+pub(crate) struct SampleBudget {
     /// Maximum total emitted sample values (`i32` / `f32` slots across
     /// all channels).
     max: u64,
@@ -3181,11 +3181,11 @@ struct SampleBudget {
 }
 
 impl SampleBudget {
-    fn new(max: u64) -> Self {
+    pub(crate) fn new(max: u64) -> Self {
         SampleBudget { max, charged: 0 }
     }
 
-    fn unlimited() -> Self {
+    pub(crate) fn unlimited() -> Self {
         SampleBudget::new(u64::MAX)
     }
 
@@ -3193,7 +3193,7 @@ impl SampleBudget {
     /// [`Error::DecodeBudgetExceeded`] when the cumulative demand would
     /// exceed the budget. Saturating: an overflowing demand reports
     /// `needed == u64::MAX`.
-    fn charge(&mut self, values: u64) -> Result<()> {
+    pub(crate) fn charge(&mut self, values: u64) -> Result<()> {
         let needed = self.charged.saturating_add(values);
         if needed > self.max {
             return Err(Error::DecodeBudgetExceeded {

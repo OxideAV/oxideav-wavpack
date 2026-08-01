@@ -30,7 +30,7 @@
 //! [`StreamReader`](crate::StreamReader)) decode only the sets a
 //! requested window touches.
 
-use crate::block::MAX_MULTICHANNEL_CHANNELS;
+use crate::block::{SampleBudget, MAX_MULTICHANNEL_CHANNELS};
 use crate::block_header::{parse_block_header, Flags};
 use crate::error::{Error, Result};
 
@@ -586,11 +586,16 @@ fn decode_range_inner(
     start_frame: u64,
     frames: u64,
     muted: bool,
+    budget: &mut SampleBudget,
 ) -> Result<(Vec<i32>, bool)> {
-    decode_range_pair_inner(bytes, index, None, start_frame, frames, muted)
+    decode_range_pair_inner(bytes, index, None, start_frame, frames, muted, budget)
 }
 
-/// Range-decode core with an optional correction source (round 415).
+/// Range-decode core with an optional correction source (round 415)
+/// and the round-436 decoded-sample budget (each touched set's
+/// declared output size — `frames × channels`, a header-only quantity
+/// off the index — is charged before the set is decoded).
+#[allow(clippy::too_many_arguments)]
 fn decode_range_pair_inner(
     bytes: &[u8],
     index: &StreamIndex,
@@ -598,6 +603,7 @@ fn decode_range_pair_inner(
     start_frame: u64,
     frames: u64,
     muted: bool,
+    budget: &mut SampleBudget,
 ) -> Result<(Vec<i32>, bool)> {
     if !index.is_seekable() {
         return Err(Error::StreamNotSeekable);
@@ -632,6 +638,10 @@ fn decode_range_pair_inner(
     let mut cursor = start_frame;
     while cursor < end_frame {
         let set = &index.sets()[set_idx];
+        // Anti-amplification: a range decode materializes each touched
+        // set whole (the window slice comes after), so charge the
+        // set's declared output size before decoding it.
+        budget.charge(u64::from(set.frames).saturating_mul(set.channels as u64))?;
         let (pcm, crc_ok) = decode_set_with_correction(bytes, index, set, correction, muted)?;
         all_crc_ok &= crc_ok;
         // Overlap of [cursor, end_frame) with this set, in set-local
@@ -669,7 +679,47 @@ pub fn decode_range(
     start_frame: u64,
     frames: u64,
 ) -> Result<Vec<i32>> {
-    decode_range_inner(bytes, index, start_frame, frames, false).map(|(pcm, _)| pcm)
+    decode_range_inner(
+        bytes,
+        index,
+        start_frame,
+        frames,
+        false,
+        &mut SampleBudget::unlimited(),
+    )
+    .map(|(pcm, _)| pcm)
+}
+
+/// [`decode_range`] with a caller-supplied cumulative decoded-sample
+/// budget — the hostile-input-hardened twin (round 436).
+///
+/// A range decode touches only the member sets the window overlaps,
+/// but it materializes each touched set **whole** before slicing the
+/// window out — and one hostile set may declare up to the per-block
+/// ceiling times the channel bound, far beyond the requested window.
+/// `max_samples` bounds the total *materialized* set output (each
+/// touched set's `frames × channels`, a header-only quantity off the
+/// index, charged before that set is decoded — note this can exceed
+/// the returned window's own size). Past the budget the typed
+/// [`crate::Error::DecodeBudgetExceeded`] surfaces ahead of any
+/// amplified allocation; within it the result is bit-identical to
+/// [`decode_range`].
+pub fn decode_range_bounded(
+    bytes: &[u8],
+    index: &StreamIndex,
+    start_frame: u64,
+    frames: u64,
+    max_samples: u64,
+) -> Result<Vec<i32>> {
+    decode_range_inner(
+        bytes,
+        index,
+        start_frame,
+        frames,
+        false,
+        &mut SampleBudget::new(max_samples),
+    )
+    .map(|(pcm, _)| pcm)
 }
 
 /// The spec §5.6 CRC-mute twin of [`decode_range`]: every member block
@@ -688,7 +738,37 @@ pub fn decode_range_muted(
     start_frame: u64,
     frames: u64,
 ) -> Result<(Vec<i32>, bool)> {
-    decode_range_inner(bytes, index, start_frame, frames, true)
+    decode_range_inner(
+        bytes,
+        index,
+        start_frame,
+        frames,
+        true,
+        &mut SampleBudget::unlimited(),
+    )
+}
+
+/// [`decode_range_muted`] with a caller-supplied cumulative
+/// decoded-sample budget — the hostile-input-hardened twin. See
+/// [`decode_range_bounded`] for the budget contract (whole touched
+/// sets are charged, header-only, before decoding); the spec §5.6
+/// per-member CRC mute gate and the `(pcm, all_crc_ok)` return shape
+/// are exactly [`decode_range_muted`]'s.
+pub fn decode_range_muted_bounded(
+    bytes: &[u8],
+    index: &StreamIndex,
+    start_frame: u64,
+    frames: u64,
+    max_samples: u64,
+) -> Result<(Vec<i32>, bool)> {
+    decode_range_inner(
+        bytes,
+        index,
+        start_frame,
+        frames,
+        true,
+        &mut SampleBudget::new(max_samples),
+    )
 }
 
 /// [`decode_range`] over a hybrid-lossless `.wv` + `.wvc` **pair**
@@ -716,6 +796,34 @@ pub fn decode_range_with_correction(
         start_frame,
         frames,
         false,
+        &mut SampleBudget::unlimited(),
+    )
+    .map(|(pcm, _)| pcm)
+}
+
+/// [`decode_range_with_correction`] with a caller-supplied cumulative
+/// decoded-sample budget — the hostile-input-hardened twin. See
+/// [`decode_range_bounded`] for the budget contract (whole touched
+/// sets are charged from the main index, header-only, before
+/// decoding; the `.wvc` twin refines the same samples and adds no
+/// output of its own).
+pub fn decode_range_with_correction_bounded(
+    bytes: &[u8],
+    index: &StreamIndex,
+    correction: &[u8],
+    start_frame: u64,
+    frames: u64,
+    max_samples: u64,
+) -> Result<Vec<i32>> {
+    let corr_index = StreamIndex::scan(correction)?;
+    decode_range_pair_inner(
+        bytes,
+        index,
+        Some((correction, &corr_index)),
+        start_frame,
+        frames,
+        false,
+        &mut SampleBudget::new(max_samples),
     )
     .map(|(pcm, _)| pcm)
 }
@@ -740,6 +848,32 @@ pub fn decode_range_with_correction_muted(
         start_frame,
         frames,
         true,
+        &mut SampleBudget::unlimited(),
+    )
+}
+
+/// [`decode_range_with_correction_muted`] with a caller-supplied
+/// cumulative decoded-sample budget — the hostile-input-hardened twin.
+/// See [`decode_range_bounded`] for the budget contract; the mute gate
+/// and return shape are exactly
+/// [`decode_range_with_correction_muted`]'s.
+pub fn decode_range_with_correction_muted_bounded(
+    bytes: &[u8],
+    index: &StreamIndex,
+    correction: &[u8],
+    start_frame: u64,
+    frames: u64,
+    max_samples: u64,
+) -> Result<(Vec<i32>, bool)> {
+    let corr_index = StreamIndex::scan(correction)?;
+    decode_range_pair_inner(
+        bytes,
+        index,
+        Some((correction, &corr_index)),
+        start_frame,
+        frames,
+        true,
+        &mut SampleBudget::new(max_samples),
     )
 }
 
@@ -771,6 +905,13 @@ pub struct StreamReader<'a> {
     position: u64,
     /// Most recently decoded set.
     cache: Option<CachedSet>,
+    /// Round-436 anti-amplification bound: the largest declared set
+    /// output (`frames × channels`) a read will materialize.
+    /// `u64::MAX` (the default) disables the check. Per-set — not
+    /// cumulative — because a reader legitimately streams a whole
+    /// file across successive reads; the amplification unit here is
+    /// one whole-set decode.
+    max_set_samples: u64,
 }
 
 /// The [`StreamReader`] set cache: one decoded set plus the mode it
@@ -828,7 +969,24 @@ impl<'a> StreamReader<'a> {
             correction: None,
             position,
             cache: None,
+            max_set_samples: u64::MAX,
         })
+    }
+
+    /// Bound the largest member set a read will materialize (round
+    /// 436): a set whose header-declared output (`frames × channels`)
+    /// exceeds `max_set_samples` is refused with the typed
+    /// [`Error::DecodeBudgetExceeded`] instead of being decoded — the
+    /// spec §4.2 zero-run path makes a set's output unbounded by its
+    /// payload bytes, so a hostile stream can otherwise force a
+    /// near-gigabyte allocation from a one-frame read. The bound is
+    /// **per set**, not cumulative across reads (a reader legitimately
+    /// streams a whole file); the failed read leaves the cursor
+    /// unchanged, like every failed read. `u64::MAX` (the
+    /// construction default) disables the check.
+    pub fn with_max_set_samples(mut self, max_set_samples: u64) -> Self {
+        self.max_set_samples = max_set_samples;
+        self
     }
 
     /// The underlying index (byte spans, sets, frame ranges).
@@ -975,6 +1133,17 @@ impl<'a> StreamReader<'a> {
                 _ => false,
             };
             if !reusable {
+                // Anti-amplification (round 436): refuse to materialize
+                // a set whose header-declared output exceeds the
+                // configured per-set bound, before any decode work.
+                let set = &self.index.sets()[set_idx];
+                let declared = u64::from(set.frames).saturating_mul(set.channels as u64);
+                if declared > self.max_set_samples {
+                    return Err(Error::DecodeBudgetExceeded {
+                        budget: self.max_set_samples,
+                        needed: declared,
+                    });
+                }
                 let correction = self
                     .correction
                     .as_ref()
@@ -1747,5 +1916,148 @@ mod tests {
         let layout = crate::block::multichannel_layout(&wv).expect("layout");
         assert_eq!(index.channels(), layout.channels);
         assert_eq!(index.set_count(), layout.sets);
+    }
+
+    // ---- round 436: seek-surface decode budget ----------------------
+
+    #[test]
+    fn decode_range_bounded_charges_whole_touched_sets() {
+        // Three 300-frame mono sets. A window touching sets 1 and 2
+        // charges both sets whole (600), regardless of the window's
+        // own size.
+        let pcm = mono_pcm(900);
+        let wv = encode_stream_mono(&pcm, 300, 2).expect("encode");
+        let index = StreamIndex::scan(&wv).expect("scan");
+
+        // Parity at the exact charge.
+        let want = decode_range(&wv, &index, 350, 400).expect("unbounded");
+        assert_eq!(want, pcm[350..750]);
+        assert_eq!(
+            decode_range_bounded(&wv, &index, 350, 400, 600).expect("exact"),
+            want
+        );
+        // One below the two-set charge refuses.
+        assert_eq!(
+            decode_range_bounded(&wv, &index, 350, 400, 599),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 599,
+                needed: 600
+            })
+        );
+        // A tiny window still materializes its whole set: 10 frames
+        // inside set 1 charge 300, not 10.
+        assert_eq!(
+            decode_range_bounded(&wv, &index, 400, 10, 300).expect("whole-set charge"),
+            pcm[400..410]
+        );
+        assert_eq!(
+            decode_range_bounded(&wv, &index, 400, 10, 299),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 299,
+                needed: 300
+            })
+        );
+        // Muted twin: parity + refusal.
+        let (want_m, want_ok) = decode_range_muted(&wv, &index, 350, 400).expect("muted");
+        let (got_m, got_ok) =
+            decode_range_muted_bounded(&wv, &index, 350, 400, 600).expect("exact muted");
+        assert_eq!(got_m, want_m);
+        assert_eq!(got_ok, want_ok);
+        assert!(got_ok);
+        assert!(matches!(
+            decode_range_muted_bounded(&wv, &index, 350, 400, 599),
+            Err(Error::DecodeBudgetExceeded { budget: 599, .. })
+        ));
+        // A zero-length window decodes nothing and charges nothing.
+        assert_eq!(
+            decode_range_bounded(&wv, &index, 350, 0, 0).expect("empty window"),
+            Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn decode_range_with_correction_bounded_matches_and_refuses() {
+        // Two 300-frame stereo hybrid sets: each charges 600 (frames ×
+        // channels) off the main index.
+        let pcm: Vec<i32> = (0..2 * 600)
+            .map(|i| {
+                let t = f64::from(i / 2) * 0.04;
+                ((t.sin() * 5000.0) as i32) + (i % 13) - 6
+            })
+            .collect();
+        let opts = crate::HybridOptions::from_bits_per_sample(3.0);
+        let pair =
+            crate::hybrid_encode::encode_stream_stereo_hybrid(&pcm, 300, 2, &opts).expect("pair");
+        let wvc = pair.wvc.as_deref().expect("correction twin");
+        let index = StreamIndex::scan(&pair.wv).expect("scan");
+
+        let want =
+            decode_range_with_correction(&pair.wv, &index, wvc, 250, 200).expect("unbounded");
+        assert_eq!(want, pcm[2 * 250..2 * 450], "pair window is lossless");
+        assert_eq!(
+            decode_range_with_correction_bounded(&pair.wv, &index, wvc, 250, 200, 1200)
+                .expect("exact"),
+            want
+        );
+        assert_eq!(
+            decode_range_with_correction_bounded(&pair.wv, &index, wvc, 250, 200, 1199),
+            Err(Error::DecodeBudgetExceeded {
+                budget: 1199,
+                needed: 1200
+            })
+        );
+        let (want_m, want_ok) = decode_range_with_correction_muted(&pair.wv, &index, wvc, 250, 200)
+            .expect("unbounded muted");
+        let (got_m, got_ok) =
+            decode_range_with_correction_muted_bounded(&pair.wv, &index, wvc, 250, 200, 1200)
+                .expect("exact muted");
+        assert_eq!(got_m, want_m);
+        assert_eq!(got_ok, want_ok);
+        assert!(got_ok);
+        assert!(matches!(
+            decode_range_with_correction_muted_bounded(&pair.wv, &index, wvc, 250, 200, 1199),
+            Err(Error::DecodeBudgetExceeded { budget: 1199, .. })
+        ));
+    }
+
+    #[test]
+    fn stream_reader_max_set_samples_bounds_materialization() {
+        let pcm = mono_pcm(900);
+        let wv = encode_stream_mono(&pcm, 300, 2).expect("encode");
+
+        // A per-set bound below the 300-value set size refuses the
+        // read (typed) and leaves the cursor unchanged.
+        let mut reader = StreamReader::new(&wv)
+            .expect("reader")
+            .with_max_set_samples(299);
+        let err = reader.read_frames(10).unwrap_err();
+        assert_eq!(
+            err,
+            Error::DecodeBudgetExceeded {
+                budget: 299,
+                needed: 300
+            }
+        );
+        assert_eq!(reader.position(), 0, "failed read restores the cursor");
+        // The muted read applies the same gate.
+        assert!(matches!(
+            reader.read_frames_muted(10),
+            Err(Error::DecodeBudgetExceeded { budget: 299, .. })
+        ));
+
+        // An exact per-set bound streams the whole file identically to
+        // an unbounded reader.
+        let mut reader = StreamReader::new(&wv)
+            .expect("reader")
+            .with_max_set_samples(300);
+        let mut got = Vec::new();
+        loop {
+            let chunk = reader.read_frames(127).expect("bounded read");
+            if chunk.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, pcm);
     }
 }
