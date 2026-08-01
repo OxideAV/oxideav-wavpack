@@ -24,6 +24,11 @@
 //! - Cross-walker: block / audio counts and the multichannel layout
 //!   agree with the metadata-parsing walkers whenever both sides
 //!   succeed.
+//! - Round 436: [`decode_range_bounded`] is a pure budget gate over
+//!   the fuzz-chosen window — unlimited and whole-stream-charge
+//!   budgets are bit-identical to the unbounded twin, and a
+//!   fuzz-chosen budget either matches it or surfaces the typed
+//!   `DecodeBudgetExceeded` with `needed > budget`.
 //!
 //! The first three input bytes steer the window start / length and
 //! the reader chunk size; the remainder is the stream under test.
@@ -38,7 +43,8 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_wavpack::{
     audio_block_count, block_count, decode_multichannel_stream, decode_multichannel_stream_muted,
-    decode_range, decode_range_muted, multichannel_layout, StreamIndex, StreamReader,
+    decode_range, decode_range_bounded, decode_range_muted, multichannel_layout, Error,
+    StreamIndex, StreamReader,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -154,6 +160,36 @@ fuzz_target!(|data: &[u8]| {
     let s = usize::try_from((start - first) * channels as u64).expect("fits");
     let e = s + usize::try_from(len * channels as u64).expect("fits");
     assert_eq!(ranged, stream.samples[s..e], "window == stream slice");
+
+    // Round-436 bounded twin: an unlimited budget matches; the exact
+    // whole-stream charge (every set materialized whole) admits any
+    // in-range window; a fuzz-chosen budget either matches or refuses
+    // with the typed error and `needed > budget`.
+    assert_eq!(
+        decode_range_bounded(bytes, &index, start, len, u64::MAX).expect("unlimited"),
+        ranged,
+        "bounded(u64::MAX) == unbounded"
+    );
+    let whole_charge: u64 = index
+        .sets()
+        .iter()
+        .map(|set| u64::from(set.frames) * set.channels as u64)
+        .sum();
+    assert_eq!(
+        decode_range_bounded(bytes, &index, start, len, whole_charge)
+            .expect("whole-stream charge admits any window"),
+        ranged,
+        "bounded(whole charge) == unbounded"
+    );
+    let fuzz_budget = u64::from(control[2]) * 129;
+    match decode_range_bounded(bytes, &index, start, len, fuzz_budget) {
+        Ok(pcm) => assert_eq!(pcm, ranged, "bounded success == unbounded"),
+        Err(Error::DecodeBudgetExceeded { budget, needed }) => {
+            assert_eq!(budget, fuzz_budget, "refusal echoes the budget");
+            assert!(needed > budget, "needed must exceed the budget");
+        }
+        Err(other) => panic!("bounded window may only fail on budget here: {other:?}"),
+    }
 
     // StreamReader chunked walk reproduces the stream.
     let chunk = 1 + control[2] as usize;
