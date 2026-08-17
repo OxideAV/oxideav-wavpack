@@ -33,7 +33,19 @@ decoder binary (30-case round-420 black-box battery on top of the
 round-418 35-case one: mono/stereo × joint/left-right × shaping
 off/static ±/full-scale/ramp × bitrate words 0..2000 × int/float/int32
 × multi-block × silence × delta-clamp imbalance × clipping-adjacent
-content).
+content). Round 447 pins the noise-shaping recurrence to the staged
+spec §4.4/§4.4.1 (the former negative-weight gap, now closed: the
+nudge is an **equality test** gated on `NEW_SHAPING`, the compact
+2-byte `0x07` form parses, and out-of-rail trajectories legitimately
+diverge into the mute gate instead of being clamped) and **closes the
+multichannel origination matrix**: wider-than-stereo layouts encode
+with real per-member compression (stereo-pair members through the
+full mode search — 50.8–61.1 % of the raw-member size on correlated
+content), in every sample format (16/24-bit, full-range int32, float)
+and every mode (lossless and hybrid, lossy `.wv` or bit-exact
+`.wv`+`.wvc` pair), in-crate and through the framework registry — 62
+black-box checks this round, all bit-exact under the reference
+decoder binary.
 
 Working surface:
 
@@ -179,6 +191,32 @@ Working surface:
   channel-count blowup) is refused with the typed errors
   `MultichannelSetMalformed` / `MultichannelSampleCountMismatch` /
   `MultichannelTooManyChannels`.
+* **Compressed multichannel origination — every format, every mode**
+  (round 447) — the raw mono-member grouping above is the floor; the
+  real multichannel encoders pair channels into **stereo members**
+  (`(0,1)`, `(2,3)`, …; an odd trailing channel rides a mono member)
+  and give every member the same compression search a standalone
+  block gets. `encode_multichannel_stream_best` / `_smallest`
+  (+ offset-aware `_at` twins) run the profile-grid / union search
+  per member (50.8–61.1 % of the raw-member size on correlated 3–8
+  channel content); `encode_multichannel_stream_float` / `_int32`
+  ride the `0x08` / `0x09` deconstructions per member
+  (`decode_multichannel_stream_f32` + `DecodedStreamF32` are the
+  typed float decode twins); `encode_multichannel_stream_hybrid`
+  (+ `_float` / `_int32`) originates hybrid member-set chains with
+  **one §6.5/§4.4 state carry per member chain** — level words seeded
+  by the first set's pre-pass and carried across sets, shaping state
+  re-seeded from the quantized payload each block — emitting the
+  `0x0D` geometry after the first member's `0x06` profile and a
+  `.wvc` twin that mirrors block structure without `0x0D` (both
+  placements pinned on the committed reference multichannel pair
+  fixture), so
+  `decode_multichannel_stream_with_correction(&wv, &wvc)?.samples ==
+  pcm` (f32 twin: `decode_multichannel_stream_with_correction_f32`).
+  Black-box, all bit-exact under the reference decoder binary: 10
+  lossless integer streams (widths 3/4/5/6/8 × best/smallest), 4
+  format streams (float 4/6 ch, int32 3/5 ch), 12 hybrid pairs
+  (widths 3–6 × shaping off/−/+) and 4 format hybrid pairs.
 * **Self-deriving compression encoder (auto / best)** — the encoder
   performs real prediction-based compression without the caller
   authoring any metadata. `serialize_mono_passes` /
@@ -371,9 +409,12 @@ Working surface:
   width — S8/S16/S24/S32 interleaved, values verbatim), and
   `WavPackEncoder` emits one packet per input frame with a **running
   `block_index`** (mono / stereo through the `encode_block_*_best`
-  mode search; wider layouts through the mono-member grouping via the
-  new offset-aware `encode_multichannel_stream_at`), so concatenated
-  packet payloads form one contiguous, seekable `.wv` chain. The
+  mode search; wider layouts through the compressed stereo-pair
+  member grouping since round 447 — the `best` search for integer
+  widths, the float / int32 member paths for `F32` / `S32`, and
+  hybrid mode through the per-member-chain carries persisted across
+  packets), so concatenated packet payloads form one contiguous,
+  seekable `.wv` chain. The
   decoder applies a per-packet decoded-sample budget
   (`WavPackDecoderOptions::max_packet_samples`, default `2^28` emitted
   values; `0` disables) so a hostile packet is refused before any
@@ -385,10 +426,10 @@ Working surface:
   orphan / surplus / mismatched correction blocks are typed refusals;
   partial coverage pairs `None`), `correction_coverage` summarises
   `(paired, total)`, and `WavPackBlock::expects_correction` classifies
-  which blocks *want* a twin (wiki bit-3 hybrid flag). Structural
-  plumbing for the two-file lossless path — folding the paired `0x0B`
-  words into the (now-decoded) coarse PCM stays gated on the shaped
-  correction-fold docs gap below.
+  which blocks *want* a twin (wiki bit-3 hybrid flag). The end-to-end
+  two-file lossless decode itself is complete (rounds 408/415 — see
+  the hybrid-lossless section below); these walkers are the
+  non-decoding structural layer under it.
 * **Entropy encode** — exact write-side inverses (`BitWriter`,
   `encode_packed_samples_mono` / `_stereo`, and the per-primitive
   interval / prefix / mantissa encoders) round-trip the decode ladder
@@ -493,6 +534,18 @@ let opts = HybridOptions::from_bits_per_sample(4.0)
 let pair = encode_stream_stereo_hybrid(&pcm, 0, 2, &opts)?;
 assert_eq!(decode_stream_with_correction(&pair.wv, pair.wvc.as_ref().unwrap())?, pcm);
 
+// Multichannel origination (round 447): stereo-pair members with the
+// full per-member compression search — lossless, float/int32, hybrid:
+use oxideav_wavpack::{
+    decode_multichannel_stream, decode_multichannel_stream_with_correction,
+    encode_multichannel_stream_hybrid, encode_multichannel_stream_smallest,
+};
+let wv = encode_multichannel_stream_smallest(&surround_pcm, 6, 0, 2)?;
+assert_eq!(decode_multichannel_stream(&wv)?.samples, surround_pcm);
+let pair = encode_multichannel_stream_hybrid(&surround_pcm, 6, 0, 2, &opts)?;
+let exact = decode_multichannel_stream_with_correction(&pair.wv, pair.wvc.as_ref().unwrap())?;
+assert_eq!(exact.samples, surround_pcm); // bit-exact through the pair
+
 // Untrusted input? Every eager decode has a budgeted twin that
 // refuses (typed) before any amplified allocation — bit-identical to
 // the unbounded call within the budget:
@@ -561,9 +614,15 @@ and both stereo codings (rounds 408/415):
 `decode_stream_with_correction` read the exact in-bracket offset from
 the `0x0B` correction stream (the same phase-in code as the lossless
 mantissa) and run the `0x07`-seeded noise-shaping filter
-(`ShapingState`: log-packed `[error, acc, (delta)]` seeds, the
-`-((weight*error + 511) >> 10)` temp term, the negative-weight
-unit-magnitude nudge, and the weight-sign-branched error update).
+(`ShapingState`, spec §4.4 exactly since round 447: log-packed
+`[error, acc, (delta)]` seeds plus the compact 2-byte signed-byte
+form, the `-((weight*error + 511) >> 10)` temp term with the product
+exact, the **equality nudge** — `temp == error` shaves one, firing
+identically at the `-1024` unity-gain rail and never past it — and
+the `NEW_SHAPING`-gated IIR/FIR error-update arms; undocumented
+payload lengths are a typed refusal, and out-of-rail trajectories
+diverge into the §5.6 mute gate as §4.4.1 specifies rather than
+being clamped).
 **Joint (mid/side) stereo pairs** — the reference encoder's default
 stereo hybrid coding — are a round-415 black-box pin: the raw `0x0B`
 fold stays in the coded domain (ahead of the §5.4 undo), but the
@@ -698,10 +757,18 @@ the decorrelation/CRC trace
 the log-domain conversions `spec/wavpack-log2-exp2.md` (tables
 mechanically transcribed from `tables/wp-log2.csv` / `wp-exp2.csv`),
 the extended sample formats `spec/wavpack-sample-formats.md`, and the
-standard-rate table `tables/sample-rates.csv`. Wire details the staged
+standard-rate table `tables/sample-rates.csv`; round 447 pins the
+noise-shaping recurrence to the staged decorrelation spec §4.4/§4.4.1
+(the equality nudge, the `NEW_SHAPING` gate, the compact 2-byte
+`0x07` form, the exact-product arithmetic and the out-of-rail
+divergence account), replacing the earlier black-box cap reading —
+identical inside the validated ±1024 envelope. Wire details the staged
 docs name but do not bit-pin (the float `ZEROS_SENT` layout and the
 float extension-CRC fold) were established black-box with the
-reference binaries as opaque oracles, never their source. No external
+reference binaries as opaque oracles, never their source; the
+round-447 multichannel hybrid placements (`0x0D` after the first
+member's `0x06`, no `0x0D` in the `.wvc` twin) are pinned by
+inspection of the committed reference pair fixture's wire bytes. No external
 library source, archived prior history, or online resources were
 consulted at any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
 and `decode_multichannel_stream` (plus its CRC-muted and `multichannel_layout`
@@ -726,6 +793,14 @@ bitrate word × plain/float/int32; every emitted pair must decode back
 bit-exactly with green CRC gates and every lossy `.wv` must decode
 within the clamp range — an opening ~5M-run campaign found, and the
 fix pinned, a clamp-bits underflow on hostile left-shift headers),
+plus a round-447 `multichannel_encode_roundtrip` **round-trip
+oracle** over the whole multichannel origination surface (fuzz-chosen
+width 1..=8 × best/smallest/float/int32/hybrid-pair modes with
+joint / shaping / small-set segmentation axes; every emitted
+member-set chain must decode back bit-exactly with green per-member
+CRC gates — an opening ~698k-run campaign is clean, with ~1.57M-run /
+~249k-run re-soaks of the hybrid and pair-decode oracles under the
+reworked §4.4 recurrence),
 plus a round-436 `bounded_decode_differential` target pinning every
 `*_bounded` twin as a pure budget gate (unlimited-budget parity with
 the unbounded decoders, exact-budget parity with a one-below refusal,
@@ -739,7 +814,7 @@ them, with the minimized input kept as a corpus regression seed; a
 round-415 campaign did the same for two overflow sites in the `0x07`
 shaping-state recurrence (accumulator add / temp bias / seed
 negation, all now 32-bit wrapping);
-1139 unit tests plus a 74-test
+1159 unit tests plus a 74-test
 foreign-decode integration battery (59 reference-encoded fixtures
 under `tests/data/` — including 18 hybrid-lossless `wv+wvc` pairs and
 the round-418 hybrid edge probes (delta clamp / output clamp /
