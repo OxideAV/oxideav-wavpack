@@ -855,6 +855,7 @@ pub use crate::block::{
     decode_multichannel_stream, decode_multichannel_stream_bounded, decode_multichannel_stream_f32,
     decode_multichannel_stream_muted, decode_multichannel_stream_muted_bounded,
     decode_multichannel_stream_with_correction, decode_multichannel_stream_with_correction_bounded,
+    decode_multichannel_stream_with_correction_f32,
     decode_multichannel_stream_with_correction_muted,
     decode_multichannel_stream_with_correction_muted_bounded, decode_stream, decode_stream_bounded,
     decode_stream_f32, decode_stream_f32_bounded, decode_stream_muted, decode_stream_muted_bounded,
@@ -903,8 +904,9 @@ pub use crate::hybrid::CorrectionFold;
 pub use crate::hybrid_encode::{
     encode_block_mono_hybrid, encode_block_mono_hybrid_float, encode_block_mono_hybrid_int32,
     encode_block_stereo_hybrid, encode_block_stereo_hybrid_float, encode_block_stereo_hybrid_int32,
-    encode_multichannel_stream_hybrid, encode_stream_mono_hybrid, encode_stream_mono_hybrid_float,
-    encode_stream_mono_hybrid_int32, encode_stream_stereo_hybrid,
+    encode_multichannel_stream_hybrid, encode_multichannel_stream_hybrid_float,
+    encode_multichannel_stream_hybrid_int32, encode_stream_mono_hybrid,
+    encode_stream_mono_hybrid_float, encode_stream_mono_hybrid_int32, encode_stream_stereo_hybrid,
     encode_stream_stereo_hybrid_float, encode_stream_stereo_hybrid_int32, HybridEncoded,
     HybridOptions, HybridShaping,
 };

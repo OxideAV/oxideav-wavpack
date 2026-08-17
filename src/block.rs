@@ -3516,6 +3516,40 @@ pub fn decode_multichannel_stream_with_correction(
     Ok(stream)
 }
 
+/// Decode a hybrid **multichannel float** `.wv` + `.wvc` pair to
+/// interleaved `f32` PCM — the typed `FLOAT_DATA` twin of
+/// [`decode_multichannel_stream_with_correction`] (whose `i32` slots
+/// carry IEEE-754 bit patterns on a float stream), mirroring
+/// [`decode_stream_with_correction_f32`]. The main stream's first
+/// audio block decides floatness; a non-float stream is refused with
+/// [`Error::BlockNotFloat`]. Round 447.
+pub fn decode_multichannel_stream_with_correction_f32(
+    main: &[u8],
+    correction: &[u8],
+) -> Result<DecodedStreamF32> {
+    match first_audio_block(main)? {
+        Some(block) if block.is_float() => {
+            let stream = decode_multichannel_stream_with_correction(main, correction)?;
+            Ok(DecodedStreamF32 {
+                samples: stream
+                    .samples
+                    .into_iter()
+                    .map(|bits| f32::from_bits(bits as u32))
+                    .collect(),
+                channels: stream.channels,
+            })
+        }
+        Some(_) => Err(Error::BlockNotFloat),
+        None => {
+            let stream = decode_multichannel_stream_with_correction(main, correction)?;
+            Ok(DecodedStreamF32 {
+                samples: Vec::new(),
+                channels: stream.channels,
+            })
+        }
+    }
+}
+
 /// [`decode_multichannel_stream_with_correction`] with the spec §5.6
 /// per-member CRC **mute gate** applied — each paired member is gated
 /// against its `.wvc` header's stored **lossless** CRC (round-415 pin;

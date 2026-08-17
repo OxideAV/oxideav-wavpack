@@ -90,7 +90,8 @@ use crate::encode::{
 };
 use crate::hybrid_encode::{
     encode_hybrid_block_float, encode_hybrid_block_int32, encode_hybrid_block_ints,
-    encode_multichannel_hybrid_members, new_multichannel_carries, HybridCarry,
+    encode_multichannel_hybrid_format_members, encode_multichannel_hybrid_members,
+    new_multichannel_carries, HybridCarry,
 };
 use crate::{HybridOptions, HybridShaping};
 
@@ -463,15 +464,6 @@ impl WavPackEncoder {
             ));
         }
         let mode = if o.mode == "hybrid" {
-            // Round 447: integer multichannel hybrid encodes through
-            // the per-member-chain carries; the float / int32 hybrid
-            // deconstructions stay mono/stereo-only (matching the
-            // crate-level origination surface).
-            if channels > 2 && (float || bytes_per_sample == 4) {
-                return Err(CoreError::unsupported(
-                    "wavpack: hybrid multichannel supports 8/16/24-bit integer input only",
-                ));
-            }
             let mut hopts = HybridOptions::from_bits_per_sample(f64::from(o.bits_per_sample));
             hopts.correction = false;
             hopts.joint = o.joint;
@@ -600,11 +592,13 @@ impl Encoder for WavPackEncoder {
                 }
             }
             _ if matches!(self.mode, EncodeMode::Hybrid { .. }) => {
-                // Round 447: integer multichannel hybrid — the shared
-                // per-set member loop with per-chain carries persisted
-                // across packets (opts.correction is false, so the
-                // wvc sink stays empty).
+                // Round 447: multichannel hybrid — the shared per-set
+                // member loop with per-chain carries persisted across
+                // packets (opts.correction is false, so the wvc sink
+                // stays empty). F32 / S32 route through the float /
+                // int32 hybrid member paths.
                 let channels = self.channels;
+                let float = self.float;
                 let bytes_per_sample = self.bytes_per_sample;
                 let next_index = self.next_index;
                 let EncodeMode::Hybrid {
@@ -617,18 +611,33 @@ impl Encoder for WavPackEncoder {
                     mc_carries.get_or_insert_with(|| new_multichannel_carries(opts, channels));
                 let mut wv = Vec::new();
                 let mut wvc_sink = Vec::new();
-                encode_multichannel_hybrid_members(
-                    &pcm,
-                    channels,
-                    DEFAULT_BLOCK_SAMPLES,
-                    bytes_per_sample,
-                    opts,
-                    carries,
-                    next_index,
-                    TOTAL_SAMPLES_UNKNOWN,
-                    &mut wv,
-                    &mut wvc_sink,
-                )
+                if float || bytes_per_sample == 4 {
+                    encode_multichannel_hybrid_format_members(
+                        &pcm,
+                        float,
+                        channels,
+                        DEFAULT_BLOCK_SAMPLES,
+                        opts,
+                        carries,
+                        next_index,
+                        TOTAL_SAMPLES_UNKNOWN,
+                        &mut wv,
+                        &mut wvc_sink,
+                    )
+                } else {
+                    encode_multichannel_hybrid_members(
+                        &pcm,
+                        channels,
+                        DEFAULT_BLOCK_SAMPLES,
+                        bytes_per_sample,
+                        opts,
+                        carries,
+                        next_index,
+                        TOTAL_SAMPLES_UNKNOWN,
+                        &mut wv,
+                        &mut wvc_sink,
+                    )
+                }
                 .map_err(invalid)?;
                 data = wv;
             }
@@ -1121,19 +1130,12 @@ mod tests {
         let mut p = audio_params(2, SampleFormat::S16, None);
         p.options.insert("mode", "psychic");
         assert!(make_encoder(&p).is_err());
-        // Integer hybrid multichannel is an encode shape since round
-        // 447; the float / int32 hybrid deconstructions stay
-        // mono/stereo-only.
-        let mut p = audio_params(6, SampleFormat::S16, None);
-        p.options.insert("mode", "hybrid");
-        assert!(make_encoder(&p).is_ok());
-        for fmt in [SampleFormat::F32, SampleFormat::S32] {
+        // Hybrid multichannel is an encode shape since round 447 —
+        // every accepted sample format, wide layouts included.
+        for fmt in [SampleFormat::S16, SampleFormat::F32, SampleFormat::S32] {
             let mut p = audio_params(6, fmt, None);
             p.options.insert("mode", "hybrid");
-            let Err(err) = make_encoder(&p) else {
-                panic!("{fmt:?} hybrid multichannel must be refused");
-            };
-            assert!(matches!(err, CoreError::Unsupported(_)), "{err:?}");
+            assert!(make_encoder(&p).is_ok(), "{fmt:?} hybrid multichannel");
         }
         // Planar float stays refused.
         let p = audio_params(2, SampleFormat::F32P, None);
@@ -1186,6 +1188,37 @@ mod tests {
         assert!(whole.samples.iter().all(|&s| (-32768..=32767).contains(&s)));
         let index = crate::seek::StreamIndex::scan(&chain).unwrap();
         assert!(index.is_seekable(), "packets form one seekable chain");
+    }
+
+    #[test]
+    fn hybrid_multichannel_float_packets_decode() {
+        // Round 447: F32 hybrid multichannel through the registry —
+        // lossy float member sets, per-chain carries across packets.
+        let mut params = audio_params(4, SampleFormat::F32, None);
+        params.options.insert("mode", "hybrid");
+        let mut enc = make_encoder(&params).unwrap();
+        let pcm: Vec<f32> = (0..4 * 600)
+            .map(|i| ((i as f32) * 0.019).sin() * 0.7)
+            .collect();
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_bits().to_le_bytes()).collect();
+        let half = bytes.len() / 2;
+        let mut chain = Vec::new();
+        for part in [&bytes[..half], &bytes[half..]] {
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples: 0,
+                pts: None,
+                data: vec![part.to_vec()],
+            }))
+            .unwrap();
+            let packet = enc.receive_packet().unwrap();
+            let decoded = crate::block::decode_multichannel_stream_f32(&packet.data).unwrap();
+            assert_eq!(decoded.channels, 4);
+            assert_eq!(decoded.samples.len() * 4, part.len());
+            chain.extend_from_slice(&packet.data);
+        }
+        let whole = crate::block::decode_multichannel_stream_f32(&chain).unwrap();
+        assert_eq!(whole.channels, 4);
+        assert_eq!(whole.samples.len(), pcm.len());
     }
 
     #[test]

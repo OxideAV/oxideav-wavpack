@@ -105,6 +105,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deconstructions stay mono/stereo-only (matching the crate-level
   origination surface), now a narrower typed refusal.
 
+- Round 447 — **float / int32 hybrid multichannel — the origination
+  matrix closes.** `encode_multichannel_stream_hybrid_float` /
+  `encode_multichannel_stream_hybrid_int32` extend the per-member-chain
+  hybrid encoder to the extended sample formats (raised-anchor `0x08`
+  / `0x09` deconstruction per member, `0x0C` in the `.wvc` twin), and
+  `decode_multichannel_stream_with_correction_f32` is the typed float
+  twin of the multichannel pair decode. The registry's remaining
+  hybrid restriction is lifted: F32 / S32 hybrid multichannel packets
+  encode through the same member paths with persisted carries. Every
+  sample format the crate decodes is now originated at **every**
+  channel width, lossless and hybrid alike. Black-box: 4 originated
+  pairs (float × 4/6 ch, int32 × 3/5 ch) restore the input bit-exactly
+  and decode their lossy PCM bit-exactly under the reference decoder
+  binary.
+
 - Round 447 — **`multichannel_encode_roundtrip` fuzz target.** A
   round-trip oracle over the whole new multichannel origination
   surface: fuzz bytes become an interleaved buffer at a fuzz-chosen

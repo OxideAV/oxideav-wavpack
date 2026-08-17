@@ -1567,6 +1567,69 @@ pub(crate) fn encode_multichannel_hybrid_members(
     wv: &mut Vec<u8>,
     wvc_all: &mut Vec<u8>,
 ) -> Result<()> {
+    hybrid_members_drive(
+        pcm,
+        channels,
+        block_samples,
+        first_block_index,
+        carries,
+        wv,
+        wvc_all,
+        &mut |member_pcm, mono, block_index, member, carry| {
+            let level_words = carry.level_words(member_pcm, mono, opts)?;
+            let set_frames = if mono {
+                member_pcm.len()
+            } else {
+                member_pcm.len() / 2
+            };
+            let shaping = carry.payload_for_block(set_frames);
+            let (blk, cblk, sl, shape) = encode_hybrid_block_ints_member(
+                member_pcm,
+                mono,
+                bytes_per_sample,
+                opts,
+                level_words,
+                shaping.as_deref(),
+                None,
+                block_index,
+                total_samples,
+                member,
+            )?;
+            carry.absorb(sl, &shape);
+            Ok((blk, cblk))
+        },
+    )
+}
+
+/// Per-member hybrid block encoder callback for
+/// [`hybrid_members_drive`]: `(window, mono, block_index, member,
+/// carry)` → the member's `.wv` block and optional `.wvc` twin (the
+/// callback owns the level/shaping derivation and the carry absorb).
+type HybridMemberEncoder<'a, T> = &'a mut dyn FnMut(
+    &[T],
+    bool,
+    u32,
+    crate::encode::Membership,
+    &mut HybridCarry,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)>;
+
+/// The shared stereo-pair member plan of every hybrid multichannel
+/// encoder (round 447): split `pcm` (whole interleaved frames, already
+/// validated) into sets of `block_samples` frames starting at the
+/// absolute frame index `first_block_index`, de-interleave each set's
+/// members, and delegate the per-member block encode to
+/// `encode_member` with that member chain's carry.
+#[allow(clippy::too_many_arguments)]
+fn hybrid_members_drive<T: Copy>(
+    pcm: &[T],
+    channels: usize,
+    block_samples: usize,
+    first_block_index: u32,
+    carries: &mut [HybridCarry],
+    wv: &mut Vec<u8>,
+    wvc_all: &mut Vec<u8>,
+    encode_member: HybridMemberEncoder<'_, T>,
+) -> Result<()> {
     let frames = pcm.len() / channels;
     let chunk_frames = if block_samples == 0 {
         DEFAULT_BLOCK_SAMPLES
@@ -1586,7 +1649,6 @@ pub(crate) fn encode_multichannel_hybrid_members(
         for (m, carry) in carries.iter_mut().enumerate() {
             let ch = m * 2;
             let width = (channels - ch).min(2);
-            let mono = width == 1;
             let mut member_pcm = Vec::with_capacity(set_frames * width);
             for f in frame_start..frame_end {
                 member_pcm.push(pcm[f * channels + ch]);
@@ -1610,29 +1672,190 @@ pub(crate) fn encode_multichannel_hybrid_members(
                 marker,
                 multichannel_info: mc_info,
             };
-            let level_words = carry.level_words(&member_pcm, mono, opts)?;
-            let shaping = carry.payload_for_block(set_frames);
-            let (blk, cblk, sl, shape) = encode_hybrid_block_ints_member(
-                &member_pcm,
-                mono,
-                bytes_per_sample,
-                opts,
-                level_words,
-                shaping.as_deref(),
-                None,
-                block_index,
-                total_samples,
-                member,
-            )?;
+            let (blk, cblk) = encode_member(&member_pcm, width == 1, block_index, member, carry)?;
             wv.extend_from_slice(&blk);
             if let Some(cblk) = cblk {
                 wvc_all.extend_from_slice(&cblk);
             }
-            carry.absorb(sl, &shape);
         }
         frame_start = frame_end;
     }
     Ok(())
+}
+
+/// The format-tagged twin of [`encode_multichannel_hybrid_members`]
+/// for the registry (round 447): per-set float / int32 hybrid members
+/// with caller-persisted carries. `float` selects the raised-anchor
+/// `0x08` path (`window` reinterpreted as f32 bit patterns) vs the
+/// `0x09` int32 path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_multichannel_hybrid_format_members(
+    pcm: &[i32],
+    float: bool,
+    channels: usize,
+    block_samples: usize,
+    opts: &HybridOptions,
+    carries: &mut [HybridCarry],
+    first_block_index: u32,
+    total_samples: u32,
+    wv: &mut Vec<u8>,
+    wvc_all: &mut Vec<u8>,
+) -> Result<()> {
+    if float {
+        let f: Vec<f32> = pcm.iter().map(|&v| f32::from_bits(v as u32)).collect();
+        hybrid_members_drive(
+            &f,
+            channels,
+            block_samples,
+            first_block_index,
+            carries,
+            wv,
+            wvc_all,
+            &mut |window, mono, index, member, carry| {
+                encode_hybrid_block_float_member(
+                    window,
+                    mono,
+                    opts,
+                    carry,
+                    index,
+                    total_samples,
+                    member,
+                )
+            },
+        )
+    } else {
+        hybrid_members_drive(
+            pcm,
+            channels,
+            block_samples,
+            first_block_index,
+            carries,
+            wv,
+            wvc_all,
+            &mut |window, mono, index, member, carry| {
+                encode_hybrid_block_int32_member(
+                    window,
+                    mono,
+                    opts,
+                    carry,
+                    index,
+                    total_samples,
+                    member,
+                )
+            },
+        )
+    }
+}
+
+/// Encode an interleaved multichannel `f32` buffer into a hybrid
+/// `FLOAT_DATA` `.wv` (+ `.wvc`) member-set chain — the float twin of
+/// [`encode_multichannel_stream_hybrid`], every member riding the
+/// raised-anchor `0x08` deconstruction of the mono / stereo float
+/// hybrid encoders with its own per-chain §6.5 / §4.4 state carry.
+/// The lossy `.wv` decodes alone (implied-zero fill); with
+/// [`HybridOptions::correction`] the pair restores the exact bit
+/// patterns: `decode_multichannel_stream_with_correction_f32(&wv,
+/// &wvc)?.samples` reproduces `pcm` bit-for-bit. Round 447.
+pub fn encode_multichannel_stream_hybrid_float(
+    pcm: &[f32],
+    channels: usize,
+    block_samples: usize,
+    opts: &HybridOptions,
+) -> Result<HybridEncoded> {
+    encode_multichannel_hybrid_format(
+        pcm,
+        channels,
+        block_samples,
+        opts,
+        &mut |window, mono, index, total, member, carry| {
+            encode_hybrid_block_float_member(window, mono, opts, carry, index, total, member)
+        },
+    )
+}
+
+/// Encode an interleaved multichannel wide-integer buffer into a
+/// hybrid `INT32_DATA` `.wv` (+ `.wvc`) member-set chain — the int32
+/// twin of [`encode_multichannel_stream_hybrid`], every member riding
+/// the `0x09` deconstruction of the mono / stereo int32 hybrid
+/// encoders with its own per-chain state carry. The lossy `.wv`
+/// decodes alone (zero-filled reduced window); the pair restores the
+/// full `i32` input exactly. Round 447.
+pub fn encode_multichannel_stream_hybrid_int32(
+    pcm: &[i32],
+    channels: usize,
+    block_samples: usize,
+    opts: &HybridOptions,
+) -> Result<HybridEncoded> {
+    encode_multichannel_hybrid_format(
+        pcm,
+        channels,
+        block_samples,
+        opts,
+        &mut |window, mono, index, total, member, carry| {
+            encode_hybrid_block_int32_member(window, mono, opts, carry, index, total, member)
+        },
+    )
+}
+
+/// Per-member hybrid block encoder callback for
+/// [`encode_multichannel_hybrid_format`]: `(window, mono, block_index,
+/// total_samples, member, carry)` → the member's `.wv` block and
+/// optional `.wvc` twin.
+type HybridFormatMemberEncoder<'a, T> = &'a mut dyn FnMut(
+    &[T],
+    bool,
+    u32,
+    u32,
+    crate::encode::Membership,
+    &mut HybridCarry,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)>;
+
+/// Shared body of the format-tagged hybrid multichannel stream
+/// encoders: validation + fresh carries around
+/// [`hybrid_members_drive`], with the per-member block encode
+/// delegated to `encode_member` (which receives the file-global
+/// `total_samples` via capture).
+fn encode_multichannel_hybrid_format<T: Copy>(
+    pcm: &[T],
+    channels: usize,
+    block_samples: usize,
+    opts: &HybridOptions,
+    encode_member: HybridFormatMemberEncoder<'_, T>,
+) -> Result<HybridEncoded> {
+    if channels == 0 || channels > crate::block::MAX_MULTICHANNEL_CHANNELS {
+        return Err(Error::MultichannelTooManyChannels(channels));
+    }
+    if pcm.is_empty() {
+        return Ok(HybridEncoded {
+            wv: Vec::new(),
+            wvc: opts.correction.then_some(Vec::new()),
+        });
+    }
+    if pcm.len() % channels != 0 {
+        // The interleaved buffer must be whole frames of `channels` each.
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let frames = pcm.len() / channels;
+    let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let mut carries = new_multichannel_carries(opts, channels);
+    let mut wv = Vec::new();
+    let mut wvc_all = Vec::new();
+    hybrid_members_drive(
+        pcm,
+        channels,
+        block_samples,
+        0,
+        &mut carries,
+        &mut wv,
+        &mut wvc_all,
+        &mut |window, mono, index, member, carry| {
+            encode_member(window, mono, index, total, member, carry)
+        },
+    )?;
+    Ok(HybridEncoded {
+        wv,
+        wvc: opts.correction.then_some(wvc_all),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1658,6 +1881,28 @@ pub(crate) fn encode_hybrid_block_float(
     block_index: u32,
     total_samples: u32,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    encode_hybrid_block_float_member(
+        pcm,
+        mono,
+        opts,
+        carry,
+        block_index,
+        total_samples,
+        crate::encode::Membership::STANDALONE,
+    )
+}
+
+/// [`encode_hybrid_block_float`] with an explicit multichannel
+/// membership (round 447).
+pub(crate) fn encode_hybrid_block_float_member(
+    pcm: &[f32],
+    mono: bool,
+    opts: &HybridOptions,
+    carry: &mut HybridCarry,
+    block_index: u32,
+    total_samples: u32,
+    member: crate::encode::Membership,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
@@ -1668,7 +1913,7 @@ pub(crate) fn encode_hybrid_block_float(
     let format = crate::encode::float_format_extras(&d);
     let level = carry.level_words(&d.integers, mono, opts)?;
     let shaping = carry.payload_for_block(pcm.len() / if mono { 1 } else { 2 });
-    let (wv, wvc, sl, shape) = encode_hybrid_block_ints(
+    let (wv, wvc, sl, shape) = encode_hybrid_block_ints_member(
         &d.integers,
         mono,
         4,
@@ -1678,10 +1923,18 @@ pub(crate) fn encode_hybrid_block_float(
         Some(&format),
         block_index,
         total_samples,
+        member,
     )?;
     // Verify the lossy stream reconstructs (the implied-zero float
     // fixup can refuse a coarse magnitude past the mantissa window).
-    crate::block::decode_stream(&wv)?;
+    // A grouped member block is decoded through the member entry the
+    // multichannel walker uses.
+    if member.marker == 0b11 {
+        crate::block::decode_stream(&wv)?;
+    } else {
+        let (blk, _) = crate::block::parse_block(&wv)?;
+        blk.decode_member_samples()?;
+    }
     carry.absorb(sl, &shape);
     Ok((wv, wvc))
 }
@@ -1695,6 +1948,28 @@ pub(crate) fn encode_hybrid_block_int32(
     block_index: u32,
     total_samples: u32,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    encode_hybrid_block_int32_member(
+        pcm,
+        mono,
+        opts,
+        carry,
+        block_index,
+        total_samples,
+        crate::encode::Membership::STANDALONE,
+    )
+}
+
+/// [`encode_hybrid_block_int32`] with an explicit multichannel
+/// membership (round 447).
+pub(crate) fn encode_hybrid_block_int32_member(
+    pcm: &[i32],
+    mono: bool,
+    opts: &HybridOptions,
+    carry: &mut HybridCarry,
+    block_index: u32,
+    total_samples: u32,
+    member: crate::encode::Membership,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
@@ -1705,7 +1980,7 @@ pub(crate) fn encode_hybrid_block_int32(
     let format = crate::encode::int32_format_extras(&d);
     let level = carry.level_words(&d.reduced, mono, opts)?;
     let shaping = carry.payload_for_block(pcm.len() / if mono { 1 } else { 2 });
-    let (wv, wvc, sl, shape) = encode_hybrid_block_ints(
+    let (wv, wvc, sl, shape) = encode_hybrid_block_ints_member(
         &d.reduced,
         mono,
         4,
@@ -1715,6 +1990,7 @@ pub(crate) fn encode_hybrid_block_int32(
         Some(&format),
         block_index,
         total_samples,
+        member,
     )?;
     carry.absorb(sl, &shape);
     Ok((wv, wvc))
@@ -2481,6 +2757,72 @@ mod tests {
         assert!(cblocks
             .iter()
             .all(|b| b.find_multichannel_info_sub_block().is_none()));
+    }
+
+    #[test]
+    fn multichannel_hybrid_float_pair_restores_bit_patterns() {
+        use crate::block::{
+            decode_multichannel_stream_f32, decode_multichannel_stream_with_correction_f32,
+        };
+        for channels in [3usize, 4, 5] {
+            let frames = 400usize;
+            let mut pcm = Vec::with_capacity(frames * channels);
+            for f in 0..frames {
+                for ch in 0..channels {
+                    let i = f * channels + ch;
+                    pcm.push(match i % 13 {
+                        0 => 0.0f32,
+                        1 => -0.0,
+                        2 => f32::from_bits(0x0000_0007), // denormal
+                        _ => ((i as f32) * 0.011).sin() * (0.3 + 0.2 * ch as f32),
+                    });
+                }
+            }
+            let o = opts(456, true, Some(DecorrProfile::Normal))
+                .with_shaping(HybridShaping::Static(-500));
+            let enc = encode_multichannel_stream_hybrid_float(&pcm, channels, 150, &o).unwrap();
+            let wvc = enc.wvc.as_ref().expect("correction requested");
+            let exact = decode_multichannel_stream_with_correction_f32(&enc.wv, wvc).unwrap();
+            assert_eq!(exact.channels, channels);
+            let got: Vec<u32> = exact.samples.iter().map(|s| s.to_bits()).collect();
+            let want: Vec<u32> = pcm.iter().map(|s| s.to_bits()).collect();
+            assert_eq!(got, want, "width {channels} float pair bit patterns");
+            // The lossy .wv decodes alone through the f32 twin.
+            let lossy = decode_multichannel_stream_f32(&enc.wv).unwrap();
+            assert_eq!(lossy.channels, channels);
+            assert_eq!(lossy.samples.len(), pcm.len());
+        }
+    }
+
+    #[test]
+    fn multichannel_hybrid_int32_pair_restores_full_range() {
+        use crate::block::{
+            decode_multichannel_stream, decode_multichannel_stream_with_correction,
+        };
+        let channels = 4usize;
+        let frames = 300usize;
+        let mut pcm = Vec::with_capacity(frames * channels);
+        for f in 0..frames {
+            for ch in 0..channels {
+                let i = (f * channels + ch) as i32;
+                pcm.push(match i % 9 {
+                    0 => i32::MIN,
+                    1 => i32::MAX,
+                    2 => i.wrapping_mul(0x0200_0000),
+                    _ => i.wrapping_mul(0x00fe_dcba),
+                });
+            }
+        }
+        let o = opts(456, false, Some(DecorrProfile::Fast));
+        let enc = encode_multichannel_stream_hybrid_int32(&pcm, channels, 100, &o).unwrap();
+        let wvc = enc.wvc.as_ref().expect("correction requested");
+        let exact = decode_multichannel_stream_with_correction(&enc.wv, wvc).unwrap();
+        assert_eq!(exact.channels, channels);
+        assert_eq!(exact.samples, pcm, "int32 multichannel pair losslessness");
+        // The lossy .wv decodes alone (implied-fill window).
+        let lossy = decode_multichannel_stream(&enc.wv).unwrap();
+        assert_eq!(lossy.channels, channels);
+        assert_eq!(lossy.samples.len(), pcm.len());
     }
 
     #[test]
