@@ -105,6 +105,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deconstructions stay mono/stereo-only (matching the crate-level
   origination surface), now a narrower typed refusal.
 
+- Round 447 — **`multichannel_encode_roundtrip` fuzz target.** A
+  round-trip oracle over the whole new multichannel origination
+  surface: fuzz bytes become an interleaved buffer at a fuzz-chosen
+  width (1..=8) and mode (`best` / `smallest` / float / int32 /
+  hybrid pair, with joint + shaping + small-set segmentation axes),
+  and every emitted member-set chain must decode back bit-exactly
+  with green per-member CRC gates (pair losslessness + the container
+  clamp for hybrid). An opening ~698k-run campaign is clean; the
+  minimized corpus is committed, and re-soaks of
+  `hybrid_encode_roundtrip` (~1.57M runs) and
+  `correction_pair_decode` (~249k runs) under the reworked §4.4
+  recurrence are clean too.
+
 - Round 447 — **compact 2-byte `0x07` form + payload-length
   validation.** The spec §4.4 compact shaping payload — one signed
   byte per channel (both present even for mono), expanded by the

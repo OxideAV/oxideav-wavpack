@@ -106,7 +106,7 @@ fuzz_target!(|data: &[u8]| {
             if pcm.is_empty() {
                 return;
             }
-            if stereo && pcm.len() % 2 != 0 {
+            if stereo && !pcm.len().is_multiple_of(2) {
                 pcm.pop();
                 if pcm.is_empty() {
                     return;
@@ -141,7 +141,7 @@ fuzz_target!(|data: &[u8]| {
             if pcm.is_empty() {
                 return;
             }
-            if stereo && pcm.len() % 2 != 0 {
+            if stereo && !pcm.len().is_multiple_of(2) {
                 pcm.pop();
                 if pcm.is_empty() {
                     return;
@@ -165,7 +165,7 @@ fuzz_target!(|data: &[u8]| {
             if pcm.is_empty() {
                 return;
             }
-            if stereo && pcm.len() % 2 != 0 {
+            if stereo && !pcm.len().is_multiple_of(2) {
                 pcm.pop();
                 if pcm.is_empty() {
                     return;

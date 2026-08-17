@@ -84,3 +84,9 @@ name = "bounded_decode_differential"
 path = "fuzz_targets/bounded_decode_differential.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "multichannel_encode_roundtrip"
+path = "fuzz_targets/multichannel_encode_roundtrip.rs"
+test = false
+doc = false
