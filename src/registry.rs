@@ -1155,7 +1155,7 @@ mod tests {
         let pcm: Vec<i32> = (0..4 * 900)
             .map(|i| {
                 let t = (i / 4) as f64 * 0.03;
-                ((t.sin() * 9000.0) as i32 + ((i as i32 * 37) % 200 - 100)).clamp(-32768, 32767)
+                ((t.sin() * 9000.0) as i32 + ((i * 37) % 200 - 100)).clamp(-32768, 32767)
             })
             .collect();
         let half = pcm.len() / 2;
