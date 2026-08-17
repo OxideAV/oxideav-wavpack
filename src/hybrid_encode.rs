@@ -1515,25 +1515,73 @@ pub fn encode_multichannel_stream_hybrid(
     }
     let frames = pcm.len() / channels;
     let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    // One §6.5 / §4.4 state carry per member chain.
+    let mut carries = new_multichannel_carries(opts, channels);
+    let mut wv = Vec::new();
+    let mut wvc_all = Vec::new();
+    encode_multichannel_hybrid_members(
+        pcm,
+        channels,
+        block_samples,
+        bytes_per_sample,
+        opts,
+        &mut carries,
+        0,
+        total,
+        &mut wv,
+        &mut wvc_all,
+    )?;
+    Ok(HybridEncoded {
+        wv,
+        wvc: opts.correction.then_some(wvc_all),
+    })
+}
+
+/// One fresh [`HybridCarry`] per stereo-pair member chain of a
+/// `channels`-wide hybrid multichannel encode (round 447).
+pub(crate) fn new_multichannel_carries(opts: &HybridOptions, channels: usize) -> Vec<HybridCarry> {
+    let member_count = channels.div_ceil(2);
+    (0..member_count)
+        .map(|m| HybridCarry::new(opts, (channels - m * 2).min(2) == 1))
+        .collect()
+}
+
+/// The shared per-set member loop of the hybrid multichannel encoders
+/// (round 447): split `pcm` (whole interleaved frames, already
+/// validated) into sets of `block_samples` frames starting at the
+/// absolute frame index `first_block_index`, encode each set's
+/// stereo-pair members with the per-chain `carries` state, and append
+/// the emitted blocks to `wv` / `wvc_all`. Used by
+/// [`encode_multichannel_stream_hybrid`] and the registry encoder
+/// (which persists `carries` across packets).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_multichannel_hybrid_members(
+    pcm: &[i32],
+    channels: usize,
+    block_samples: usize,
+    bytes_per_sample: u8,
+    opts: &HybridOptions,
+    carries: &mut [HybridCarry],
+    first_block_index: u32,
+    total_samples: u32,
+    wv: &mut Vec<u8>,
+    wvc_all: &mut Vec<u8>,
+) -> Result<()> {
+    let frames = pcm.len() / channels;
     let chunk_frames = if block_samples == 0 {
         DEFAULT_BLOCK_SAMPLES
     } else {
         block_samples
     };
     let member_count = channels.div_ceil(2);
-    // One §6.5 / §4.4 state carry per member chain.
-    let mut carries: Vec<HybridCarry> = (0..member_count)
-        .map(|m| HybridCarry::new(opts, (channels - m * 2).min(2) == 1))
-        .collect();
-
-    let mut wv = Vec::new();
-    let mut wvc_all = Vec::new();
     let mut frame_start: usize = 0;
     while frame_start < frames {
         let frame_end = (frame_start + chunk_frames).min(frames);
         let set_frames = frame_end - frame_start;
-        let block_index =
-            u32::try_from(frame_start).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+        let block_index = u32::try_from(frame_start)
+            .ok()
+            .and_then(|fs| first_block_index.checked_add(fs))
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
 
         for (m, carry) in carries.iter_mut().enumerate() {
             let ch = m * 2;
@@ -1573,7 +1621,7 @@ pub fn encode_multichannel_stream_hybrid(
                 shaping.as_deref(),
                 None,
                 block_index,
-                total,
+                total_samples,
                 member,
             )?;
             wv.extend_from_slice(&blk);
@@ -1584,10 +1632,7 @@ pub fn encode_multichannel_stream_hybrid(
         }
         frame_start = frame_end;
     }
-    Ok(HybridEncoded {
-        wv,
-        wvc: opts.correction.then_some(wvc_all),
-    })
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

@@ -95,6 +95,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   binary. Every hybrid axis the crate decodes is now also originated
   at every channel width.
 
+- Round 447 — **registry hybrid multichannel.** The framework
+  encoder's hybrid mode accepts wider integer layouts: >2-channel
+  frames encode through the same per-set member loop the crate-level
+  hybrid multichannel encoder uses, with **one `HybridCarry` per
+  member chain persisted across packets** — so concatenated packets
+  form one contiguous, seekable, conformant lossy chain whose `0x06`
+  level words carry rather than re-seed. The float / int32 hybrid
+  deconstructions stay mono/stereo-only (matching the crate-level
+  origination surface), now a narrower typed refusal.
+
 - Round 447 — **compact 2-byte `0x07` form + payload-length
   validation.** The spec §4.4 compact shaping payload — one signed
   byte per channel (both present even for mono), expanded by the
