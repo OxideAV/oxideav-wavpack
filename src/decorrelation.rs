@@ -454,8 +454,10 @@ pub fn expand_weights(payload: &[u8]) -> DecorrelationWeights {
 /// Single-byte log-pack expander used by [`expand_weights`].
 ///
 /// Exposed pub(crate) so the test module can call it directly without
-/// allocating a [`Vec`] for every assertion.
-fn expand_weight_byte(byte: u8) -> i32 {
+/// allocating a [`Vec`] for every assertion, and so the `0x07` compact
+/// shaping form (spec §4.4 — the 2-byte payload's signed bytes expand
+/// by this same restore rule) can reuse it.
+pub(crate) fn expand_weight_byte(byte: u8) -> i32 {
     // The on-disk byte is a signed 8-bit value. Sign-extension into
     // i32 lets the < 0 / > 0 / == 0 branching match the wiki snippet
     // straightforwardly.

@@ -223,6 +223,14 @@ pub enum Error {
     /// or carries a negative seed in either set (same defensive
     /// rejection as the mono variant). Round 201.
     InvalidEntropyInfoForStereo,
+    /// A `0x07` shaping-weights payload has a length that is none of
+    /// the documented forms (spec §4.4): 2 bytes (the compact
+    /// signed-byte form, both channels present even for mono), 4 / 8
+    /// bytes (mono / stereo `[error, acc]` log words) or 6 / 12 bytes
+    /// (the long form with the trailing per-channel `delta` group).
+    /// The contained value is the offending payload length in bytes.
+    /// Round 447.
+    InvalidShapingWeightsLength(usize),
     /// `WavPackBlock::decode_samples` was called on a block that does
     /// not carry a `0x05` entropy-info sub-block — the medians driving
     /// the round-15/199 `0x0A` per-sample decode must come from the
@@ -384,9 +392,10 @@ pub enum Error {
     /// the `CROSS_DECORR` (`0x20`) *pre*-decorrelation fold (which must run
     /// before the decorrelation passes, not on the reconstructed output),
     /// or the `HYBRID_SHAPE` (`0x40`) / `NEW_SHAPING` (`0x2000_0000`)
-    /// noise-shaped fold (whose `read_shaping_info` state layout is a
-    /// documented gap). The raw post-decorrelation fold is correct only
-    /// for the non-cross, non-shaped case.
+    /// noise-shaped fold (which routes through the `ShapingState`
+    /// filter in the end-to-end pair decode, spec §4.4 — not an
+    /// after-the-fact raw add). The raw post-decorrelation fold is
+    /// correct only for the non-cross, non-shaped case.
     HybridFoldPlacementUnsupported,
     /// A block-encode was requested with an empty PCM buffer. A WavPack
     /// audio block carries `block_samples >= 1` (the wiki "samples in
@@ -662,6 +671,10 @@ impl core::fmt::Display for Error {
             ),
             Error::InvalidEntropyInfoForStereo => f.write_str(
                 "oxideav-wavpack: decode_packed_samples_stereo_from_entropy: EntropyInfo is mono or carries a negative per-channel seed",
+            ),
+            Error::InvalidShapingWeightsLength(len) => write!(
+                f,
+                "oxideav-wavpack: ShapingState::from_shaping_words: 0x07 payload length {len} is none of the documented forms (2 compact; 4/6 mono; 8/12 stereo)"
             ),
             Error::BlockMissingEntropyInfo => f.write_str(
                 "oxideav-wavpack: WavPackBlock::decode_samples: block carries no 0x05 entropy-info sub-block",

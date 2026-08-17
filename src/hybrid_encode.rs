@@ -142,13 +142,13 @@ pub enum HybridShaping {
         /// **rail-saturated**: each block's delta is shrunk (down to
         /// `0`) so the accumulator can never leave the full-scale
         /// `±1024` weight range inside the block — the ramp runs to
-        /// the rail and holds there. Black-box finding behind the
-        /// rail: trajectories that cross **below** `-1024` can decode
-        /// differently under the reference decoder (the staged spec
-        /// names an IIR variant for negative weights whose exact
-        /// out-of-range recurrence is an open docs gap), while the
-        /// validated envelope — every static weight in `±1024` and
-        /// every in-range ramp — is bit-exact under it.
+        /// the rail and holds there. Spec §4.4.1 rationale: at exactly
+        /// `-1024` the filter sits at unity gain, bounded only by the
+        /// equality nudge; past it the loop gain exceeds 1 and the
+        /// decode legitimately diverges into the §5.6 mute gate — so
+        /// an encoder must never let the accumulator cross the rail
+        /// (the spec's own encoder-side guidance), which is exactly
+        /// what the per-block saturation guarantees.
         delta: i32,
     },
 }
@@ -886,8 +886,10 @@ pub(crate) fn encode_hybrid_block_ints(
     };
     let mut hybrid = HybridState::from_profile(&profile);
     // The 0x07-seeded shaping filter, in exact decoder lockstep (an
-    // absent payload seeds the all-zero no-op state).
-    let mut shaping = crate::ShapingState::from_shaping_words(shaping_payload, stereo);
+    // absent payload seeds the all-zero no-op state). A shaped encode
+    // always sets flag bits 6 and 29 together (the reference shaped
+    // combination), so the state runs with the NEW_SHAPING arm live.
+    let mut shaping = crate::ShapingState::from_shaping_words(shaping_payload, stereo, true)?;
 
     let streams = if mono {
         let mut stepper = MonoStepper::new(passes)?;
@@ -1149,10 +1151,13 @@ impl HybridCarry {
         };
         HybridCarry {
             level: None,
-            shaping: opts
-                .shaping
-                .initial_payload(stereo)
-                .map(|p| crate::ShapingState::from_shaping_words(Some(&p), stereo)),
+            shaping: opts.shaping.initial_payload(stereo).map(|p| {
+                // Self-packed payloads are always a documented layout
+                // (short or long form), and a shaped encode runs with
+                // the NEW_SHAPING arm live (bits 6/29 set together).
+                crate::ShapingState::from_shaping_words(Some(&p), stereo, true)
+                    .expect("encoder-packed 0x07 payload is a documented layout")
+            }),
             requested_delta,
             with_delta: opts.shaping.with_delta(),
             stereo,
@@ -2222,7 +2227,7 @@ mod tests {
         // Mono static layout: [error, acc] (2 log words), zero error
         // seed, acc = quantized 717 << 16.
         assert_eq!(sp.payload.len(), 4);
-        let st = crate::ShapingState::from_shaping_words(Some(sp.payload), false);
+        let st = crate::ShapingState::from_shaping_words(Some(sp.payload), false, true).unwrap();
         assert_eq!(st.error(0), 0);
         // The 0x07 sub-block leads the correction chain (reference
         // pair-encode placement): first metadata id byte after the

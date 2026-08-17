@@ -741,7 +741,11 @@ impl<'a> WavPackBlock<'a> {
         let stereo = !flags.is_block_data_mono();
         let profile = crate::hybrid::expand_hybrid_profile(profile_sub.payload, stereo)?;
         let mut hybrid = crate::HybridState::from_profile(&profile);
-        let mut shaping = crate::ShapingState::from_shaping_words(shaping_payload, stereo);
+        let mut shaping = crate::ShapingState::from_shaping_words(
+            shaping_payload,
+            stereo,
+            flags.hybrid_noise_shaping_iir,
+        )?;
 
         let (exact, coarse) = if stereo {
             if entropy_sub.payload.len() != crate::entropy::STEREO_PAYLOAD_BYTES {

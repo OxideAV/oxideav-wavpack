@@ -63,18 +63,20 @@
 //! encoder emitted with the original sample to recover the residual the
 //! decoder's [`fold_correction`] consumes.
 //!
-//! ## Not covered (documented gaps)
+//! ## Shaped folds route through the pair decode
 //!
 //! The **noise-shaping** variant of the correction fold (`HYBRID_SHAPE`
-//! `0x40` / `NEW_SHAPING` `0x20000000`, spec §4.1) replaces the raw add
-//! with a first-order error-feedback filter whose per-channel shaping
-//! weight/state come from the `0x07` metadata — a seed layout the
-//! staged docs name but do not transcribe. The raw-add fold here is the
-//! `HYBRID_SHAPE`-clear case; the shaped **fold** stays a documented
-//! gap. (Note the shaping bits do NOT affect the `.wv`-only lossy
-//! decode — round-408 black-box fixtures carry `HYBRID_SHAPE` and
-//! decode bit-exact without any shaping arithmetic; the filter only
-//! participates when folding a `0x0B` correction stream.)
+//! `0x40` / `NEW_SHAPING` `0x20000000`, spec §4.4) replaces the raw add
+//! with the first-order error-feedback filter [`ShapingState`] runs,
+//! seeded from the `0x07` metadata. The raw-add primitives here cover
+//! only the `HYBRID_SHAPE`-clear case; a shaped block's correction must
+//! fold through the end-to-end pair decode
+//! (`decode_samples_with_correction` and its stream twins), which runs
+//! the filter in-line. (Note the shaping bits do NOT affect the
+//! `.wv`-only lossy decode — round-408 black-box fixtures carry
+//! `HYBRID_SHAPE` and decode bit-exact without any shaping arithmetic;
+//! the filter only participates when folding a `0x0B` correction
+//! stream.)
 
 use crate::error::{Error, Result};
 
@@ -88,16 +90,17 @@ pub const HYBRID_FLAG: u32 = 0x08;
 pub const CROSS_DECORR_FLAG: u32 = 0x20;
 
 /// The `HYBRID_SHAPE` bit (`0x40`, spec §6): the correction is applied
-/// through a first-order error-feedback (noise-shaping) filter rather than
-/// added raw. The shaped fold is **not** implemented here (its
-/// `read_shaping_info` state layout is a documented gap); this constant
-/// names the flag so a consumer can detect and refuse the shaped case
-/// before reaching the raw-add fold.
+/// through the first-order error-feedback (noise-shaping) filter
+/// ([`ShapingState`], spec §4.4) rather than added raw. The raw-add
+/// fold primitives in this module refuse the shaped case; the
+/// end-to-end pair decode runs the filter in-line.
 pub const HYBRID_SHAPE_FLAG: u32 = 0x40;
 
-/// The `NEW_SHAPING` bit (`0x2000_0000`, spec §6): selects the IIR
-/// negative-shaping variant of the [`HYBRID_SHAPE_FLAG`] error-feedback
-/// filter. Like `HYBRID_SHAPE`, the shaped fold is not implemented here.
+/// The `NEW_SHAPING` bit (`0x2000_0000`, spec §6): the negative-weight
+/// arm of the [`HYBRID_SHAPE_FLAG`] error-feedback filter takes the IIR
+/// form (spec §4.4: the equality nudge plus the fed-back error update);
+/// when clear, every sample takes the FIR arm regardless of weight
+/// sign.
 pub const NEW_SHAPING_FLAG: u32 = 0x2000_0000;
 
 /// Fold one correction residual into a reconstructed lossy sample
@@ -449,32 +452,50 @@ impl HybridState {
 ///
 /// ## Wire layout of `0x07` (in the **correction** block)
 ///
-/// Little-endian 16-bit **log-packed** words (each unpacked with
-/// [`crate::wp_exp2s`]):
+/// Three payload lengths occur, discriminated by byte count (spec
+/// §4.4). The short / long forms are little-endian 16-bit
+/// **log-packed** words (each unpacked with [`crate::wp_exp2s`]):
 ///
-/// | Shape                | Words                                              |
-/// | -------------------- | -------------------------------------------------- |
-/// | mono, static shaping | `[error, acc]`                                     |
-/// | mono, dynamic (DNS)  | `[error, acc, delta]`                              |
-/// | stereo, static       | `[error0, acc0, error1, acc1]`                     |
-/// | stereo, dynamic      | `[error0, acc0, error1, acc1, delta0, delta1]`     |
+/// | Shape                     | Bytes | Content                                        |
+/// | ------------------------- | ----- | ---------------------------------------------- |
+/// | compact (static, no seed) | 2     | two **signed bytes** (see below)               |
+/// | mono, static shaping      | 4     | `[error, acc]`                                 |
+/// | mono, dynamic (DNS)       | 6     | `[error, acc, delta]`                          |
+/// | stereo, static            | 8     | `[error0, acc0, error1, acc1]`                 |
+/// | stereo, dynamic           | 12    | `[error0, acc0, error1, acc1, delta0, delta1]` |
 ///
 /// The **error seed is negated** on the wire (`error = -wp_exp2s(word)`);
-/// `acc` / `delta` unpack directly. A missing `0x07` (the no-shaping
-/// `-s0` encode) seeds everything at zero, making every `temp` zero —
-/// the raw §4.1 fold.
+/// `acc` / `delta` unpack directly. The **compact 2-byte form** does
+/// not use the log packing: it carries one signed byte per channel
+/// (both present even for a mono stream), each expanded by the same
+/// restore rule the `0x03` decorrelation weights use (multiply by 8;
+/// if positive add `(result + 64) >> 7`) and shifted left 16 into the
+/// accumulator — a constant whole-block weight with no error seed and
+/// no `delta`. Any other payload length is invalid (typed
+/// [`crate::Error::InvalidShapingWeightsLength`] refusal). A missing
+/// `0x07` (the no-shaping encode) seeds everything at zero, making
+/// every `temp` zero — the raw §4.1 fold.
 ///
-/// ## Per-sample recurrence
+/// ## Per-sample recurrence (spec §4.4)
 ///
 /// ```text
 /// acc += delta;  weight = acc >> 16
 /// temp = -((weight * error + 511) >> 10)
-/// if weight < 0 and |temp| >= |error| != 0:
-///     temp = sign(temp) * (|error| - 1)      // unit-magnitude nudge
+/// if NEW_SHAPING and weight < 0 and temp != 0 and temp == error:
+///     temp -= sign(temp)                     // equality nudge — NOT a cap
 /// exact = wvc_bracket_value + temp           // bracketed samples only
-/// error = (exact - coarse)                   // weight <  0
-/// error = (exact - coarse) - temp            // weight >= 0
+/// error = (exact - coarse)                   // IIR arm: NEW_SHAPING, weight < 0, temp != 0
+/// error = (exact - coarse) - temp            // FIR arm: otherwise
 /// ```
+///
+/// The nudge is an **equality test**: it fires only when `temp` lands
+/// exactly on `error` — which happens identically at `weight == -1024`
+/// (unity gain) and never below it, so trajectories past the rail
+/// legitimately diverge until the §5.6 mute gate zeroes the block
+/// (spec §4.4.1; do **not** clamp the weight, saturate the
+/// accumulator, or cap `|temp|`). When the block's `NEW_SHAPING` flag
+/// (bit 29) is clear the FIR arm is taken for every sample regardless
+/// of weight sign, and the nudge never fires.
 ///
 /// Zero-run / lossless-dispatch samples apply no `temp` and update the
 /// error state with `exact == coarse` (both zero for run members).
@@ -483,16 +504,54 @@ pub struct ShapingState {
     error: [i32; 2],
     acc: [i32; 2],
     delta: [i32; 2],
+    /// Block-flag bit 29 (`NEW_SHAPING`): gates the equality nudge and
+    /// the IIR error-update arm (spec §4.4). Clear ⇒ FIR arm always.
+    new_shaping: bool,
 }
 
 impl ShapingState {
-    /// Seed from a `0x07` payload (`None` / empty → all-zero state, the
+    /// Seed from a `0x07` payload (`None` → all-zero state, the
     /// no-shaping raw fold). `stereo` selects the per-channel word
-    /// interleave shown in the type-level docs.
-    #[must_use]
-    pub fn from_shaping_words(payload: Option<&[u8]>, stereo: bool) -> Self {
-        let words: Vec<i32> = payload
-            .unwrap_or(&[])
+    /// interleave shown in the type-level docs; `new_shaping` is the
+    /// block's flag bit 29 (see the recurrence above).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidShapingWeightsLength`] when the payload
+    /// length is none of the documented forms (2 compact; 4 / 6 mono;
+    /// 8 / 12 stereo).
+    pub fn from_shaping_words(
+        payload: Option<&[u8]>,
+        stereo: bool,
+        new_shaping: bool,
+    ) -> crate::Result<Self> {
+        let Some(p) = payload else {
+            return Ok(ShapingState {
+                new_shaping,
+                ..ShapingState::default()
+            });
+        };
+        // The compact 2-byte form: one signed byte per channel (both
+        // present even for mono), decorrelation-weight restore rule,
+        // shifted left 16 into the accumulator (spec §4.4).
+        if p.len() == 2 {
+            let acc = |b: u8| crate::decorrelation::expand_weight_byte(b) << 16;
+            return Ok(ShapingState {
+                error: [0, 0],
+                acc: [acc(p[0]), acc(p[1])],
+                delta: [0, 0],
+                new_shaping,
+            });
+        }
+        let valid = if stereo {
+            p.len() == 8 || p.len() == 12
+        } else {
+            p.len() == 4 || p.len() == 6
+        };
+        if !valid {
+            return Err(crate::Error::InvalidShapingWeightsLength(p.len()));
+        }
+        let words: Vec<i32> = p
             .chunks_exact(2)
             .map(|c| crate::logpack::wp_exp2s(i32::from(i16::from_le_bytes([c[0], c[1]]))))
             .collect();
@@ -502,45 +561,47 @@ impl ShapingState {
         // itself (round-415 fuzz find; 32-bit-register semantics as
         // everywhere else in the recurrence).
         let e = |i: usize| g(i).wrapping_neg();
-        if stereo {
+        Ok(if stereo {
             ShapingState {
                 error: [e(0), e(2)],
                 acc: [g(1), g(3)],
                 delta: [g(4), g(5)],
+                new_shaping,
             }
         } else {
             ShapingState {
                 error: [e(0), 0],
                 acc: [g(1), 0],
                 delta: [g(2), 0],
+                new_shaping,
             }
-        }
+        })
     }
 
     /// Advance `channel`'s weight one sample (`acc += delta`) and return
     /// this sample's `temp` term from the pre-update error state.
     ///
-    /// The accumulator add and the `temp` product/bias arithmetic wrap in
-    /// 32 bits: adversarial `0x07` seeds can drive `acc`/`delta` (and the
-    /// error state) to magnitudes where the canonical 32-bit-register
-    /// arithmetic wraps, and the decoder must follow it rather than
-    /// overflow (round-415 fuzz find; same posture as the round-386
-    /// wrapping-predictor fix).
+    /// The accumulator add wraps in 32 bits (adversarial `0x07` seeds
+    /// can drive `acc`/`delta` to the wrap point, and the decoder must
+    /// follow rather than overflow — round-415 fuzz find; same posture
+    /// as the round-386 wrapping predictors). The `weight * error`
+    /// product is **exact** (spec §4.4.1 verification note: the
+    /// wide-magnitude split form the recurrence uses past the
+    /// signed-16-bit error range is an overflow-avoidance rewrite of
+    /// the same value, not a second rounding rule), with the result
+    /// stored back in 32 bits.
     pub fn advance(&mut self, channel: usize) -> i32 {
         let ch = channel & 1;
         self.acc[ch] = self.acc[ch].wrapping_add(self.delta[ch]);
         let weight = self.acc[ch] >> 16;
         let err = self.error[ch];
-        if err == 0 {
-            return 0;
-        }
-        let mut temp = -(weight.wrapping_mul(err).wrapping_add(511) >> 10);
-        if weight < 0 && temp.unsigned_abs() >= err.unsigned_abs() {
-            // The unit-magnitude nudge: |temp| stays strictly below
-            // |error| under a negative weight. (`|err| - 1` is computed
-            // in u32 so an `i32::MIN` error state cannot overflow the
-            // subtraction; the result always fits `i32`.)
-            temp = temp.signum().wrapping_mul((err.unsigned_abs() - 1) as i32);
+        let mut temp = (-((i64::from(weight) * i64::from(err) + 511) >> 10)) as i32;
+        // Spec §4.4: ONE conditional nudge, an equality test — not a
+        // cap. It fires exactly at the -1024 unity-gain rail and never
+        // past it (§4.4.1); out-of-rail trajectories must be left to
+        // diverge into the §5.6 mute gate.
+        if self.new_shaping && weight < 0 && temp != 0 && temp == err {
+            temp -= temp.signum();
         }
         temp
     }
@@ -552,7 +613,11 @@ impl ShapingState {
     pub fn update(&mut self, channel: usize, exact: i32, coarse: i32, temp: i32) {
         let ch = channel & 1;
         let q = exact.wrapping_sub(coarse);
-        self.error[ch] = if self.acc[ch] >> 16 < 0 {
+        // Spec §4.4: the IIR arm (error keeps the fed-back temp) is
+        // gated on NEW_SHAPING, a negative weight and a non-zero temp;
+        // every other combination takes the FIR arm. (When temp == 0
+        // the arms coincide.)
+        self.error[ch] = if self.new_shaping && self.acc[ch] >> 16 < 0 && temp != 0 {
             q
         } else {
             q.wrapping_sub(temp)
@@ -609,13 +674,14 @@ impl ShapingState {
 }
 
 /// `true` when the flag word selects the **noise-shaped** correction fold
-/// (`HYBRID_SHAPE` or `NEW_SHAPING`), which this module does not implement.
+/// (`HYBRID_SHAPE` or `NEW_SHAPING`).
 ///
 /// A hybrid consumer should test this before applying the raw-add fold:
 /// when it is `true` the correction must be applied through the
-/// error-feedback filter (spec §4.1), whose `read_shaping_info` state
-/// layout is a documented gap — so the raw add here would produce wrong
-/// samples. The raw-add fold is correct only when this returns `false`.
+/// [`ShapingState`] error-feedback filter (spec §4.4) — the end-to-end
+/// pair decode (`decode_samples_with_correction`) does exactly that —
+/// so the raw add here would produce wrong samples. The raw-add fold
+/// is correct only when this returns `false`.
 #[inline]
 #[must_use]
 pub fn flags_select_shaping(flags: u32) -> bool {
@@ -654,9 +720,11 @@ pub enum CorrectionFold {
     /// this flag.
     PreDecorrelationCross,
     /// The correction is applied through the `HYBRID_SHAPE` / `NEW_SHAPING`
-    /// error-feedback filter (spec §4.1). Not a raw add; its
-    /// `read_shaping_info` state layout is a documented gap, so no fold is
-    /// available here.
+    /// error-feedback filter (spec §4.4, the [`ShapingState`]
+    /// recurrence). Not a raw add — use the end-to-end pair decode
+    /// (`decode_samples_with_correction` and its stream/multichannel
+    /// twins), which runs the filter in-line; the after-the-fact raw
+    /// fold primitives refuse this placement.
     NoiseShaped,
 }
 
@@ -712,7 +780,7 @@ mod tests {
         for w in [0i16, -6736, -3602] {
             p.extend_from_slice(&w.to_le_bytes());
         }
-        let st = ShapingState::from_shaping_words(Some(&p), false);
+        let st = ShapingState::from_shaping_words(Some(&p), false, true).unwrap();
         assert_eq!(st.error(0), 0);
         let mut probe = st;
         // First advance: acc += delta, weight = acc >> 16.
@@ -723,64 +791,115 @@ mod tests {
         for w in [-1825i16, -6716, -1825, -6716] {
             p.extend_from_slice(&w.to_le_bytes());
         }
-        let st = ShapingState::from_shaping_words(Some(&p), true);
+        let st = ShapingState::from_shaping_words(Some(&p), true, true).unwrap();
         assert_eq!(st.error(0), -crate::logpack::wp_exp2s(-1825));
         assert_eq!(st.error(0), 70, "negated log-packed error seed");
         assert_eq!(st.error(1), 70);
     }
 
     #[test]
-    fn shaping_absent_payload_is_the_raw_fold() {
-        let mut st = ShapingState::from_shaping_words(None, false);
-        for _ in 0..8 {
-            assert_eq!(st.advance(0), 0);
-            st.update(0, 123, 120, 0);
-            // weight stays 0 (acc 0, delta 0) → temp stays 0 even with
-            // a non-zero error state.
-            assert_eq!(st.advance(0), 0);
+    fn shaping_compact_form_seeds_the_accumulator_only() {
+        // Spec §4.4: the 2-byte compact form carries one signed byte
+        // per channel (both present even for mono), expanded by the
+        // decorrelation-weight restore rule (×8; positive values add
+        // `(v + 64) >> 7`) and shifted left 16 into the accumulator.
+        // Byte 127 → 1016 + (1080 >> 7) = 1024 (the positive rail);
+        // byte -128 (0x80) → -1024; byte -96 (0xA0) → -768 (negative
+        // values take no rounding add).
+        let st = ShapingState::from_shaping_words(Some(&[127, 0xA0]), true, true).unwrap();
+        assert_eq!(st.acc(0), 1024 << 16);
+        assert_eq!(st.acc(1), -768 << 16);
+        assert_eq!(st.error(0), 0, "compact form seeds no error state");
+        assert_eq!(st.error(1), 0);
+        let mut probe = st;
+        probe.advance(0);
+        assert_eq!(st.acc(0), probe.acc(0), "compact form carries no delta");
+        // Mono reads channel 0 from byte 0 (byte 1 is present on the
+        // wire but belongs to the absent channel).
+        let st = ShapingState::from_shaping_words(Some(&[0x80, 127]), false, true).unwrap();
+        assert_eq!(st.acc(0), -1024 << 16);
+        // The compact form is legal for both channel shapes.
+        assert!(ShapingState::from_shaping_words(Some(&[1, 2]), false, true).is_ok());
+    }
+
+    #[test]
+    fn shaping_payload_lengths_are_validated() {
+        // Spec §4.4: three documented forms per channel shape; any
+        // other length is invalid. (6 bytes is the mono long form but
+        // no stereo form; 4/8 swap the same way.)
+        for (len, stereo, ok) in [
+            (0usize, false, false),
+            (1, false, false),
+            (2, false, true),
+            (3, false, false),
+            (4, false, true),
+            (5, false, false),
+            (6, false, true),
+            (8, false, false),
+            (12, false, false),
+            (0, true, false),
+            (2, true, true),
+            (4, true, false),
+            (6, true, false),
+            (8, true, true),
+            (10, true, false),
+            (12, true, true),
+            (14, true, false),
+        ] {
+            let payload = vec![0u8; len];
+            let got = ShapingState::from_shaping_words(Some(&payload), stereo, true);
+            match (ok, got) {
+                (true, Ok(_)) => {}
+                (false, Err(crate::Error::InvalidShapingWeightsLength(l))) => assert_eq!(l, len),
+                (want, got) => panic!("len {len} stereo {stereo}: want ok={want}, got {got:?}"),
+            }
         }
     }
 
     #[test]
-    fn shaping_advance_wraps_on_adversarial_seeds() {
-        // Round-415 fuzz find: adversarial 0x07 seed words can drive
-        // `acc` / `delta` to magnitudes where `acc += delta` overflows
-        // an i32 in debug builds, and an `i32::MIN` error state
-        // overflowed the nudge's `|err| - 1`. The recurrence wraps in
-        // 32 bits instead (the same posture as the round-386 wrapping
-        // predictors); each call must simply return.
+    fn shaping_advance_is_exact_product_with_wrapping_store() {
+        // The `weight * error` product is exact (spec §4.4.1: the
+        // wide-magnitude split form is an overflow-avoidance rewrite,
+        // not a second rounding rule); the result is stored back in 32
+        // bits, and the accumulator add wraps (round-415 fuzz posture).
+        // weight = i32::MIN >> 16 = -32768, error = i32::MIN: the exact
+        // product is 2^46; (2^46 + 511) >> 10 = 2^36, whose low 32 bits
+        // are 0 — so temp is 0 and the nudge (temp != 0) cannot fire.
         let mut st = ShapingState {
-            error: [i32::MIN, 5],
-            acc: [i32::MAX, i32::MIN],
-            delta: [i32::MAX, i32::MIN],
-        };
-        for _ in 0..8 {
-            let t0 = st.advance(0);
-            let t1 = st.advance(1);
-            st.update(0, i32::MIN, i32::MAX, t0);
-            st.update(1, i32::MAX, i32::MIN, t1);
-        }
-        // Nudge arm specifically: negative weight with err == i32::MIN.
-        let mut nudge = ShapingState {
             error: [i32::MIN, 0],
             acc: [i32::MIN, 0],
             delta: [0, 0],
+            new_shaping: true,
         };
-        let t = nudge.advance(0);
-        // |temp| stays strictly below |error|.
-        assert!(t.unsigned_abs() < (i32::MIN).unsigned_abs());
+        assert_eq!(st.advance(0), 0);
+        // The accumulator add wraps rather than overflowing.
+        let mut st = ShapingState {
+            error: [5, 5],
+            acc: [i32::MAX, i32::MIN],
+            delta: [i32::MAX, i32::MIN],
+            new_shaping: true,
+        };
+        let _ = st.advance(0);
+        let _ = st.advance(1);
+        assert_eq!(st.acc(0), i32::MAX.wrapping_add(i32::MAX));
+        assert_eq!(st.acc(1), i32::MIN.wrapping_add(i32::MIN));
     }
 
     #[test]
     fn shaping_seed_expansion_accepts_every_log_word() {
         // Round-415 fuzz find: the error-seed negation must wrap (a log
         // word can expand to i32::MIN). Every 16-bit word — and thus
-        // every possible 0x07 seed byte pair — must construct.
+        // every possible 0x07 seed byte pair — must construct, in both
+        // documented long forms.
         for w in i16::MIN..=i16::MAX {
             let b = w.to_le_bytes();
-            let payload = [b[0], b[1], b[0], b[1], b[0], b[1]];
-            let _ = ShapingState::from_shaping_words(Some(&payload), false);
-            let _ = ShapingState::from_shaping_words(Some(&payload), true);
+            let mono = [b[0], b[1], b[0], b[1], b[0], b[1]];
+            let _ = ShapingState::from_shaping_words(Some(&mono), false, true).unwrap();
+            let mut stereo = Vec::with_capacity(12);
+            for _ in 0..6 {
+                stereo.extend_from_slice(&b);
+            }
+            let _ = ShapingState::from_shaping_words(Some(&stereo), true, true).unwrap();
         }
     }
 
@@ -793,7 +912,7 @@ mod tests {
         for w in [0i16, -6736, -3602] {
             p.extend_from_slice(&w.to_le_bytes());
         }
-        let mut st = ShapingState::from_shaping_words(Some(&p), false);
+        let mut st = ShapingState::from_shaping_words(Some(&p), false, true).unwrap();
         // Prime the error state as if the previous sample left q = 62.
         st.update(0, 62, 0, 0);
         assert_eq!(st.advance(0), 39);
@@ -802,46 +921,129 @@ mod tests {
     }
 
     #[test]
-    fn shaping_unit_magnitude_nudge_caps_small_errors() {
-        // Negative weight, |error| == 1 → temp 0; |error| == 2 with a
-        // strong weight (-768 = -0.75) would round to 2 but is capped
-        // at 1 (round-408 pin: the unit-magnitude nudge).
+    fn shaping_equality_nudge_fires_only_on_exact_landing() {
+        // Spec §4.4: the nudge is an equality test (`temp == error`),
+        // not a cap. In-rail it coincides with the round-408 black-box
+        // reading: weight -768, |error| == 2 rounds temp to 2 == error
+        // → nudged to 1; error 90 gives temp 68 ≠ 90 → untouched.
         let mut p = Vec::new();
         // acc word: wp_log2-domain value expanding to -768 << 16.
         // wp_exp2s(-6806) == -50331648 == -768 * 65536.
         for w in [0i16, -6806, 0] {
             p.extend_from_slice(&w.to_le_bytes());
         }
-        let mut st = ShapingState::from_shaping_words(Some(&p), false);
+        let mut st = ShapingState::from_shaping_words(Some(&p), false, true).unwrap();
         assert_eq!(crate::logpack::wp_exp2s(-6806), -768 << 16);
         st.update(0, 1, 0, 0);
-        assert_eq!(st.advance(0), 0, "unit error is inert");
+        assert_eq!(st.advance(0), 0, "unit error lands exactly → nudged to 0");
         st.update(0, -1, 0, 0);
         assert_eq!(st.advance(0), 0);
         st.update(0, 2, 0, 0);
-        assert_eq!(st.advance(0), 1, "capped strictly below |error|");
+        assert_eq!(st.advance(0), 1, "temp == error → magnitude shaved by 1");
         st.update(0, 90, 0, 0);
-        assert_eq!(st.advance(0), 68, "half products round away from zero");
+        assert_eq!(st.advance(0), 68, "no equality → no nudge");
     }
 
     #[test]
-    fn shaping_error_update_branches_on_weight_sign() {
-        // Positive weight: error accumulates q - temp; negative: q.
+    fn shaping_rail_is_unity_gain_and_past_rail_diverges() {
+        // Spec §4.4.1: at weight == -1024 `temp == error` identically,
+        // so the nudge fires on every sample and the loop gain stays
+        // just below 1; past the rail the equality never holds, the
+        // nudge never fires, and |temp| overshoots |error|.
+        let rail = |err: i32| {
+            let mut st = ShapingState {
+                error: [err, 0],
+                acc: [-1024 << 16, 0],
+                delta: [0, 0],
+                new_shaping: true,
+            };
+            st.advance(0)
+        };
+        assert_eq!(rail(1000), 999);
+        assert_eq!(rail(-1000), -999);
+        assert_eq!(rail(1), 0);
+        let past = |err: i32| {
+            let mut st = ShapingState {
+                error: [err, 0],
+                acc: [-1025 << 16, 0],
+                delta: [0, 0],
+                new_shaping: true,
+            };
+            st.advance(0)
+        };
+        // -((-1025 * 1000 + 511) >> 10) = 1001 > 1000: overshoot, kept.
+        assert_eq!(past(1000), 1001);
+        assert_eq!(past(-1000), -1001);
+        // Out-of-rail trajectories diverge geometrically: feeding the
+        // IIR arm (error' = q where exact tracks coarse + temp) grows
+        // the error magnitude strictly on every step.
+        let mut st = ShapingState {
+            error: [1000, 0],
+            acc: [-1100 << 16, 0],
+            delta: [0, 0],
+            new_shaping: true,
+        };
+        let mut last = 1000i64;
+        for _ in 0..16 {
+            let temp = st.advance(0);
+            st.update(0, temp, 0, temp); // q == temp → IIR arm keeps it
+            let now = i64::from(st.error(0)).abs();
+            assert!(now > last, "gain past the rail must exceed 1");
+            last = now;
+        }
+    }
+
+    #[test]
+    fn shaping_new_shaping_clear_takes_fir_arm_everywhere() {
+        // Spec §4.4: with flag bit 29 clear the FIR arm is taken for
+        // every sample regardless of weight sign, and the nudge never
+        // fires — even exactly at the -1024 rail.
+        let mut st = ShapingState {
+            error: [1000, 0],
+            acc: [-1024 << 16, 0],
+            delta: [0, 0],
+            new_shaping: false,
+        };
+        assert_eq!(st.advance(0), 1000, "no nudge with NEW_SHAPING clear");
+        st.update(0, 100, 60, 7);
+        assert_eq!(st.error(0), 100 - 60 - 7, "FIR arm under negative weight");
+    }
+
+    #[test]
+    fn shaping_error_update_selects_the_arm() {
+        // Spec §4.4: IIR arm (error keeps the fed-back temp) iff
+        // NEW_SHAPING and weight < 0 and temp != 0; FIR otherwise.
         let mut p = Vec::new();
         for w in [0i16, 6806, 0] {
             p.extend_from_slice(&w.to_le_bytes());
         }
-        let mut pos = ShapingState::from_shaping_words(Some(&p), false);
+        let mut pos = ShapingState::from_shaping_words(Some(&p), false, true).unwrap();
         pos.update(0, 100, 60, 7);
-        assert_eq!(pos.error(0), 100 - 60 - 7);
+        assert_eq!(pos.error(0), 100 - 60 - 7, "positive weight → FIR");
 
         let mut p = Vec::new();
         for w in [0i16, -6806, 0] {
             p.extend_from_slice(&w.to_le_bytes());
         }
-        let mut neg = ShapingState::from_shaping_words(Some(&p), false);
+        let mut neg = ShapingState::from_shaping_words(Some(&p), false, true).unwrap();
         neg.update(0, 100, 60, 7);
-        assert_eq!(neg.error(0), 40);
+        assert_eq!(neg.error(0), 40, "negative weight + NEW_SHAPING → IIR");
+        // temp == 0: the arms coincide (q - 0 == q).
+        let mut zero = ShapingState::from_shaping_words(Some(&p), false, true).unwrap();
+        zero.update(0, 100, 60, 0);
+        assert_eq!(zero.error(0), 40);
+    }
+
+    #[test]
+    fn shaping_absent_payload_is_the_raw_fold() {
+        let mut st = ShapingState::from_shaping_words(None, false, true).unwrap();
+        for _ in 0..8 {
+            assert_eq!(st.advance(0), 0);
+            st.update(0, 123, 120, 0);
+            // weight stays 0 (acc 0, delta 0) → temp stays 0 even with
+            // a non-zero error state.
+            assert_eq!(st.advance(0), 0);
+        }
     }
 
     #[test]
@@ -849,7 +1051,7 @@ mod tests {
         // Encode-side pack (round 420): expanding the packed payload
         // must reproduce the packed state exactly once the values are
         // log-word representable (the quantized fixed point).
-        let mut st = ShapingState::from_shaping_words(None, true);
+        let mut st = ShapingState::from_shaping_words(None, true, true).unwrap();
         st.update(0, 100, 37, 5);
         st.update(1, -80, -80, 0);
         for (stereo, with_delta, words) in [
@@ -864,7 +1066,7 @@ mod tests {
                 words * 2,
                 "stereo={stereo} delta={with_delta}"
             );
-            let seeded = ShapingState::from_shaping_words(Some(&payload), stereo);
+            let seeded = ShapingState::from_shaping_words(Some(&payload), stereo, true).unwrap();
             // Idempotence: pack(expand(pack(x))) == pack(x).
             assert_eq!(seeded.to_shaping_words(stereo, with_delta), payload);
         }
@@ -880,7 +1082,7 @@ mod tests {
         for w in [0i16, 0x1a7d, 0, 0x1a7d] {
             payload.extend_from_slice(&w.to_le_bytes());
         }
-        let st = ShapingState::from_shaping_words(Some(&payload), true);
+        let st = ShapingState::from_shaping_words(Some(&payload), true, true).unwrap();
         assert_eq!(st.to_shaping_words(true, false), payload);
         // The negated-error convention survives the pack: a state whose
         // error expands from word -1825 (value 70) packs back to -1825.
@@ -888,7 +1090,7 @@ mod tests {
         for w in [-1825i16, -6716, -1825, -6716] {
             payload.extend_from_slice(&w.to_le_bytes());
         }
-        let st = ShapingState::from_shaping_words(Some(&payload), true);
+        let st = ShapingState::from_shaping_words(Some(&payload), true, true).unwrap();
         assert_eq!(st.error(0), 70);
         assert_eq!(st.to_shaping_words(true, false), payload);
     }
@@ -897,11 +1099,11 @@ mod tests {
     fn shaping_pack_wraps_extreme_error_states() {
         // An i32::MIN error state must pack without overflow (the
         // negation wraps, mirroring the expansion side).
-        let mut st = ShapingState::from_shaping_words(None, false);
+        let mut st = ShapingState::from_shaping_words(None, false, true).unwrap();
         st.update(0, i32::MIN, 0, 0);
         assert_eq!(st.error(0), i32::MIN);
         let payload = st.to_shaping_words(false, true);
-        let _ = ShapingState::from_shaping_words(Some(&payload), false);
+        let _ = ShapingState::from_shaping_words(Some(&payload), false, true).unwrap();
     }
 
     // ---- 0x06 profile expansion (round 408) ---------------------------

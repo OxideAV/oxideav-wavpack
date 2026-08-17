@@ -6,7 +6,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Round 447 — **noise-shaping recurrence pinned to spec §4.4/§4.4.1
+  (the former open gap is closed in the staged docs).** The
+  `ShapingState` filter now implements the exact staged recurrence:
+  the negative-weight nudge is an **equality test** (`temp == error`
+  → shave one off the magnitude), not a magnitude cap — the two
+  readings coincide everywhere inside the ±1024 weight range
+  (including exactly at the −1024 unity-gain rail, where the equality
+  holds identically), but past the rail the equality never fires, the
+  loop gain exceeds 1 and the decode legitimately diverges into the
+  §5.6 mute gate instead of being clamped. Both the nudge and the IIR
+  error-update arm are now gated on the block's `NEW_SHAPING` flag
+  (bit 29): with the bit clear every sample takes the FIR arm
+  regardless of weight sign. The `weight * error` product is computed
+  exactly (spec §4.4.1 verification note: the wide-magnitude split
+  form is an overflow-avoidance rewrite, not a second rounding rule)
+  with the result stored back in 32 bits; the accumulator add keeps
+  its round-415 wrapping posture, and the accumulator is never
+  clamped (a long hostile ramp wraps and flips the weight sign, as
+  specified). `ShapingState::from_shaping_words` takes the flag and
+  is now fallible: the payload length must be one of the documented
+  forms. Encoder-side rail saturation is unchanged — it is exactly
+  the spec's own encoder-side guidance. Black-box re-validation:
+  12 fresh reference-encoded hybrid pairs (static ± / DNS × default /
+  `-h` / `-f`) decode bit-exactly (lossy and pair), and 32 originated
+  shaped variants (weights ±1.0/±0.5/0.7, in-range and past-rail
+  ramps × joint/left-right × two bitrate words) reproduce their lossy
+  PCM bit-exactly under the reference decoder and recover the input
+  losslessly from the pair.
+
 ### Added
+
+- Round 447 — **compact 2-byte `0x07` form + payload-length
+  validation.** The spec §4.4 compact shaping payload — one signed
+  byte per channel (both present even for mono), expanded by the
+  `0x03` decorrelation-weight restore rule and shifted left 16 into
+  the accumulator, no error seed, no delta — now parses; a `0x07`
+  payload of any undocumented length is the new typed
+  `Error::InvalidShapingWeightsLength` refusal (2 / 4 / 6 bytes mono,
+  2 / 8 / 12 bytes stereo).
 
 - Round 436 — **stream-level decode budget (`*_bounded` twins).** The
   per-block anti-amplification ceiling (round 296) bounds what one
