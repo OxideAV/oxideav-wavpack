@@ -3392,6 +3392,49 @@ pub fn decode_multichannel_stream(bytes: &[u8]) -> Result<DecodedStream> {
     Ok(stream)
 }
 
+/// A decoded multichannel `f32` stream: interleaved float PCM plus the
+/// per-frame channel count — the `FLOAT_DATA` twin of
+/// [`DecodedStream`]. Round 447.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedStreamF32 {
+    /// Interleaved PCM, `samples.len() == frames * channels`.
+    pub samples: Vec<f32>,
+    /// Number of channels in one interleaved frame.
+    pub channels: usize,
+}
+
+/// Decode a WavPack byte buffer that may carry **multichannel float**
+/// audio to interleaved `f32` PCM — the typed `FLOAT_DATA` twin of
+/// [`decode_multichannel_stream`] (whose `i32` decode slots are
+/// IEEE-754 bit patterns on a float stream), exactly as
+/// [`decode_stream_f32`] twins [`decode_stream`]. The stream's first
+/// audio block decides floatness; a non-float stream is refused with
+/// [`Error::BlockNotFloat`]. Round 447.
+pub fn decode_multichannel_stream_f32(bytes: &[u8]) -> Result<DecodedStreamF32> {
+    match first_audio_block(bytes)? {
+        Some(block) if block.is_float() => {
+            let stream = decode_multichannel_stream(bytes)?;
+            Ok(DecodedStreamF32 {
+                samples: stream
+                    .samples
+                    .into_iter()
+                    .map(|bits| f32::from_bits(bits as u32))
+                    .collect(),
+                channels: stream.channels,
+            })
+        }
+        Some(_) => Err(Error::BlockNotFloat),
+        None => {
+            // Mirror decode_multichannel_stream's no-audio shape.
+            let stream = decode_multichannel_stream(bytes)?;
+            Ok(DecodedStreamF32 {
+                samples: Vec::new(),
+                channels: stream.channels,
+            })
+        }
+    }
+}
+
 /// Decode a multichannel WavPack byte buffer with the spec §5.6 per-member
 /// CRC *mute gate* applied — the multichannel twin of
 /// [`decode_stream_muted`].

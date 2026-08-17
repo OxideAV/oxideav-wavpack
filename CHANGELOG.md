@@ -58,6 +58,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   3 / 4 / 5 / 6 / 8 × `best` / `smallest`) decode **bit-exactly**
   under the reference decoder binary.
 
+- Round 447 — **float / int32 multichannel origination.**
+  `encode_multichannel_stream_float` / `encode_multichannel_stream_int32`
+  (+ `_at` twins) extend the stereo-pair member plan to the extended
+  sample formats: every member rides the `0x08` float / `0x09` int32
+  deconstruction plus the same joint/decorrelation mode search the
+  narrow format paths use, each member deriving its own profile from
+  its own samples. `decode_multichannel_stream_f32` (+ the new
+  `DecodedStreamF32`) is the typed float twin of
+  `decode_multichannel_stream`, mirroring `decode_stream_f32`. The
+  framework registry drops its F32 / S32 multichannel refusal: wider
+  float layouts route through the paired float members and full-range
+  `S32` through the int32 members (hybrid multichannel remains
+  refused). Bit-exact over IEEE-754 patterns (`-0.0`, denormals, inf,
+  NaN payloads) and the full `i32` range in-crate; black-box, 4
+  originated streams (float × 4/6 ch, int32 × 3/5 ch) decode
+  **bit-exactly** under the reference decoder binary.
+
 - Round 447 — **compact 2-byte `0x07` form + payload-length
   validation.** The spec §4.4 compact shaping payload — one signed
   byte per channel (both present even for mono), expanded by the

@@ -1930,6 +1930,28 @@ fn encode_block_best_ints(
     block_index: u32,
     total_samples: u32,
 ) -> Result<Vec<u8>> {
+    encode_block_best_ints_member(
+        ints,
+        mono,
+        profile,
+        format,
+        block_index,
+        total_samples,
+        Membership::STANDALONE,
+    )
+}
+
+/// [`encode_block_best_ints`] with an explicit multichannel membership
+/// (round 447: format-tagged member blocks get the same mode search).
+fn encode_block_best_ints_member(
+    ints: &[i32],
+    mono: bool,
+    profile: DecorrProfile,
+    format: &FormatExtras,
+    block_index: u32,
+    total_samples: u32,
+    member: Membership,
+) -> Result<Vec<u8>> {
     let mut best: Option<Vec<u8>> = None;
     let joint_modes: &[bool] = if mono { &[false] } else { &[false, true] };
     let mut joint_domain = Vec::new();
@@ -1949,6 +1971,8 @@ fn encode_block_best_ints(
                 BlockConfig {
                     joint,
                     format: Some(format),
+                    marker: member.marker,
+                    multichannel_info: member.multichannel_info,
                     ..raw_config(mono, 4)
                 },
                 block_index,
@@ -1973,6 +1997,8 @@ fn encode_block_best_ints(
                             joint,
                             decorr: Some((&terms, &weights, &samples)),
                             format: Some(format),
+                            marker: member.marker,
+                            multichannel_info: member.multichannel_info,
                             ..raw_config(mono, 4)
                         },
                         block_index,
@@ -2750,6 +2776,188 @@ pub fn encode_multichannel_stream_at(
     Ok(out)
 }
 
+/// Encode an interleaved multichannel `f32` buffer into a
+/// `FLOAT_DATA` `.wv` stream: the stereo-pair member plan of
+/// [`encode_multichannel_stream_best`], with every member riding the
+/// `0x08` float deconstruction + mode search of
+/// [`encode_block_stereo_float_best`] / [`encode_block_mono_float_best`]
+/// (each member derives its own profile from its own samples).
+/// Bit-exact over IEEE-754 bit patterns — `-0.0`, denormals, `±inf`
+/// and NaN payloads included:
+/// `decode_multichannel_stream_f32(&out)?.samples` reproduces `pcm`
+/// bit-for-bit. Round 447.
+pub fn encode_multichannel_stream_float(
+    pcm: &[f32],
+    channels: usize,
+    block_samples: usize,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    let frames = pcm.len().checked_div(channels).unwrap_or(0);
+    let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    encode_multichannel_stream_float_at(pcm, channels, block_samples, 0, total, profile)
+}
+
+/// The offset-aware streaming form of
+/// [`encode_multichannel_stream_float`] (see
+/// [`encode_multichannel_stream_at`] for the offset/total contract).
+/// Round 447.
+pub fn encode_multichannel_stream_float_at(
+    pcm: &[f32],
+    channels: usize,
+    block_samples: usize,
+    first_block_index: u32,
+    total_samples: u32,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    encode_multichannel_format_at(
+        pcm,
+        channels,
+        block_samples,
+        first_block_index,
+        &|window, mono, index, member| {
+            let d = crate::float::deconstruct_float(window);
+            let format = float_format_extras(&d);
+            encode_block_best_ints_member(
+                &d.integers,
+                mono,
+                profile,
+                &format,
+                index,
+                total_samples,
+                member,
+            )
+        },
+    )
+}
+
+/// Encode an interleaved multichannel wide-integer buffer into an
+/// `INT32_DATA` `.wv` stream: the stereo-pair member plan of
+/// [`encode_multichannel_stream_best`], with every member riding the
+/// `0x09` int32 deconstruction + mode search of
+/// [`encode_block_stereo_int32_best`] / [`encode_block_mono_int32_best`].
+/// `decode_multichannel_stream(&out)?.samples == pcm` exactly, full
+/// `i32` range. Round 447.
+pub fn encode_multichannel_stream_int32(
+    pcm: &[i32],
+    channels: usize,
+    block_samples: usize,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    let frames = pcm.len().checked_div(channels).unwrap_or(0);
+    let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    encode_multichannel_stream_int32_at(pcm, channels, block_samples, 0, total, profile)
+}
+
+/// The offset-aware streaming form of
+/// [`encode_multichannel_stream_int32`]. Round 447.
+pub fn encode_multichannel_stream_int32_at(
+    pcm: &[i32],
+    channels: usize,
+    block_samples: usize,
+    first_block_index: u32,
+    total_samples: u32,
+    profile: DecorrProfile,
+) -> Result<Vec<u8>> {
+    encode_multichannel_format_at(
+        pcm,
+        channels,
+        block_samples,
+        first_block_index,
+        &|window, mono, index, member| {
+            let d = crate::int32::deconstruct_int32(window);
+            let format = int32_format_extras(&d);
+            encode_block_best_ints_member(
+                &d.reduced,
+                mono,
+                profile,
+                &format,
+                index,
+                total_samples,
+                member,
+            )
+        },
+    )
+}
+
+/// Per-member block encoder callback for
+/// [`encode_multichannel_format_at`]: `(window, mono, block_index,
+/// member)` → one encoded member block.
+type MemberEncoder<'a, T> = &'a dyn Fn(&[T], bool, u32, Membership) -> Result<Vec<u8>>;
+
+/// Shared body of the format-tagged (float / int32) multichannel
+/// stream encoders: the stereo-pair member plan of
+/// [`encode_multichannel_stream_search_at`] with the per-member block
+/// encode delegated to `encode_member(window, mono, block_index,
+/// member)`.
+fn encode_multichannel_format_at<T: Copy>(
+    pcm: &[T],
+    channels: usize,
+    block_samples: usize,
+    first_block_index: u32,
+    encode_member: MemberEncoder<'_, T>,
+) -> Result<Vec<u8>> {
+    if channels == 0 || channels > crate::block::MAX_MULTICHANNEL_CHANNELS {
+        return Err(Error::MultichannelTooManyChannels(channels));
+    }
+    if pcm.is_empty() {
+        return Ok(Vec::new());
+    }
+    if pcm.len() % channels != 0 {
+        // The interleaved buffer must be whole frames of `channels` each.
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let frames = pcm.len() / channels;
+    let chunk_frames = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let member_count = channels.div_ceil(2);
+
+    let mut out = Vec::new();
+    let mut frame_start: usize = 0;
+    while frame_start < frames {
+        let frame_end = (frame_start + chunk_frames).min(frames);
+        let set_frames = frame_end - frame_start;
+        let block_index = u32::try_from(frame_start)
+            .ok()
+            .and_then(|fs| first_block_index.checked_add(fs))
+            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+
+        for m in 0..member_count {
+            let ch = m * 2;
+            let width = (channels - ch).min(2);
+            let mut member_pcm = Vec::with_capacity(set_frames * width);
+            for f in frame_start..frame_end {
+                member_pcm.push(pcm[f * channels + ch]);
+                if width == 2 {
+                    member_pcm.push(pcm[f * channels + ch + 1]);
+                }
+            }
+            let marker = if member_count == 1 {
+                0b11
+            } else if m == 0 {
+                0b01
+            } else if m == member_count - 1 {
+                0b10
+            } else {
+                0b00
+            };
+            let mc_info = (m == 0 && member_count > 1)
+                .then(|| u8::try_from(channels).ok().map(|c| [c, 0u8]))
+                .flatten();
+            let member = Membership {
+                marker,
+                multichannel_info: mc_info,
+            };
+            let block = encode_member(&member_pcm, width == 1, block_index, member)?;
+            out.extend_from_slice(&block);
+        }
+        frame_start = frame_end;
+    }
+    Ok(out)
+}
+
 /// Which per-member compression search the compressed multichannel
 /// encoders run (round 447).
 #[derive(Clone, Copy)]
@@ -2867,7 +3075,8 @@ pub fn encode_multichannel_stream_smallest_at(
 }
 
 /// Shared body of the compressed multichannel stream encoders: the
-/// stereo-pair member plan plus the per-member mode search.
+/// stereo-pair member plan ([`encode_multichannel_format_at`]) plus
+/// the per-member mode search.
 fn encode_multichannel_stream_search_at(
     pcm: &[i32],
     channels: usize,
@@ -2877,103 +3086,44 @@ fn encode_multichannel_stream_search_at(
     total_samples: u32,
     search: MemberSearch,
 ) -> Result<Vec<u8>> {
-    if channels == 0 || channels > crate::block::MAX_MULTICHANNEL_CHANNELS {
-        return Err(Error::MultichannelTooManyChannels(channels));
-    }
-    if pcm.is_empty() {
-        return Ok(Vec::new());
-    }
-    if pcm.len() % channels != 0 {
-        // The interleaved buffer must be whole frames of `channels` each.
-        return Err(Error::EncodeStereoOddLength(pcm.len()));
-    }
-    let frames = pcm.len() / channels;
-    let chunk_frames = if block_samples == 0 {
-        DEFAULT_BLOCK_SAMPLES
-    } else {
-        block_samples
-    };
-    // The member plan: stereo pairs, then the odd trailing mono.
-    let member_count = channels.div_ceil(2);
-
-    let mut out = Vec::new();
-    let mut frame_start: usize = 0;
-    while frame_start < frames {
-        let frame_end = (frame_start + chunk_frames).min(frames);
-        let set_frames = frame_end - frame_start;
-        let block_index = u32::try_from(frame_start)
-            .ok()
-            .and_then(|fs| first_block_index.checked_add(fs))
-            .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
-
-        for m in 0..member_count {
-            let ch = m * 2;
-            let width = (channels - ch).min(2);
-            let mut member_pcm = Vec::with_capacity(set_frames * width);
-            for f in frame_start..frame_end {
-                member_pcm.push(pcm[f * channels + ch]);
-                if width == 2 {
-                    member_pcm.push(pcm[f * channels + ch + 1]);
-                }
-            }
-            // Marker plan mirrors encode_multichannel_stream_at: a
-            // one-member set degenerates to a standalone block.
-            let marker = if member_count == 1 {
-                0b11
-            } else if m == 0 {
-                0b01
-            } else if m == member_count - 1 {
-                0b10
-            } else {
-                0b00
-            };
-            // 0x0D geometry on the set's first member (speaker mask 0 =
-            // unassigned; widths past 255 stay in-crate-only, exactly
-            // as on the raw member path).
-            let mc_info = (m == 0 && member_count > 1)
-                .then(|| u8::try_from(channels).ok().map(|c| [c, 0u8]))
-                .flatten();
-            let member = Membership {
-                marker,
-                multichannel_info: mc_info,
-            };
-            let block = match (search, width) {
-                (MemberSearch::Best(profile), 2) => encode_block_stereo_best_member(
-                    &member_pcm,
-                    profile,
-                    bytes_per_sample,
-                    block_index,
-                    total_samples,
-                    member,
-                )?,
-                (MemberSearch::Best(profile), _) => encode_block_mono_best_member(
-                    &member_pcm,
-                    profile,
-                    bytes_per_sample,
-                    block_index,
-                    total_samples,
-                    member,
-                )?,
-                (MemberSearch::Smallest, 2) => encode_block_stereo_smallest_member(
-                    &member_pcm,
-                    bytes_per_sample,
-                    block_index,
-                    total_samples,
-                    member,
-                )?,
-                (MemberSearch::Smallest, _) => encode_block_mono_smallest_member(
-                    &member_pcm,
-                    bytes_per_sample,
-                    block_index,
-                    total_samples,
-                    member,
-                )?,
-            };
-            out.extend_from_slice(&block);
-        }
-        frame_start = frame_end;
-    }
-    Ok(out)
+    encode_multichannel_format_at(
+        pcm,
+        channels,
+        block_samples,
+        first_block_index,
+        &|member_pcm, mono, block_index, member| match (search, mono) {
+            (MemberSearch::Best(profile), false) => encode_block_stereo_best_member(
+                member_pcm,
+                profile,
+                bytes_per_sample,
+                block_index,
+                total_samples,
+                member,
+            ),
+            (MemberSearch::Best(profile), true) => encode_block_mono_best_member(
+                member_pcm,
+                profile,
+                bytes_per_sample,
+                block_index,
+                total_samples,
+                member,
+            ),
+            (MemberSearch::Smallest, false) => encode_block_stereo_smallest_member(
+                member_pcm,
+                bytes_per_sample,
+                block_index,
+                total_samples,
+                member,
+            ),
+            (MemberSearch::Smallest, true) => encode_block_mono_smallest_member(
+                member_pcm,
+                bytes_per_sample,
+                block_index,
+                total_samples,
+                member,
+            ),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -3744,6 +3894,113 @@ mod tests {
         assert_eq!(decoded.samples, pcm);
         let index = crate::seek::StreamIndex::scan(&chain).unwrap();
         assert!(index.is_seekable());
+    }
+
+    #[test]
+    fn multichannel_float_round_trips_bit_patterns() {
+        use crate::block::decode_multichannel_stream_f32;
+        for channels in 3..=6usize {
+            let frames = 30usize;
+            let mut pcm = Vec::with_capacity(frames * channels);
+            for f in 0..frames {
+                for ch in 0..channels {
+                    let i = f * channels + ch;
+                    pcm.push(match i % 9 {
+                        0 => 0.0f32,
+                        1 => -0.0,
+                        2 => f32::from_bits(0x0000_0001), // denormal
+                        3 => f32::INFINITY,
+                        4 => f32::from_bits(0x7fc0_1234), // NaN payload
+                        _ => ((i as f32) * 0.13).sin() * (1.0 + ch as f32),
+                    });
+                }
+            }
+            let out =
+                encode_multichannel_stream_float(&pcm, channels, 16, DecorrProfile::Fast).unwrap();
+            let decoded = decode_multichannel_stream_f32(&out).unwrap();
+            assert_eq!(decoded.channels, channels, "width {channels}");
+            let got: Vec<u32> = decoded.samples.iter().map(|s| s.to_bits()).collect();
+            let want: Vec<u32> = pcm.iter().map(|s| s.to_bits()).collect();
+            assert_eq!(got, want, "width {channels} bit patterns");
+        }
+        // The typed twin refuses a non-float multichannel stream.
+        let ints = correlated_multichannel(8, 4);
+        let plain = encode_multichannel_stream_best(&ints, 4, 0, 2, DecorrProfile::Fast).unwrap();
+        assert!(matches!(
+            decode_multichannel_stream_f32(&plain),
+            Err(Error::BlockNotFloat)
+        ));
+    }
+
+    #[test]
+    fn multichannel_int32_round_trips_full_range() {
+        use crate::block::decode_multichannel_stream;
+        let channels = 5usize;
+        let frames = 40usize;
+        let mut pcm = Vec::with_capacity(frames * channels);
+        for f in 0..frames {
+            for ch in 0..channels {
+                let i = (f * channels + ch) as i32;
+                pcm.push(match i % 7 {
+                    0 => i32::MIN,
+                    1 => i32::MAX,
+                    2 => i.wrapping_mul(0x0100_0000), // trailing zeros
+                    _ => i.wrapping_mul(0x0123_4567),
+                });
+            }
+        }
+        let out =
+            encode_multichannel_stream_int32(&pcm, channels, 16, DecorrProfile::Fast).unwrap();
+        let decoded = decode_multichannel_stream(&out).unwrap();
+        assert_eq!(decoded.channels, channels);
+        assert_eq!(decoded.samples, pcm);
+    }
+
+    #[test]
+    fn multichannel_format_at_chains_and_refusals() {
+        use crate::block::decode_multichannel_stream;
+        // Chained int32 _at encode decodes as one stream.
+        let channels = 3usize;
+        let pcm: Vec<i32> = (0..channels as i32 * 20).map(|i| i * 100_003).collect();
+        let split = 8 * channels;
+        let total = (pcm.len() / channels) as u32;
+        let mut chain = encode_multichannel_stream_int32_at(
+            &pcm[..split],
+            channels,
+            4,
+            0,
+            total,
+            DecorrProfile::Fast,
+        )
+        .unwrap();
+        chain.extend_from_slice(
+            &encode_multichannel_stream_int32_at(
+                &pcm[split..],
+                channels,
+                4,
+                8,
+                total,
+                DecorrProfile::Fast,
+            )
+            .unwrap(),
+        );
+        let decoded = decode_multichannel_stream(&chain).unwrap();
+        assert_eq!(decoded.channels, channels);
+        assert_eq!(decoded.samples, pcm);
+        // Refusals mirror the integer path.
+        assert!(
+            encode_multichannel_stream_float(&[], 3, 0, DecorrProfile::Fast)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            encode_multichannel_stream_float(&[1.0, 2.0, 3.0], 0, 0, DecorrProfile::Fast),
+            Err(Error::MultichannelTooManyChannels(0))
+        ));
+        assert!(matches!(
+            encode_multichannel_stream_int32(&[1, 2, 3, 4], 3, 0, DecorrProfile::Fast),
+            Err(Error::EncodeStereoOddLength(4))
+        ));
     }
 
     #[test]

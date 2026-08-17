@@ -852,7 +852,7 @@ oxideav_core::register!("wavpack", register);
 
 pub use crate::block::{
     audio_block_count, block_count, correction_block_count, correction_coverage,
-    decode_multichannel_stream, decode_multichannel_stream_bounded,
+    decode_multichannel_stream, decode_multichannel_stream_bounded, decode_multichannel_stream_f32,
     decode_multichannel_stream_muted, decode_multichannel_stream_muted_bounded,
     decode_multichannel_stream_with_correction, decode_multichannel_stream_with_correction_bounded,
     decode_multichannel_stream_with_correction_muted,
@@ -866,7 +866,7 @@ pub use crate::block::{
     multichannel_layout, pair_correction_stream, parse_block, parse_blocks, stream_channel_info,
     stream_sample_rate, stream_total_samples, total_audio_samples, total_block_samples,
     total_correction_payload_bytes, AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream,
-    MultichannelLayout, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
+    DecodedStreamF32, MultichannelLayout, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
     MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
 };
 pub use crate::block_header::{
@@ -888,7 +888,9 @@ pub use crate::encode::{
     encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
     encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
     encode_multichannel_stream, encode_multichannel_stream_at, encode_multichannel_stream_best,
-    encode_multichannel_stream_best_at, encode_multichannel_stream_smallest,
+    encode_multichannel_stream_best_at, encode_multichannel_stream_float,
+    encode_multichannel_stream_float_at, encode_multichannel_stream_int32,
+    encode_multichannel_stream_int32_at, encode_multichannel_stream_smallest,
     encode_multichannel_stream_smallest_at, encode_stream_mono, encode_stream_mono_best,
     encode_stream_mono_float, encode_stream_mono_int32, encode_stream_mono_smallest,
     encode_stream_stereo, encode_stream_stereo_best, encode_stream_stereo_float,

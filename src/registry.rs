@@ -85,7 +85,8 @@ use crate::block_header::TOTAL_SAMPLES_UNKNOWN;
 use crate::encode::{
     encode_block_mono_best, encode_block_mono_float_best, encode_block_mono_int32_best,
     encode_block_stereo_best, encode_block_stereo_float_best, encode_block_stereo_int32_best,
-    encode_multichannel_stream_best_at, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
+    encode_multichannel_stream_best_at, encode_multichannel_stream_float_at,
+    encode_multichannel_stream_int32_at, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
 };
 use crate::hybrid_encode::{
     encode_hybrid_block_float, encode_hybrid_block_int32, encode_hybrid_block_ints, HybridCarry,
@@ -449,11 +450,6 @@ impl WavPackEncoder {
                 "wavpack: unsupported channel count {channels}"
             )));
         }
-        if (float || format == SampleFormat::S32) && channels > 2 {
-            return Err(CoreError::unsupported(format!(
-                "wavpack: {format:?} encoding supports mono/stereo only (multichannel is 8/16/24-bit)"
-            )));
-        }
         let o: WavPackEncoderOptions = parse_options(&params.options)?;
         if o.correction {
             return Err(CoreError::unsupported(
@@ -597,16 +593,39 @@ impl Encoder for WavPackEncoder {
             _ => {
                 // Round 447: wider layouts get real per-member
                 // compression — stereo-pair members through the same
-                // mode search the mono/stereo paths run.
-                data = encode_multichannel_stream_best_at(
-                    &pcm,
-                    self.channels,
-                    DEFAULT_BLOCK_SAMPLES,
-                    self.bytes_per_sample,
-                    self.next_index,
-                    TOTAL_SAMPLES_UNKNOWN,
-                    DecorrProfile::Normal,
-                )
+                // mode search the mono/stereo paths run — and the F32 /
+                // S32 formats route through the same 0x08 / 0x09
+                // deconstructions the narrow paths use.
+                data = if self.float {
+                    let f = as_f32_bits(&pcm);
+                    encode_multichannel_stream_float_at(
+                        &f,
+                        self.channels,
+                        DEFAULT_BLOCK_SAMPLES,
+                        self.next_index,
+                        TOTAL_SAMPLES_UNKNOWN,
+                        DecorrProfile::Normal,
+                    )
+                } else if self.bytes_per_sample == 4 {
+                    encode_multichannel_stream_int32_at(
+                        &pcm,
+                        self.channels,
+                        DEFAULT_BLOCK_SAMPLES,
+                        self.next_index,
+                        TOTAL_SAMPLES_UNKNOWN,
+                        DecorrProfile::Normal,
+                    )
+                } else {
+                    encode_multichannel_stream_best_at(
+                        &pcm,
+                        self.channels,
+                        DEFAULT_BLOCK_SAMPLES,
+                        self.bytes_per_sample,
+                        self.next_index,
+                        TOTAL_SAMPLES_UNKNOWN,
+                        DecorrProfile::Normal,
+                    )
+                }
                 .map_err(invalid)?;
             }
         }
@@ -958,6 +977,49 @@ mod tests {
         let decoded = crate::block::decode_multichannel_stream(&packet.data).unwrap();
         assert_eq!(decoded.channels, 6);
         assert_eq!(decoded.samples, pcm);
+    }
+
+    #[test]
+    fn encoder_multichannel_float_and_int32_round_trip() {
+        // Round 447: F32 / S32 multichannel encode through the paired
+        // 0x08 / 0x09 member paths (formerly a typed refusal).
+        let params = audio_params(4, SampleFormat::F32, Some(48_000));
+        let mut enc = make_encoder(&params).unwrap();
+        let pcm: Vec<f32> = (0..4 * 200)
+            .map(|i| ((i as f32) * 0.017).sin() * 0.9)
+            .collect();
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_bits().to_le_bytes()).collect();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: 0,
+            pts: None,
+            data: vec![bytes.clone()],
+        }))
+        .unwrap();
+        let packet = enc.receive_packet().unwrap();
+        let decoded = crate::block::decode_multichannel_stream_f32(&packet.data).unwrap();
+        assert_eq!(decoded.channels, 4);
+        let got: Vec<u32> = decoded.samples.iter().map(|s| s.to_bits()).collect();
+        let want: Vec<u32> = pcm.iter().map(|s| s.to_bits()).collect();
+        assert_eq!(got, want, "multichannel float bit patterns");
+        // And through the registry decoder the plane bytes come back
+        // verbatim.
+        let mut dec = make_decoder(&params).unwrap();
+        dec.send_packet(&packet).unwrap();
+        let Frame::Audio(frame) = dec.receive_frame().unwrap() else {
+            panic!("audio frame expected");
+        };
+        assert_eq!(frame.data[0], bytes);
+
+        let params = audio_params(6, SampleFormat::S32, Some(48_000));
+        let mut enc = make_encoder(&params).unwrap();
+        let pcm: Vec<i32> = (0..6i32 * 150)
+            .map(|i| i.wrapping_mul(0x00fe_dcba))
+            .collect();
+        enc.send_frame(&frame_from_pcm(&pcm, 4, None)).unwrap();
+        let packet = enc.receive_packet().unwrap();
+        let decoded = crate::block::decode_multichannel_stream(&packet.data).unwrap();
+        assert_eq!(decoded.channels, 6);
+        assert_eq!(decoded.samples, pcm, "multichannel int32 full range");
     }
 
     #[test]
