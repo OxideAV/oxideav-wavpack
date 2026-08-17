@@ -852,6 +852,39 @@ pub(crate) fn encode_hybrid_block_ints(
     block_index: u32,
     total_samples: u32,
 ) -> Result<HybridBlock> {
+    encode_hybrid_block_ints_member(
+        pcm,
+        mono,
+        bytes_per_sample,
+        opts,
+        level_words,
+        shaping_payload,
+        format,
+        block_index,
+        total_samples,
+        crate::encode::Membership::STANDALONE,
+    )
+}
+
+/// [`encode_hybrid_block_ints`] with an explicit multichannel
+/// membership (round 447: hybrid member blocks carry the grouping
+/// marker and — on the set's first member — the `0x0D` geometry,
+/// placed after the `0x06` profile as observed on reference
+/// multichannel hybrid pair fixtures; the `.wvc` twin mirrors the flag
+/// word but carries no `0x0D`, matching the same observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_hybrid_block_ints_member(
+    pcm: &[i32],
+    mono: bool,
+    bytes_per_sample: u8,
+    opts: &HybridOptions,
+    level_words: [i16; 2],
+    shaping_payload: Option<&[u8]>,
+    format: Option<&FormatExtras>,
+    block_index: u32,
+    total_samples: u32,
+    member: crate::encode::Membership,
+) -> Result<HybridBlock> {
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
@@ -944,7 +977,7 @@ pub(crate) fn encode_hybrid_block_ints(
     };
 
     // Header flag word.
-    let mut flags_raw = with_marker(base_flags(bytes_per_sample), 0b11);
+    let mut flags_raw = with_marker(base_flags(bytes_per_sample), member.marker);
     flags_raw |= HYBRID_FLAG | HYBRID_PROFILE_FLAG_9;
     if shaping_payload.is_some() {
         // Both shape bits are set on every reference shaped block —
@@ -1012,6 +1045,16 @@ pub(crate) fn encode_hybrid_block_ints(
         SubBlockId::HybridProfile.as_id_byte(),
         &profile_payload,
     )?;
+    // 0x0D multichannel geometry on the set's first member — after
+    // the 0x06 profile, the placement observed on reference
+    // multichannel hybrid fixtures. The .wvc twin carries none.
+    if let Some(info) = member.multichannel_info {
+        append_sub_block(
+            &mut metadata,
+            SubBlockId::MultichannelInfo.as_id_byte(),
+            &info,
+        )?;
+    }
     if let Some(format) = format {
         append_sub_block(&mut metadata, format.profile_id, &format.profile_payload)?;
     }
@@ -1423,6 +1466,123 @@ pub fn encode_stream_stereo_hybrid(
         index = index
             .checked_add((window.len() / 2) as u32)
             .ok_or(Error::EncodeBlockTooLarge(pcm.len()))?;
+    }
+    Ok(HybridEncoded {
+        wv,
+        wvc: opts.correction.then_some(wvc_all),
+    })
+}
+
+/// Encode an interleaved **multichannel** PCM buffer into a hybrid
+/// `.wv` (+ `.wvc`) member-set chain (round 447): the stereo-pair
+/// member plan of [`crate::encode_multichannel_stream_best`] — channels
+/// `(0,1)`, `(2,3)`, … as stereo members (joint per
+/// [`HybridOptions::joint`]), an odd trailing channel as a mono member
+/// — with **every member chain carrying its own §6.5 running state**:
+/// per-member `0x06` level words seeded by the first set's pre-pass and
+/// carried across sets from the packed end state, and (when shaping is
+/// on) the per-member `0x07` filter state re-seeded from the quantized
+/// payload each block, exactly as the mono / stereo stream encoders do
+/// per stream. The set's first member carries the `0x0D` geometry after
+/// its `0x06` profile (the reference multichannel hybrid placement);
+/// the `.wvc` twin mirrors block structure and flags without `0x0D`.
+///
+/// The lossy `.wv` decodes alone via
+/// [`crate::decode_multichannel_stream`]; with
+/// [`HybridOptions::correction`] the pair restores the input
+/// bit-exactly:
+/// `decode_multichannel_stream_with_correction(&wv, &wvc)?.samples ==
+/// pcm`. Widths 1 / 2 degenerate to plain mono / stereo hybrid chains.
+pub fn encode_multichannel_stream_hybrid(
+    pcm: &[i32],
+    channels: usize,
+    block_samples: usize,
+    bytes_per_sample: u8,
+    opts: &HybridOptions,
+) -> Result<HybridEncoded> {
+    if channels == 0 || channels > crate::block::MAX_MULTICHANNEL_CHANNELS {
+        return Err(Error::MultichannelTooManyChannels(channels));
+    }
+    if pcm.is_empty() {
+        return Ok(HybridEncoded {
+            wv: Vec::new(),
+            wvc: opts.correction.then_some(Vec::new()),
+        });
+    }
+    if pcm.len() % channels != 0 {
+        // The interleaved buffer must be whole frames of `channels` each.
+        return Err(Error::EncodeStereoOddLength(pcm.len()));
+    }
+    let frames = pcm.len() / channels;
+    let total = u32::try_from(frames).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+    let chunk_frames = if block_samples == 0 {
+        DEFAULT_BLOCK_SAMPLES
+    } else {
+        block_samples
+    };
+    let member_count = channels.div_ceil(2);
+    // One §6.5 / §4.4 state carry per member chain.
+    let mut carries: Vec<HybridCarry> = (0..member_count)
+        .map(|m| HybridCarry::new(opts, (channels - m * 2).min(2) == 1))
+        .collect();
+
+    let mut wv = Vec::new();
+    let mut wvc_all = Vec::new();
+    let mut frame_start: usize = 0;
+    while frame_start < frames {
+        let frame_end = (frame_start + chunk_frames).min(frames);
+        let set_frames = frame_end - frame_start;
+        let block_index =
+            u32::try_from(frame_start).map_err(|_| Error::EncodeBlockTooLarge(pcm.len()))?;
+
+        for (m, carry) in carries.iter_mut().enumerate() {
+            let ch = m * 2;
+            let width = (channels - ch).min(2);
+            let mono = width == 1;
+            let mut member_pcm = Vec::with_capacity(set_frames * width);
+            for f in frame_start..frame_end {
+                member_pcm.push(pcm[f * channels + ch]);
+                if width == 2 {
+                    member_pcm.push(pcm[f * channels + ch + 1]);
+                }
+            }
+            let marker = if member_count == 1 {
+                0b11
+            } else if m == 0 {
+                0b01
+            } else if m == member_count - 1 {
+                0b10
+            } else {
+                0b00
+            };
+            let mc_info = (m == 0 && member_count > 1)
+                .then(|| u8::try_from(channels).ok().map(|c| [c, 0u8]))
+                .flatten();
+            let member = crate::encode::Membership {
+                marker,
+                multichannel_info: mc_info,
+            };
+            let level_words = carry.level_words(&member_pcm, mono, opts)?;
+            let shaping = carry.payload_for_block(set_frames);
+            let (blk, cblk, sl, shape) = encode_hybrid_block_ints_member(
+                &member_pcm,
+                mono,
+                bytes_per_sample,
+                opts,
+                level_words,
+                shaping.as_deref(),
+                None,
+                block_index,
+                total,
+                member,
+            )?;
+            wv.extend_from_slice(&blk);
+            if let Some(cblk) = cblk {
+                wvc_all.extend_from_slice(&cblk);
+            }
+            carry.absorb(sl, &shape);
+        }
+        frame_start = frame_end;
     }
     Ok(HybridEncoded {
         wv,
@@ -2187,6 +2347,121 @@ mod tests {
 
     fn shaped(sh: HybridShaping, joint: bool) -> HybridOptions {
         opts(456, joint, Some(DecorrProfile::Normal)).with_shaping(sh)
+    }
+
+    /// Interleave one `signal16`-shaped channel per slot with small
+    /// per-channel decorrelation.
+    fn multichannel_signal(frames: usize, channels: usize) -> Vec<i32> {
+        let base = signal16(frames, 0x77);
+        let mut pcm = Vec::with_capacity(frames * channels);
+        for (f, &b) in base.iter().enumerate() {
+            for ch in 0..channels {
+                let tweak = ((f as i32).wrapping_mul(7 + ch as i32) % 61) - 30;
+                pcm.push((b / (1 + ch as i32 / 2) + tweak).clamp(-32768, 32767));
+            }
+        }
+        pcm
+    }
+
+    #[test]
+    fn multichannel_hybrid_pair_is_lossless_across_widths() {
+        use crate::block::{
+            decode_multichannel_stream, decode_multichannel_stream_with_correction,
+            decode_multichannel_stream_with_correction_muted,
+        };
+        for channels in 3..=6usize {
+            for shaping in [HybridShaping::Off, HybridShaping::Static(-717)] {
+                let pcm = multichannel_signal(700, channels);
+                let o = opts(456, true, Some(DecorrProfile::Normal)).with_shaping(shaping);
+                let enc = encode_multichannel_stream_hybrid(&pcm, channels, 300, 2, &o).unwrap();
+                let wvc = enc.wvc.as_ref().expect("correction requested");
+                let exact = decode_multichannel_stream_with_correction(&enc.wv, wvc).unwrap();
+                assert_eq!(exact.channels, channels, "width {channels}");
+                assert_eq!(exact.samples, pcm, "width {channels} pair lossless");
+                let (muted, ok) =
+                    decode_multichannel_stream_with_correction_muted(&enc.wv, wvc).unwrap();
+                assert!(ok, "width {channels} pair CRC gate");
+                assert_eq!(muted.samples, pcm);
+                // The lossy .wv decodes alone, channel-complete and
+                // within the 16-bit output clamp.
+                let lossy = decode_multichannel_stream(&enc.wv).unwrap();
+                assert_eq!(lossy.channels, channels);
+                assert_eq!(lossy.samples.len(), pcm.len());
+                assert!(lossy.samples.iter().all(|&s| (-32768..=32767).contains(&s)));
+            }
+        }
+    }
+
+    #[test]
+    fn multichannel_hybrid_member_shape_and_carry() {
+        use crate::block::parse_blocks;
+        // 5 channels, 2 sets: members [stereo, stereo, mono] per set,
+        // 0x0D on the first member only, hybrid flag everywhere, and
+        // the second set's 0x06 level words differ from the first
+        // (the running carry, not a re-seed).
+        let pcm = multichannel_signal(600, 5);
+        let o = opts(456, true, Some(DecorrProfile::Normal));
+        let enc = encode_multichannel_stream_hybrid(&pcm, 5, 300, 2, &o).unwrap();
+        let blocks = parse_blocks(&enc.wv).unwrap();
+        assert_eq!(blocks.len(), 6);
+        let mut first_set_levels = Vec::new();
+        let mut second_set_levels = Vec::new();
+        for (i, b) in blocks.iter().enumerate() {
+            let m = i % 3;
+            assert_eq!(m == 2, b.flags().is_block_data_mono(), "member {i}");
+            assert!(b.flags().hybrid, "member {i} hybrid flag");
+            let info = b.find_multichannel_info_sub_block();
+            if m == 0 {
+                assert_eq!(info.expect("0x0D on first member").payload, &[5u8, 0u8]);
+            } else {
+                assert!(info.is_none(), "member {i} must not carry 0x0D");
+            }
+            let profile = crate::metadata::find_hybrid_profile(&b.sub_blocks)
+                .expect("0x06 on every hybrid member")
+                .payload
+                .to_vec();
+            if i / 3 == 0 {
+                first_set_levels.push(profile);
+            } else {
+                second_set_levels.push(profile);
+            }
+        }
+        assert_ne!(
+            first_set_levels, second_set_levels,
+            "level words must carry across sets, not re-seed"
+        );
+        // The .wvc mirrors the member count and carries no 0x0D.
+        let cblocks = parse_blocks(enc.wvc.as_ref().unwrap()).unwrap();
+        assert_eq!(cblocks.len(), 6);
+        assert!(cblocks
+            .iter()
+            .all(|b| b.find_multichannel_info_sub_block().is_none()));
+    }
+
+    #[test]
+    fn multichannel_hybrid_refusals_and_degenerate_widths() {
+        let o = opts(456, true, Some(DecorrProfile::Normal));
+        assert!(matches!(
+            encode_multichannel_stream_hybrid(&[1, 2, 3], 0, 0, 2, &o),
+            Err(Error::MultichannelTooManyChannels(0))
+        ));
+        assert!(matches!(
+            encode_multichannel_stream_hybrid(&[1, 2, 3, 4], 3, 0, 2, &o),
+            Err(Error::EncodeStereoOddLength(4))
+        ));
+        let empty = encode_multichannel_stream_hybrid(&[], 3, 0, 2, &o).unwrap();
+        assert!(empty.wv.is_empty());
+        // Width 2 degenerates to a plain stereo hybrid chain: the
+        // standalone marker and a pair decode identical to the stereo
+        // stream encoder's.
+        let pcm = multichannel_signal(400, 2);
+        let enc = encode_multichannel_stream_hybrid(&pcm, 2, 0, 2, &o).unwrap();
+        let blocks = crate::block::parse_blocks(&enc.wv).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].flags().is_first_block() && blocks[0].flags().is_final_block());
+        let twin = encode_stream_stereo_hybrid(&pcm, 0, 2, &o).unwrap();
+        assert_eq!(enc.wv, twin.wv, "degenerate stereo equals the stereo path");
+        assert_eq!(enc.wvc, twin.wvc);
     }
 
     /// Lag-1 autocorrelation sign proxy of the lossy quantization

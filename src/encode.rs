@@ -1421,13 +1421,13 @@ fn keep_smaller(best: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
 /// the mode-search encoders so member blocks get the same compression
 /// search standalone blocks do (round 447).
 #[derive(Clone, Copy)]
-struct Membership {
-    marker: u32,
-    multichannel_info: Option<[u8; 2]>,
+pub(crate) struct Membership {
+    pub(crate) marker: u32,
+    pub(crate) multichannel_info: Option<[u8; 2]>,
 }
 
 impl Membership {
-    const STANDALONE: Membership = Membership {
+    pub(crate) const STANDALONE: Membership = Membership {
         marker: 0b11,
         multichannel_info: None,
     };

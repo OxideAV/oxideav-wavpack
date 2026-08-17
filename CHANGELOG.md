@@ -75,6 +75,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   originated streams (float × 4/6 ch, int32 × 3/5 ch) decode
   **bit-exactly** under the reference decoder binary.
 
+- Round 447 — **hybrid multichannel origination.**
+  `encode_multichannel_stream_hybrid` encodes an interleaved
+  multichannel buffer into a hybrid `.wv` (+ `.wvc`) member-set chain:
+  the stereo-pair member plan with **one §6.5 / §4.4 state carry per
+  member chain** — per-member `0x06` level words seeded by the first
+  set's pre-pass and carried across sets from the packed end state,
+  and per-member `0x07` shaping state re-seeded from the quantized
+  payload each block. The set's first member carries the `0x0D`
+  geometry **after** its `0x06` profile and the `.wvc` twin mirrors
+  block structure without `0x0D` — both placements pinned by
+  inspection of the committed reference multichannel pair fixture.
+  The lossy `.wv` decodes alone via `decode_multichannel_stream`; the
+  pair restores the input bit-exactly through
+  `decode_multichannel_stream_with_correction`. Black-box: 12
+  originated pairs (widths 3 / 4 / 5 / 6 × shaping off / static − /
+  static +) recover the input **bit-exactly** from the pair and decode
+  their lossy PCM **bit-exactly**, both under the reference decoder
+  binary. Every hybrid axis the crate decodes is now also originated
+  at every channel width.
+
 - Round 447 — **compact 2-byte `0x07` form + payload-length
   validation.** The spec §4.4 compact shaping payload — one signed
   byte per channel (both present even for mono), expanded by the
