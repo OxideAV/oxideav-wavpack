@@ -85,7 +85,7 @@ use crate::block_header::TOTAL_SAMPLES_UNKNOWN;
 use crate::encode::{
     encode_block_mono_best, encode_block_mono_float_best, encode_block_mono_int32_best,
     encode_block_stereo_best, encode_block_stereo_float_best, encode_block_stereo_int32_best,
-    encode_multichannel_stream_at, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
+    encode_multichannel_stream_best_at, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
 };
 use crate::hybrid_encode::{
     encode_hybrid_block_float, encode_hybrid_block_int32, encode_hybrid_block_ints, HybridCarry,
@@ -595,13 +595,17 @@ impl Encoder for WavPackEncoder {
                 }
             }
             _ => {
-                data = encode_multichannel_stream_at(
+                // Round 447: wider layouts get real per-member
+                // compression — stereo-pair members through the same
+                // mode search the mono/stereo paths run.
+                data = encode_multichannel_stream_best_at(
                     &pcm,
                     self.channels,
                     DEFAULT_BLOCK_SAMPLES,
                     self.bytes_per_sample,
                     self.next_index,
                     TOTAL_SAMPLES_UNKNOWN,
+                    DecorrProfile::Normal,
                 )
                 .map_err(invalid)?;
             }

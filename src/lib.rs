@@ -887,11 +887,13 @@ pub use crate::encode::{
     encode_block_stereo_joint, encode_block_stereo_joint_auto,
     encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
     encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
-    encode_multichannel_stream, encode_multichannel_stream_at, encode_stream_mono,
-    encode_stream_mono_best, encode_stream_mono_float, encode_stream_mono_int32,
-    encode_stream_mono_smallest, encode_stream_stereo, encode_stream_stereo_best,
-    encode_stream_stereo_float, encode_stream_stereo_int32, encode_stream_stereo_smallest,
-    set_stream_sample_rate, DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
+    encode_multichannel_stream, encode_multichannel_stream_at, encode_multichannel_stream_best,
+    encode_multichannel_stream_best_at, encode_multichannel_stream_smallest,
+    encode_multichannel_stream_smallest_at, encode_stream_mono, encode_stream_mono_best,
+    encode_stream_mono_float, encode_stream_mono_int32, encode_stream_mono_smallest,
+    encode_stream_stereo, encode_stream_stereo_best, encode_stream_stereo_float,
+    encode_stream_stereo_int32, encode_stream_stereo_smallest, set_stream_sample_rate,
+    DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
 };
 pub use crate::entropy::EntropyInfo;
 pub use crate::error::{Error, Result};

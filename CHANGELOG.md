@@ -39,6 +39,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 447 — **compressed multichannel encoding (stereo-pair
+  members).** `encode_multichannel_stream_best` /
+  `encode_multichannel_stream_smallest` (+ offset-aware `_at` twins)
+  replace the raw mono-member grouping with real per-member
+  compression: channels pair into **stereo members** (`(0,1)`,
+  `(2,3)`, …; an odd trailing channel rides a mono member) and every
+  member runs the same mode search a standalone block gets —
+  self-derived decorrelation, per-pair joint mid/side decision,
+  left-shift detection — under the wiki bits-11..=12 grouping markers
+  and the `0x0D` first-member geometry. Widths 1 / 2 degenerate to
+  plain mono / stereo files. The framework registry's multichannel
+  path now routes through the paired `best` search (`Normal`
+  ceiling), so wider layouts stop paying the raw-member size penalty.
+  Measured on 6 000-frame correlated content: the paired `smallest`
+  encode lands at 50.8–61.1 % of the raw-member size across 3 / 4 /
+  5 / 6 / 8 channels. Black-box: 10 originated streams (widths
+  3 / 4 / 5 / 6 / 8 × `best` / `smallest`) decode **bit-exactly**
+  under the reference decoder binary.
+
 - Round 447 — **compact 2-byte `0x07` form + payload-length
   validation.** The spec §4.4 compact shaping payload — one signed
   byte per channel (both present even for mono), expanded by the
