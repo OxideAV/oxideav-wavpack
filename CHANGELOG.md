@@ -6,6 +6,163 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-wavpack/compare/v0.0.2...v0.0.3) - 2026-10-04
+
+### Other
+
+- zero-run probe moves into StereoDecodeState::take_zero_run
+- README examples use the current registry API
+- round-447 rollup — §4.4/§4.4.1 shaping pin + the multichannel origination matrix
+- Float / int32 hybrid multichannel closes the origination matrix
+- multichannel_encode_roundtrip oracle over the round-447 origination surface
+- Registry test: drop a redundant cast in the hybrid multichannel signal
+- Registry hybrid multichannel: per-member-chain carries persisted across packets
+- Hybrid multichannel origination: per-member-chain state carries + pair losslessness
+- Float / int32 multichannel origination + typed f32 multichannel decode
+- Compressed multichannel encoding: stereo-pair members through the full mode search
+- Shaping recurrence pinned to spec §4.4/§4.4.1: equality nudge + NEW_SHAPING gate + compact 0x07 form
+- round-436 rollup — hostile-input decode budgets across every eager surface
+- seek_surface bounded-window differential
+- Seek-surface decode budget: decode_range *_bounded + reader per-set bound
+- rustfmt reflow in correction_pair_decode
+- bounded_decode_differential oracle over the *_bounded surface
+- per-packet decoded-sample budget (max_packet_samples option)
+- Pair-surface decode budget: with_correction *_bounded twins
+- Stream-level decode budget: *_bounded twins with typed pre-decode refusal
+- shaping example in the API sketch; fuzz corpus refresh
+- Shaping ramps rail-saturate at full scale (reference-envelope pin)
+- README + exports: round-420 shaping/registry surface; export WavPackEncoderOptions
+- forward-direction round-418 edge-probe battery
+- float + hybrid encode wiring, typed encoder options
+- Hybrid noise-shaping origination: 0x07 emission + shaped bracketing
+- round-418 rollup — encoder origination axis complete
+- Conformance fixtures: r418 hybrid edge-probe battery (delta clamp / output clamp / implied fill)
+- hybrid_encode_roundtrip pair-decode oracle; fix clamp-bits underflow
+- Float / int32 hybrid pairs; hybrid lossy output clamp + implied-fill pins
+- Hybrid origination: lossy .wv + lossless .wv/.wvc pairs; $6.5 delta-clamp erratum fix
+- Per-sample decorrelation steppers: MonoStepper / StereoStepper
+- Float / int32 origination: encode-side 0x08/0x09 deconstruction + block/stream encoders
+- Pair-aware seeking: decode_range_with_correction + StreamReader::new_with_correction
+- round-415 rollup — pair-decode surface, fuzz target, fixture counts
+- correction-pair differential target; fix two shaping-state overflow sites
+- Multichannel (member-set) hybrid-lossless pair decode
+- single_match -> if let in the wvc corruption trip-wire
+- CRC-gated pair decode: .wvc header stores the lossless decode's CRC
+- Float / int32 hybrid-lossless pairs decode; int32 lossy implied-zeros fill
+- reflow round-415 cross-placement tests
+- CROSS_DECORR pairs pinned decorative: post-decorrelation fold is bit-exact
+- Joint (mid/side) stereo hybrid-lossless pair decode, bit-exact
+- doc(hidden) the internal plumbing surface (188 re-exports)
+- wv+wvc pair decode (mono + left/right stereo) — 0x0B bracket completion + 0x07 shaping filter, black-box pinned
+- lossy decode end-to-end — §6.5 error_limit model pinned black-box bit-exact + false-stereo output fix
+- SHIFT_SAME + EXCEPTIONS decode (staged spec §2.1-§2.2 + black-box pins) + short-0x03 weights prefix rule
+- README — round-405 rollup (foreign bit-exact decode, float/int32, sample rates, channel geometry) + fuzz corpus seeds
+- 0x0D first-member channel geometry — typed ChannelInfo surface
+- float (FLOAT_DATA) sample-format decode — 0x08 profile, wvx mantissa/zero layouts, float crc_x erratum
+- int32 (INT32_DATA) sample-format decode — 0x09 profile + 0x0C extension bits + crc_x gate
+- sample-rate surface — staged table, 0x27 custom rate, time-addressed seeking
+- foreign-decode conformance battery — 10 reference-encoded fixtures pinned bit-exact
+- wp_log2/wp_exp2s log-domain conversions — foreign-file decode unblocked
+- README + CHANGELOG — reference-decoder conformance rollup
+- fix unnecessary-cast clippy lint in round-393 pinning test
+- reference-decoder conformance — encoder now byte-exact under wvunpack
+- README + CHANGELOG — registry wiring + streaming multichannel encoder
+- oxideav-core registry wiring + streaming multichannel encoder
+- README + CHANGELOG round-393 rollup — seeking subsystem
+- seek_surface fuzz target + corpus seeds + clean campaign
+- StreamReader seekable decoding cursor
+- random-access decode_range / decode_range_muted
+- header-only stream index (StreamIndex/IndexEntry/SetEntry)
+- add CI / crates.io / docs.rs / MIT-license badges
+- README round-386 rollup — search-family depth + .wvc pairing + hardening
+- introspection-surface fuzz target + new-shape corpus seeds
+- wrap extrapolator predictors against adversarial history (fuzz finding)
+- .wvc correction-file pairing plumbing (pair_correction_stream)
+- union smallest encoders (encode_block/stream_*_smallest)
+- greedy term-search encoder mode (encode_block_*_searched)
+- iterated weight training (derive_*_passes_iterated)
+- DecorrProfile::Extra — spec §2.1 MAX_NTERMS (16-pass) derivation ceiling
+- README round-383 rollup — self-deriving encoder surface
+- encoder round-trip fuzz target + new-shape corpus seeds
+- profile-ceiling mode search in the best encoders
+- stream-level best encode (encode_stream_*_best)
+- left-shift auto-detection + best-of block mode selection
+- joint-stereo + decorrelation combined encode via single-body core
+- self-deriving decorrelation encoder (encode_block_*_auto)
+- forward decorrelation-metadata serializers (0x02/0x03/0x04)
+- pin false-stereo member + channel-cap refusal in multichannel decode
+- fuzz the multichannel decoder + README round-378 rollup
+- multichannel layout introspection (multichannel_layout)
+- multichannel CRC-muted decode (decode_multichannel_stream_muted)
+- multichannel stream encode (encode_multichannel_stream)
+- multichannel grouping decode (decode_multichannel_stream + member path)
+- simplify raw block API (drop unused passes param)
+- sub-byte bit-depth (left-shift) block encode
+- joint (mid/side) stereo block encode
+- lossless-with-decorrelation block encode (verbatim 0x02/0x03/0x04)
+- multi-block .wv stream encoder (encode_stream_mono/_stereo)
+- first complete encode→decode lossless block round-trip
+- wavpack r367: forward (encode) block-level hybrid correction split (§4.1)
+- wavpack r367: block-level hybrid correction fold + placement selector (§4.1)
+- wavpack r367: hybrid correction-fold arithmetic (decorrelation-spec §4.1)
+- public forward decorrelation encoder (recorrelate_mono/_stereo)
+- README — document left-shift final-normalization milestone
+- pin left-shift fixup across both stereo channels + whole-byte regression
+- apply left-shift fixup in decode_samples, CRC folds pre-shift
+- add left-shift final-normalization fixup module (wiki bits 13-17)
+- refresh stale decode-refusal docs for now-supported stereo + joint paths
+- document stereo decode + CRC mute gate; pin hybrid docs gap
+- decode_stream_muted — stream-level §5.6 CRC mute gate
+- add spec §5.6 CRC mute gate (decode_samples_muted)
+- wire stereo decorrelation prediction loop + joint-stereo undo into block decode
+- extension-stream CRC accumulator (crc_x / ExtensionCrc)
+- add verify_decoded_crc — tie §5 block CRC to the decode path
+- wire mono lossless decode through to reconstructed PCM
+- assemble §3.2/§3.3/§3.7 decorrelation inverse-prediction loop
+- neutralize decorative reference-decoder prose
+- spec §3 decorrelation inverse-prediction weight arithmetic
+- spec §5 running block-CRC primitives over decoded PCM
+- refuse joint-stereo / cross-channel decorrelation stereo blocks
+- refresh to current status, drop per-round changelog cruft
+- spec §1 even-byte rule for 0x0A packed-samples payload
+- Round 296: decode_stream cargo-fuzz target + three decode-side hardening fixes
+- Round 281: spec §4.2 exact-inverse entropy encoder + three §4.2 conformance corrections
+- Round 278: spec §4.2 step 1 zero-run fast path on the public typed surface + over-cap shift hardening
+- Round 274: spec §4.2 step 2+3 raw prefix decode + step 4 holding-bit fold on the public typed surface
+- Round 261: spec §4.2 step 7 sign-bit reconstruction on the typed surface
+- Round 260: spec §4.2 step 6 truncated-binary mantissa primitive on SampleInterval + spec §3.2 zone-predicate accessors on Zone
+- Round 255: typed SampleInterval view + AdaptiveMedians::sample_interval / sample_interval_for_ones_count accessors
+- Round 252: typed version / track_number / track_sub_index accessors + has_track_id / supports_false_stereo predicates
+- drop release-plz.toml — use release-plz defaults across the workspace
+- Round 245: block-CRC accessor on WavPackBlockHeader / WavPackBlock
+- Round 242: 0x0C packed-overflow-bits typed view + walker bridges + block-level introspection
+- Round 239: typed file-total / end-cursor accessors + stream_total_samples
+- Round 233: .wvc correction-stream typed view + walker bridges + introspection accessors
+- Round 230: stream-level introspection accessors
+- Round 224: multi-block stream → PCM composer (decode_stream / StreamDecodeIter / iter_decoded_blocks)
+- Round 219: multi-block stream iteration via BlockIter / iter_blocks / parse_blocks / block_count / total_block_samples
+- block-level discovery / accessor sweep on WavPackBlock
+- Round 206: WavPackBlock::decode_samples block-level composer + Flags::is_block_data_mono
+- Round 201: EntropyInfo → AdaptiveMedians bridges + decode_packed_samples_*_from_entropy wrappers
+- Round 199: stereo per-sample 0x0A decode loop (spec §2 channel-alternation)
+- Round 15: stateful per-sample 0x0A decode loop (spec §3 + §3.2 + §4.2)
+- release v0.0.2 ([#3](https://github.com/OxideAV/oxideav-wavpack/pull/3))
+- Round 14: median-adaptation amount (spec §3 + §3.2) — AdaptiveMedians + Zone
+- Round 13: end-to-end parse_block aggregate + BitReader peek/skip primitives
+- Round 12: 0x0A PackedSamples typed view + BitReader position accessors + channel-indexed EntropyInfo bridges
+- Round 11: per-term decorrelation sample-count helper + flat-payload partitioner
+- Round 10: MD5 typed view + walker finders + remaining metadata-kind predicates
+- Round 9: term-kind classifier + decorrelation/metadata kind accessors
+- round-8 block-header accessor coverage (lossless / sample-rate sentinel / experimental / effective bit-depth / audio-block / payload-bytes)
+- Round 7: single-call per-sample decode + EntropyInfo→Medians bridge
+- Golomb (base, add) interval + sample-value reconstruction (round 6)
+- Round 5: sample-coding bit reader + run-length decoder
+- Round 4: 0x05 entropy-info sub-block expander
+- Round 3: decorrelation sub-block expanders (terms / weights / samples)
+- Round 2: metadata sub-block walker
+- Round 1: WavPack v.4 block-header parser
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Changed
 
 - Round 447 — **noise-shaping recurrence pinned to spec §4.4/§4.4.1
