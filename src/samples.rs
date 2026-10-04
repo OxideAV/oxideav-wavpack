@@ -2468,25 +2468,7 @@ pub fn decode_packed_samples_stereo_hybrid_lossless(
             state.zero_run_pending -= 1;
             state.next_channel ^= 1;
             (0, 0, false)
-        } else if let Some(zero) = {
-            if state.run_break {
-                state.run_break = false;
-                None
-            } else if state.zero_run_eligible(medians) {
-                let run = read_zero_run_length(&mut reader)?;
-                if run > 0 {
-                    medians[0].values = [0, 0, 0];
-                    medians[1].values = [0, 0, 0];
-                    state.run_break = true;
-                    state.zero_run_pending = run - 1;
-                    Some(0)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } {
+        } else if let Some(zero) = state.take_zero_run(medians, &mut reader)? {
             state.next_channel ^= 1;
             (zero, zero, false)
         } else {
@@ -2557,25 +2539,7 @@ pub fn decode_packed_samples_stereo_hybrid_lossless_raw(
             state.zero_run_pending -= 1;
             state.next_channel ^= 1;
             (0, 0, false)
-        } else if let Some(zero) = {
-            if state.run_break {
-                state.run_break = false;
-                None
-            } else if state.zero_run_eligible(medians) {
-                let run = read_zero_run_length(&mut reader)?;
-                if run > 0 {
-                    medians[0].values = [0, 0, 0];
-                    medians[1].values = [0, 0, 0];
-                    state.run_break = true;
-                    state.zero_run_pending = run - 1;
-                    Some(0)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } {
+        } else if let Some(zero) = state.take_zero_run(medians, &mut reader)? {
             state.next_channel ^= 1;
             (zero, zero, false)
         } else {
@@ -2749,6 +2713,35 @@ impl StereoDecodeState {
     /// Pure predicate — reads no bits, mutates nothing. Stereo
     /// counterpart of [`DecodeState::zero_run_eligible`]; the private
     /// stereo decode loop's gate IS this predicate.
+    /// Consume a zero-run opportunity at the current slot: a pending
+    /// run break clears itself, an eligible position reads the run
+    /// length and, when it is non-zero, zeroes both channels' medians
+    /// and arms the remaining `run - 1` slots. Returns the zero sample
+    /// to emit for this slot, or `None` when a coded sample follows.
+    pub fn take_zero_run(
+        &mut self,
+        medians: &mut [AdaptiveMedians; 2],
+        reader: &mut BitReader<'_>,
+    ) -> Result<Option<i32>> {
+        if self.run_break {
+            self.run_break = false;
+            return Ok(None);
+        }
+        if !self.zero_run_eligible(medians) {
+            return Ok(None);
+        }
+        let run = read_zero_run_length(reader)?;
+        if run > 0 {
+            medians[0].values = [0, 0, 0];
+            medians[1].values = [0, 0, 0];
+            self.run_break = true;
+            self.zero_run_pending = run - 1;
+            Ok(Some(0))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn zero_run_eligible(&self, medians: &[AdaptiveMedians; 2]) -> bool {
         medians[0].values[0] <= 1
             && medians[1].values[0] <= 1
