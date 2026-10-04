@@ -472,6 +472,10 @@ Working surface:
 
 ```rust
 use oxideav_wavpack::{parse_block, decode_stream, decode_stream_muted};
+# let (file_bytes, float_file_bytes, untrusted_bytes): (&[u8], &[u8], &[u8]) = (&[], &[], &[]);
+# let (wv_bytes, wvc_bytes, wv_51, wvc_51): (&[u8], &[u8], &[u8], &[u8]) = (&[], &[], &[], &[]);
+# let (wide_pcm, surround_pcm): (Vec<i32>, Vec<i32>) = (vec![0; 2], vec![0; 12]);
+# let frames: u32 = 1;
 
 // Whole-stream decode → interleaved Vec<i32> PCM:
 let pcm = decode_stream(file_bytes)?;
@@ -537,8 +541,8 @@ assert_eq!(decode_stream_with_correction(&pair.wv, pair.wvc.as_ref().unwrap())?,
 // Multichannel origination (round 447): stereo-pair members with the
 // full per-member compression search — lossless, float/int32, hybrid:
 use oxideav_wavpack::{
-    decode_multichannel_stream, decode_multichannel_stream_with_correction,
-    encode_multichannel_stream_hybrid, encode_multichannel_stream_smallest,
+    decode_multichannel_stream, encode_multichannel_stream_hybrid,
+    encode_multichannel_stream_smallest,
 };
 let wv = encode_multichannel_stream_smallest(&surround_pcm, 6, 0, 2)?;
 assert_eq!(decode_multichannel_stream(&wv)?.samples, surround_pcm);
@@ -565,6 +569,7 @@ let window = decode_range(&wv, &index, 44100, 1024)?; // frames 44100..45124
 let mut reader = StreamReader::new(&wv)?;
 reader.seek_seconds(1.0)?; // == reader.seek(44100)? at 44.1 kHz
 let frames = reader.read_frames(1024)?; // == window
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Not yet supported
