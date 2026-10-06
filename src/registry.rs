@@ -836,12 +836,13 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
 /// dispatch through the [`oxideav_core::register!`]-generated entry
 /// point, or directly by standalone consumers.
 pub fn register(ctx: &mut RuntimeContext) {
-    let caps = CodecCapabilities {
-        decode: true,
-        encode: true,
-        lossless: true,
-        ..CodecCapabilities::audio("wavpack_sw")
-    };
+    // Constructor + builders: `CodecCapabilities` is `#[non_exhaustive]`, so
+    // struct-update syntax from this crate would stop compiling whenever core
+    // adds a field.
+    let caps = CodecCapabilities::audio("wavpack_sw")
+        .with_decode()
+        .with_encode()
+        .with_lossless(true);
     ctx.codecs.register(
         CodecInfo::new(CodecId::new(CODEC_ID))
             .capabilities(caps)

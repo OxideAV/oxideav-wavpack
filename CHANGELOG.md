@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `CodecCapabilities` is built with the core constructors / `with_*` builders (the struct is `#[non_exhaustive]` from core 0.1.39; a literal broke the published crate when core 0.1.38 added fields).
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-wavpack/compare/v0.0.2...v0.0.3) - 2026-10-04
 
 ### Other
