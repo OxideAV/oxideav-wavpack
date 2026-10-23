@@ -75,23 +75,23 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    options::{parse_options, CodecOptionsStruct, OptionField, OptionKind, OptionValue},
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecTag, Decoder, Encoder,
     Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, SampleFormat,
     TimeBase,
+    options::{CodecOptionsStruct, OptionField, OptionKind, OptionValue, parse_options},
 };
 
 use crate::block_header::TOTAL_SAMPLES_UNKNOWN;
 use crate::encode::{
-    encode_block_mono_best, encode_block_mono_float_best, encode_block_mono_int32_best,
-    encode_block_stereo_best, encode_block_stereo_float_best, encode_block_stereo_int32_best,
-    encode_multichannel_stream_best_at, encode_multichannel_stream_float_at,
-    encode_multichannel_stream_int32_at, DecorrProfile, DEFAULT_BLOCK_SAMPLES,
+    DEFAULT_BLOCK_SAMPLES, DecorrProfile, encode_block_mono_best, encode_block_mono_float_best,
+    encode_block_mono_int32_best, encode_block_stereo_best, encode_block_stereo_float_best,
+    encode_block_stereo_int32_best, encode_multichannel_stream_best_at,
+    encode_multichannel_stream_float_at, encode_multichannel_stream_int32_at,
 };
 use crate::hybrid_encode::{
-    encode_hybrid_block_float, encode_hybrid_block_int32, encode_hybrid_block_ints,
+    HybridCarry, encode_hybrid_block_float, encode_hybrid_block_int32, encode_hybrid_block_ints,
     encode_multichannel_hybrid_format_members, encode_multichannel_hybrid_members,
-    new_multichannel_carries, HybridCarry,
+    new_multichannel_carries,
 };
 use crate::{HybridOptions, HybridShaping};
 
@@ -364,8 +364,7 @@ impl CodecOptionsStruct for WavPackEncoderOptions {
             name: "shaping",
             kind: OptionKind::F32,
             default: OptionValue::F32(0.0),
-            help:
-                "hybrid noise-shaping weight in -1.0..=1.0 (0 = off, positive tilts noise upward)",
+            help: "hybrid noise-shaping weight in -1.0..=1.0 (0 = off, positive tilts noise upward)",
         },
         OptionField {
             name: "joint",
@@ -538,7 +537,7 @@ impl Encoder for WavPackEncoder {
             ));
         };
         let pcm = widen_bytes(plane, self.bytes_per_sample);
-        if pcm.len() % self.channels != 0 {
+        if !pcm.len().is_multiple_of(self.channels) {
             return Err(CoreError::invalid(format!(
                 "wavpack: frame carries {} samples, not whole {}-channel frames",
                 pcm.len(),
@@ -686,10 +685,10 @@ impl Encoder for WavPackEncoder {
         // sub-block on the stream's first block for non-standard
         // rates) so the emitted chain self-describes its rate
         // (round 405).
-        if let Some(rate) = self.params.sample_rate {
-            if rate > 0 {
-                data = crate::encode::set_stream_sample_rate(&data, rate).map_err(invalid)?;
-            }
+        if let Some(rate) = self.params.sample_rate
+            && rate > 0
+        {
+            data = crate::encode::set_stream_sample_rate(&data, rate).map_err(invalid)?;
         }
 
         let mut packet = Packet::new(0, self.time_base(), data);

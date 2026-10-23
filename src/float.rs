@@ -571,11 +571,7 @@ fn deconstruct_float_impl(pcm: &[f32], raised: bool) -> FloatDeconstruction {
                 wvx.write_bits(man, 23);
             }
             let mag = 1i32 << (24 - float_shift);
-            if neg {
-                -mag
-            } else {
-                mag
-            }
+            if neg { -mag } else { mag }
         } else if exp == 0 || anchor - exp > 23 {
             if exp == 0 && man == 0 {
                 // True ±0: integer 0; marker + optional sign under
@@ -609,11 +605,7 @@ fn deconstruct_float_impl(pcm: &[f32], raised: bool) -> FloatDeconstruction {
                 }
             }
             let mag = ((mantissa24 >> d) >> float_shift) as i32;
-            if neg {
-                -mag
-            } else {
-                mag
-            }
+            if neg { -mag } else { mag }
         };
         integers.push(integer);
     }
@@ -627,7 +619,7 @@ fn deconstruct_float_impl(pcm: &[f32], raised: bool) -> FloatDeconstruction {
         // reference decoder rejects a 0x0C sub-block framed with the
         // odd-size pad flag as "not compatible"; every reference-
         // encoded 0x0C payload is even).
-        if payload.len() % 2 != 0 {
+        if !payload.len().is_multiple_of(2) {
             payload.push(0);
         }
         Some(payload)

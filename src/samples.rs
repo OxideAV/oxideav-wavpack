@@ -1962,11 +1962,7 @@ fn read_truncated_binary(reader: &mut BitReader<'_>, maxcode: u32) -> Result<u32
 /// the decode ladder produces non-negative after the `as i32` cast.
 pub const fn apply_sign(magnitude: u32, sign_bit_set: bool) -> i32 {
     let mid = magnitude as i32;
-    if sign_bit_set {
-        !mid
-    } else {
-        mid
-    }
+    if sign_bit_set { !mid } else { mid }
 }
 
 /// Exact inverse of [`apply_sign`]: split a signed sample into the
@@ -2964,7 +2960,7 @@ pub fn decode_packed_samples_stereo_from_entropy(
 /// decoder consuming exactly the encoded samples never reads it.
 fn finish_even(writer: BitWriter) -> Vec<u8> {
     let mut bytes = writer.finish();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         bytes.push(0);
     }
     bytes

@@ -88,21 +88,23 @@
 //! bytes map to via `b - 128`).
 
 use oxideav_wavpack::{
-    decode_multichannel_stream, decode_multichannel_stream_muted, decode_stream,
-    decode_stream_muted, StreamIndex,
+    StreamIndex, decode_multichannel_stream, decode_multichannel_stream_muted, decode_stream,
+    decode_stream_muted,
 };
 
 /// Decode an expected-PCM sidecar (`.pcm32le`: little-endian `i32`s).
 fn expected_pcm(bytes: &[u8]) -> Vec<i32> {
     assert_eq!(bytes.len() % 4, 0, "expected-PCM sidecar must be i32s");
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
 
 macro_rules! foreign_fixture {
-    ($name:ident, $stem:literal, $channels:expr) => {
+    ($name:ident, $stem:literal, $channels:expr_2021) => {
         #[test]
         fn $name() {
             let wv = include_bytes!(concat!("data/", $stem, ".wv"));
@@ -245,7 +247,7 @@ fn foreign_hybrid_false_stereo_duplicates_channels() {
     let wv = include_bytes!("data/foreign_hybrid_false_stereo_b4.wv");
     let decoded = oxideav_wavpack::decode_multichannel_stream(wv).expect("decode");
     assert_eq!(decoded.channels, 2);
-    for pair in decoded.samples.chunks_exact(2) {
+    for pair in decoded.samples.as_chunks::<2>().0 {
         assert_eq!(pair[0], pair[1], "false stereo duplicates L to R");
     }
 }
@@ -374,7 +376,7 @@ fn hybrid_pair_5dot1_is_lossless() {
 #[test]
 fn pair_window_decode_matches_whole_pair_decode() {
     use oxideav_wavpack::{
-        decode_range_with_correction, decode_range_with_correction_muted, StreamIndex, StreamReader,
+        StreamIndex, StreamReader, decode_range_with_correction, decode_range_with_correction_muted,
     };
     let cases: [(&[u8], &[u8], usize); 3] = [
         (
@@ -598,12 +600,16 @@ fn foreign_exception_fixtures_reproduce_ieee_specials() {
     let floats =
         oxideav_wavpack::decode_stream_f32(include_bytes!("data/foreign_float_exceptions.wv"))
             .expect("f32 decode");
-    assert!(floats
-        .iter()
-        .any(|f| f.is_infinite() && f.is_sign_positive()));
-    assert!(floats
-        .iter()
-        .any(|f| f.is_infinite() && f.is_sign_negative()));
+    assert!(
+        floats
+            .iter()
+            .any(|f| f.is_infinite() && f.is_sign_positive())
+    );
+    assert!(
+        floats
+            .iter()
+            .any(|f| f.is_infinite() && f.is_sign_negative())
+    );
     assert!(floats.iter().any(|f| f.is_nan()));
 
     // exc_tiny: 0.5 everywhere except +inf / NaN(0x155555) / -inf.
@@ -617,11 +623,12 @@ fn foreign_exception_fixtures_reproduce_ieee_specials() {
         "NaN payload bits preserved"
     );
     assert_eq!(tiny[30], f32::NEG_INFINITY);
-    assert!(tiny
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| ![10, 20, 30].contains(i))
-        .all(|(_, &f)| f == 0.5));
+    assert!(
+        tiny.iter()
+            .enumerate()
+            .filter(|(i, _)| ![10, 20, 30].contains(i))
+            .all(|(_, &f)| f == 0.5)
+    );
 }
 
 /// The typed f32 surface reinterprets a float stream's decoded bit
@@ -684,7 +691,9 @@ fn foreign_5dot1_channel_info_declares_count_and_mask() {
     assert_eq!(decoded.channels, usize::from(info.count));
     // Plain mono / stereo files carry no 0x0D.
     let mono = include_bytes!("data/foreign_default_mono16.wv");
-    assert!(oxideav_wavpack::stream_channel_info(mono)
-        .expect("parse")
-        .is_none());
+    assert!(
+        oxideav_wavpack::stream_channel_info(mono)
+            .expect("parse")
+            .is_none()
+    );
 }

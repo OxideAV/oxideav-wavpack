@@ -25,11 +25,12 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_wavpack::{
-    decode_multichannel_stream, decode_multichannel_stream_f32, decode_multichannel_stream_muted,
+    DecorrProfile, HybridOptions, HybridShaping, decode_multichannel_stream,
+    decode_multichannel_stream_f32, decode_multichannel_stream_muted,
     decode_multichannel_stream_with_correction, decode_multichannel_stream_with_correction_muted,
     encode_multichannel_stream_best, encode_multichannel_stream_float,
     encode_multichannel_stream_hybrid, encode_multichannel_stream_int32,
-    encode_multichannel_stream_smallest, DecorrProfile, HybridOptions, HybridShaping,
+    encode_multichannel_stream_smallest,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -74,7 +75,9 @@ fuzz_target!(|data: &[u8]| {
             // Float: any bit pattern is a legal sample (NaN payloads,
             // infinities, denormals included).
             let raw: Vec<i32> = data[3..]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .take(360)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
@@ -99,7 +102,9 @@ fuzz_target!(|data: &[u8]| {
             // Int32: the full i32 range rides the 0x09 deconstruction.
             let pcm = whole(
                 data[3..]
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .take(360)
                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
@@ -120,7 +125,9 @@ fuzz_target!(|data: &[u8]| {
             // Hybrid pair over 16-bit-container integers.
             let pcm = whole(
                 data[3..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .take(600)
                     .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
                     .collect(),
@@ -162,7 +169,9 @@ fuzz_target!(|data: &[u8]| {
             // Lossless integer members through best / smallest.
             let pcm = whole(
                 data[3..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .take(600)
                     .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
                     .collect(),

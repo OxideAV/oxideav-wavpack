@@ -127,7 +127,7 @@ impl<'a> PackedSamples<'a> {
     /// [`Self::validate_length`] for the checked-accessor form that
     /// surfaces [`Error::PackedSamplesOddLength`] on an odd payload.
     pub const fn is_even_length(&self) -> bool {
-        self.bytes.len() % 2 == 0
+        self.bytes.len().is_multiple_of(2)
     }
 
     /// Return `Ok(*self)` when the payload satisfies the spec §1 even-byte

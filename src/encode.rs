@@ -48,12 +48,12 @@
 
 use crate::block_header::{MAGIC, MIN_CK_SIZE};
 use crate::decorrelation::{
-    quantize_weight, recorrelate_mono, recorrelate_stereo, serialize_mono_passes,
-    serialize_stereo_passes, DecorrPass, MAX_TERM,
+    DecorrPass, MAX_TERM, quantize_weight, recorrelate_mono, recorrelate_stereo,
+    serialize_mono_passes, serialize_stereo_passes,
 };
 use crate::error::{Error, Result};
-use crate::metadata::{SubBlockId, ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE};
-use crate::samples::{encode_packed_samples_mono, encode_packed_samples_stereo, AdaptiveMedians};
+use crate::metadata::{ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, SubBlockId};
+use crate::samples::{AdaptiveMedians, encode_packed_samples_mono, encode_packed_samples_stereo};
 
 /// The stream-format version this encoder writes into the 16-bit header
 /// `version` field. `0x0410` is the highest version
@@ -368,7 +368,7 @@ fn encode_block_core(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if !config.mono && pcm.len() % 2 != 0 {
+    if !config.mono && !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
 
@@ -397,7 +397,7 @@ fn encode_block_core(
     // Stage 3: forward mid/side ahead of prediction, mirroring the
     // decoder's decorrelate-then-joint-undo order.
     if config.joint {
-        for pair in work.chunks_exact_mut(2) {
+        for pair in work.as_chunks_mut::<2>().0 {
             let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
             pair[0] = mid;
             pair[1] = side;
@@ -1313,7 +1313,7 @@ pub fn encode_block_stereo_auto(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let passes = derive_stereo_passes(pcm, profile)?;
@@ -1349,12 +1349,12 @@ pub fn encode_block_stereo_joint_auto(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     // Train over the joint (mid/side) domain the real loop will see.
     let mut joint = pcm.to_vec();
-    for pair in joint.chunks_exact_mut(2) {
+    for pair in joint.as_chunks_mut::<2>().0 {
         let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
         pair[0] = mid;
         pair[1] = side;
@@ -1395,11 +1395,7 @@ pub fn detect_left_shift(pcm: &[i32]) -> u8 {
             }
         }
     }
-    if any_nonzero {
-        common as u8
-    } else {
-        0
-    }
+    if any_nonzero { common as u8 } else { 0 }
 }
 
 /// Keep `candidate` when it is strictly smaller than the current best
@@ -1567,7 +1563,7 @@ fn encode_block_stereo_best_member(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let left_shift = detect_left_shift(pcm);
@@ -1576,7 +1572,7 @@ fn encode_block_stereo_best_member(
         narrow_left_shift(&mut narrow, left_shift)?;
     }
     let mut joint_narrow = narrow.clone();
-    for pair in joint_narrow.chunks_exact_mut(2) {
+    for pair in joint_narrow.as_chunks_mut::<2>().0 {
         let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
         pair[0] = mid;
         pair[1] = side;
@@ -1743,7 +1739,7 @@ fn encode_block_stereo_searched_member(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let left_shift = detect_left_shift(pcm);
@@ -1752,7 +1748,7 @@ fn encode_block_stereo_searched_member(
         narrow_left_shift(&mut narrow, left_shift)?;
     }
     let mut joint_narrow = narrow.clone();
-    for pair in joint_narrow.chunks_exact_mut(2) {
+    for pair in joint_narrow.as_chunks_mut::<2>().0 {
         let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
         pair[0] = mid;
         pair[1] = side;
@@ -1957,7 +1953,7 @@ fn encode_block_best_ints_member(
     let mut joint_domain = Vec::new();
     if !mono {
         joint_domain = ints.to_vec();
-        for pair in joint_domain.chunks_exact_mut(2) {
+        for pair in joint_domain.as_chunks_mut::<2>().0 {
             let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
             pair[0] = mid;
             pair[1] = side;
@@ -2055,7 +2051,7 @@ pub fn encode_block_stereo_float(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let d = crate::float::deconstruct_float(pcm);
@@ -2111,7 +2107,7 @@ pub fn encode_block_stereo_float_best(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let d = crate::float::deconstruct_float(pcm);
@@ -2163,7 +2159,7 @@ pub fn encode_stream_stereo_float(
     block_samples: usize,
     profile: DecorrProfile,
 ) -> Result<Vec<u8>> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -2224,7 +2220,7 @@ pub fn encode_block_stereo_int32(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let d = crate::int32::deconstruct_int32(pcm);
@@ -2276,7 +2272,7 @@ pub fn encode_block_stereo_int32_best(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let d = crate::int32::deconstruct_int32(pcm);
@@ -2325,7 +2321,7 @@ pub fn encode_stream_stereo_int32(
     block_samples: usize,
     profile: DecorrProfile,
 ) -> Result<Vec<u8>> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -2487,7 +2483,7 @@ pub fn encode_stream_stereo(
     block_samples: usize,
     bytes_per_sample: u8,
 ) -> Result<Vec<u8>> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -2558,7 +2554,7 @@ pub fn encode_stream_stereo_best(
     bytes_per_sample: u8,
     profile: DecorrProfile,
 ) -> Result<Vec<u8>> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -2618,7 +2614,7 @@ pub fn encode_stream_stereo_smallest(
     block_samples: usize,
     bytes_per_sample: u8,
 ) -> Result<Vec<u8>> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -2709,7 +2705,7 @@ pub fn encode_multichannel_stream_at(
     if pcm.is_empty() {
         return Ok(Vec::new());
     }
-    if pcm.len() % channels != 0 {
+    if !pcm.len().is_multiple_of(channels) {
         // The interleaved buffer must be whole frames of `channels` each.
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
@@ -2902,7 +2898,7 @@ fn encode_multichannel_format_at<T: Copy>(
     if pcm.is_empty() {
         return Ok(Vec::new());
     }
-    if pcm.len() % channels != 0 {
+    if !pcm.len().is_multiple_of(channels) {
         // The interleaved buffer must be whole frames of `channels` each.
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
@@ -3130,8 +3126,8 @@ fn encode_multichannel_stream_search_at(
 mod tests {
     use super::*;
     use crate::block::decode_stream;
-    use crate::block_header::{parse_block_header, TOTAL_SAMPLES_UNKNOWN};
-    use crate::metadata::{parse_metadata_sub_block, SubBlockId};
+    use crate::block_header::{TOTAL_SAMPLES_UNKNOWN, parse_block_header};
+    use crate::metadata::{SubBlockId, parse_metadata_sub_block};
 
     /// The core lossless guarantee: a mono block encodes and decodes back
     /// to the exact input PCM, via the no-decorrelation raw-residual path.
@@ -4274,7 +4270,7 @@ mod tests {
         let pcm = smooth_stereo(300);
         // Derive over the joint domain by hand, mirroring the auto path.
         let mut joint = pcm.clone();
-        for pair in joint.chunks_exact_mut(2) {
+        for pair in joint.as_chunks_mut::<2>().0 {
             let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
             pair[0] = mid;
             pair[1] = side;
@@ -4569,12 +4565,16 @@ mod tests {
     /// Empty inputs yield empty streams; odd stereo is refused.
     #[test]
     fn stream_best_edge_arms() {
-        assert!(encode_stream_mono_best(&[], 0, 2, DecorrProfile::Fast)
-            .unwrap()
-            .is_empty());
-        assert!(encode_stream_stereo_best(&[], 0, 2, DecorrProfile::Fast)
-            .unwrap()
-            .is_empty());
+        assert!(
+            encode_stream_mono_best(&[], 0, 2, DecorrProfile::Fast)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            encode_stream_stereo_best(&[], 0, 2, DecorrProfile::Fast)
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
             encode_stream_stereo_best(&[1, 2, 3], 0, 2, DecorrProfile::Fast),
             Err(Error::EncodeStereoOddLength(3))
@@ -5178,10 +5178,10 @@ mod tests {
         let pos = broken.len() - 3;
         broken[pos] ^= 0x40;
         let parsed = crate::parse_block(&broken).unwrap().0;
-        if let Ok((muted, ok)) = parsed.decode_samples_muted() {
-            if !ok {
-                assert!(muted.iter().all(|&s| s == 0), "muted buffer is zeroed");
-            }
+        if let Ok((muted, ok)) = parsed.decode_samples_muted()
+            && !ok
+        {
+            assert!(muted.iter().all(|&s| s == 0), "muted buffer is zeroed");
         }
     }
 
@@ -5207,11 +5207,13 @@ mod tests {
             .collect();
         let block = encode_block_stereo_int32(&pcm, 0, 300).unwrap();
         assert_eq!(decode_stream(&block).unwrap(), pcm);
-        assert!(crate::parse_block(&block)
-            .unwrap()
-            .0
-            .verify_decoded_crc()
-            .unwrap());
+        assert!(
+            crate::parse_block(&block)
+                .unwrap()
+                .0
+                .verify_decoded_crc()
+                .unwrap()
+        );
     }
 
     #[test]

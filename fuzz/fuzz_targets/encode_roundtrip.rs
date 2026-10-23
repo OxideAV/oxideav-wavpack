@@ -21,8 +21,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_wavpack::{
-    decode_stream, decode_stream_muted, encode_block_mono_best, encode_block_stereo_best,
-    DecorrProfile,
+    DecorrProfile, decode_stream, decode_stream_muted, encode_block_mono_best,
+    encode_block_stereo_best,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -44,7 +44,9 @@ fuzz_target!(|data: &[u8]| {
     // bounded so a fuzz run stays fast. Keep the samples within a
     // 24-bit-ish range so the synthetic shift cannot overflow.
     let mut pcm: Vec<i32> = data[1..]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(512)
         .map(|c| (i32::from_le_bytes([c[0], c[1], c[2], c[3]]) >> 8) << scale)
         .collect();

@@ -68,19 +68,19 @@
 //! bit-exactly.
 
 use crate::decorrelation::{
-    assemble_mono_passes, assemble_stereo_passes, recorrelate_mono, recorrelate_stereo,
-    serialize_mono_passes, serialize_stereo_passes, DecorrPass, MonoStepper, StereoStepper,
+    DecorrPass, MonoStepper, StereoStepper, assemble_mono_passes, assemble_stereo_passes,
+    recorrelate_mono, recorrelate_stereo, serialize_mono_passes, serialize_stereo_passes,
 };
 use crate::encode::{
-    append_sub_block, base_flags, build_block, forward_joint_stereo, magnitude_bits,
-    pack_entropy_info, with_marker, DecorrProfile, FormatExtras, DEFAULT_BLOCK_SAMPLES,
+    DEFAULT_BLOCK_SAMPLES, DecorrProfile, FormatExtras, append_sub_block, base_flags, build_block,
+    forward_joint_stereo, magnitude_bits, pack_entropy_info, with_marker,
 };
 use crate::error::{Error, Result};
-use crate::hybrid::{HybridProfile, HybridState, HYBRID_FLAG};
+use crate::hybrid::{HYBRID_FLAG, HybridProfile, HybridState};
 use crate::metadata::SubBlockId;
 use crate::samples::{
-    emit_raw_prefix, emit_zero_run_length, split_sign, AdaptiveMedians, BitWriter, RunState,
-    SampleInterval, Zone,
+    AdaptiveMedians, BitWriter, RunState, SampleInterval, Zone, emit_raw_prefix,
+    emit_zero_run_length, split_sign,
 };
 
 /// Wiki flag bit 9 — the first hybrid-profile sub-flag. Set on every
@@ -311,7 +311,7 @@ fn emit_pending(
                     value: pending.zone,
                     low: 0,
                     high: 0,
-                })
+                });
             }
         }
     }
@@ -375,7 +375,7 @@ fn plan_word(
 /// words; round-393/418 pins).
 fn finish_even(writer: BitWriter) -> Vec<u8> {
     let mut bytes = writer.finish();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         bytes.push(0);
     }
     bytes
@@ -888,7 +888,7 @@ pub(crate) fn encode_hybrid_block_ints_member(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if !mono && pcm.len() % 2 != 0 {
+    if !mono && !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let stereo = !mono;
@@ -901,7 +901,7 @@ pub(crate) fn encode_hybrid_block_ints_member(
     // Coded domain: joint-transform stereo pairs ahead of prediction.
     let mut coded = pcm.to_vec();
     if joint {
-        for pair in coded.chunks_exact_mut(2) {
+        for pair in coded.as_chunks_mut::<2>().0 {
             let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
             pair[0] = mid;
             pair[1] = side;
@@ -957,7 +957,7 @@ pub(crate) fn encode_hybrid_block_ints_member(
     // error by the reference decoder).
     let mut lossy_out = streams.coarse_out;
     if joint {
-        for pair in lossy_out.chunks_exact_mut(2) {
+        for pair in lossy_out.as_chunks_mut::<2>().0 {
             let (l, r) = crate::crc::undo_joint_stereo(pair[0], pair[1]);
             pair[0] = l;
             pair[1] = r;
@@ -1145,7 +1145,7 @@ fn hybrid_seed(pcm: &[i32], mono: bool, opts: &HybridOptions) -> Result<[i16; 2]
     let joint = !mono && opts.joint;
     let mut coded = pcm.to_vec();
     if joint {
-        for pair in coded.chunks_exact_mut(2) {
+        for pair in coded.as_chunks_mut::<2>().0 {
             let (mid, side) = forward_joint_stereo(pair[0], pair[1]);
             pair[0] = mid;
             pair[1] = side;
@@ -1349,7 +1349,7 @@ pub fn encode_block_stereo_hybrid(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let carry = HybridCarry::new(opts, false);
@@ -1431,7 +1431,7 @@ pub fn encode_stream_stereo_hybrid(
     bytes_per_sample: u8,
     opts: &HybridOptions,
 ) -> Result<HybridEncoded> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -1509,7 +1509,7 @@ pub fn encode_multichannel_stream_hybrid(
             wvc: opts.correction.then_some(Vec::new()),
         });
     }
-    if pcm.len() % channels != 0 {
+    if !pcm.len().is_multiple_of(channels) {
         // The interleaved buffer must be whole frames of `channels` each.
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
@@ -1831,7 +1831,7 @@ fn encode_multichannel_hybrid_format<T: Copy>(
             wvc: opts.correction.then_some(Vec::new()),
         });
     }
-    if pcm.len() % channels != 0 {
+    if !pcm.len().is_multiple_of(channels) {
         // The interleaved buffer must be whole frames of `channels` each.
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
@@ -1906,7 +1906,7 @@ pub(crate) fn encode_hybrid_block_float_member(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if !mono && pcm.len() % 2 != 0 {
+    if !mono && !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let d = crate::float::deconstruct_float_raised(pcm);
@@ -1973,7 +1973,7 @@ pub(crate) fn encode_hybrid_block_int32_member(
     if pcm.is_empty() {
         return Err(Error::EncodeEmptyAudio);
     }
-    if !mono && pcm.len() % 2 != 0 {
+    if !mono && !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let d = crate::int32::deconstruct_int32(pcm);
@@ -2101,7 +2101,7 @@ pub fn encode_stream_stereo_hybrid_float(
     block_samples: usize,
     opts: &HybridOptions,
 ) -> Result<HybridEncoded> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -2168,7 +2168,7 @@ pub fn encode_stream_stereo_hybrid_int32(
     block_samples: usize,
     opts: &HybridOptions,
 ) -> Result<HybridEncoded> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         return Err(Error::EncodeStereoOddLength(pcm.len()));
     }
     let pairs = if block_samples == 0 {
@@ -2754,9 +2754,11 @@ mod tests {
         // The .wvc mirrors the member count and carries no 0x0D.
         let cblocks = parse_blocks(enc.wvc.as_ref().unwrap()).unwrap();
         assert_eq!(cblocks.len(), 6);
-        assert!(cblocks
-            .iter()
-            .all(|b| b.find_multichannel_info_sub_block().is_none()));
+        assert!(
+            cblocks
+                .iter()
+                .all(|b| b.find_multichannel_info_sub_block().is_none())
+        );
     }
 
     #[test]

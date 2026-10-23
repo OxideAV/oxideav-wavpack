@@ -37,16 +37,16 @@
 //! per-sample loop the wiki "Samples coding" section depends on; this
 //! round adds no sample-level state and so is not impacted by that gap.
 
-use crate::block_header::{parse_block_header, Flags, WavPackBlockHeader, HEADER_LEN};
+use crate::block_header::{Flags, HEADER_LEN, WavPackBlockHeader, parse_block_header};
 use crate::decorrelation::{
     assemble_mono_passes, assemble_stereo_passes, decorrelate_mono, decorrelate_stereo,
 };
-use crate::entropy::{expand_entropy, EntropyInfo};
+use crate::entropy::{EntropyInfo, expand_entropy};
 use crate::error::{Error, Result};
 use crate::metadata::{
-    find_entropy_info, find_first, find_md5_checksum_block, find_multichannel_info,
-    find_packed_samples, parse_md5_checksum, walk_metadata, Md5Checksum, MetadataSubBlock,
-    SubBlockId,
+    Md5Checksum, MetadataSubBlock, SubBlockId, find_entropy_info, find_first,
+    find_md5_checksum_block, find_multichannel_info, find_packed_samples, parse_md5_checksum,
+    walk_metadata,
 };
 use crate::packed_samples::PackedSamples;
 use crate::samples::decode_packed_samples_mono_from_entropy;
@@ -1454,7 +1454,7 @@ impl<'a> WavPackBlock<'a> {
                 // Spec §5.4: undo mid/side joint stereo per pair *after*
                 // decorrelation, *before* CRC accumulation. The decoded
                 // pair is (mid, side); recover (left, right).
-                for pair in residuals.chunks_exact_mut(2) {
+                for pair in residuals.as_chunks_mut::<2>().0 {
                     let (left, right) = crate::crc::undo_joint_stereo(pair[0], pair[1]);
                     pair[0] = left;
                     pair[1] = right;
@@ -1470,11 +1470,7 @@ impl<'a> WavPackBlock<'a> {
     /// duplicates to both outputs; round 408). The per-member channel
     /// count a multichannel set sums over its members. Round 378.
     fn member_channel_count(&self) -> usize {
-        if self.header.flags.mono {
-            1
-        } else {
-            2
-        }
+        if self.header.flags.mono { 1 } else { 2 }
     }
 
     /// Decode a **multichannel-set member** block's PCM up to but not
@@ -1647,12 +1643,11 @@ impl<'a> WavPackBlock<'a> {
         // well-formed).
         let mut bits =
             (u32::from(flags.bytes_per_sample()) * 8).saturating_sub(u32::from(flags.left_shift));
-        if flags.int32_mode {
-            if let Some(sub) = self.find_sub_block(SubBlockId::Int32Info) {
-                if let Ok(info) = crate::int32::expand_int32_info(sub.payload) {
-                    bits = bits.saturating_sub(info.total_shift());
-                }
-            }
+        if flags.int32_mode
+            && let Some(sub) = self.find_sub_block(SubBlockId::Int32Info)
+            && let Ok(info) = crate::int32::expand_int32_info(sub.payload)
+        {
+            bits = bits.saturating_sub(info.total_shift());
         }
         let bits = bits.clamp(1, 32);
         if bits == 32 {
@@ -3715,7 +3710,7 @@ fn decode_multichannel_pair_inner(
             let frames = pcm.len() / 2;
             let mut left = Vec::with_capacity(frames);
             let mut right = Vec::with_capacity(frames);
-            for frame in pcm.chunks_exact(2) {
+            for frame in pcm.as_chunks::<2>().0 {
                 left.push(frame[0]);
                 right.push(frame[1]);
             }
@@ -3792,7 +3787,10 @@ mod tests {
         // size_words = payload.len() / 2 (wiki: every metadata block has
         // even length, size is in 16-bit words). Tests use even-length
         // payloads only.
-        assert!(payload.len() % 2 == 0, "tests use even-length payloads");
+        assert!(
+            payload.len().is_multiple_of(2),
+            "tests use even-length payloads"
+        );
         let words = (payload.len() / 2) as u8;
         buf.push(id_byte);
         buf.push(words);
@@ -3928,7 +3926,7 @@ mod tests {
         let body_len = payload_len - 2; // subtract the 2-byte sub-block header
         let mut payload = Vec::with_capacity(payload_len);
         payload.push(0x00); // Dummy ID
-        assert!(body_len % 2 == 0, "test body must be even-length");
+        assert!(body_len.is_multiple_of(2), "test body must be even-length");
         assert!(body_len / 2 <= u8::MAX as usize, "body fits in 1-byte size");
         payload.push((body_len / 2) as u8);
         payload.extend(std::iter::repeat_n(0u8, body_len));
@@ -4061,10 +4059,10 @@ mod tests {
     #[test]
     fn decode_samples_mono_decorrelation_reconstructs_pcm_end_to_end() {
         use crate::decorrelation::{
-            assemble_mono_passes, decorrelate_mono, TERM_BYTE_BIAS, TERM_PREDICTOR_BITS,
-            TERM_PREDICTOR_MASK,
+            TERM_BYTE_BIAS, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, assemble_mono_passes,
+            decorrelate_mono,
         };
-        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+        use crate::samples::{AdaptiveMedians, encode_packed_samples_mono};
 
         // Build a residual buffer, encode it into the 0x0A bitstream
         // (seeded from the 0x05 entropy info), attach a 0x02/0x03/0x04
@@ -4138,10 +4136,10 @@ mod tests {
     /// layout the end-to-end decorrelation test pins.
     fn synthesise_mono_decorr_block_with_left_shift(left_shift: u32) -> (Vec<u8>, Vec<i32>) {
         use crate::decorrelation::{
-            assemble_mono_passes, decorrelate_mono, TERM_BYTE_BIAS, TERM_PREDICTOR_BITS,
-            TERM_PREDICTOR_MASK,
+            TERM_BYTE_BIAS, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, assemble_mono_passes,
+            decorrelate_mono,
         };
-        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+        use crate::samples::{AdaptiveMedians, encode_packed_samples_mono};
 
         let residuals: Vec<i32> = vec![5, -3, 8, 0, 12, -7, 4, 1, -2, 9, 6, -1];
         let term_byte = |term: i8, delta: u8| -> u8 {
@@ -4343,7 +4341,7 @@ mod tests {
         // A non-zero mono PCM block with a deliberately-wrong stored CRC:
         // the §5.6 mute gate zeros the buffer and reports crc_ok = false,
         // while preserving the decoded length.
-        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+        use crate::samples::{AdaptiveMedians, encode_packed_samples_mono};
 
         let pcm = vec![5i32, -3, 8, 0];
         let info_block = crate::entropy::expand_entropy(&[0u8; 6]).expect("entropy");
@@ -4408,10 +4406,10 @@ mod tests {
     #[test]
     fn verify_decoded_crc_matches_for_mono_decorrelation_block() {
         use crate::decorrelation::{
-            assemble_mono_passes, decorrelate_mono, TERM_BYTE_BIAS, TERM_PREDICTOR_BITS,
-            TERM_PREDICTOR_MASK,
+            TERM_BYTE_BIAS, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, assemble_mono_passes,
+            decorrelate_mono,
         };
-        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+        use crate::samples::{AdaptiveMedians, encode_packed_samples_mono};
 
         // Reconstruct PCM from a decorrelation block (as the end-to-end
         // decode test does), compute its §5 CRC over the reconstructed
@@ -5012,7 +5010,7 @@ mod tests {
                 writer.write_bits(u32::from(bit), 1);
             }
             wvx.extend_from_slice(&writer.finish());
-            if wvx.len() % 2 != 0 {
+            if !wvx.len().is_multiple_of(2) {
                 wvx.push(0);
             }
             append_small_sub_block(&mut payload, 0x0C, &wvx);
@@ -5428,7 +5426,7 @@ mod tests {
         // stamp a non-zero left_shift, and confirm every interleaved slot
         // is shifted.
         use crate::decorrelation::{assemble_stereo_passes, decorrelate_stereo};
-        use crate::samples::{encode_packed_samples_stereo, AdaptiveMedians};
+        use crate::samples::{AdaptiveMedians, encode_packed_samples_stereo};
 
         // Interleaved stereo residuals [L0,R0,L1,R1,…].
         let residuals: Vec<i32> = vec![5, -3, 8, 2, 12, -7, 4, 1];
@@ -5471,7 +5469,7 @@ mod tests {
         // The 0x0A payload must be even-length (spec §1: it binds as 16-bit
         // words). Pad with a trailing zero byte the reader never reaches
         // (decode stops after `block_samples` frames).
-        if packed_0a.len() % 2 != 0 {
+        if !packed_0a.len().is_multiple_of(2) {
             packed_0a.push(0);
         }
 
@@ -6441,7 +6439,7 @@ mod tests {
         // [good][bad] where the bad block carries a non-zero sample but a
         // wrong CRC: the good block's sample survives, the bad block is
         // zeroed, and all_crc_ok is false.
-        use crate::samples::{encode_packed_samples_mono, AdaptiveMedians};
+        use crate::samples::{AdaptiveMedians, encode_packed_samples_mono};
 
         let good = synthesise_crc_correct_mono_block_one_zero_sample();
 

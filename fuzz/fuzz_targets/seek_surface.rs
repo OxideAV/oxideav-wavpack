@@ -42,9 +42,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_wavpack::{
-    audio_block_count, block_count, decode_multichannel_stream, decode_multichannel_stream_muted,
-    decode_range, decode_range_bounded, decode_range_muted, multichannel_layout, Error,
-    StreamIndex, StreamReader,
+    Error, StreamIndex, StreamReader, audio_block_count, block_count, decode_multichannel_stream,
+    decode_multichannel_stream_muted, decode_range, decode_range_bounded, decode_range_muted,
+    multichannel_layout,
 };
 
 fuzz_target!(|data: &[u8]| {

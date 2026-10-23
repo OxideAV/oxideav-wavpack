@@ -834,7 +834,7 @@ mod seek;
 /// registry path installed by [`register`].
 pub mod decoder {
     pub use crate::registry::{
-        make_decoder, WavPackDecoder, WavPackDecoderOptions, DEFAULT_PACKET_SAMPLE_BUDGET,
+        DEFAULT_PACKET_SAMPLE_BUDGET, WavPackDecoder, WavPackDecoderOptions, make_decoder,
     };
 }
 
@@ -842,19 +842,22 @@ pub mod decoder {
 /// `<crate>::encoder::make_encoder` convention), alongside the
 /// registry path installed by [`register`].
 pub mod encoder {
-    pub use crate::registry::{make_encoder, WavPackEncoder, WavPackEncoderOptions};
+    pub use crate::registry::{WavPackEncoder, WavPackEncoderOptions, make_encoder};
 }
 
-pub use crate::registry::{register, CODEC_ID};
+pub use crate::registry::{CODEC_ID, register};
 
 // Canonical sibling entry point for `oxideav_meta::register_all`.
 oxideav_core::register!("wavpack", register);
 
 pub use crate::block::{
-    audio_block_count, block_count, correction_block_count, correction_coverage,
-    decode_multichannel_stream, decode_multichannel_stream_bounded, decode_multichannel_stream_f32,
-    decode_multichannel_stream_muted, decode_multichannel_stream_muted_bounded,
-    decode_multichannel_stream_with_correction, decode_multichannel_stream_with_correction_bounded,
+    AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream, DecodedStreamF32,
+    MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS, MultichannelLayout, StreamDecodeIter,
+    UnsupportedBlockFeature, WavPackBlock, audio_block_count, block_count, correction_block_count,
+    correction_coverage, decode_multichannel_stream, decode_multichannel_stream_bounded,
+    decode_multichannel_stream_f32, decode_multichannel_stream_muted,
+    decode_multichannel_stream_muted_bounded, decode_multichannel_stream_with_correction,
+    decode_multichannel_stream_with_correction_bounded,
     decode_multichannel_stream_with_correction_f32,
     decode_multichannel_stream_with_correction_muted,
     decode_multichannel_stream_with_correction_muted_bounded, decode_stream, decode_stream_bounded,
@@ -866,58 +869,56 @@ pub use crate::block::{
     iter_blocks, iter_correction_blocks, iter_decoded_blocks, metadata_block_count,
     multichannel_layout, pair_correction_stream, parse_block, parse_blocks, stream_channel_info,
     stream_sample_rate, stream_total_samples, total_audio_samples, total_block_samples,
-    total_correction_payload_bytes, AudioBlockIter, BlockIter, CorrectionBlockIter, DecodedStream,
-    DecodedStreamF32, MultichannelLayout, StreamDecodeIter, UnsupportedBlockFeature, WavPackBlock,
-    MAX_DECODE_SAMPLES_PER_BLOCK, MAX_MULTICHANNEL_CHANNELS,
+    total_correction_payload_bytes,
 };
 pub use crate::block_header::{
-    parse_block_header, sample_rate_index_for, Flags, WavPackBlockHeader, HEADER_LEN, MAGIC,
-    MAX_VERSION, MIN_CK_SIZE, MIN_VERSION, SAMPLE_RATE_INDEX_CUSTOM, STANDARD_SAMPLE_RATES,
-    TOTAL_SAMPLES_UNKNOWN,
+    Flags, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE, MIN_VERSION, SAMPLE_RATE_INDEX_CUSTOM,
+    STANDARD_SAMPLE_RATES, TOTAL_SAMPLES_UNKNOWN, WavPackBlockHeader, parse_block_header,
+    sample_rate_index_for,
 };
 // Typed sub-block views that appear in `WavPackBlock` accessor signatures
 // stay on the stable surface; their expanders/finders are internal (below).
 pub use crate::correction::PackedCorrectionData;
 pub use crate::encode::{
-    detect_left_shift, encode_block_mono, encode_block_mono_auto, encode_block_mono_best,
-    encode_block_mono_float, encode_block_mono_float_best, encode_block_mono_int32,
-    encode_block_mono_int32_best, encode_block_mono_searched, encode_block_mono_shifted,
-    encode_block_mono_smallest, encode_block_mono_with_decorr, encode_block_stereo,
-    encode_block_stereo_auto, encode_block_stereo_best, encode_block_stereo_float,
-    encode_block_stereo_float_best, encode_block_stereo_int32, encode_block_stereo_int32_best,
-    encode_block_stereo_joint, encode_block_stereo_joint_auto,
-    encode_block_stereo_joint_with_decorr, encode_block_stereo_searched,
-    encode_block_stereo_shifted, encode_block_stereo_smallest, encode_block_stereo_with_decorr,
-    encode_multichannel_stream, encode_multichannel_stream_at, encode_multichannel_stream_best,
-    encode_multichannel_stream_best_at, encode_multichannel_stream_float,
-    encode_multichannel_stream_float_at, encode_multichannel_stream_int32,
-    encode_multichannel_stream_int32_at, encode_multichannel_stream_smallest,
-    encode_multichannel_stream_smallest_at, encode_stream_mono, encode_stream_mono_best,
-    encode_stream_mono_float, encode_stream_mono_int32, encode_stream_mono_smallest,
-    encode_stream_stereo, encode_stream_stereo_best, encode_stream_stereo_float,
-    encode_stream_stereo_int32, encode_stream_stereo_smallest, set_stream_sample_rate,
-    DecorrProfile, DEFAULT_BLOCK_SAMPLES, ENCODE_VERSION,
+    DEFAULT_BLOCK_SAMPLES, DecorrProfile, ENCODE_VERSION, detect_left_shift, encode_block_mono,
+    encode_block_mono_auto, encode_block_mono_best, encode_block_mono_float,
+    encode_block_mono_float_best, encode_block_mono_int32, encode_block_mono_int32_best,
+    encode_block_mono_searched, encode_block_mono_shifted, encode_block_mono_smallest,
+    encode_block_mono_with_decorr, encode_block_stereo, encode_block_stereo_auto,
+    encode_block_stereo_best, encode_block_stereo_float, encode_block_stereo_float_best,
+    encode_block_stereo_int32, encode_block_stereo_int32_best, encode_block_stereo_joint,
+    encode_block_stereo_joint_auto, encode_block_stereo_joint_with_decorr,
+    encode_block_stereo_searched, encode_block_stereo_shifted, encode_block_stereo_smallest,
+    encode_block_stereo_with_decorr, encode_multichannel_stream, encode_multichannel_stream_at,
+    encode_multichannel_stream_best, encode_multichannel_stream_best_at,
+    encode_multichannel_stream_float, encode_multichannel_stream_float_at,
+    encode_multichannel_stream_int32, encode_multichannel_stream_int32_at,
+    encode_multichannel_stream_smallest, encode_multichannel_stream_smallest_at,
+    encode_stream_mono, encode_stream_mono_best, encode_stream_mono_float,
+    encode_stream_mono_int32, encode_stream_mono_smallest, encode_stream_stereo,
+    encode_stream_stereo_best, encode_stream_stereo_float, encode_stream_stereo_int32,
+    encode_stream_stereo_smallest, set_stream_sample_rate,
 };
 pub use crate::entropy::EntropyInfo;
 pub use crate::error::{Error, Result};
 pub use crate::hybrid::CorrectionFold;
 pub use crate::hybrid_encode::{
-    encode_block_mono_hybrid, encode_block_mono_hybrid_float, encode_block_mono_hybrid_int32,
-    encode_block_stereo_hybrid, encode_block_stereo_hybrid_float, encode_block_stereo_hybrid_int32,
+    HybridEncoded, HybridOptions, HybridShaping, encode_block_mono_hybrid,
+    encode_block_mono_hybrid_float, encode_block_mono_hybrid_int32, encode_block_stereo_hybrid,
+    encode_block_stereo_hybrid_float, encode_block_stereo_hybrid_int32,
     encode_multichannel_stream_hybrid, encode_multichannel_stream_hybrid_float,
     encode_multichannel_stream_hybrid_int32, encode_stream_mono_hybrid,
     encode_stream_mono_hybrid_float, encode_stream_mono_hybrid_int32, encode_stream_stereo_hybrid,
-    encode_stream_stereo_hybrid_float, encode_stream_stereo_hybrid_int32, HybridEncoded,
-    HybridOptions, HybridShaping,
+    encode_stream_stereo_hybrid_float, encode_stream_stereo_hybrid_int32,
 };
 pub use crate::metadata::{ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId};
 pub use crate::overflow_bits::PackedOverflowBits;
 pub use crate::packed_samples::PackedSamples;
 pub use crate::seek::{
-    decode_range, decode_range_bounded, decode_range_muted, decode_range_muted_bounded,
-    decode_range_with_correction, decode_range_with_correction_bounded,
-    decode_range_with_correction_muted, decode_range_with_correction_muted_bounded, IndexEntry,
-    SetEntry, StreamIndex, StreamReader,
+    IndexEntry, SetEntry, StreamIndex, StreamReader, decode_range, decode_range_bounded,
+    decode_range_muted, decode_range_muted_bounded, decode_range_with_correction,
+    decode_range_with_correction_bounded, decode_range_with_correction_muted,
+    decode_range_with_correction_muted_bounded,
 };
 
 // ---------------------------------------------------------------------------
@@ -932,23 +933,23 @@ pub use crate::correction::expand_packed_correction_data;
 // Internal: block/extension CRC arithmetic used inside the decode pipeline.
 #[doc(hidden)]
 pub use crate::crc::{
-    crc_extension, crc_joint_stereo_interleaved, crc_mono, crc_stereo_interleaved,
-    undo_joint_stereo, update_extension, update_mono, update_stereo, BlockCrc, ExtensionCrc,
-    CRC_INIT, JOINT_STEREO_FLAG,
+    BlockCrc, CRC_INIT, ExtensionCrc, JOINT_STEREO_FLAG, crc_extension,
+    crc_joint_stereo_interleaved, crc_mono, crc_stereo_interleaved, undo_joint_stereo,
+    update_extension, update_mono, update_stereo,
 };
 // Internal: spec §3 decorrelation ladder primitives and wire constants.
 #[doc(hidden)]
 pub use crate::decorrelation::{
-    apply_weight, assemble_mono_passes, assemble_stereo_passes, decode_term_byte, decorrelate_mono,
-    decorrelate_stereo, decorrelation_sample_count, encode_term_byte, expand_samples, expand_terms,
-    expand_weights, is_cross_term, is_valid_term, pack_sample_word, pack_weight_byte,
-    partition_decorrelation_samples, quantize_seed_sample, quantize_weight, recorrelate_mono,
-    recorrelate_stereo, serialize_mono_passes, serialize_stereo_passes, update_weight,
-    update_weight_clip, weights_per_term, DecorrPass, DecorrelationSamples, DecorrelationTerms,
-    DecorrelationWeights, MonoStepper, StereoStepper, TermKind, MAX_DECORRELATION_SAMPLES_PER_TERM,
-    MAX_DOCUMENTED_TERM, MAX_NTERMS, MAX_TERM, SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES,
-    TERM_BYTE_BIAS, TERM_DELTA_BITS, TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK,
-    WEIGHT_CLIP, WEIGHT_ROUND_BIAS, WEIGHT_SHIFT,
+    DecorrPass, DecorrelationSamples, DecorrelationTerms, DecorrelationWeights,
+    MAX_DECORRELATION_SAMPLES_PER_TERM, MAX_DOCUMENTED_TERM, MAX_NTERMS, MAX_TERM, MonoStepper,
+    SAMPLE_EXPONENT_BIAS, SAMPLE_ON_WIRE_BYTES, StereoStepper, TERM_BYTE_BIAS, TERM_DELTA_BITS,
+    TERM_DELTA_MASK, TERM_PREDICTOR_BITS, TERM_PREDICTOR_MASK, TermKind, WEIGHT_CLIP,
+    WEIGHT_ROUND_BIAS, WEIGHT_SHIFT, apply_weight, assemble_mono_passes, assemble_stereo_passes,
+    decode_term_byte, decorrelate_mono, decorrelate_stereo, decorrelation_sample_count,
+    encode_term_byte, expand_samples, expand_terms, expand_weights, is_cross_term, is_valid_term,
+    pack_sample_word, pack_weight_byte, partition_decorrelation_samples, quantize_seed_sample,
+    quantize_weight, recorrelate_mono, recorrelate_stereo, serialize_mono_passes,
+    serialize_stereo_passes, update_weight, update_weight_clip, weights_per_term,
 };
 // Internal: pass-derivation helpers producing internal `DecorrPass` lists
 // (the `encode_block_*` / `encode_stream_*` entry points above are stable).
@@ -960,8 +961,8 @@ pub use crate::encode::{
 // Internal: 0x05 entropy-info expander and wire-size constants.
 #[doc(hidden)]
 pub use crate::entropy::{
-    expand_entropy, MEDIANS_PER_CHANNEL, MEDIAN_ON_WIRE_BYTES, MONO_PAYLOAD_BYTES,
-    STEREO_PAYLOAD_BYTES,
+    MEDIAN_ON_WIRE_BYTES, MEDIANS_PER_CHANNEL, MONO_PAYLOAD_BYTES, STEREO_PAYLOAD_BYTES,
+    expand_entropy,
 };
 // Internal: left-shift fixup applied by `decode_samples` itself.
 #[doc(hidden)]
@@ -970,42 +971,42 @@ pub use crate::fixup::{apply_left_shift, apply_left_shift_buffer};
 // and the `encode_*_float` origination entry points.
 #[doc(hidden)]
 pub use crate::float::{
-    deconstruct_float, expand_float_info, reassemble_float, FloatDeconstruction, FloatInfo,
     FLOAT_EXCEPTIONS, FLOAT_INFO_PAYLOAD_BYTES, FLOAT_NEG_ZEROS, FLOAT_SHIFT_ONES,
-    FLOAT_SHIFT_SAME, FLOAT_SHIFT_SENT, FLOAT_ZEROS_SENT,
+    FLOAT_SHIFT_SAME, FLOAT_SHIFT_SENT, FLOAT_ZEROS_SENT, FloatDeconstruction, FloatInfo,
+    deconstruct_float, expand_float_info, reassemble_float,
 };
 // Internal: hybrid-mode fold/split plumbing behind the pair decode APIs.
 #[doc(hidden)]
 pub use crate::hybrid::{
-    expand_hybrid_profile, flags_select_shaping, fold_correction, fold_correction_pair,
-    fold_correction_pre_decorrelation, fold_correction_pre_decorrelation_pair, split_correction,
-    HybridProfile, HybridState, ShapingState, CROSS_DECORR_FLAG, HYBRID_FLAG,
-    HYBRID_LIMIT_ARG_CEILING, HYBRID_LIMIT_BIAS, HYBRID_PROFILE_MONO_BYTES,
-    HYBRID_PROFILE_STEREO_BYTES, HYBRID_SHAPE_FLAG, NEW_SHAPING_FLAG,
+    CROSS_DECORR_FLAG, HYBRID_FLAG, HYBRID_LIMIT_ARG_CEILING, HYBRID_LIMIT_BIAS,
+    HYBRID_PROFILE_MONO_BYTES, HYBRID_PROFILE_STEREO_BYTES, HYBRID_SHAPE_FLAG, HybridProfile,
+    HybridState, NEW_SHAPING_FLAG, ShapingState, expand_hybrid_profile, flags_select_shaping,
+    fold_correction, fold_correction_pair, fold_correction_pre_decorrelation,
+    fold_correction_pre_decorrelation_pair, split_correction,
 };
 // Internal: INT32_DATA (0x09) profile plumbing behind `decode_stream`
 // and the `encode_*_int32` origination entry points.
 #[doc(hidden)]
 pub use crate::int32::{
+    INT32_INFO_PAYLOAD_BYTES, INT32_TARGET_MAGNITUDE_BITS, Int32Deconstruction, Int32Info,
     deconstruct_int32, expand_int32_info, reassemble_int32, reassemble_int32_implied,
-    Int32Deconstruction, Int32Info, INT32_INFO_PAYLOAD_BYTES, INT32_TARGET_MAGNITUDE_BITS,
 };
 // Internal: integer log2/exp2 wire converters used by the expanders.
 #[doc(hidden)]
 pub use crate::logpack::{
-    expand_log_word, pack_log_word, quantize_log_value, wp_exp2s, wp_log2, EXP2_TABLE, LOG2_TABLE,
-    MAX_LOG2_INPUT, MAX_LOG_WORD,
+    EXP2_TABLE, LOG2_TABLE, MAX_LOG_WORD, MAX_LOG2_INPUT, expand_log_word, pack_log_word,
+    quantize_log_value, wp_exp2s, wp_log2,
 };
 // Internal: metadata walkers/finders (the typed views above are stable).
 #[doc(hidden)]
 pub use crate::metadata::{
+    ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
     find_audio_payload, find_decorrelation_triple, find_entropy_info, find_first,
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
     find_noise_shaping_profile, find_non_standard_sample_rate, find_packed_correction_data,
     find_packed_correction_data_sub_block, find_packed_overflow_bits,
     find_packed_overflow_bits_sub_block, find_packed_samples, parse_channel_info,
     parse_md5_checksum, parse_metadata_sub_block, parse_non_standard_sample_rate, walk_metadata,
-    ID_FLAG_LARGE_SIZE, ID_FLAG_ODD_SIZE, ID_FLAG_OPTIONAL, ID_MASK, MD5_DIGEST_BYTES,
 };
 // Internal: 0x0C overflow-bits expander (typed view above is stable).
 #[doc(hidden)]
@@ -1017,19 +1018,18 @@ pub use crate::packed_samples::{expand_packed_samples, validate_packed_samples};
 // per-sample state machines and their spec constants).
 #[doc(hidden)]
 pub use crate::samples::{
-    apply_sign, decode_packed_samples_mono, decode_packed_samples_mono_from_entropy,
-    decode_packed_samples_mono_hybrid, decode_packed_samples_mono_hybrid_lossless,
-    decode_packed_samples_stereo, decode_packed_samples_stereo_from_entropy,
-    decode_packed_samples_stereo_hybrid, decode_packed_samples_stereo_hybrid_lossless,
-    decode_packed_samples_stereo_hybrid_lossless_raw, decode_run_length, decode_sample,
-    decode_sample_stateful, decode_sample_stateful_stereo,
+    AdaptiveMedians, BitReader, BitWriter, DIV0, DIV1, DIV2, DecodeState, ESCAPE_EOF_CBITS,
+    GET_MED_FLOOR, GET_MED_SHIFT, GolombInterval, INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER,
+    MEDIAN_INC_MULTIPLIER, Medians, RUN_ESCAPE_CAP, RunState, SampleInterval, StereoDecodeState,
+    UNARY_ESCAPE, Zone, apply_sign, decode_packed_samples_mono,
+    decode_packed_samples_mono_from_entropy, decode_packed_samples_mono_hybrid,
+    decode_packed_samples_mono_hybrid_lossless, decode_packed_samples_stereo,
+    decode_packed_samples_stereo_from_entropy, decode_packed_samples_stereo_hybrid,
+    decode_packed_samples_stereo_hybrid_lossless, decode_packed_samples_stereo_hybrid_lossless_raw,
+    decode_run_length, decode_sample, decode_sample_stateful, decode_sample_stateful_stereo,
     decode_sample_stateful_stereo_with_limit, decode_sample_stateful_with_limit,
     decode_sample_value, emit_end_of_stream_marker, emit_raw_prefix, emit_zero_run_length,
     encode_packed_samples_mono, encode_packed_samples_mono_from_entropy,
     encode_packed_samples_stereo, encode_packed_samples_stereo_from_entropy, golomb_interval,
     read_folded_ones_count, read_raw_prefix, read_sign_and_apply, read_zero_run_length, split_sign,
-    AdaptiveMedians, BitReader, BitWriter, DecodeState, GolombInterval, Medians, RunState,
-    SampleInterval, StereoDecodeState, Zone, DIV0, DIV1, DIV2, ESCAPE_EOF_CBITS, GET_MED_FLOOR,
-    GET_MED_SHIFT, INTERVAL_MASK_31, MEDIAN_DEC_MULTIPLIER, MEDIAN_INC_MULTIPLIER, RUN_ESCAPE_CAP,
-    UNARY_ESCAPE,
 };

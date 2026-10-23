@@ -278,11 +278,7 @@ impl TermKind {
 /// "monaural" bit on the block header, which is binary; multi-channel
 /// blocks decompose into per-block stereo pairs).
 pub const fn weights_per_term(channels: u8) -> u8 {
-    if channels >= 2 {
-        2
-    } else {
-        1
-    }
+    if channels >= 2 { 2 } else { 1 }
 }
 
 /// Stand-alone shorthand for [`TermKind::from_code`] +
@@ -494,11 +490,11 @@ pub(crate) fn expand_weight_byte(byte: u8) -> i32 {
 /// stripped odd-size padding, so an odd-length payload here is a
 /// malformed sub-block.
 pub fn expand_samples(payload: &[u8]) -> Result<DecorrelationSamples> {
-    if payload.len() % SAMPLE_ON_WIRE_BYTES != 0 {
+    if !payload.len().is_multiple_of(SAMPLE_ON_WIRE_BYTES) {
         return Err(Error::DecorrelationSamplesOddByteCount(payload.len()));
     }
     let mut samples = Vec::with_capacity(payload.len() / SAMPLE_ON_WIRE_BYTES);
-    for word in payload.chunks_exact(SAMPLE_ON_WIRE_BYTES) {
+    for word in payload.as_chunks::<SAMPLE_ON_WIRE_BYTES>().0 {
         samples.push(expand_sample_word(word[0], word[1]));
     }
     Ok(DecorrelationSamples { samples })
@@ -2550,7 +2546,7 @@ mod tests {
         let _ = expand_sample_word(0xFF, 0x7F);
         let _ = expand_sample_word(0x00, 0x80); // i16::MIN word
         let _ = expand_sample_word(0xFF, 0xFF); // -1 log word
-                                                // The all-zero word stays the canonical exact zero.
+        // The all-zero word stays the canonical exact zero.
         assert_eq!(expand_sample_word(0x00, 0x00), 0);
     }
 
@@ -3298,7 +3294,7 @@ mod tests {
         // Mono: one weight per pass. Weight byte b expands to b*8 (no +)
         // for non-positive b; pick weights that round-trip simply.
         let weights = vec![5u8, 0x80]; // 5*8=40 (+adj), -128*8=-1024
-                                       // Seeds in wire order: term 1 needs 1, term 3 needs 3 → 4 words.
+        // Seeds in wire order: term 1 needs 1, term 3 needs 3 → 4 words.
         let mut samples = Vec::new();
         samples.extend_from_slice(&seed_word(7)); // term 1 seed
         for v in [11, 12, 13] {
@@ -4093,7 +4089,7 @@ mod tests {
             decorrelate_stereo(&mut whole, &mut buffer).unwrap();
 
             let mut stepper = StereoStepper::new(passes).unwrap();
-            for (f, pair) in residuals.chunks_exact(2).enumerate() {
+            for (f, pair) in residuals.as_chunks::<2>().0.iter().enumerate() {
                 let off_a = stepper.offset_a();
                 let off_b = stepper.offset_b(pair[0]);
                 let (a, b) = stepper.advance(pair[0], pair[1]);
@@ -4120,7 +4116,7 @@ mod tests {
         decorrelate_stereo(&mut whole, &mut buffer).unwrap();
         let mut stepper = StereoStepper::new(passes).unwrap();
         let mut out = Vec::new();
-        for pair in residuals.chunks_exact(2) {
+        for pair in residuals.as_chunks::<2>().0 {
             let (a, b) = stepper.advance(pair[0], pair[1]);
             out.push(a);
             out.push(b);

@@ -325,7 +325,7 @@ pub fn deconstruct_int32(pcm: &[i32]) -> Int32Deconstruction {
         payload.extend_from_slice(&wvx.finish());
         // Even byte count, like the 0x0A main bitstream (round-418
         // black-box pin — see `deconstruct_float`).
-        if payload.len() % 2 != 0 {
+        if !payload.len().is_multiple_of(2) {
             payload.push(0);
         }
         Some(payload)
@@ -551,11 +551,7 @@ mod tests {
             .iter()
             .map(|&v| {
                 let hi = (v >> 16) << 4;
-                if hi & 0x10 != 0 {
-                    hi | 0xF
-                } else {
-                    hi
-                }
+                if hi & 0x10 != 0 { hi | 0xF } else { hi }
             })
             .collect();
         let info = assert_deconstruction_round_trips(&pcm);

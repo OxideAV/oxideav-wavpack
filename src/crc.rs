@@ -299,7 +299,7 @@ pub fn crc_mono(samples: &[i32]) -> u32 {
 #[must_use]
 pub fn crc_stereo_interleaved(samples: &[i32]) -> u32 {
     let mut crc = CRC_INIT;
-    for pair in samples.chunks_exact(2) {
+    for pair in samples.as_chunks::<2>().0 {
         crc = update_stereo(crc, pair[0], pair[1]);
     }
     crc
@@ -313,7 +313,7 @@ pub fn crc_stereo_interleaved(samples: &[i32]) -> u32 {
 #[must_use]
 pub fn crc_joint_stereo_interleaved(samples: &[i32]) -> u32 {
     let mut crc = CRC_INIT;
-    for pair in samples.chunks_exact(2) {
+    for pair in samples.as_chunks::<2>().0 {
         let (left, right) = undo_joint_stereo(pair[0], pair[1]);
         crc = update_stereo(crc, left, right);
     }

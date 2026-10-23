@@ -162,11 +162,7 @@ impl EntropyInfo {
     /// for samples decoding" — is reflected here as the count of sets
     /// actually on the wire.
     pub fn channels(&self) -> u8 {
-        if self.is_mono() {
-            1
-        } else {
-            2
-        }
+        if self.is_mono() { 1 } else { 2 }
     }
 
     /// Per-channel median accessor — `Some([m0, m1, m2])` when
@@ -223,7 +219,7 @@ pub fn expand_entropy(payload: &[u8]) -> Result<EntropyInfo> {
 fn read_median_set(set: &[u8]) -> [i32; MEDIANS_PER_CHANNEL] {
     debug_assert_eq!(set.len(), MONO_PAYLOAD_BYTES);
     let mut out = [0i32; MEDIANS_PER_CHANNEL];
-    for (i, word) in set.chunks_exact(MEDIAN_ON_WIRE_BYTES).enumerate() {
+    for (i, word) in set.as_chunks::<MEDIAN_ON_WIRE_BYTES>().0.iter().enumerate() {
         out[i] = expand_sample_word(word[0], word[1]);
     }
     out

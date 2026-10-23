@@ -30,8 +30,8 @@
 //! [`StreamReader`](crate::StreamReader)) decode only the sets a
 //! requested window touches.
 
-use crate::block::{SampleBudget, MAX_MULTICHANNEL_CHANNELS};
-use crate::block_header::{parse_block_header, Flags};
+use crate::block::{MAX_MULTICHANNEL_CHANNELS, SampleBudget};
+use crate::block_header::{Flags, parse_block_header};
 use crate::error::{Error, Result};
 
 /// Header-level index record for one `wvpk` block.
@@ -79,11 +79,7 @@ impl IndexEntry {
     /// for interleaved stereo AND for false-stereo (bit 30 — one coded
     /// channel duplicated to both outputs by the decoder; round 408).
     pub fn member_channels(&self) -> usize {
-        if self.flags.mono {
-            1
-        } else {
-            2
-        }
+        if self.flags.mono { 1 } else { 2 }
     }
 }
 
@@ -446,7 +442,7 @@ fn decode_set(
             let frames = pcm.len() / 2;
             let mut left = Vec::with_capacity(frames);
             let mut right = Vec::with_capacity(frames);
-            for pair in pcm.chunks_exact(2) {
+            for pair in pcm.as_chunks::<2>().0 {
                 left.push(pair[0]);
                 right.push(pair[1]);
             }
@@ -560,7 +556,7 @@ fn decode_set_with_correction(
             let frames = pcm.len() / 2;
             let mut left = Vec::with_capacity(frames);
             let mut right = Vec::with_capacity(frames);
-            for pair in pcm.chunks_exact(2) {
+            for pair in pcm.as_chunks::<2>().0 {
                 left.push(pair[0]);
                 right.push(pair[1]);
             }

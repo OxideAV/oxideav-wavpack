@@ -552,7 +552,9 @@ impl ShapingState {
             return Err(crate::Error::InvalidShapingWeightsLength(p.len()));
         }
         let words: Vec<i32> = p
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| crate::logpack::wp_exp2s(i32::from(i16::from_le_bytes([c[0], c[1]]))))
             .collect();
         let g = |i: usize| words.get(i).copied().unwrap_or(0);
@@ -1446,7 +1448,9 @@ mod tests {
         // Round 415: the raw post-decorrelation fold covers cross-flagged
         // blocks too — current-version reference encoders set the bit
         // decoratively and their pairs are bit-exact under the raw add.
-        assert!(CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG).is_supported_raw_fold());
+        assert!(
+            CorrectionFold::from_flags(HYBRID_FLAG | CROSS_DECORR_FLAG).is_supported_raw_fold()
+        );
     }
 
     #[test]

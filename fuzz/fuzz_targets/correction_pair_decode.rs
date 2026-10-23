@@ -22,9 +22,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_wavpack::{
-    decode_multichannel_stream_with_correction, decode_multichannel_stream_with_correction_muted,
-    decode_range_with_correction, decode_stream, decode_stream_with_correction,
-    decode_stream_with_correction_f32, decode_stream_with_correction_muted, StreamIndex,
+    StreamIndex, decode_multichannel_stream_with_correction,
+    decode_multichannel_stream_with_correction_muted, decode_range_with_correction, decode_stream,
+    decode_stream_with_correction, decode_stream_with_correction_f32,
+    decode_stream_with_correction_muted,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -83,20 +84,20 @@ fuzz_target!(|data: &[u8]| {
     // Multichannel pair walker: never panics; on 1/2-channel streams it
     // matches the plain pair path sample-for-sample.
     let mc = decode_multichannel_stream_with_correction(main, wvc);
-    if let (Ok(p), Ok(d)) = (&plain, &mc) {
-        if d.channels <= 2 {
-            assert_eq!(
-                p, &d.samples,
-                "stereo-or-narrower streams must decode identically"
-            );
-        }
+    if let (Ok(p), Ok(d)) = (&plain, &mc)
+        && d.channels <= 2
+    {
+        assert_eq!(
+            p, &d.samples,
+            "stereo-or-narrower streams must decode identically"
+        );
     }
-    if let Ok((dm, all_ok)) = decode_multichannel_stream_with_correction_muted(main, wvc) {
-        if let Ok(d) = &mc {
-            assert_eq!(d.samples.len(), dm.samples.len());
-            if all_ok {
-                assert_eq!(d.samples, dm.samples);
-            }
+    if let Ok((dm, all_ok)) = decode_multichannel_stream_with_correction_muted(main, wvc)
+        && let Ok(d) = &mc
+    {
+        assert_eq!(d.samples.len(), dm.samples.len());
+        if all_ok {
+            assert_eq!(d.samples, dm.samples);
         }
     }
 
@@ -105,19 +106,19 @@ fuzz_target!(|data: &[u8]| {
     // to indices that are seekable on BOTH sides (unique frame ranges),
     // where the seek layer's set-based pairing provably coincides with
     // the stream walker's sequential pairing.
-    if let (Ok(index), Ok(d)) = (StreamIndex::scan(main), &mc) {
-        if index.is_seekable() {
-            let seekable_corr = StreamIndex::scan(wvc).map(|c| c.is_seekable());
-            if matches!(seekable_corr, Ok(true)) {
-                let span = index.end_frame() - index.first_frame();
-                if let Ok(w) =
-                    decode_range_with_correction(main, &index, wvc, index.first_frame(), span)
-                {
-                    assert_eq!(
-                        w, d.samples,
-                        "full-span pair window must equal the whole-stream pair decode"
-                    );
-                }
+    if let (Ok(index), Ok(d)) = (StreamIndex::scan(main), &mc)
+        && index.is_seekable()
+    {
+        let seekable_corr = StreamIndex::scan(wvc).map(|c| c.is_seekable());
+        if matches!(seekable_corr, Ok(true)) {
+            let span = index.end_frame() - index.first_frame();
+            if let Ok(w) =
+                decode_range_with_correction(main, &index, wvc, index.first_frame(), span)
+            {
+                assert_eq!(
+                    w, d.samples,
+                    "full-span pair window must equal the whole-stream pair decode"
+                );
             }
         }
     }

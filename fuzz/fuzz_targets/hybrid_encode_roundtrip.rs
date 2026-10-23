@@ -28,10 +28,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_wavpack::{
-    decode_stream_muted, decode_stream_with_correction, decode_stream_with_correction_muted,
-    encode_block_mono_hybrid, encode_block_mono_hybrid_float, encode_block_mono_hybrid_int32,
-    encode_block_stereo_hybrid, encode_block_stereo_hybrid_float, encode_block_stereo_hybrid_int32,
-    DecorrProfile, HybridEncoded, HybridOptions, HybridShaping,
+    DecorrProfile, HybridEncoded, HybridOptions, HybridShaping, decode_stream_muted,
+    decode_stream_with_correction, decode_stream_with_correction_muted, encode_block_mono_hybrid,
+    encode_block_mono_hybrid_float, encode_block_mono_hybrid_int32, encode_block_stereo_hybrid,
+    encode_block_stereo_hybrid_float, encode_block_stereo_hybrid_int32,
 };
 
 fn check_pair(pcm: &[i32], enc: &HybridEncoded) {
@@ -96,7 +96,9 @@ fuzz_target!(|data: &[u8]| {
             // keeping some specials (the deconstruction must take any
             // pattern).
             let mut pcm: Vec<f32> = data[2..]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .take(256)
                 .map(|c| {
                     let bits = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -134,7 +136,9 @@ fuzz_target!(|data: &[u8]| {
         }
         3 => {
             let mut pcm: Vec<i32> = data[2..]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .take(256)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
@@ -158,7 +162,9 @@ fuzz_target!(|data: &[u8]| {
         _ => {
             // Plain 16-bit-container integers.
             let mut pcm: Vec<i32> = data[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .take(512)
                 .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
                 .collect();

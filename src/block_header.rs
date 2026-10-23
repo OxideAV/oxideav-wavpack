@@ -240,11 +240,7 @@ impl Flags {
     /// per-block channel count; multi-channel files convey the global
     /// layout through metadata sub-block `0x0D`.
     pub fn channels_in_block(&self) -> u8 {
-        if self.mono {
-            1
-        } else {
-            2
-        }
+        if self.mono { 1 } else { 2 }
     }
 
     /// `true` when this specific block's sample payload is **mono** —
@@ -484,11 +480,7 @@ impl WavPackBlockHeader {
     pub fn samples_remaining_after(&self) -> Option<u64> {
         let total = self.total_samples_in_file()? as u64;
         let end = self.end_sample_index();
-        if end > total {
-            None
-        } else {
-            Some(total - end)
-        }
+        if end > total { None } else { Some(total - end) }
     }
 
     /// The 32-bit CRC word the wiki "Block structure" listing places at

@@ -777,7 +777,10 @@ mod tests {
         if id_byte & ID_FLAG_ODD_SIZE != 0 {
             on_wire_payload.push(0);
         }
-        assert!(on_wire_payload.len() % 2 == 0, "metadata is even-length");
+        assert!(
+            on_wire_payload.len().is_multiple_of(2),
+            "metadata is even-length"
+        );
         let words = on_wire_payload.len() / 2;
         assert!(words <= 0xFF, "use synth_large for >255-word payloads");
         let mut out = Vec::with_capacity(2 + on_wire_payload.len());
@@ -794,7 +797,7 @@ mod tests {
         if id_byte & ID_FLAG_ODD_SIZE != 0 {
             on_wire_payload.push(0);
         }
-        assert!(on_wire_payload.len() % 2 == 0);
+        assert!(on_wire_payload.len().is_multiple_of(2));
         let words = on_wire_payload.len() / 2;
         assert!(words <= 0xFF_FFFF);
         let mut out = Vec::with_capacity(4 + on_wire_payload.len());
@@ -1260,8 +1263,8 @@ mod tests {
         let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
         assert!(sub.is_md5_payload());
         assert!(sub.is_optional()); // 0x20 bit set on 0x26
-                                    // 0x06 has the same low-5-bit value but no optional flag, so
-                                    // SubBlockId::from_id_byte resolves it to HybridProfile, not MD5.
+        // 0x06 has the same low-5-bit value but no optional flag, so
+        // SubBlockId::from_id_byte resolves it to HybridProfile, not MD5.
         let wire = synth_small(0x06, &[0u8; 2]);
         let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
         assert!(!sub.is_md5_payload());
@@ -1274,7 +1277,7 @@ mod tests {
         let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
         assert!(sub.is_dummy_payload());
         assert!(!sub.is_riff_payload()); // 0x20 is RiffHeader, NOT dummy.
-                                         // 0x20 (low-5-bit 0 + optional flag) is RiffHeader, not Dummy.
+        // 0x20 (low-5-bit 0 + optional flag) is RiffHeader, not Dummy.
         let wire = synth_small(0x20, b"RIFF");
         let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
         assert!(!sub.is_dummy_payload());
