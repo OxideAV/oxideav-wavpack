@@ -6,6 +6,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-wavpack/compare/v0.0.5...v0.0.6) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable enums and records
+
 ### Added
 
 - `HybridOptions::new(bitrate_word, correction, joint, profile, shaping)`
