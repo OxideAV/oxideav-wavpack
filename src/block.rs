@@ -104,6 +104,7 @@ pub const MAX_MULTICHANNEL_CHANNELS: usize = 256;
 /// prediction loop consumes them yet), and no special handling for the
 /// two "experimental" / "low-latency" bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnsupportedBlockFeature {
     /// Wiki bit 3 ("hybrid profile (lossy compression)") is set.
     ///
@@ -231,6 +232,7 @@ impl core::fmt::Display for UnsupportedBlockFeature {
 /// and rounds-2 parsers already produced; this aggregate just bundles
 /// them.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WavPackBlock<'a> {
     /// Fixed-size block header (round 1).
     pub header: WavPackBlockHeader,
@@ -2247,6 +2249,7 @@ pub fn audio_block_count(bytes: &[u8]) -> Result<usize> {
 /// route channels before paying for a full
 /// [`decode_multichannel_stream`]. Round 378.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultichannelLayout {
     /// Per-frame channel count — the summed member channel counts of one
     /// set (every well-formed set carries the same width). `0` for an
@@ -3335,6 +3338,7 @@ pub fn decode_stream_muted(bytes: &[u8]) -> Result<(Vec<i32>, bool)> {
 /// file `channels` is the per-frame sum across one set's members.
 /// Round 378.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedStream {
     /// Interleaved PCM, `samples.len() == frames * channels`.
     pub samples: Vec<i32>,
@@ -3391,6 +3395,7 @@ pub fn decode_multichannel_stream(bytes: &[u8]) -> Result<DecodedStream> {
 /// per-frame channel count — the `FLOAT_DATA` twin of
 /// [`DecodedStream`]. Round 447.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecodedStreamF32 {
     /// Interleaved PCM, `samples.len() == frames * channels`.
     pub samples: Vec<f32>,

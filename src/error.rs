@@ -2,6 +2,7 @@
 
 /// Errors produced while parsing a WavPack stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A read did not produce the requested number of bytes — the
     /// buffer ended before the WavPack block header was fully

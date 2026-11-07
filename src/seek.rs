@@ -41,6 +41,7 @@ use crate::error::{Error, Result};
 /// The byte span lets a caller slice the original buffer (or issue a
 /// ranged read) to re-parse exactly this block later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IndexEntry {
     /// Byte offset of the block's `wvpk` magic within the scanned
     /// buffer.
@@ -92,6 +93,7 @@ impl IndexEntry {
 /// exactly the interleave [`crate::decode_multichannel_stream`]
 /// produces for the same members.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SetEntry {
     /// Absolute frame index of the set's first frame (the first
     /// member's `block_index` header word).

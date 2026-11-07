@@ -698,6 +698,7 @@ pub fn flags_select_shaping(flags: u32) -> bool {
 /// placement so a consumer can dispatch (or refuse) correctly. Derive it
 /// from a block's 32-bit flag word with [`CorrectionFold::from_flags`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CorrectionFold {
     /// The correction is added to the reconstructed sample **after** the
     /// decorrelation passes (spec §4.1, `read_word += correction`). This

@@ -6,6 +6,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `HybridOptions::new(bitrate_word, correction, joint, profile, shaping)`
+  plus `with_bitrate_word` / `with_correction` / `with_joint` /
+  `with_profile`.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the enums `Error`,
+  `UnsupportedBlockFeature`, `SubBlockId`, `DecorrProfile`,
+  `HybridShaping` and `CorrectionFold`, and on the records
+  `HybridOptions`, `HybridEncoded`, `WavPackBlock`, `MultichannelLayout`,
+  `DecodedStream`, `DecodedStreamF32`, `IndexEntry` and `SetEntry`. The
+  fixed-layout bitstream records (`WavPackBlockHeader`, `Flags`,
+  `SubBlockFlags`, `MetadataSubBlock`, `ChannelInfo`, `EntropyInfo`)
+  stay exhaustive. No behaviour change.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-wavpack/compare/v0.0.4...v0.0.5) - 2026-10-23
 
 ### Other

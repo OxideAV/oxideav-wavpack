@@ -62,6 +62,7 @@ pub const ID_MASK: u8 = 0x1F;
 /// `0x20..=0x27` (with the optional flag set) as separate entries
 /// even though the low-5-bit ID number overlaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SubBlockId {
     /// `0x00` — dummy (used for padding).
     Dummy,

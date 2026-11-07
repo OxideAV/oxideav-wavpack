@@ -117,6 +117,7 @@ const BITRATE_WORD_BIAS: i32 = 568;
 /// bit-exact: the correction stream stores the shaped in-bracket value
 /// and the decoder re-derives the same `temp` from its `0x07` seed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HybridShaping {
     /// No shaping (the reference `-s0` shape): no `0x07` sub-block, no
     /// shape flag bits, raw §4.1 correction fold.
@@ -201,6 +202,7 @@ impl HybridShaping {
 
 /// Options for one hybrid encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HybridOptions {
     /// The `0x06` log-domain bitrate word (8 fractional bits). Higher
     /// = more bits = less noise; `0` is the coarsest documented floor
@@ -221,6 +223,49 @@ pub struct HybridOptions {
     ///
     /// [`Off`]: HybridShaping::Off
     pub shaping: HybridShaping,
+}
+
+impl HybridOptions {
+    /// Build a [`HybridOptions`] from its fields.
+    pub fn new(
+        bitrate_word: i32,
+        correction: bool,
+        joint: bool,
+        profile: Option<DecorrProfile>,
+        shaping: HybridShaping,
+    ) -> Self {
+        Self {
+            bitrate_word,
+            correction,
+            joint,
+            profile,
+            shaping,
+        }
+    }
+
+    /// Set `bitrate_word`.
+    pub fn with_bitrate_word(mut self, v: i32) -> Self {
+        self.bitrate_word = v;
+        self
+    }
+
+    /// Set `correction`.
+    pub fn with_correction(mut self, v: bool) -> Self {
+        self.correction = v;
+        self
+    }
+
+    /// Set `joint`.
+    pub fn with_joint(mut self, v: bool) -> Self {
+        self.joint = v;
+        self
+    }
+
+    /// Set `profile`.
+    pub fn with_profile(mut self, v: Option<DecorrProfile>) -> Self {
+        self.profile = v;
+        self
+    }
 }
 
 impl HybridOptions {
@@ -258,6 +303,7 @@ impl Default for HybridOptions {
 /// One hybrid encode's output: the lossy `.wv` bytes and (when
 /// requested) the `.wvc` correction twin that restores losslessness.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HybridEncoded {
     /// The lossy main stream — a standalone `.wv` file/chain.
     pub wv: Vec<u8>,

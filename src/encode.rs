@@ -884,6 +884,7 @@ pub fn encode_block_stereo_joint_with_decorr(
 /// describes. More passes model more structure (usually smaller blocks)
 /// at more encode/decode arithmetic per sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DecorrProfile {
     /// Two extrapolate passes — cheapest derivation, catches the
     /// dominant smooth/linear structure.

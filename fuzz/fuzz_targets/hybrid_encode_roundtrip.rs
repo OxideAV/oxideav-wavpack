@@ -81,13 +81,7 @@ fuzz_target!(|data: &[u8]| {
         },
         _ => HybridShaping::Static(1024),
     };
-    let opts = HybridOptions {
-        bitrate_word,
-        correction: true,
-        joint,
-        profile,
-        shaping,
-    };
+    let opts = HybridOptions::new(bitrate_word, true, joint, profile, shaping);
 
     match format {
         2 => {

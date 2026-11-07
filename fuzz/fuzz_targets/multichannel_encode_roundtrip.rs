@@ -135,17 +135,17 @@ fuzz_target!(|data: &[u8]| {
             if pcm.is_empty() {
                 return;
             }
-            let opts = HybridOptions {
-                bitrate_word: match data[0] >> 4 {
+            let opts = HybridOptions::new(
+                match data[0] >> 4 {
                     0 => 0,
                     v if v < 8 => 456,
                     _ => 2000,
                 },
-                correction: true,
+                true,
                 joint,
-                profile: Some(profile),
+                Some(profile),
                 shaping,
-            };
+            );
             let enc = encode_multichannel_stream_hybrid(&pcm, channels, block_samples, 2, &opts)
                 .expect("hybrid multichannel encode");
             let wvc = enc.wvc.as_ref().expect("correction requested");
