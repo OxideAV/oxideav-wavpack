@@ -94,18 +94,37 @@ pub enum SubBlockId {
     /// `0x0D` — multichannel information (including Microsoft
     /// channel mask).
     MultichannelInfo,
-    /// `0x20` — RIFF header for `.wav` files (before audio).
-    /// Same low-5-bit number as [`Self::Dummy`], distinguished by
-    /// the [`ID_FLAG_OPTIONAL`] bit being set on the ID byte.
+    /// `0x0E` — compressed DSD audio (stream version 5.0+).
+    DsdBlock,
+    /// `0x21` — RIFF header for `.wav` files (before audio), per the
+    /// published file-format description §3.0. (The orientation wiki
+    /// listing has header / trailer one lower, at `0x20` / `0x21`;
+    /// real streams carry the header at `0x21`.)
     RiffHeader,
-    /// `0x21` — RIFF trailer for `.wav` files (after audio).
+    /// `0x22` — RIFF trailer for `.wav` files (after audio).
     RiffTrailer,
+    /// `0x23` — header of a non-`.wav` source file (5.0+).
+    AltHeader,
+    /// `0x24` — trailer of a non-`.wav` source file (5.0+).
+    AltTrailer,
     /// `0x25` — some encoding details for informational purposes.
     EncodingDetails,
     /// `0x26` — 16-byte MD5 checksum of the raw audio data.
     Md5Checksum,
     /// `0x27` — non-standard sampling rate.
     NonStandardSampleRate,
+    /// `0x28` — target filename extension of a non-`.wav` source.
+    AltExtension,
+    /// `0x29` — 16-byte MD5 of the raw audio in the source file's own
+    /// (non-`.wav`-standard, e.g. big-endian) layout.
+    AltMd5Checksum,
+    /// `0x2A` — file configuration: source file type, non-`.wav`
+    /// sample layouts, channel layouts and reordering.
+    NewConfigBlock,
+    /// `0x2B` — identities of channels outside the Microsoft set.
+    ChannelIdentities,
+    /// `0x2F` — 2- or 4-byte checksum of the entire block (5.0+).
+    BlockChecksum,
     /// An ID number whose `(low-5-bits, optional-flag)` combination
     /// isn't named by the wiki "IDs" listing. The walker surfaces
     /// the raw payload so a caller can still inspect it — the
@@ -180,11 +199,19 @@ impl SubBlockId {
             0x0B => SubBlockId::PackedCorrectionData,
             0x0C => SubBlockId::PackedOverflowBits,
             0x0D => SubBlockId::MultichannelInfo,
-            0x20 => SubBlockId::RiffHeader,
-            0x21 => SubBlockId::RiffTrailer,
+            0x0E => SubBlockId::DsdBlock,
+            0x21 => SubBlockId::RiffHeader,
+            0x22 => SubBlockId::RiffTrailer,
+            0x23 => SubBlockId::AltHeader,
+            0x24 => SubBlockId::AltTrailer,
             0x25 => SubBlockId::EncodingDetails,
             0x26 => SubBlockId::Md5Checksum,
             0x27 => SubBlockId::NonStandardSampleRate,
+            0x28 => SubBlockId::AltExtension,
+            0x29 => SubBlockId::AltMd5Checksum,
+            0x2A => SubBlockId::NewConfigBlock,
+            0x2B => SubBlockId::ChannelIdentities,
+            0x2F => SubBlockId::BlockChecksum,
             other => SubBlockId::Unknown(other),
         }
     }
@@ -208,11 +235,19 @@ impl SubBlockId {
             SubBlockId::PackedCorrectionData => 0x0B,
             SubBlockId::PackedOverflowBits => 0x0C,
             SubBlockId::MultichannelInfo => 0x0D,
-            SubBlockId::RiffHeader => 0x20,
-            SubBlockId::RiffTrailer => 0x21,
+            SubBlockId::DsdBlock => 0x0E,
+            SubBlockId::RiffHeader => 0x21,
+            SubBlockId::RiffTrailer => 0x22,
+            SubBlockId::AltHeader => 0x23,
+            SubBlockId::AltTrailer => 0x24,
             SubBlockId::EncodingDetails => 0x25,
             SubBlockId::Md5Checksum => 0x26,
             SubBlockId::NonStandardSampleRate => 0x27,
+            SubBlockId::AltExtension => 0x28,
+            SubBlockId::AltMd5Checksum => 0x29,
+            SubBlockId::NewConfigBlock => 0x2A,
+            SubBlockId::ChannelIdentities => 0x2B,
+            SubBlockId::BlockChecksum => 0x2F,
             SubBlockId::Unknown(v) => *v & (ID_MASK | ID_FLAG_OPTIONAL),
         }
     }
@@ -227,7 +262,7 @@ pub struct SubBlockFlags {
     /// ignore data contained here". Exposed here as a bool for
     /// callers that want to inspect the bit directly; the
     /// [`SubBlockId`] enum also folds it into the variant name
-    /// (e.g. `RiffHeader` is `Dummy` + optional flag).
+    /// (e.g. `Md5Checksum` is number 6 + optional flag).
     pub optional: bool,
     /// `0x40` set — the size field counts 16-bit words, but the last
     /// byte of the payload is encoder-supplied padding (the actual
@@ -316,8 +351,8 @@ impl<'a> MetadataSubBlock<'a> {
     }
 
     /// `true` when this sub-block carries one of the **RIFF wrapper**
-    /// payloads (`0x20` header, `0x21` trailer) the wiki "IDs" listing
-    /// notes as the original `.wav` framing surrounding the audio.
+    /// payloads (`0x21` header, `0x22` trailer): the original `.wav`
+    /// framing surrounding the audio.
     pub fn is_riff_payload(&self) -> bool {
         matches!(self.id, SubBlockId::RiffHeader | SubBlockId::RiffTrailer)
     }
@@ -521,9 +556,9 @@ pub fn parse_md5_checksum(payload: &[u8]) -> Result<Md5Checksum> {
 /// the `0x26` MD5 digest) without re-implementing the match arm.
 ///
 /// Matches are by [`SubBlockId`] equality — the `0x20` optional flag
-/// is part of the ID identifier, so e.g. `SubBlockId::RiffHeader`
-/// matches only the `0x20`-prefixed entry and not the bare `0x00`
-/// `SubBlockId::Dummy`.
+/// is part of the ID identifier, so e.g. `SubBlockId::Md5Checksum`
+/// matches only the `0x26` entry and not the bare `0x06`
+/// `SubBlockId::HybridProfile`.
 pub fn find_first<'walk, 'a>(
     subs: &'walk [MetadataSubBlock<'a>],
     id: SubBlockId,
@@ -822,12 +857,12 @@ mod tests {
             SubBlockId::DecorrelationTerms
         );
 
-        // 0x20 = id 0 + 0x20 optional → RiffHeader
-        let f = SubBlockFlags::from_id_byte(0x20);
+        // 0x21 = id 1 + 0x20 optional → RiffHeader
+        let f = SubBlockFlags::from_id_byte(0x21);
         assert!(f.optional);
         assert!(!f.odd_size);
         assert!(!f.large_size);
-        assert_eq!(SubBlockId::from_id_byte(0x20), SubBlockId::RiffHeader);
+        assert_eq!(SubBlockId::from_id_byte(0x21), SubBlockId::RiffHeader);
 
         // 0x66 = id 6 + 0x20 optional + 0x40 odd → Md5Checksum.
         // Bits set: 6 (0x40 odd), 5 (0x20 optional), 1 + 2 (low-id 6).
@@ -868,11 +903,19 @@ mod tests {
             (0x0B, SubBlockId::PackedCorrectionData),
             (0x0C, SubBlockId::PackedOverflowBits),
             (0x0D, SubBlockId::MultichannelInfo),
-            (0x20, SubBlockId::RiffHeader),
-            (0x21, SubBlockId::RiffTrailer),
+            (0x0E, SubBlockId::DsdBlock),
+            (0x21, SubBlockId::RiffHeader),
+            (0x22, SubBlockId::RiffTrailer),
+            (0x23, SubBlockId::AltHeader),
+            (0x24, SubBlockId::AltTrailer),
             (0x25, SubBlockId::EncodingDetails),
             (0x26, SubBlockId::Md5Checksum),
             (0x27, SubBlockId::NonStandardSampleRate),
+            (0x28, SubBlockId::AltExtension),
+            (0x29, SubBlockId::AltMd5Checksum),
+            (0x2A, SubBlockId::NewConfigBlock),
+            (0x2B, SubBlockId::ChannelIdentities),
+            (0x2F, SubBlockId::BlockChecksum),
         ];
         for (raw, want) in ids {
             assert_eq!(SubBlockId::from_id_byte(*raw), *want);
@@ -882,16 +925,16 @@ mod tests {
 
     #[test]
     fn unlisted_id_numbers_fall_into_unknown() {
-        // The wiki "IDs" listing skips `0x01` and `0x0E..=0x1F`
-        // (and `0x22..=0x24` in the high half). The walker surfaces
-        // those as `Unknown` rather than rejecting them — the
-        // `0x20` "decoder may ignore" flag is the documented
-        // forward-compat mechanism.
+        // The published ID list (file-format description §3.0) skips
+        // `0x01`, `0x0F..=0x1F`, `0x20` and `0x2C..=0x2E` ("unlisted
+        // ids are reserved"). The walker surfaces those as `Unknown`
+        // rather than rejecting them — the `0x20` "decoder needn't
+        // understand" flag is the documented forward-compat mechanism.
         assert_eq!(SubBlockId::from_id_byte(0x01), SubBlockId::Unknown(0x01));
-        assert_eq!(SubBlockId::from_id_byte(0x0E), SubBlockId::Unknown(0x0E));
+        assert_eq!(SubBlockId::from_id_byte(0x0F), SubBlockId::Unknown(0x0F));
         assert_eq!(SubBlockId::from_id_byte(0x1F), SubBlockId::Unknown(0x1F));
-        assert_eq!(SubBlockId::from_id_byte(0x22), SubBlockId::Unknown(0x22));
-        assert_eq!(SubBlockId::from_id_byte(0x24), SubBlockId::Unknown(0x24));
+        assert_eq!(SubBlockId::from_id_byte(0x20), SubBlockId::Unknown(0x20));
+        assert_eq!(SubBlockId::from_id_byte(0x2C), SubBlockId::Unknown(0x2C));
         // 0x40 and 0x80 are flag bits, not part of the ID identifier —
         // an id-byte of 0x44 means id 4 + odd-size flag, not Unknown.
         assert_eq!(
@@ -995,11 +1038,11 @@ mod tests {
 
     #[test]
     fn riff_wrapper_and_sample_rate_sub_blocks_decode() {
-        // A `0x20` RIFF header sub-block carrying a tiny fake header
+        // A `0x21` RIFF header sub-block carrying a tiny fake header
         // and a `0x27` non-standard-rate sub-block carrying a four-
         // byte rate.
         let mut stream = Vec::new();
-        stream.extend(synth_small(0x20, b"RIFF\x00\x00\x00\x00WAVEfmt "));
+        stream.extend(synth_small(0x21, b"RIFF\x00\x00\x00\x00WAVEfmt "));
         stream.extend(synth_small(0x27, &96000u32.to_le_bytes()));
         let subs = walk_metadata(&stream).unwrap();
         assert_eq!(subs.len(), 2);
@@ -1104,8 +1147,8 @@ mod tests {
     }
 
     #[test]
-    fn is_riff_payload_covers_0x20_and_0x21() {
-        for id in [0x20u8, 0x21] {
+    fn is_riff_payload_covers_0x21_and_0x22() {
+        for id in [0x21u8, 0x22] {
             let wire = synth_small(id, b"RIFF");
             let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
             assert!(
@@ -1158,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_block_id_is_riff_wrapper_only_for_0x20_and_0x21() {
+    fn sub_block_id_is_riff_wrapper_only_for_0x21_and_0x22() {
         assert!(SubBlockId::RiffHeader.is_riff_wrapper());
         assert!(SubBlockId::RiffTrailer.is_riff_wrapper());
         // Adjacent IDs that share the 0x20 optional flag (0x25/0x26/0x27)
@@ -1166,8 +1209,9 @@ mod tests {
         assert!(!SubBlockId::EncodingDetails.is_riff_wrapper());
         assert!(!SubBlockId::Md5Checksum.is_riff_wrapper());
         assert!(!SubBlockId::NonStandardSampleRate.is_riff_wrapper());
-        // Dummy (0x00) shares the low-5-bit value with RiffHeader (0x20)
-        // but lacks the optional flag — it's not a RIFF wrapper.
+        // Neither is the padding dummy, nor the non-`.wav` header pair.
+        assert!(!SubBlockId::AltHeader.is_riff_wrapper());
+        assert!(!SubBlockId::AltTrailer.is_riff_wrapper());
         assert!(!SubBlockId::Dummy.is_riff_wrapper());
     }
 
@@ -1277,9 +1321,9 @@ mod tests {
         let wire = synth_small(0x00, &[]);
         let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
         assert!(sub.is_dummy_payload());
-        assert!(!sub.is_riff_payload()); // 0x20 is RiffHeader, NOT dummy.
-        // 0x20 (low-5-bit 0 + optional flag) is RiffHeader, not Dummy.
-        let wire = synth_small(0x20, b"RIFF");
+        assert!(!sub.is_riff_payload());
+        // 0x21 is the RIFF header, not a dummy.
+        let wire = synth_small(0x21, b"RIFF");
         let (sub, _) = parse_metadata_sub_block(&wire).unwrap();
         assert!(!sub.is_dummy_payload());
         assert!(sub.is_riff_payload());

@@ -87,6 +87,8 @@
 //! | `foreign_hybrid_pair_cross_js` | `-h -b4 -cc` | joint pair whose stack carries `-1` / `-2` passes under `CROSS_DECORR` — pins the lossless same-sample predictor of the pre-decorrelation fold (round 493) |
 //! | `foreign_hybrid_pair_cross_lr` | `-h -b4 -cc -j0` | left/right pair, same stack shape |
 //! | `foreign_hybrid_narrow_ones_b3` | `-b3`       | 16-bit mono rail-to-rail square (every sample odd): `INT32_DATA` with `ones = 1` in a 2-byte container — the lossy decode re-inserts the pattern and saturates afterwards (round 493) |
+//! | `foreign_tagged_md5_stereo`    | `-m -w …`    | 16-bit stereo with an MD5 sub-block and a trailing APEv2 tag (whose text names the block magic) — pins the walkers skipping bytes outside the blocks (round 493) |
+//! | `foreign_optimized_int32`      | `--optimize-int32` | 32-bit int stereo whose extension stream rides the reserved `0x2C` sub-block form — pins the typed refusal (round 493; no expected PCM) |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -255,6 +257,44 @@ foreign_fixture!(
     "foreign_hybrid_narrow_ones_b3",
     1
 );
+foreign_fixture!(
+    tagged_md5_stereo_is_bit_exact,
+    "foreign_tagged_md5_stereo",
+    2
+);
+
+/// The tagged fixture really does end in bytes that are no block, and
+/// its MD5 sub-block is reachable through the typed view.
+#[test]
+fn tagged_fixture_carries_a_trailing_tag_and_an_md5() {
+    let wv = include_bytes!("data/foreign_tagged_md5_stereo.wv");
+    assert!(wv.windows(8).any(|w| w == b"APETAGEX"));
+    let blocks = oxideav_wavpack::parse_blocks(wv).expect("blocks parse past the tag");
+    let on_disk: u64 = blocks.iter().map(|b| b.on_disk_len()).sum();
+    assert!(
+        on_disk < wv.len() as u64,
+        "tag bytes lie outside the blocks"
+    );
+    assert!(blocks.iter().any(|b| b.has_md5_checksum()));
+    assert!(blocks.iter().any(|b| b.has_riff_header()));
+}
+
+/// The 32-bit optimisation option of the outside encoder moves the
+/// extension stream to the reserved `0x2C` sub-block form, whose coding
+/// the staged documents do not describe. The decoder must say exactly
+/// that rather than report a structurally incomplete block or emit
+/// 24-bit-resolution samples as if they were the lossless decode.
+#[test]
+fn optimized_int32_extension_is_a_typed_refusal() {
+    let wv = include_bytes!("data/foreign_optimized_int32.wv");
+    let err = decode_multichannel_stream(wv).expect_err("0x2C form is not decodable");
+    assert_eq!(
+        err,
+        oxideav_wavpack::Error::UnsupportedBlockFeature(
+            oxideav_wavpack::UnsupportedBlockFeature::OptimizedInt32Extension
+        )
+    );
+}
 
 /// Hybrid-specific shape assertions on top of the bit-exact battery:
 /// the lossy decode carries real coding error against the WAV source

@@ -189,6 +189,14 @@ pub enum UnsupportedBlockFeature {
     /// are the negative `0x02` decorr *terms* `-1`/`-2`/`-3`, which ARE
     /// decoded by the stereo path.)
     CrossChannelDecorrelation,
+    /// An `INT32_DATA` block carries its extension stream under the
+    /// reserved, optional-flagged ID `0x2C` instead of `0x0C` — what the
+    /// outside encoder writes for 32-bit integer sources under its
+    /// 32-bit optimisation option. The stream's coding differs from the
+    /// `0x0C` layout (reading it as one fails the extension CRC) and is
+    /// not described by the staged documents, so the block's low
+    /// `sent_bits` window cannot be restored. Round 493.
+    OptimizedInt32Extension,
 }
 
 impl core::fmt::Display for UnsupportedBlockFeature {
@@ -216,6 +224,9 @@ impl core::fmt::Display for UnsupportedBlockFeature {
             UnsupportedBlockFeature::JointStereo => "joint-stereo (mid/side) coding (flag bit 4)",
             UnsupportedBlockFeature::CrossChannelDecorrelation => {
                 "cross-channel decorrelation (flag bit 5)"
+            }
+            UnsupportedBlockFeature::OptimizedInt32Extension => {
+                "int32 extension stream in the reserved 0x2C sub-block form"
             }
         };
         f.write_str(name)
@@ -367,16 +378,16 @@ impl<'a> WavPackBlock<'a> {
         self.contains_sub_block(SubBlockId::Md5Checksum)
     }
 
-    /// `true` when a `0x20` RIFF-header sub-block is present. The wiki
-    /// "IDs" listing puts this sub-block "before audio" — the original
+    /// `true` when a `0x21` RIFF-header sub-block is present. It sits
+    /// "before audio" — the original
     /// `.wav` file's RIFF header preserved verbatim so a lossless decode
     /// can re-emit a byte-identical `.wav`. Round 214.
     pub fn has_riff_header(&self) -> bool {
         self.contains_sub_block(SubBlockId::RiffHeader)
     }
 
-    /// `true` when a `0x21` RIFF-trailer sub-block is present. The wiki
-    /// "IDs" listing puts this sub-block "after audio" — any RIFF
+    /// `true` when a `0x22` RIFF-trailer sub-block is present. It sits
+    /// "after audio" — any RIFF
     /// chunks the original `.wav` carried after the audio data
     /// (e.g. `LIST INFO`) preserved verbatim. Round 214.
     pub fn has_riff_trailer(&self) -> bool {
@@ -428,17 +439,15 @@ impl<'a> WavPackBlock<'a> {
         find_multichannel_info(&self.sub_blocks)
     }
 
-    /// Borrow the first `0x20` RIFF-header sub-block, or `None` when
-    /// none is present. The wiki "IDs" listing places this before any
-    /// audio; the payload is the verbatim RIFF/WAVE header from the
+    /// Borrow the first `0x21` RIFF-header sub-block, or `None` when
+    /// none is present. It comes before any audio; the payload is the verbatim RIFF/WAVE header from the
     /// source `.wav` file. Round 214.
     pub fn find_riff_header_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
         find_first(&self.sub_blocks, SubBlockId::RiffHeader)
     }
 
-    /// Borrow the first `0x21` RIFF-trailer sub-block, or `None` when
-    /// none is present. The wiki "IDs" listing places this after the
-    /// audio; the payload carries any RIFF chunks following the source
+    /// Borrow the first `0x22` RIFF-trailer sub-block, or `None` when
+    /// none is present. It comes after the audio; the payload carries any RIFF chunks following the source
     /// `.wav` file's `data` chunk. Round 214.
     pub fn find_riff_trailer_sub_block(&self) -> Option<&MetadataSubBlock<'a>> {
         find_first(&self.sub_blocks, SubBlockId::RiffTrailer)
@@ -1847,7 +1856,17 @@ impl<'a> WavPackBlock<'a> {
                 crate::int32::reassemble_int32_implied(pcm, &info);
                 return Ok(None);
             }
-            let overflow = overflow.ok_or(Error::BlockMissingOverflowBits)?;
+            let Some(overflow) = overflow else {
+                // The literal bits may be present after all, in the
+                // undocumented `0x2C` form: name that precisely instead
+                // of reporting a structurally incomplete block.
+                if self.contains_sub_block(SubBlockId::Unknown(0x2C)) {
+                    return Err(Error::UnsupportedBlockFeature(
+                        UnsupportedBlockFeature::OptimizedInt32Extension,
+                    ));
+                }
+                return Err(Error::BlockMissingOverflowBits);
+            };
             let stored = overflow.crc_wvx()?;
             let mut reader = overflow.extension_bit_reader()?;
             let computed = crate::int32::reassemble_int32(pcm, &info, Some(&mut reader))?;
@@ -2180,7 +2199,8 @@ impl<'a> BlockIter<'a> {
     /// because the buffer is empty or because a previous `next()` call
     /// returned `Err(_)` (the iterator is fused on error).
     pub fn is_exhausted(&self) -> bool {
-        self.done || self.remaining.is_empty()
+        self.done
+            || crate::block_header::leading_non_block_bytes(self.remaining) == self.remaining.len()
     }
 
     /// Advance to and return the next **audio** block in the input,
@@ -2219,7 +2239,14 @@ impl<'a> Iterator for BlockIter<'a> {
     type Item = Result<WavPackBlock<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done || self.remaining.is_empty() {
+        if self.done {
+            return None;
+        }
+        // Tags and other non-block bytes may sit before, between or
+        // after the blocks; they are not part of the audio stream.
+        let skip = crate::block_header::leading_non_block_bytes(self.remaining);
+        self.remaining = &self.remaining[skip..];
+        if self.remaining.is_empty() {
             return None;
         }
         match parse_block(self.remaining) {
@@ -2430,7 +2457,7 @@ pub fn multichannel_layout(bytes: &[u8]) -> Result<MultichannelLayout> {
 /// Inverse of [`audio_block_count`]; together they sum to
 /// [`block_count`]. The wiki examples of metadata-only blocks are
 /// leading RIFF-header blocks (block + sub-block `0x20`) and trailing
-/// RIFF-trailer / MD5 blocks (sub-block `0x21` / `0x26`); this counter
+/// RIFF-trailer / MD5 blocks (sub-block `0x22` / `0x26`); this counter
 /// reports the count without inspecting the sub-block list.
 ///
 /// Drives [`iter_blocks`] under the hood; any parse error surfaces
@@ -2518,6 +2545,7 @@ pub fn decoded_sample_count(bytes: &[u8]) -> Result<u64> {
 /// per-block on-disk length validation, so this is constant-time
 /// regardless of stream size. Round 239.
 pub fn stream_total_samples(bytes: &[u8]) -> Result<Option<Option<u32>>> {
+    let bytes = &bytes[crate::block_header::leading_non_block_bytes(bytes)..];
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -5831,7 +5859,7 @@ mod tests {
     #[test]
     fn has_riff_header_predicate_tracks_presence() {
         let mut payload = Vec::new();
-        append_small_sub_block(&mut payload, 0x20, b"RIFF\x00\x00\x00\x00WAVEfmt ");
+        append_small_sub_block(&mut payload, 0x21, b"RIFF\x00\x00\x00\x00WAVEfmt ");
         let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
         assert!(block.has_riff_header());
@@ -5844,7 +5872,7 @@ mod tests {
     #[test]
     fn has_riff_trailer_predicate_tracks_presence() {
         let mut payload = Vec::new();
-        append_small_sub_block(&mut payload, 0x21, &[0u8; 4]);
+        append_small_sub_block(&mut payload, 0x22, &[0u8; 4]);
         let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
         assert!(block.has_riff_trailer());
@@ -5944,13 +5972,13 @@ mod tests {
     #[test]
     fn find_riff_header_sub_block_borrow_pairs_with_predicate() {
         let mut payload = Vec::new();
-        append_small_sub_block(&mut payload, 0x20, b"RIFF\x00\x00\x00\x00WAVEfmt ");
+        append_small_sub_block(&mut payload, 0x21, b"RIFF\x00\x00\x00\x00WAVEfmt ");
         let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
 
         let sub = block
             .find_riff_header_sub_block()
-            .expect("0x20 sub-block present");
+            .expect("0x21 sub-block present");
         assert_eq!(sub.id, SubBlockId::RiffHeader);
         assert_eq!(sub.payload, b"RIFF\x00\x00\x00\x00WAVEfmt ".as_slice());
 
@@ -5962,13 +5990,13 @@ mod tests {
     #[test]
     fn find_riff_trailer_sub_block_borrow_pairs_with_predicate() {
         let mut payload = Vec::new();
-        append_small_sub_block(&mut payload, 0x21, &[0xDDu8; 4]);
+        append_small_sub_block(&mut payload, 0x22, &[0xDDu8; 4]);
         let bytes = synthesise_block(0, flags_with(1 << 2), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
 
         let sub = block
             .find_riff_trailer_sub_block()
-            .expect("0x21 sub-block present");
+            .expect("0x22 sub-block present");
         assert_eq!(sub.id, SubBlockId::RiffTrailer);
         assert_eq!(sub.payload, [0xDDu8; 4].as_slice());
 
@@ -6212,19 +6240,19 @@ mod tests {
 
     #[test]
     fn iter_blocks_fuses_on_first_error() {
-        // First block parses; second carries a corrupt magic. After
+        // First block parses; second carries a corrupt ck_size. After
         // yielding the first Ok and the second Err, every subsequent
         // next() must return None (FusedIterator contract).
         let good = synthesise_header_bytes(MIN_CK_SIZE);
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let mut bytes = good.clone();
         bytes.extend_from_slice(&bad);
 
         let mut iter = iter_blocks(&bytes);
         iter.next().expect("first").expect("ok");
         let err = iter.next().expect("second").expect_err("must reject");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
         assert!(iter.is_exhausted());
         assert!(iter.next().is_none());
         // The remaining() slice still points at the malformed block's
@@ -6268,13 +6296,14 @@ mod tests {
     #[test]
     fn iter_blocks_yields_truncated_on_partial_header_between_blocks() {
         // First block parses cleanly; the trailing buffer carries only
-        // a partial header (no magic / ck_size) for the next block. The
+        // a partial header (magic, cut short) for the next block. The
         // iterator should report Truncated (parse_block_header's "buffer
         // ran out before HEADER_LEN" error) — distinct from
         // CkSizeExceedsBuffer per the round-13 split.
         let first = synthesise_header_bytes(MIN_CK_SIZE);
         let mut bytes = first.clone();
-        bytes.extend_from_slice(&[0u8; HEADER_LEN - 1]);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&[0u8; HEADER_LEN - 5]);
 
         let mut iter = iter_blocks(&bytes);
         iter.next().expect("first").expect("ok");
@@ -6319,12 +6348,37 @@ mod tests {
         // first error rather than the partial Vec.
         let good = synthesise_header_bytes(MIN_CK_SIZE);
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let mut bytes = good.clone();
         bytes.extend_from_slice(&bad);
 
         let err = parse_blocks(&bytes).expect_err("must reject");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
+    }
+
+    #[test]
+    fn walkers_skip_bytes_outside_the_blocks() {
+        // Published format description §1.0 / §4.0: tags sit outside
+        // the blocks (before, in-between or after) and are ignored.
+        let block = synthesise_header_bytes(MIN_CK_SIZE);
+        let mut bytes = b"leading junk".to_vec();
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(b"between; mentions wvpk without being a block");
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(b"APETAGEX trailing tag");
+        assert_eq!(block_count(&bytes).unwrap(), 2);
+        let mut iter = iter_blocks(&bytes);
+        iter.next().unwrap().unwrap();
+        iter.next().unwrap().unwrap();
+        assert!(iter.is_exhausted());
+        assert!(iter.next().is_none());
+        // Nothing but foreign bytes is an empty stream.
+        assert_eq!(block_count(b"APETAGEX only a tag").unwrap(), 0);
+        // A candidate whose declared size overruns the buffer is not a
+        // block either (the magic can occur inside tag payload).
+        let mut cut = b"tag ".to_vec();
+        cut.extend_from_slice(&block[..block.len() - 1]);
+        assert_eq!(block_count(&cut).unwrap(), 0);
     }
 
     #[test]
@@ -6357,12 +6411,12 @@ mod tests {
         // underlying parse_block error rather than silently undercounting.
         let good = synthesise_header_bytes(MIN_CK_SIZE);
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let mut bytes = good.clone();
         bytes.extend_from_slice(&bad);
 
         let err = block_count(&bytes).expect_err("malformed second block");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
     }
 
     #[test]
@@ -6939,7 +6993,7 @@ mod tests {
         // the audio block, then the parse error on the next call.
         let audio = synthesise_decodable_mono_block_one_zero_sample();
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let mut bytes = audio.clone();
         bytes.extend_from_slice(&bad);
 
@@ -6953,7 +7007,7 @@ mod tests {
             .next_audio()
             .expect("second yield")
             .expect_err("must reject");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
         // Fused after error: next_audio returns None.
         assert!(iter.next_audio().is_none());
     }
@@ -6987,9 +7041,9 @@ mod tests {
     #[test]
     fn audio_block_count_propagates_parse_error() {
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let err = audio_block_count(&bad).expect_err("must reject");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
     }
 
     #[test]
@@ -7046,9 +7100,9 @@ mod tests {
     #[test]
     fn total_audio_samples_propagates_parse_error() {
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let err = total_audio_samples(&bad).expect_err("must reject");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
     }
 
     #[test]
@@ -7115,12 +7169,12 @@ mod tests {
         // Bad block first; first_audio_block surfaces the error rather
         // than skipping past it.
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let audio = synthesise_decodable_mono_block_one_zero_sample();
         let mut bytes = bad.clone();
         bytes.extend_from_slice(&audio);
         let err = first_audio_block(&bytes).expect_err("must reject");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
     }
 
     #[test]
@@ -7164,14 +7218,14 @@ mod tests {
         // parse error; then None forever.
         let audio = synthesise_decodable_mono_block_one_zero_sample();
         let mut bad = synthesise_header_bytes(MIN_CK_SIZE);
-        bad[0] = b'X';
+        bad[4..8].copy_from_slice(&1u32.to_le_bytes());
         let mut bytes = audio.clone();
         bytes.extend_from_slice(&bad);
 
         let mut iter = iter_audio_blocks(&bytes);
         iter.next().expect("audio").expect("ok");
         let err = iter.next().expect("second yield").expect_err("must reject");
-        assert_eq!(err, Error::InvalidMagic);
+        assert_eq!(err, Error::InvalidCkSize(1));
         assert!(iter.is_exhausted());
         assert!(iter.next().is_none());
     }
@@ -7537,14 +7591,14 @@ mod tests {
 
     #[test]
     fn correction_block_count_propagates_parse_error() {
-        // Trailing 3 bytes too short for a header → Truncated.
+        // Trailing cut-short magic: too short for a header → Truncated.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
         append_packed_correction_data(&mut payload, &[0x09, 0x0A]);
         let good = synthesise_block(1, flags_with(1 << 2), &payload);
         let mut bytes = good.clone();
-        bytes.extend_from_slice(&[0u8; 3]);
+        bytes.extend_from_slice(b"wvp");
         let err = correction_block_count(&bytes).expect_err("must reject trailing");
         assert_eq!(err, Error::Truncated);
     }
@@ -7636,7 +7690,7 @@ mod tests {
         append_packed_correction_data(&mut payload, &[0xAA, 0xBB]);
         let good = synthesise_block(1, flags_with(1 << 2), &payload);
         let mut bytes = good.clone();
-        bytes.extend_from_slice(&[0u8; 3]); // truncated trailing
+        bytes.extend_from_slice(b"wvp"); // truncated trailing
         let mut iter = iter_correction_blocks(&bytes);
         // First item: the good correction block.
         let first = iter.next().expect("first").expect("ok");
@@ -7766,7 +7820,7 @@ mod tests {
         append_packed_correction_data(&mut payload, &[0x01, 0x02]);
         let good = synthesise_block(1, flags_with(1 << 2), &payload);
         let mut bytes = good.clone();
-        bytes.extend_from_slice(&[0u8; 3]); // truncated trailing header
+        bytes.extend_from_slice(b"wvp"); // truncated trailing header
         let err = total_correction_payload_bytes(&bytes).expect_err("must reject");
         assert_eq!(err, Error::Truncated);
     }
@@ -7924,11 +7978,11 @@ mod tests {
         let mono = 1u32 << 2;
         let good = synth_pairing_block(0, 100, mono, false);
         let mut bad_main = good.clone();
-        bad_main.extend_from_slice(&[0u8; 3]);
+        bad_main.extend_from_slice(b"wvp");
         assert!(pair_correction_stream(&bad_main, &[]).is_err());
 
         let mut bad_wvc = synth_pairing_block(0, 100, mono, true);
-        bad_wvc.extend_from_slice(&[0u8; 3]);
+        bad_wvc.extend_from_slice(b"wvp");
         assert!(pair_correction_stream(&good, &bad_wvc).is_err());
     }
 

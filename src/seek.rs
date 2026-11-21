@@ -181,7 +181,13 @@ impl StreamIndex {
         let mut set_open = false;
 
         let mut offset = 0usize;
-        while offset < bytes.len() {
+        loop {
+            // Skip tags / other non-block bytes at the block boundary,
+            // exactly as the decoding walkers do.
+            offset += crate::block_header::leading_non_block_bytes(&bytes[offset..]);
+            if offset >= bytes.len() {
+                break;
+            }
             let (header, _tail) = parse_block_header(&bytes[offset..])?;
             let byte_len = 8usize + header.ck_size as usize;
             if offset + byte_len > bytes.len() {
@@ -1404,10 +1410,25 @@ mod tests {
 
     #[test]
     fn scan_propagates_header_refusals() {
-        // Bad magic.
+        // Undecodable version in a block that does start with the magic.
         let mut wv = raw_block(0, 64, MONO | STANDALONE);
-        wv[0] = b'X';
-        assert!(matches!(StreamIndex::scan(&wv), Err(Error::InvalidMagic)));
+        wv[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert!(matches!(
+            StreamIndex::scan(&wv),
+            Err(Error::UnsupportedVersion(0xFFFF))
+        ));
+        // Bytes that are no block at all are skipped, not refused: a
+        // stream with a tag after (or before, or between) its blocks
+        // indexes exactly like the bare stream.
+        let bare = raw_block(0, 64, MONO | STANDALONE);
+        let plain = StreamIndex::scan(&bare).unwrap();
+        let mut tagged = b"ID3 leading bytes".to_vec();
+        tagged.extend_from_slice(&bare);
+        tagged.extend_from_slice(b"APETAGEX trailing tag that names wvpk in passing");
+        let skipped = StreamIndex::scan(&tagged).unwrap();
+        assert_eq!(skipped.entries().len(), plain.entries().len());
+        assert_eq!(skipped.frame_count(), plain.frame_count());
+        assert_eq!(skipped.entries()[0].byte_offset, 17);
         // Truncated between blocks (partial header).
         let mut wv = raw_block(0, 64, MONO | STANDALONE);
         wv.extend_from_slice(&MAGIC[..2]);

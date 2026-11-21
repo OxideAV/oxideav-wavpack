@@ -644,6 +644,42 @@ pub fn parse_block_header(bytes: &[u8]) -> Result<(WavPackBlockHeader, &[u8])> {
     Ok((header, &bytes[HEADER_LEN..]))
 }
 
+/// Number of leading bytes of `bytes` that belong to **no block**.
+///
+/// The published file-format description (§1.0, §4.0) allows tags and
+/// other information in a WavPack file "outside the blocks (either
+/// before, in-between, or after)", ignored for the purpose of unpacking
+/// audio — an APEv2 / ID3v1 tag at the end of the file is the common
+/// case. Every stream walker in this crate therefore skips such bytes
+/// at a block boundary.
+///
+/// Returns `0` when `bytes` begins with the block magic (whatever
+/// follows is then that block's business, errors included). Otherwise
+/// the result is the offset of the first later position that holds a
+/// complete, structurally valid block — magic, a `ck_size` that fits
+/// the buffer, a decodable version — or `bytes.len()` when there is
+/// none. Requiring the whole block to fit keeps tag payload that merely
+/// *contains* the four magic bytes from being taken for a block.
+#[must_use]
+pub fn leading_non_block_bytes(bytes: &[u8]) -> usize {
+    // A block start — or a buffer cut short inside the magic, which is
+    // a truncated block start rather than foreign bytes.
+    if bytes.starts_with(MAGIC) || (bytes.len() < MAGIC.len() && MAGIC.starts_with(bytes)) {
+        return 0;
+    }
+    let mut from = 1usize;
+    while let Some(found) = bytes[from..].windows(MAGIC.len()).position(|w| w == MAGIC) {
+        let at = from + found;
+        if let Ok((header, _)) = parse_block_header(&bytes[at..])
+            && bytes.len() - at >= 8 + header.ck_size as usize
+        {
+            return at;
+        }
+        from = at + 1;
+    }
+    bytes.len()
+}
+
 #[inline]
 fn u16_le(b: &[u8]) -> u16 {
     u16::from_le_bytes([b[0], b[1]])

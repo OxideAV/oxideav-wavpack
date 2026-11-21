@@ -245,6 +245,15 @@ impl Decoder for WavPackDecoder {
                 "wavpack: send_packet after flush (reset the decoder to reuse it)",
             ));
         }
+        // The packet contract is whole blocks: a non-empty packet in
+        // which no block can be found at all is not a WavPack packet.
+        // (File-level tags around the blocks are tolerated, as they are
+        // by the stream walkers.)
+        if !packet.data.is_empty()
+            && crate::block_header::leading_non_block_bytes(&packet.data) == packet.data.len()
+        {
+            return Err(CoreError::invalid("wavpack: packet holds no block"));
+        }
         // Container width from the first audio block's header (wiki
         // flags bits 0..=1) — needed to pick the output byte packing.
         let first_audio = crate::block::first_audio_block(&packet.data).map_err(invalid)?;

@@ -12,8 +12,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   plus `with_bitrate_word` / `with_correction` / `with_joint` /
   `with_profile`.
 
+### Added
+
+- **Live black-box matrix** (`tests/blackbox_matrix.rs`): streams
+  written by an outside encoder across its option space — every
+  speed mode × extra-processing level × stereo coding, 14 integer
+  bit depths plus float, 1..12 channels with speaker masks, 27
+  sample rates, stream lengths from one frame, block-size options,
+  container options, and hybrid at 14 bitrates × modes × correction
+  kinds × shaping options × formats × layouts — are decoded here and
+  compared sample-for-sample with an outside decoder (and with the
+  source where the path is lossless). 1210 cases; generated in a
+  temporary directory at run time, skipped when the tools are absent.
+- `SubBlockId` gains the remaining published IDs: `DsdBlock` (`0x0E`),
+  `AltHeader` / `AltTrailer` (`0x23` / `0x24`), `AltExtension`
+  (`0x28`), `AltMd5Checksum` (`0x29`), `NewConfigBlock` (`0x2A`),
+  `ChannelIdentities` (`0x2B`), `BlockChecksum` (`0x2F`).
+- `leading_non_block_bytes`, and
+  `UnsupportedBlockFeature::OptimizedInt32Extension`.
+- `examples/wvinfo`: dump a file's blocks, flags and sub-blocks.
+
 ### Fixed
 
+- **Files with tags did not decode.** Every stream walker stopped
+  with "invalid block magic" at the first byte that was not a block —
+  so any file carrying an APEv2 / ID3v1 tag failed. The published
+  file-format description places tags "outside the blocks (either
+  before, in-between, or after)", ignored for unpacking; the block
+  iterator and the header-only index scan now skip such bytes at a
+  block boundary (a later position counts as a block only when a
+  complete, structurally valid block fits there, so tag payload that
+  merely contains the magic is not taken for one). A block that does
+  start with the magic still reports its own errors. The framework
+  decoder refuses a non-empty packet that holds no block at all.
+  Pin: `foreign_tagged_md5_stereo`.
+- **RIFF header / trailer sub-block IDs.** They are `0x21` / `0x22`
+  (published format description §3.0), not `0x20` / `0x21`:
+  `has_riff_header` and friends never matched a real file, and a real
+  header was reported as the trailer.
+- **32-bit streams with the extension bits in the `0x2C` form** (the
+  outside encoder's 32-bit optimisation option) reported a
+  structurally incomplete block. The form is not described by the
+  staged documents, so it stays undecodable, but the refusal is now
+  the typed `OptimizedInt32Extension`. Pin: `foreign_optimized_int32`.
 - **Fixed-lag `0x04` seed order.** A block whose leading wire term is
   a fixed lag of 2..8 mis-decoded from its first sample (the stored
   CRC caught it, so the muted paths zeroed the block): the seed words
