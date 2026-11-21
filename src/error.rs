@@ -72,6 +72,10 @@ pub enum Error {
     /// staged spec `wavpack-sample-formats.md` §3 documents. The
     /// contained number is the observed byte count.
     Int32InfoLength(usize),
+    /// A `0x09` int32-info sub-block sends more literal low bits per
+    /// sample (`sent_bits`, the contained value) than the 32 a sample
+    /// has.
+    Int32InfoSentBits(u8),
     /// A `0x09` int32-info sub-block populated more than one of its
     /// mutually exclusive redundancy fields (staged spec
     /// `wavpack-sample-formats.md` §3: "only one of `zeros` / `ones` /
@@ -595,6 +599,10 @@ impl core::fmt::Display for Error {
             Error::Int32InfoLength(n) => write!(
                 f,
                 "oxideav-wavpack: 0x09 int32-info payload has {n} bytes (expected 4: sent_bits, zeros, ones, dups)"
+            ),
+            Error::Int32InfoSentBits(n) => write!(
+                f,
+                "oxideav-wavpack: int32 profile sends {n} literal bits per sample (a sample has 32)"
             ),
             Error::Int32InfoConflict { zeros, ones, dups } => write!(
                 f,

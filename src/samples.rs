@@ -323,6 +323,45 @@ impl<'a> BitReader<'a> {
         Ok(value)
     }
 
+    /// Spec §4.2 steps 6 + 7 in one read: the phase-in (truncated
+    /// binary) code of a value in `0..=maxcode`, then the sign bit.
+    /// Returns `(code, sign_bit)`.
+    ///
+    /// The code is `bitcount − 1` bits when its value is below
+    /// `extras = 2^bitcount − maxcode − 1` and one bit longer otherwise.
+    /// Which of the two it is depends on the data and is close to a
+    /// coin flip, so both candidates are formed from one look at the
+    /// accumulator and selected without a branch. Bit consumption and
+    /// results are exactly those of reading the short code, then the
+    /// extra bit when needed, then the sign bit, one field at a time —
+    /// which is what the slow path below does when the buffer is too
+    /// near its end to hold the whole word.
+    #[inline]
+    fn get_phase_in_and_sign(&mut self, maxcode: u32) -> Result<(u32, u32)> {
+        let bitcount = 32 - maxcode.leading_zeros(); // bit-length of maxcode
+        if self.acc_bits <= bitcount {
+            self.refill();
+        }
+        if maxcode == 0 || self.acc_bits <= bitcount {
+            let code = read_truncated_binary(self, maxcode)?;
+            return Ok((code, self.get_bit()?));
+        }
+        let extras = (1u32 << bitcount) - maxcode - 1;
+        let short_bits = bitcount - 1;
+        let window = self.acc;
+        let short = (window & ((1u64 << short_bits) - 1)) as u32;
+        let long = (short << 1)
+            .wrapping_sub(extras)
+            .wrapping_add(((window >> short_bits) & 1) as u32);
+        let is_long = u32::from(short >= extras);
+        let code = if is_long == 1 { long } else { short };
+        let used = short_bits + is_long;
+        let sign = ((window >> used) & 1) as u32;
+        self.acc >>= used + 1;
+        self.acc_bits -= used + 1;
+        Ok((code, sign))
+    }
+
     /// Count consecutive `1` bits up to and including the terminating
     /// `0`, returning the run length.
     ///
@@ -1428,8 +1467,8 @@ impl SampleInterval {
     /// [`BitReader::get_bits`] partial-consume semantics.
     #[inline]
     pub fn decode_signed_value(&self, reader: &mut BitReader<'_>) -> Result<i32> {
-        let magnitude = self.decode_value(reader)?;
-        read_sign_and_apply(reader, magnitude)
+        let (code, sign) = reader.get_phase_in_and_sign(self.maxcode())?;
+        Ok(apply_sign(self.low.wrapping_add(code), sign == 1))
     }
 
     /// Spec §6.5 hybrid replacement for steps 6 + 7: bracket the value

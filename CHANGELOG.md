@@ -68,6 +68,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also lets a 256-channel stream carry its geometry. The matrix now
   sweeps 1..18, 24, 32, 33, 64, 255 and 256 channels in both
   directions.
+- `WavPackBlockHeader::block_index_40` / `total_samples_40`: the
+  40-bit sample counters of stream format 5.0 (header bytes 10 and 11
+  are their upper bytes, not a track number).
 - `SubBlockId` gains the remaining published IDs: `DsdBlock` (`0x0E`),
   `AltHeader` / `AltTrailer` (`0x23` / `0x24`), `AltExtension`
   (`0x28`), `AltMd5Checksum` (`0x29`), `NewConfigBlock` (`0x2A`),
@@ -100,16 +103,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte-identical across every profile, mono / stereo, hybrid pairs,
   float and multichannel (7.9 MB compared), and the decode matrix is
   unchanged.
+- **Mantissa and sign in one branch-free read.** Whether a phase-in
+  code is the short or the long form is close to a coin flip per
+  sample; both candidates are now formed from one look at the bit
+  accumulator and selected without a branch, the sign bit taken from
+  the same look.
 - Measured on 20 s of 44.1 kHz stereo (synthesised plucked strings,
   swept tone, faint pink noise; one thread, old and new binaries run
-  alternately, medians): decode of outside-encoded streams 407 →
-  623 × real time (fast mode), 332 → 532 × (default), 195 → 341 ×
-  (very high); encode 26 → 39 × (`Normal`), 13.7 → 22.5 × (`High`),
-  8.1 → 13 × (`Extra`), 3.5 → 6.5 × (`smallest`).
+  alternately, medians), as a multiple of real time: decode of
+  outside-encoded streams 458 → 926 × (fast mode), 352 → 708 ×
+  (default), 258 → 508 × (high), 196 → 404 × (very high), 389 →
+  534 × (hybrid lossy), 264 → 383 × (hybrid pair); encode 63 → 97 ×
+  (`Fast`), 24 → 38 × (`Normal`), 12.9 → 21.9 × (`High`), 7.3 →
+  9.8 × (`Extra`), 3.3 → 4.9 × (`smallest`), 144 → 169 × (hybrid).
   `examples/wvbench` reproduces the figures.
 
 ### Fixed
 
+- **A hostile `0x09` profile could trip a debug assertion.** A
+  `sent_bits` count above 32 reached the extension-stream bit read
+  unchecked (found by the `decode_stream` fuzz target, input kept as a
+  corpus seed); it is now the typed `Error::Int32InfoSentBits`.
 - **Files with tags did not decode.** Every stream walker stopped
   with "invalid block magic" at the first byte that was not a block —
   so any file carrying an APEv2 / ID3v1 tag failed. The published

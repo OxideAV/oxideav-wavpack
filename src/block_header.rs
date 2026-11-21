@@ -84,11 +84,15 @@ pub struct WavPackBlockHeader {
     pub ck_size: u32,
     /// Stream format version, currently `0x0402..=0x0410`.
     pub version: u16,
-    /// Multi-track number (wiki: "not currently implemented"). Stored
-    /// verbatim — callers may surface it for diagnostic round-trip.
+    /// Header byte 10. The orientation wiki calls it a multi-track
+    /// number ("not currently implemented"); in stream format 5.0 it is
+    /// the **upper 8 bits of the 40-bit block index** (published
+    /// file-format description §2.0) — see [`Self::block_index_40`].
+    /// Stored verbatim under its original field name.
     pub track_number: u8,
-    /// Multi-track sub index (wiki: "not currently implemented").
-    /// Stored verbatim for the same reason.
+    /// Header byte 11. The wiki's multi-track sub index; in stream
+    /// format 5.0 the **upper 8 bits of the 40-bit total sample
+    /// count** — see [`Self::total_samples_40`].
     pub track_sub_index: u8,
     /// Total samples in the file. Equal to [`TOTAL_SAMPLES_UNKNOWN`]
     /// when the encoder couldn't predict the total at write time.
@@ -448,6 +452,29 @@ impl WavPackBlockHeader {
         }
     }
 
+    /// The block's first-sample index as the full **40-bit** quantity
+    /// of stream format 5.0: header byte 10 supplies the upper 8 bits
+    /// above the 32-bit `block_index` field (published file-format
+    /// description §2.0). Equal to `block_index` for any file shorter
+    /// than 2³² frames.
+    pub fn block_index_40(&self) -> u64 {
+        (u64::from(self.track_number) << 32) | u64::from(self.block_index)
+    }
+
+    /// The file's total sample count as the full **40-bit** quantity:
+    /// header byte 11 supplies the upper 8 bits above the 32-bit
+    /// `total_samples` field. `None` when the lower 32 bits are all
+    /// set — the unknown-length sentinel, which the 40-bit form
+    /// reserves whatever the upper byte holds (published file-format
+    /// description §2.0).
+    pub fn total_samples_40(&self) -> Option<u64> {
+        if self.total_samples == TOTAL_SAMPLES_UNKNOWN {
+            None
+        } else {
+            Some((u64::from(self.track_sub_index) << 32) | u64::from(self.total_samples))
+        }
+    }
+
     /// Sample index of the first sample **after** this block — the
     /// half-open upper bound of the wiki "offset in samples for current
     /// block" / "samples in this block" pair, computed as `block_index
@@ -717,6 +744,22 @@ mod tests {
         buf[24..28].copy_from_slice(&flags.to_le_bytes());
         buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // crc
         buf
+    }
+
+    #[test]
+    fn forty_bit_counters_take_their_upper_bytes_from_the_header() {
+        let mut buf = synthesise_minimal_header(0);
+        buf[10] = 0x02; // upper byte of the block index
+        buf[11] = 0x01; // upper byte of the total sample count
+        buf[12..16].copy_from_slice(&0x0000_0010u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+        let (header, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(header.block_index_40(), 0x02_8000_0000);
+        assert_eq!(header.total_samples_40(), Some(0x01_0000_0010));
+        // The unknown-length sentinel lives in the lower 32 bits.
+        buf[12..16].copy_from_slice(&TOTAL_SAMPLES_UNKNOWN.to_le_bytes());
+        let (header, _) = parse_block_header(&buf).unwrap();
+        assert_eq!(header.total_samples_40(), None);
     }
 
     #[test]

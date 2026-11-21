@@ -94,8 +94,9 @@ high with extra processing 3).
   parsed but not verified; the encoder writes neither, nor RIFF
   headers or tags.
 * Header bytes 10–11 carry the upper 8 bits of the 40-bit sample
-  counters in version 5 streams; this crate reads the 32-bit fields
-  only (files past 2³² frames).
+  counters in version 5 streams. `block_index_40` / `total_samples_40`
+  read them, but the stream walkers, the seek index and the encoder
+  work in the 32-bit fields (files past 2³² frames are untested).
 * DSD: decode only; the mode-1 interval-collapse restart and the
   verbatim model-table form are implemented from the staged chapter
   but no outside stream exercised them.
@@ -103,22 +104,30 @@ high with extra processing 3).
 ### Speed
 
 One thread, 20 s of 44.1 kHz 16-bit stereo, as a multiple of real
-time (medians; old and new binaries run alternately on a busy shared
-host — `examples/wvbench` reproduces them):
+time (medians of 11 decode / 3 encode runs; old and new binaries run
+alternately on a busy shared host — `examples/wvbench` reproduces
+them):
 
 | | before | after |
 | --- | --- | --- |
-| decode, outside-encoded fast mode | 407 × | 623 × |
-| decode, outside-encoded default mode | 332 × | 532 × |
-| decode, outside-encoded very-high mode | 195 × | 341 × |
-| encode `Normal` | 26 × | 39 × |
-| encode `High` | 13.7 × | 22.5 × |
-| encode `Extra` | 8.1 × | 13 × |
-| encode `smallest` | 3.5 × | 6.5 × |
+| decode, outside-encoded fast mode | 458 × | 926 × |
+| decode, outside-encoded default mode | 352 × | 708 × |
+| decode, outside-encoded high mode | 258 × | 508 × |
+| decode, outside-encoded very-high mode | 196 × | 404 × |
+| decode, outside-encoded hybrid (lossy alone) | 389 × | 534 × |
+| decode, outside-encoded hybrid pair | 264 × | 383 × |
+| encode `Fast` | 63 × | 97 × |
+| encode `Normal` | 24 × | 38 × |
+| encode `High` | 12.9 × | 21.9 × |
+| encode `Extra` | 7.3 × | 9.8 × (fastest run 13.2 ×) |
+| encode `smallest` | 3.3 × | 4.9 × (fastest run 6.4 ×) |
+| encode hybrid, 4 bits/sample | 144 × | 169 × |
 
-The gains come from word-at-a-time bit I/O and from running the
-decorrelation stack over cache-sized stretches with per-term loops;
-encoder output is byte-identical.
+The gains come from word-at-a-time bit I/O, a branch-free
+mantissa-and-sign read, and running the decorrelation stack over
+cache-sized stretches with per-term loops; encoder output is
+byte-identical. The search encoders still entropy-code every candidate
+in full to compare sizes — the next place to look.
 
 Working surface:
 

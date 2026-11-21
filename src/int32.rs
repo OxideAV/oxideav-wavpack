@@ -120,7 +120,8 @@ fn low_bits_mask(count: u8) -> i32 {
 ///
 /// The payload must be exactly 4 bytes (`sent_bits, zeros, ones, dups`
 /// in wire order — staged spec §3) or [`Error::Int32InfoLength`] is
-/// returned, and at most one of `zeros` / `ones` / `dups` may be
+/// returned; `sent_bits` may not exceed the 32-bit sample width
+/// ([`Error::Int32InfoSentBits`]); and at most one of `zeros` / `ones` / `dups` may be
 /// non-zero ("mutually exclusive low-bit redundancy patterns") or
 /// [`Error::Int32InfoConflict`] is returned.
 pub fn expand_int32_info(payload: &[u8]) -> Result<Int32Info> {
@@ -133,6 +134,11 @@ pub fn expand_int32_info(payload: &[u8]) -> Result<Int32Info> {
         ones: *ones,
         dups: *dups,
     };
+    // A sample is 32 bits wide: more literal low bits than that is not
+    // a profile (and would not fit one extension-stream read).
+    if info.sent_bits > 32 {
+        return Err(Error::Int32InfoSentBits(info.sent_bits));
+    }
     let populated = [info.zeros, info.ones, info.dups]
         .iter()
         .filter(|&&c| c > 0)
@@ -342,6 +348,19 @@ pub fn deconstruct_int32(pcm: &[i32]) -> Int32Deconstruction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_refuses_more_literal_bits_than_a_sample_has() {
+        assert!(expand_int32_info(&[32, 0, 0, 0]).is_ok());
+        assert_eq!(
+            expand_int32_info(&[33, 0, 0, 0]),
+            Err(Error::Int32InfoSentBits(33))
+        );
+        assert_eq!(
+            expand_int32_info(&[200, 0, 0, 0]),
+            Err(Error::Int32InfoSentBits(200))
+        );
+    }
 
     #[test]
     fn expand_reads_the_four_wire_fields() {
