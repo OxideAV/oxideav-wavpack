@@ -21,7 +21,7 @@ use std::process::Command;
 use oxideav_wavpack::{
     decode_multichannel_stream, decode_multichannel_stream_f32, decode_multichannel_stream_muted,
     decode_multichannel_stream_with_correction, decode_multichannel_stream_with_correction_f32,
-    first_audio_block, stream_channel_info, stream_sample_rate,
+    first_audio_block, stream_channel_geometry, stream_sample_rate,
 };
 
 // ---------------------------------------------------------------------
@@ -190,7 +190,9 @@ impl Format {
             6 => 0x3F,
             7 => 0x13F,
             8 => 0x63F,
-            n => (1u32 << n.min(18)) - 1,
+            n if n <= 18 => (1u32 << n) - 1,
+            // More channels than speaker positions: unassigned.
+            _ => 0,
         }
     }
 }
@@ -453,12 +455,27 @@ fn check_foreign(scratch: &Scratch, case: &Case, tally: &mut Tally) -> Result<()
         // Plain mono / stereo with the default speaker pair carries no
         // geometry sub-block; everything else must.
         if fmt.channels > 2 || fmt.mask.is_some_and(|m| m != fmt.default_mask()) {
-            let info = stream_channel_info(&wv_bytes).map_err(|e| format!("channel info: {e}"))?;
+            let info =
+                stream_channel_geometry(&wv_bytes).map_err(|e| format!("channel info: {e}"))?;
             let Some(info) = info else {
                 return Err("no channel geometry on a multichannel stream".to_string());
             };
-            if usize::from(info.count) != fmt.channels {
-                return Err(format!("geometry count {}", info.count));
+            if usize::from(info.channels) != fmt.channels {
+                return Err(format!("geometry count {}", info.channels));
+            }
+            // The long form also states how many member blocks a set
+            // has; it must agree with what the stream actually holds.
+            if let Some(streams) = info.streams {
+                let layout = oxideav_wavpack::multichannel_layout(&wv_bytes)
+                    .map_err(|e| format!("layout: {e}"))?;
+                let members = oxideav_wavpack::audio_block_count(&wv_bytes)
+                    .map_err(|e| format!("block count: {e}"))?
+                    / layout.sets.max(1);
+                if members != usize::from(streams) {
+                    return Err(format!(
+                        "geometry states {streams} streams, the sets hold {members}"
+                    ));
+                }
             }
             let want = fmt.mask.unwrap_or(fmt.default_mask());
             if info.mask != want {
@@ -741,8 +758,11 @@ fn foreign_lossless_formats() {
 #[test]
 fn foreign_channels_and_rates() {
     let mut cases = Vec::new();
-    for channels in 1usize..=12 {
+    for channels in (1usize..=18).chain([24, 32, 33, 64, 255, 256]) {
         for (bits, float) in [(16u32, false), (24, false), (32, true)] {
+            if channels > 18 && bits != 16 {
+                continue;
+            }
             let mut fmt = Format::int(bits, channels, 44_100);
             fmt.float = float;
             for mode in [&[][..], &["-hh"][..]] {
@@ -754,7 +774,7 @@ fn foreign_channels_and_rates() {
                             mode_name(mode)
                         ),
                         fmt,
-                        5_000,
+                        if channels > 18 { 600 } else { 5_000 },
                         Content::Music,
                     )
                     .args(mode),
@@ -773,6 +793,11 @@ fn foreign_channels_and_rates() {
         (4, 0x107),
         (6, 0x60F),
         (8, 0xFF),
+        // (Masks with bits above the 18 speaker positions are written
+        // by the outside encoder but refused by the outside decoder.)
+        (13, 0x1_F0FF),
+        (17, 0),
+        (9, 0),
     ] {
         let mut fmt = Format::int(16, channels, 48_000);
         fmt.mask = Some(mask);
@@ -1591,6 +1616,46 @@ fn ours_lossless_formats_and_layouts() {
             );
         }
     }
+    // Wide layouts: more than 8 member blocks per set needs the long
+    // geometry form, up to the 256-channel ceiling.
+    for channels in [9usize, 12, 16, 17, 18, 24, 33, 64, 255, 256] {
+        let fmt = Format::int(16, channels, 48_000);
+        let pcm = quantize(&fmt, &content(Content::Music, 400, channels, 48_000, 67));
+        for (name, wv) in [
+            ("members", encode_multichannel_stream(&pcm, channels, 0, 2)),
+            (
+                "best",
+                encode_multichannel_stream_best(&pcm, channels, 150, 2, DecorrProfile::Fast),
+            ),
+        ] {
+            out.push(Emitted {
+                name: format!("{channels}ch-{name}"),
+                fmt,
+                wv: wv.expect("encode"),
+                wvc: None,
+                exact: pcm.clone(),
+                hybrid: false,
+            });
+        }
+    }
+    let wide = Format::int(16, 20, 48_000);
+    let pcm = quantize(&wide, &content(Content::Music, 400, 20, 48_000, 71));
+    let enc = encode_multichannel_stream_hybrid(
+        &pcm,
+        20,
+        150,
+        2,
+        &HybridOptions::from_bits_per_sample(4.0),
+    )
+    .expect("encode");
+    out.push(Emitted {
+        name: "20ch-hybrid".to_string(),
+        fmt: wide,
+        wv: enc.wv,
+        wvc: enc.wvc,
+        exact: pcm,
+        hybrid: true,
+    });
     run_emitted("ours-lossless-formats", out);
 }
 

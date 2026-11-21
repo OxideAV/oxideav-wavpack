@@ -868,9 +868,9 @@ pub use crate::block::{
     decode_stream_with_correction_muted, decode_stream_with_correction_muted_bounded,
     decoded_sample_count, first_audio_block, first_correction_block, iter_audio_blocks,
     iter_blocks, iter_correction_blocks, iter_decoded_blocks, metadata_block_count,
-    multichannel_layout, pair_correction_stream, parse_block, parse_blocks, stream_channel_info,
-    stream_sample_rate, stream_total_samples, total_audio_samples, total_block_samples,
-    total_correction_payload_bytes,
+    multichannel_layout, pair_correction_stream, parse_block, parse_blocks,
+    stream_channel_geometry, stream_channel_info, stream_sample_rate, stream_total_samples,
+    total_audio_samples, total_block_samples, total_correction_payload_bytes,
 };
 pub use crate::block_header::{
     Flags, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE, MIN_VERSION, SAMPLE_RATE_INDEX_CUSTOM,
@@ -916,7 +916,9 @@ pub use crate::hybrid_encode::{
     encode_stream_mono_hybrid_float, encode_stream_mono_hybrid_int32, encode_stream_stereo_hybrid,
     encode_stream_stereo_hybrid_float, encode_stream_stereo_hybrid_int32,
 };
-pub use crate::metadata::{ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId};
+pub use crate::metadata::{
+    ChannelGeometry, ChannelInfo, Md5Checksum, MetadataSubBlock, SubBlockFlags, SubBlockId,
+};
 pub use crate::overflow_bits::PackedOverflowBits;
 pub use crate::packed_samples::PackedSamples;
 pub use crate::seek::{
@@ -1010,8 +1012,9 @@ pub use crate::metadata::{
     find_hybrid_profile, find_md5_checksum_block, find_multichannel_info,
     find_noise_shaping_profile, find_non_standard_sample_rate, find_packed_correction_data,
     find_packed_correction_data_sub_block, find_packed_overflow_bits,
-    find_packed_overflow_bits_sub_block, find_packed_samples, parse_channel_info,
-    parse_md5_checksum, parse_metadata_sub_block, parse_non_standard_sample_rate, walk_metadata,
+    find_packed_overflow_bits_sub_block, find_packed_samples, parse_channel_geometry,
+    parse_channel_info, parse_md5_checksum, parse_metadata_sub_block,
+    parse_non_standard_sample_rate, walk_metadata,
 };
 // Internal: 0x0C overflow-bits expander (typed view above is stable).
 #[doc(hidden)]

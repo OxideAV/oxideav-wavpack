@@ -47,14 +47,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   container options, and hybrid at 14 bitrates × modes × correction
   kinds × shaping options × formats × layouts — are decoded here and
   compared sample-for-sample with an outside decoder (and with the
-  source where the path is lossless). 1290 cases; generated in a
+  source where the path is lossless). 1431 cases; generated in a
   temporary directory at run time, skipped when the tools are absent.
   The other direction sweeps this crate's encoders — every lossless
   entry point × profile × block size × width × content, float, 32-bit
   integer, 3..8 channels, and hybrid across bitrate × shaping × stereo
   coding × profile × correction × format × layout — and requires an
   outside reader to verify each stream silently and decode it to the
-  source (1768 streams).
+  source (1789 streams).
+- **Long-form channel geometry.** A stream whose sets have more than
+  8 member blocks (13+ assigned channels, 9+ unassigned ones) states
+  its geometry in a 6- or 7-byte `0x0D` payload — `[count − 1,
+  streams − 1, 0, mask]` — which `stream_channel_info` refused
+  outright. `ChannelGeometry` / `parse_channel_geometry` /
+  `WavPackBlock::channel_geometry` / `stream_channel_geometry` read
+  both forms (16-bit channel count, optional stream count);
+  `parse_channel_info` accepts the long form up to 255 channels. The
+  multichannel encoders write the long form past 8 members, which
+  also lets a 256-channel stream carry its geometry. The matrix now
+  sweeps 1..18, 24, 32, 33, 64, 255 and 256 channels in both
+  directions.
 - `SubBlockId` gains the remaining published IDs: `DsdBlock` (`0x0E`),
   `AltHeader` / `AltTrailer` (`0x23` / `0x24`), `AltExtension`
   (`0x28`), `AltMd5Checksum` (`0x29`), `NewConfigBlock` (`0x2A`),

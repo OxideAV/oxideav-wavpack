@@ -1057,7 +1057,7 @@ pub(crate) fn encode_hybrid_block_ints_member(
         append_sub_block(
             &mut metadata,
             SubBlockId::MultichannelInfo.as_id_byte(),
-            &info,
+            info.as_slice(),
         )?;
     }
     if let Some(format) = format {
@@ -1670,8 +1670,8 @@ fn hybrid_members_drive<T: Copy>(
             } else {
                 0b00
             };
-            let mc_info = (m == 0 && member_count > 1)
-                .then(|| u8::try_from(channels).ok().map(|c| [c, 0u8]))
+            let mc_info = (m == 0)
+                .then(|| crate::encode::GeometryPayload::unassigned(channels, member_count))
                 .flatten();
             let member = crate::encode::Membership {
                 marker,

@@ -277,7 +277,7 @@ struct BlockConfig<'a> {
     /// whose first member lacks the `0x0D` sub-block; the observed
     /// layout is one channel-count byte followed by the Microsoft
     /// speaker-mask byte the wiki names, `0` = unassigned.)
-    multichannel_info: Option<[u8; 2]>,
+    multichannel_info: Option<GeometryPayload>,
     /// Extended sample-format extras (float `0x08` / int32 `0x09`
     /// profile + optional `0x0C` extension payload + the header flag
     /// bit) for a block whose PCM buffer is the pre-fixup
@@ -475,7 +475,7 @@ fn encode_block_core(
         append_sub_block(
             &mut metadata,
             SubBlockId::MultichannelInfo.as_id_byte(),
-            &info,
+            info.as_slice(),
         )?;
     }
 
@@ -616,7 +616,7 @@ fn encode_block_mono_marker(
     block_index: u32,
     total_samples: u32,
     marker: u32,
-    multichannel_info: Option<[u8; 2]>,
+    multichannel_info: Option<GeometryPayload>,
 ) -> Result<Vec<u8>> {
     let config = BlockConfig {
         marker,
@@ -645,6 +645,48 @@ fn narrow_left_shift(buffer: &mut [i32], left_shift: u8) -> Result<()> {
         *s >>= left_shift;
     }
     Ok(())
+}
+
+/// A `0x0D` payload for a stream of unassigned channels.
+///
+/// The short form `[count, mask]` serves a set of up to 8 member
+/// blocks; past that the long form `[count − 1, members − 1, 0,
+/// mask(3)]` is what outside readers expect (see
+/// [`crate::parse_channel_geometry`] — a short form on a wider set is
+/// refused by them), and it is also the only form that can state 256
+/// channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GeometryPayload {
+    bytes: [u8; 6],
+    len: usize,
+}
+
+impl GeometryPayload {
+    /// The payload for `channels` unassigned channels split across
+    /// `members` blocks per set; `None` for a plain mono / stereo
+    /// stream (one member), which carries no geometry.
+    pub(crate) fn unassigned(channels: usize, members: usize) -> Option<Self> {
+        if members <= 1 {
+            return None;
+        }
+        if members > 8 {
+            let count = u8::try_from(channels - 1).ok()?;
+            let streams = u8::try_from(members - 1).ok()?;
+            return Some(Self {
+                bytes: [count, streams, 0, 0, 0, 0],
+                len: 6,
+            });
+        }
+        let count = u8::try_from(channels).ok()?;
+        Some(Self {
+            bytes: [count, 0, 0, 0, 0, 0],
+            len: 2,
+        })
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
 }
 
 /// Set the wiki flag-bits-13..=17 `left_shift` field in a flag word.
@@ -1420,7 +1462,7 @@ fn keep_smaller(best: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
 #[derive(Clone, Copy)]
 pub(crate) struct Membership {
     pub(crate) marker: u32,
-    pub(crate) multichannel_info: Option<[u8; 2]>,
+    pub(crate) multichannel_info: Option<GeometryPayload>,
 }
 
 impl Membership {
@@ -2749,14 +2791,11 @@ pub fn encode_multichannel_stream_at(
                 0b00 // continuation
             };
             // The set's first member carries the 0x0D multichannel
-            // information ([count, mask]) reference decoders require
-            // (see BlockConfig::multichannel_info). The speaker mask is
-            // 0 = unassigned — this API has no layout knowledge. A
-            // width past 255 cannot be expressed in the observed
-            // one-byte count; MAX_MULTICHANNEL_CHANNELS-wide grouping
-            // still encodes/decodes in-crate, without the sub-block.
-            let mc_info = (ch == 0 && channels > 1)
-                .then(|| u8::try_from(channels).ok().map(|c| [c, 0u8]))
+            // information outside decoders require (see
+            // BlockConfig::multichannel_info). The speaker mask is
+            // 0 = unassigned — this API has no layout knowledge.
+            let mc_info = (ch == 0)
+                .then(|| GeometryPayload::unassigned(channels, channels))
                 .flatten();
             let block = encode_block_mono_marker(
                 &channel_pcm,
@@ -2940,8 +2979,8 @@ fn encode_multichannel_format_at<T: Copy>(
             } else {
                 0b00
             };
-            let mc_info = (m == 0 && member_count > 1)
-                .then(|| u8::try_from(channels).ok().map(|c| [c, 0u8]))
+            let mc_info = (m == 0)
+                .then(|| GeometryPayload::unassigned(channels, member_count))
                 .flatten();
             let member = Membership {
                 marker,

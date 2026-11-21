@@ -1104,12 +1104,25 @@ impl<'a> WavPackBlock<'a> {
     }
 
     /// Locate the `0x0D` multichannel-information sub-block and parse
-    /// its first-member `[count, mask]` payload into a typed
-    /// [`crate::ChannelInfo`] (staged spec `wavpack-sample-formats.md`
-    /// §6). Returns `Ok(None)` when no `0x0D` sub-block is present
-    /// (mono / stereo streams, and non-first members of a set);
-    /// malformed payloads propagate [`Error::ChannelInfoLength`] /
-    /// [`Error::ChannelInfoZeroChannels`]. Round 405.
+    /// it — short `[count, mask]` form (staged spec
+    /// `wavpack-sample-formats.md` §6) or long form — into a typed
+    /// [`crate::ChannelGeometry`]. Returns `Ok(None)` when no `0x0D`
+    /// sub-block is present (mono / stereo streams, and non-first
+    /// members of a set); malformed payloads propagate
+    /// [`Error::ChannelInfoLength`] / [`Error::ChannelInfoZeroChannels`].
+    pub fn channel_geometry(&self) -> Result<Option<crate::ChannelGeometry>> {
+        match crate::metadata::find_multichannel_info(&self.sub_blocks) {
+            Some(sub) => Ok(Some(crate::metadata::parse_channel_geometry(sub.payload)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The `0x0D` geometry as the narrower [`crate::ChannelInfo`]
+    /// record (8-bit channel count, no stream count); see
+    /// [`Self::channel_geometry`] for the full statement. `Ok(None)`
+    /// when no `0x0D` sub-block is present; malformed payloads — and a
+    /// 256-channel long form, which the record cannot hold — propagate
+    /// [`Error::ChannelInfoLength`] / [`Error::ChannelInfoZeroChannels`].
     pub fn channel_info(&self) -> Result<Option<crate::ChannelInfo>> {
         match crate::metadata::find_multichannel_info(&self.sub_blocks) {
             Some(sub) => Ok(Some(crate::metadata::parse_channel_info(sub.payload)?)),
@@ -2624,14 +2637,24 @@ pub fn stream_total_samples(bytes: &[u8]) -> Result<Option<Option<u32>>> {
 }
 
 /// The stream's declared channel geometry — the first audio block's
-/// `0x0D` first-member `[count, mask]` sub-block as a typed
-/// [`crate::ChannelInfo`] (staged spec `wavpack-sample-formats.md` §6).
+/// `0x0D` sub-block, short or long form, as a typed
+/// [`crate::ChannelGeometry`] (staged spec `wavpack-sample-formats.md`
+/// §6; the long form per [`crate::parse_channel_geometry`]).
 ///
 /// Returns `Ok(None)` for streams that carry no `0x0D` (plain mono /
 /// stereo files); parse errors surface verbatim. The geometry is
 /// *declarative*: [`decode_multichannel_stream`] derives the actual
 /// interleaved width from the member-set grouping, and a conformant
 /// stream's `count` matches it. Round 405.
+pub fn stream_channel_geometry(bytes: &[u8]) -> Result<Option<crate::ChannelGeometry>> {
+    match first_audio_block(bytes)? {
+        Some(block) => block.channel_geometry(),
+        None => Ok(None),
+    }
+}
+
+/// [`stream_channel_geometry`] as the narrower [`crate::ChannelInfo`]
+/// record (8-bit channel count); a 256-channel stream is an error here.
 pub fn stream_channel_info(bytes: &[u8]) -> Result<Option<crate::ChannelInfo>> {
     match first_audio_block(bytes)? {
         Some(block) => block.channel_info(),

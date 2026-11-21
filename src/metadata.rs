@@ -628,34 +628,91 @@ impl ChannelInfo {
     }
 }
 
+/// The stream's channel geometry as either `0x0D` form states it — the
+/// wide-count twin of [`ChannelInfo`] (whose 8-bit `count` cannot hold
+/// 256).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChannelGeometry {
+    /// Total number of channels in the stream.
+    pub channels: u16,
+    /// Number of member streams (blocks per set) the channels are
+    /// split across — stated only by the long form, which is what an
+    /// encoder writes once that number exceeds 8.
+    pub streams: Option<u16>,
+    /// Microsoft speaker bit-mask (`0` = no assignment).
+    pub mask: u32,
+}
+
+/// Parse a `0x0D` multichannel-information payload in either form.
+///
+/// * **Short form**, 1..=5 bytes (staged spec
+///   `wavpack-sample-formats.md` §6): `[count, mask…]` with a 0..=4-byte
+///   little-endian mask.
+/// * **Long form**, 6 or 7 bytes: `[count − 1, streams − 1, 0, mask…]`
+///   with a 3- or 4-byte little-endian mask. The staged spec names this
+///   form without giving its layout; the three fields were read off
+///   outside-encoded streams (round 493 — 9..=256 channels with and
+///   without speaker masks: the first byte tracked the channel count
+///   minus one, the second the number of member blocks per set minus
+///   one, and the tail the mask; the form appears exactly when a set
+///   has more than 8 members). The third byte was zero in every probe —
+///   the outside encoder stops at 256 channels — so a non-zero value
+///   there is refused rather than interpreted.
+///
+/// Errors: [`Error::ChannelInfoLength`] for an empty or over-long
+/// payload and for a long form with a non-zero third byte;
+/// [`Error::ChannelInfoZeroChannels`] for a short-form zero count.
+pub fn parse_channel_geometry(payload: &[u8]) -> Result<ChannelGeometry> {
+    let le_mask = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .enumerate()
+            .fold(0u32, |mask, (i, &b)| mask | (u32::from(b) << (8 * i)))
+    };
+    match payload {
+        [] => Err(Error::ChannelInfoLength(0)),
+        [0, rest @ ..] if rest.len() <= 4 => Err(Error::ChannelInfoZeroChannels),
+        [count, rest @ ..] if rest.len() <= 4 => Ok(ChannelGeometry {
+            channels: u16::from(*count),
+            streams: None,
+            mask: le_mask(rest),
+        }),
+        [count_less_one, streams_less_one, 0, mask @ ..] if mask.len() == 3 || mask.len() == 4 => {
+            Ok(ChannelGeometry {
+                channels: u16::from(*count_less_one) + 1,
+                streams: Some(u16::from(*streams_less_one) + 1),
+                mask: le_mask(mask),
+            })
+        }
+        _ => Err(Error::ChannelInfoLength(payload.len())),
+    }
+}
+
 /// Parse the payload of a first-member `0x0D` multichannel-information
 /// sub-block into a typed [`ChannelInfo`].
 ///
 /// Staged spec `wavpack-sample-formats.md` §6 (erratum pin): the
-/// **first member** form is `[count (1 byte), mask (little-endian, byte
-/// length = sub-block length − 1)]`; a zero-length mask means "no
-/// assignment". A payload longer than `1 + 4` bytes is the extended
-/// `0x0D` form (later encoders, >32 channels / reordering) whose layout
-/// the staged spec does not pin — rejected with
-/// [`Error::ChannelInfoLength`], as is an empty payload. A zero channel
-/// count is rejected with [`Error::ChannelInfoZeroChannels`].
+/// short form is `[count (1 byte), mask (little-endian, byte length =
+/// sub-block length − 1)]`; a zero-length mask means "no assignment".
+/// The long form (6 or 7 bytes — see [`parse_channel_geometry`], which
+/// also reports its stream count) is accepted as long as its channel
+/// count fits this record's 8-bit `count`; a 256-channel stream is
+/// only representable through [`parse_channel_geometry`]. An empty or
+/// over-long payload is rejected with [`Error::ChannelInfoLength`], a
+/// zero channel count with [`Error::ChannelInfoZeroChannels`].
 pub fn parse_channel_info(payload: &[u8]) -> Result<ChannelInfo> {
-    let (count, mask_bytes) = match payload {
-        [] => return Err(Error::ChannelInfoLength(0)),
-        [count, rest @ ..] if rest.len() <= 4 => (*count, rest),
-        _ => return Err(Error::ChannelInfoLength(payload.len())),
+    let geometry = parse_channel_geometry(payload)?;
+    let count =
+        u8::try_from(geometry.channels).map_err(|_| Error::ChannelInfoLength(payload.len()))?;
+    let mask_bytes = match geometry.streams {
+        None => payload.len() - 1,
+        Some(_) => payload.len() - 3,
     };
-    if count == 0 {
-        return Err(Error::ChannelInfoZeroChannels);
-    }
-    let mut mask = 0u32;
-    for (i, &b) in mask_bytes.iter().enumerate() {
-        mask |= u32::from(b) << (8 * i);
-    }
     Ok(ChannelInfo {
         count,
-        mask,
-        mask_bytes: mask_bytes.len() as u8,
+        mask: geometry.mask,
+        mask_bytes: mask_bytes as u8,
     })
 }
 
@@ -1454,13 +1511,46 @@ mod tests {
     #[test]
     fn parse_channel_info_rejects_malformed_payloads() {
         assert_eq!(parse_channel_info(&[]), Err(Error::ChannelInfoLength(0)));
-        // Longer than count + 4 mask bytes = the extended 0x0D form.
+        // Six or seven bytes are the long form, whose third byte must
+        // be zero; anything longer is no known form.
         assert_eq!(
             parse_channel_info(&[6, 1, 2, 3, 4, 5]),
             Err(Error::ChannelInfoLength(6))
         );
         assert_eq!(
+            parse_channel_info(&[6, 1, 0, 3, 4, 5, 6, 7]),
+            Err(Error::ChannelInfoLength(8))
+        );
+        assert_eq!(
             parse_channel_info(&[0, 0x3F]),
+            Err(Error::ChannelInfoZeroChannels)
+        );
+    }
+
+    /// The long `0x0D` form, with payloads taken from outside-encoded
+    /// 13- / 17- / 256-channel streams (round 493).
+    #[test]
+    fn parse_channel_geometry_reads_both_forms() {
+        // 13 channels, mask 0x1FFF, 9 member streams.
+        let g = parse_channel_geometry(&[0x0C, 0x08, 0x00, 0xFF, 0x1F, 0x00]).unwrap();
+        assert_eq!((g.channels, g.streams, g.mask), (13, Some(9), 0x1FFF));
+        let ci = parse_channel_info(&[0x0C, 0x08, 0x00, 0xFF, 0x1F, 0x00]).unwrap();
+        assert_eq!((ci.count, ci.mask, ci.mask_bytes), (13, 0x1FFF, 3));
+        // 13 channels with a mask bit above 24: a 4-byte mask.
+        let g = parse_channel_geometry(&[0x0C, 0x08, 0x00, 0xFF, 0x1F, 0x00, 0x80]).unwrap();
+        assert_eq!((g.channels, g.streams, g.mask), (13, Some(9), 0x8000_1FFF));
+        // 17 unassigned channels: 17 mono streams.
+        let g = parse_channel_geometry(&[0x10, 0x10, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!((g.channels, g.streams, g.mask), (17, Some(17), 0));
+        // 256 channels fit the geometry, not the 8-bit record.
+        let wide = [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_channel_geometry(&wide).unwrap().channels, 256);
+        assert_eq!(parse_channel_info(&wide), Err(Error::ChannelInfoLength(6)));
+        // Short form.
+        let g = parse_channel_geometry(&[6, 0x3F]).unwrap();
+        assert_eq!((g.channels, g.streams, g.mask), (6, None, 0x3F));
+        assert_eq!(
+            parse_channel_geometry(&[0]),
             Err(Error::ChannelInfoZeroChannels)
         );
     }
