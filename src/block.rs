@@ -1677,12 +1677,18 @@ impl<'a> WavPackBlock<'a> {
     /// before the sample-format fixups. The pair decode applies it
     /// after the correction fold, where it is the identity for any
     /// losslessly-recovered (in-range) sample. The `left_shift` term
-    /// extends the same "effective depth" reading to shifted blocks
-    /// (untested corner: reference hybrid encodes do not combine
-    /// left-shift with clipping-adjacent content).
+    /// extends the same "effective depth" reading to shifted blocks.
+    ///
+    /// Round 493: an `INT32_DATA` block in a container **narrower than
+    /// four bytes** (the outside encoder strips shared trailing ones /
+    /// duplicated low bits from 8..24-bit material too) is the
+    /// exception — its lossy decode re-inserts the redundancy pattern
+    /// and saturates *afterwards*, to the container-minus-left-shift
+    /// range, so this pre-fixup clamp stands aside for it (see
+    /// [`Self::apply_int32_fixup`]).
     fn clamp_hybrid_output(&self, pcm: &mut [i32]) {
         let flags = &self.header.flags;
-        if !flags.hybrid {
+        if !flags.hybrid || self.is_narrow_int32_block() {
             return;
         }
         // Hostile headers can carry a left shift past the container
@@ -1705,6 +1711,14 @@ impl<'a> WavPackBlock<'a> {
         for s in pcm.iter_mut() {
             *s = (*s).clamp(lo, hi);
         }
+    }
+
+    /// `true` for an `INT32_DATA` block whose container is narrower
+    /// than four bytes: a redundancy-only reduction of ordinary
+    /// 8..24-bit material.
+    fn is_narrow_int32_block(&self) -> bool {
+        let flags = &self.header.flags;
+        flags.int32_mode && flags.bytes_per_sample() < 4
     }
 
     fn apply_sample_format_fixups(&self, pcm: &mut [i32]) -> Result<Option<(u32, u32)>> {
@@ -1800,6 +1814,29 @@ impl<'a> WavPackBlock<'a> {
             .find_sub_block(SubBlockId::Int32Info)
             .ok_or(Error::BlockMissingInt32Info)?;
         let info = crate::int32::expand_int32_info(info_sub.payload)?;
+        if self.header.flags.hybrid && self.is_narrow_int32_block() && !info.requires_extension() {
+            // Narrow container (round-493 black-box pin, 8/16/24-bit
+            // hybrid encodes of trailing-ones / duplicated-low-bit /
+            // trailing-zero content): the pattern IS re-inserted on the
+            // lossy path, and the output then saturates to the
+            // container-minus-left-shift range — so a coarse value one
+            // step past the rail lands on the rail itself, pattern bits
+            // and all. On a pair decode the saturation is the identity.
+            let computed = crate::int32::reassemble_int32(pcm, &info, None)?;
+            let flags = &self.header.flags;
+            let bits = (u32::from(flags.bytes_per_sample()) * 8)
+                .saturating_sub(u32::from(flags.left_shift))
+                .clamp(1, 32);
+            let hi = ((1i64 << (bits - 1)) - 1) as i32;
+            let lo = (-(1i64 << (bits - 1))) as i32;
+            for s in pcm.iter_mut() {
+                *s = (*s).clamp(lo, hi);
+            }
+            return match overflow {
+                Some(overflow) if pair => Ok(Some((computed, overflow.crc_wvx()?))),
+                _ => Ok(None),
+            };
+        }
         if info.requires_extension() {
             if overflow.is_none() && self.header.flags.hybrid && !pair {
                 // A hybrid (lossy) int32 block legitimately omits the wvx
@@ -1816,12 +1853,14 @@ impl<'a> WavPackBlock<'a> {
             let computed = crate::int32::reassemble_int32(pcm, &info, Some(&mut reader))?;
             Ok(Some((computed, stored)))
         } else if overflow.is_none() && self.header.flags.hybrid && !pair {
-            // Redundancy-only reduction on the lossy path: the pattern
-            // is NOT re-inserted — the reference decoder zero-fills the
-            // whole window exactly as in the sent-bits case (round-418
-            // black-box pin: trailing-ones and duplicated-low-bit
-            // profiles decode with all-zero low windows in the lossy
-            // stream, while the pair decode restores the pattern).
+            // Redundancy-only reduction on the lossy path of a 4-byte
+            // container: the pattern is NOT re-inserted — the whole
+            // window zero-fills exactly as in the sent-bits case
+            // (round-418 black-box pin: 32-bit trailing-ones and
+            // duplicated-low-bit profiles decode with all-zero low
+            // windows in the lossy stream, while the pair decode
+            // restores the pattern). Narrower containers took the
+            // re-inserting branch above.
             crate::int32::reassemble_int32_implied(pcm, &info);
             Ok(None)
         } else {

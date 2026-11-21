@@ -50,6 +50,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   other way round, so a block leading with a seeded `-3` pass decoded
   wrongly. Pin: `foreign_hybrid_cross3_seed`.
 
+- **Lossy decode of `INT32_DATA` blocks in 1..3-byte containers.**
+  The outside encoder strips shared trailing ones / duplicated low
+  bits / trailing zeros from ordinary 8..24-bit material as well
+  (a rail-to-rail square wave is all-odd, for one). On the lossy
+  (`.wv`-only) path such a block re-inserts the pattern and
+  saturates **afterwards**, to the container-minus-left-shift range;
+  the zero-fill-and-clamp-first rule holds for 4-byte containers
+  only. Hybrid decodes of that content were off by the pattern bits
+  on every sample. Pin: `foreign_hybrid_narrow_ones_b3`.
+
 ### Changed
 
 - API hygiene: `#[non_exhaustive]` on the enums `Error`,

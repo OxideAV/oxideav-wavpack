@@ -86,6 +86,7 @@
 //! | `foreign_hybrid_cross3_seed`   | `-h -b3.5 -x3 -j0` | hybrid stereo whose leading wire term is `-3` with non-zero seeds — pins the crossed-over seed words of term `-3` (round 493) |
 //! | `foreign_hybrid_pair_cross_js` | `-h -b4 -cc` | joint pair whose stack carries `-1` / `-2` passes under `CROSS_DECORR` — pins the lossless same-sample predictor of the pre-decorrelation fold (round 493) |
 //! | `foreign_hybrid_pair_cross_lr` | `-h -b4 -cc -j0` | left/right pair, same stack shape |
+//! | `foreign_hybrid_narrow_ones_b3` | `-b3`       | 16-bit mono rail-to-rail square (every sample odd): `INT32_DATA` with `ones = 1` in a 2-byte container — the lossy decode re-inserts the pattern and saturates afterwards (round 493) |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -248,6 +249,11 @@ foreign_fixture!(
     hybrid_cross3_seed_is_bit_exact,
     "foreign_hybrid_cross3_seed",
     2
+);
+foreign_fixture!(
+    hybrid_narrow_ones_b3_is_bit_exact,
+    "foreign_hybrid_narrow_ones_b3",
+    1
 );
 
 /// Hybrid-specific shape assertions on top of the bit-exact battery:
