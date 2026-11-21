@@ -44,15 +44,18 @@
 //!   6/29 clear, no `0x07`) the raw §4.1 fold applies — the shape the
 //!   reference's shaping-off mode produces.
 //! * **Noise shaping** ([`HybridShaping`], round 420). When selected,
-//!   every §6.5-bracketed word targets the **shaped** residual
-//!   `exact - temp` (the spec §4.1 error-feedback term, recomputed in
-//!   exact decoder lockstep via [`crate::ShapingState`]), tilting the
-//!   lossy stream's quantization-noise spectrum by the weight; the
-//!   `.wvc` twin leads with the block's `0x07` seed so the pair decode
-//!   re-derives the same temps and stays bit-exact. Joint (mid/side)
-//!   blocks run the filter per **output** channel with the round-415
-//!   coded-domain temp transform. Header bits 6/29 are both set,
-//!   matching every reference shaped block.
+//!   every sample is coded as the **shaped** value `source - temp`
+//!   (the spec §4.1 error-feedback term, recomputed in exact decoder
+//!   lockstep via [`crate::ShapingState`]), tilting the lossy stream's
+//!   quantization-noise spectrum by the weight; the `.wvc` twin leads
+//!   with the block's `0x07` seed so the pair decode re-derives the
+//!   same temps and stays bit-exact. The filter runs per **output**
+//!   channel and its term applies to every sample — bracketed words,
+//!   exactly-read words and zero-run members (round 493) — so stereo
+//!   blocks shape the left/right frame and re-express it in the coded
+//!   domain, and a zero run spans only samples whose shaped residual
+//!   is zero. Header bits 6/29 are both set, matching every reference
+//!   shaped block.
 //! * **The `.wvc` twin.** Same 32-byte header fields as the `.wv`
 //!   block except the CRC, which stores the §5 running CRC of the
 //!   **lossless** decode (round-415 pin), then the `0x0B` correction
@@ -511,11 +514,11 @@ struct HybridStreams {
 /// `shaping` is the `0x07`-seeded noise-shaping filter, advanced /
 /// updated in exact decoder lockstep
 /// ([`crate::decode_packed_samples_mono_hybrid_lossless`]): every
-/// sample advances the weight, bracketed words target the **shaped**
-/// residual `exact - temp` (the value the correction stream stores and
-/// the pair decode adds `temp` back onto), and zero-run / lossless
-/// dispatches apply no temp and fold `exact == coarse` into the error
-/// state. A zero (absent-`0x07`) state makes every temp zero — the
+/// sample advances the weight and **every** wire value — bracketed
+/// word, lossless-dispatch word or zero-run member — is the shaped
+/// residual `exact - temp` (the pair decode adds `temp` back onto all
+/// of them), so a zero run can only span samples whose shaped residual
+/// is zero. A zero (absent-`0x07`) state makes every temp zero — the
 /// bitstream is then bit-identical to the unshaped encode.
 fn hybrid_entropy_mono(
     coded: &[i32],
@@ -534,19 +537,20 @@ fn hybrid_entropy_mono(
     let mut max_res_bits = 0u32;
     let n = coded.len();
     let mut i = 0usize;
+    // The temp of a sample whose filter advance already happened (the
+    // sample that terminated a zero run).
+    let mut held: Option<i32> = None;
     while i < n {
         // Decoder per-sample order: limit from the pre-sample state,
         // weight advance, then the word dispatch.
         let limit = hybrid.frame_limits()[0];
-        let temp = shaping.advance(0);
-        let exact = coded[i].wrapping_sub(stepper.offset());
-        // The wire word's value: bracketed words target the shaped
-        // residual; the lossless dispatch writes the exact residual.
-        let wire = if limit == 0 {
-            exact
-        } else {
-            exact.wrapping_sub(temp)
+        let temp = match held.take() {
+            Some(t) => t,
+            None => shaping.advance(0),
         };
+        let exact = coded[i].wrapping_sub(stepper.offset());
+        // The wire value is the shaped residual on every path.
+        let wire = exact.wrapping_sub(temp);
         let (mag, _) = split_sign(wire);
         max_res_bits = max_res_bits.max(32 - mag.leading_zeros());
         if let Some(p) = pending.take() {
@@ -555,30 +559,33 @@ fn hybrid_entropy_mono(
         if run_break {
             run_break = false;
         } else if medians.values[0] <= 1 && !run.last_one && !run.last_zero {
-            // §4.2 step 1: the maximal run of zero exact residuals
-            // (run members decode exact == coarse == 0, so membership
-            // keys on the exact residual even under shaping).
+            // §4.2 step 1: the maximal run of zero **shaped**
+            // residuals (a run member decodes to `0 + temp`, so it must
+            // be a sample whose exact residual equals its temp).
             let mut run_len = 0u32;
+            let mut temp_i = temp;
             let mut exact_i = exact;
-            let mut advanced = true; // the entry sample already advanced
-            while i < n && exact_i == 0 {
-                if !advanced {
-                    let _ = shaping.advance(0);
-                }
-                advanced = false;
-                shaping.update(0, 0, 0, 0);
+            while exact_i == temp_i {
+                shaping.update(0, exact_i, 0, temp_i);
                 hybrid.update_signed(0, 0);
                 coarse_out.push(stepper.advance(0));
                 run_len += 1;
                 i += 1;
-                if i < n {
-                    exact_i = coded[i].wrapping_sub(stepper.offset());
+                if i == n {
+                    break;
                 }
+                temp_i = shaping.advance(0);
+                exact_i = coded[i].wrapping_sub(stepper.offset());
             }
             emit_zero_run_length(&mut writer, run_len);
             if run_len > 0 {
                 medians.values = [0, 0, 0];
                 run_break = true;
+                // The sample that ended the run has already advanced
+                // the filter: code it as a word without advancing again.
+                if i < n {
+                    held = Some(temp_i);
+                }
                 continue;
             }
         }
@@ -590,11 +597,7 @@ fn hybrid_entropy_mono(
         let (cmag, _) = split_sign(coarse_res);
         max_res_bits = max_res_bits.max(32 - cmag.leading_zeros());
         hybrid.update_signed(0, coarse_res);
-        if limit == 0 {
-            shaping.update(0, exact, exact, 0);
-        } else {
-            shaping.update(0, exact, coarse_res, temp);
-        }
+        shaping.update(0, exact, coarse_res, temp);
         coarse_out.push(stepper.advance(coarse_res));
         i += 1;
     }
@@ -609,36 +612,31 @@ fn hybrid_entropy_mono(
     })
 }
 
-/// How the noise-shaping filter maps onto an interleaved stereo encode
-/// (round 420, mirroring the two decode-side placements).
+/// How the noise-shaping filter's two channels relate to the coded
+/// channels of an interleaved stereo encode. The filter always runs
+/// per **output** channel, both weights advancing once per frame and
+/// both temps applying unconditionally (see
+/// `WavPackBlock::decode_samples_with_correction`); the mode only says
+/// how an output frame maps to the coded frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StereoShapingMode {
-    /// Left/right-coded blocks: the shaping channels coincide with the
-    /// coded channels and the temps fold per slot, exactly as in the
-    /// mono loop ([`crate::decode_packed_samples_stereo_hybrid_lossless`]).
+    /// Left/right-coded blocks: coded channels are the output channels.
     PerChannel,
-    /// Joint (mid/side) blocks: the shaping channels are the **output**
-    /// (left/right) channels; both weights advance once per frame and
-    /// the coded-domain temps are the round-415 transform
-    /// (`t_m = t_l - t_r`;
-    /// `t_s = t_r + ((mid_out + t_m) >> 1) - (mid_out >> 1)`), with the
-    /// error states folded against the post-undo left/right values —
-    /// see `WavPackBlock::decode_joint_samples_with_correction`.
+    /// Joint (mid/side) blocks: the output frame is the §5.4 undo of
+    /// the coded frame.
     JointOutput,
 }
 
-/// Per-frame bookkeeping of the joint-output shaping transform: what
-/// the even (mid) slot decided, consumed by the odd (side) slot.
+/// One frame of the stereo shaping lockstep: the temps the frame
+/// starts with and the **shaped** coded-domain targets they imply.
 #[derive(Debug, Clone, Copy, Default)]
-struct JointFrame {
-    /// The frame's left/right weight advances (`t_l`, `t_r`).
-    t_l: i32,
-    t_r: i32,
-    /// The exact coded-domain mid target (`coded[2f]`).
-    m_exact: i32,
-    /// The applied mid temp: `t_l - t_r` when the mid slot was
-    /// bracketed, `0` otherwise.
-    t_m_applied: i32,
+struct ShapedFrame {
+    /// The frame's left / right feedback terms.
+    temps: [i32; 2],
+    /// Coded-domain values the lossless decode must reach *before* the
+    /// temps are added back: `source - temp` per output channel,
+    /// re-expressed as mid/side on a joint block.
+    target: [i32; 2],
 }
 
 /// The §6.5 bracketed entropy encode of a whole interleaved **stereo**
@@ -669,72 +667,77 @@ fn hybrid_entropy_stereo(
     let mut coarse_out = Vec::with_capacity(coded.len());
     let mut max_res_bits = 0u32;
     let slots = coded.len();
+    let joint = mode == StereoShapingMode::JointOutput;
     let mut limits = [0u32; 2];
     // The current frame's channel-A coarse residual (set at every even
     // slot, consumed by the odd slot's offset and the frame advance).
     let mut frame_res_a = 0i32;
-    let mut frame = JointFrame::default();
-    // Completes one frame at its odd slot: stepper advance, joint
-    // error-state fold (the round-415 effective per-output deltas
-    // against the post-undo left/right values), coarse output push.
-    let complete_frame = |shaping: &mut crate::ShapingState,
+    let mut frame = ShapedFrame::default();
+    // Index of the frame `frame` / `limits` describe (each frame's
+    // filter advance must happen exactly once, even when a zero-run
+    // probe looks at a frame the word path then codes).
+    let mut opened = usize::MAX;
+    let open_frame = |f: usize,
+                      opened: &mut usize,
+                      frame: &mut ShapedFrame,
+                      limits: &mut [u32; 2],
+                      hybrid: &HybridState,
+                      shaping: &mut crate::ShapingState| {
+        if *opened == f {
+            return;
+        }
+        *opened = f;
+        *limits = hybrid.frame_limits();
+        let temps = [shaping.advance(0), shaping.advance(1)];
+        let source = (coded[2 * f], coded[2 * f + 1]);
+        let target = if joint {
+            let (left, right) = crate::crc::undo_joint_stereo(source.0, source.1);
+            let left = left.wrapping_sub(temps[0]);
+            let right = right.wrapping_sub(temps[1]);
+            let mid = left.wrapping_sub(right);
+            [mid, right.wrapping_add(mid >> 1)]
+        } else {
+            [
+                source.0.wrapping_sub(temps[0]),
+                source.1.wrapping_sub(temps[1]),
+            ]
+        };
+        *frame = ShapedFrame { temps, target };
+    };
+    // Completes frame `f` at its odd slot: stepper advance, error-state
+    // fold of the lossless against the lossy output frame, coarse push.
+    let complete_frame = |f: usize,
+                          shaping: &mut crate::ShapingState,
                           stepper: &mut StereoStepper,
                           coarse_out: &mut Vec<i32>,
-                          frame: &JointFrame,
+                          frame: &ShapedFrame,
                           res_a: i32,
-                          res_b: i32,
-                          s_exact: i32,
-                          t_s_applied: i32,
-                          half_step: i32| {
+                          res_b: i32| {
         let (a, b) = stepper.advance(res_a, res_b);
-        if mode == StereoShapingMode::JointOutput {
-            let d_r = t_s_applied.wrapping_sub(half_step);
-            let d_l = frame.t_m_applied.wrapping_add(d_r);
-            let (left, right) = crate::crc::undo_joint_stereo(frame.m_exact, s_exact);
-            let (left_lossy, right_lossy) = crate::crc::undo_joint_stereo(a, b);
-            shaping.update(0, left, left_lossy, d_l);
-            shaping.update(1, right, right_lossy, d_r);
-        }
+        let source = (coded[2 * f], coded[2 * f + 1]);
+        let (exact, lossy) = if joint {
+            (
+                crate::crc::undo_joint_stereo(source.0, source.1),
+                crate::crc::undo_joint_stereo(a, b),
+            )
+        } else {
+            (source, (a, b))
+        };
+        shaping.update(0, exact.0, lossy.0, frame.temps[0]);
+        shaping.update(1, exact.1, lossy.1, frame.temps[1]);
         coarse_out.push(a);
         coarse_out.push(b);
-    };
-    // The joint half-step of the current frame's side slot:
-    // `(mid_shaped >> 1) - (mid >> 1)` with `mid_shaped == m_exact`
-    // and `mid == m_exact - t_m_applied` (both known exactly on the
-    // encode side because the mid slot was constructed to reach its
-    // target).
-    let joint_half_step = |frame: &JointFrame| {
-        (frame.m_exact >> 1).wrapping_sub(frame.m_exact.wrapping_sub(frame.t_m_applied) >> 1)
     };
     let mut i = 0usize;
     while i < slots {
         let ch = i & 1;
-        if ch == 0 {
-            limits = hybrid.frame_limits();
-            if mode == StereoShapingMode::JointOutput {
-                frame.t_l = shaping.advance(0);
-                frame.t_r = shaping.advance(1);
-            }
-        }
-        let temp = match mode {
-            StereoShapingMode::PerChannel => shaping.advance(ch),
-            // The candidate coded-domain temp of this slot, applied
-            // only when the slot ends up bracketed.
-            StereoShapingMode::JointOutput if ch == 0 => frame.t_l.wrapping_sub(frame.t_r),
-            StereoShapingMode::JointOutput => frame.t_r.wrapping_add(joint_half_step(&frame)),
-        };
-        let exact = if ch == 0 {
-            coded[i].wrapping_sub(stepper.offset_a())
+        open_frame(i / 2, &mut opened, &mut frame, &mut limits, hybrid, shaping);
+        // The wire value: the shaped coded-domain target minus the
+        // prediction the decoder will form from its coarse history.
+        let wire = if ch == 0 {
+            frame.target[0].wrapping_sub(stepper.offset_a())
         } else {
-            coded[i].wrapping_sub(stepper.offset_b(frame_res_a))
-        };
-        if mode == StereoShapingMode::JointOutput && ch == 0 {
-            frame.m_exact = coded[i];
-        }
-        let wire = if limits[ch] == 0 {
-            exact
-        } else {
-            exact.wrapping_sub(temp)
+            frame.target[1].wrapping_sub(stepper.offset_b(frame_res_a))
         };
         let (mag, _) = split_sign(wire);
         max_res_bits = max_res_bits.max(32 - mag.leading_zeros());
@@ -753,59 +756,37 @@ fn hybrid_entropy_stereo(
             && !run.last_one
             && !run.last_zero
         {
-            // Stream-level zero run across both channels (membership
-            // keys on the exact residual: run members decode
-            // exact == coarse == 0).
+            // Stream-level zero run across both channels: the maximal
+            // run of zero **shaped** residuals.
             let mut run_len = 0u32;
-            let mut exact_i = exact;
-            let mut advanced = true; // the entry slot already advanced
-            while i < slots && exact_i == 0 {
+            let mut wire_i = wire;
+            while wire_i == 0 {
                 let chx = i & 1;
-                match mode {
-                    StereoShapingMode::PerChannel => {
-                        if !advanced {
-                            let _ = shaping.advance(chx);
-                        }
-                        shaping.update(chx, 0, 0, 0);
-                    }
-                    StereoShapingMode::JointOutput => {
-                        if chx == 0 {
-                            if !advanced {
-                                frame.t_l = shaping.advance(0);
-                                frame.t_r = shaping.advance(1);
-                            }
-                            frame.m_exact = coded[i];
-                            frame.t_m_applied = 0;
-                        }
-                    }
-                }
-                advanced = false;
                 hybrid.update_signed(chx, 0);
                 if chx == 0 {
                     frame_res_a = 0;
                 } else {
                     complete_frame(
+                        i / 2,
                         shaping,
                         stepper,
                         &mut coarse_out,
                         &frame,
                         frame_res_a,
                         0,
-                        coded[i],
-                        0,
-                        joint_half_step(&frame),
                     );
                 }
                 run_len += 1;
                 i += 1;
-                if i < slots {
-                    if i & 1 == 0 {
-                        limits = hybrid.frame_limits();
-                        exact_i = coded[i].wrapping_sub(stepper.offset_a());
-                    } else {
-                        exact_i = coded[i].wrapping_sub(stepper.offset_b(frame_res_a));
-                    }
+                if i == slots {
+                    break;
                 }
+                open_frame(i / 2, &mut opened, &mut frame, &mut limits, hybrid, shaping);
+                wire_i = if i & 1 == 0 {
+                    frame.target[0].wrapping_sub(stepper.offset_a())
+                } else {
+                    frame.target[1].wrapping_sub(stepper.offset_b(frame_res_a))
+                };
             }
             emit_zero_run_length(&mut writer, run_len);
             if run_len > 0 {
@@ -820,42 +801,20 @@ fn hybrid_entropy_stereo(
         medians[ch].adapt(Zone::from_ones_count(zone));
         let (word, coarse_res) = plan_word(&interval, zone, wire, limits[ch], wvc.as_mut())?;
         pending = Some(word);
-        let bracketed = limits[ch] != 0;
         let (cmag, _) = split_sign(coarse_res);
         max_res_bits = max_res_bits.max(32 - cmag.leading_zeros());
         hybrid.update_signed(ch, coarse_res);
-        match mode {
-            StereoShapingMode::PerChannel => {
-                if bracketed {
-                    shaping.update(ch, exact, coarse_res, temp);
-                } else {
-                    shaping.update(ch, exact, exact, 0);
-                }
-            }
-            StereoShapingMode::JointOutput => {
-                if ch == 0 {
-                    frame.t_m_applied = if bracketed { temp } else { 0 };
-                }
-            }
-        }
         if ch == 0 {
             frame_res_a = coarse_res;
         } else {
-            let (t_s_applied, half_step) = if mode == StereoShapingMode::JointOutput {
-                (if bracketed { temp } else { 0 }, joint_half_step(&frame))
-            } else {
-                (0, 0)
-            };
             complete_frame(
+                i / 2,
                 shaping,
                 stepper,
                 &mut coarse_out,
                 &frame,
                 frame_res_a,
                 coarse_res,
-                coded[i],
-                t_s_applied,
-                half_step,
             );
         }
         i += 1;

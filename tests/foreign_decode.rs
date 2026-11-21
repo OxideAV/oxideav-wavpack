@@ -89,6 +89,7 @@
 //! | `foreign_hybrid_narrow_ones_b3` | `-b3`       | 16-bit mono rail-to-rail square (every sample odd): `INT32_DATA` with `ones = 1` in a 2-byte container — the lossy decode re-inserts the pattern and saturates afterwards (round 493) |
 //! | `foreign_tagged_md5_stereo`    | `-m -w …`    | 16-bit stereo with an MD5 sub-block and a trailing APEv2 tag (whose text names the block magic) — pins the walkers skipping bytes outside the blocks (round 493) |
 //! | `foreign_optimized_int32`      | `--optimize-int32` | 32-bit int stereo whose extension stream rides the reserved `0x2C` sub-block form — pins the typed refusal (round 493; no expected PCM) |
+//! | `foreign_hybrid_pair_shaped_resume` | `-b4 -c -s0.5 -x0` | joint pair, static positive shaping, signal resuming after 250 silent frames: the side channel is read exactly (`error_limit == 0`) while the right output's shaping error is non-zero — pins the feedback term applying to every sample (round 493) |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -374,6 +375,10 @@ hybrid_pair_fixture!(
 hybrid_pair_fixture!(
     hybrid_pair_cross_lr_is_lossless,
     "foreign_hybrid_pair_cross_lr"
+);
+hybrid_pair_fixture!(
+    hybrid_pair_shaped_resume_is_lossless,
+    "foreign_hybrid_pair_shaped_resume"
 );
 
 /// The typed f32 pair twin: bit patterns reinterpret, ±0 signs survive,

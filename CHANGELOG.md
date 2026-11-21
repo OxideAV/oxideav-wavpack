@@ -22,8 +22,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   container options, and hybrid at 14 bitrates × modes × correction
   kinds × shaping options × formats × layouts — are decoded here and
   compared sample-for-sample with an outside decoder (and with the
-  source where the path is lossless). 1210 cases; generated in a
+  source where the path is lossless). 1290 cases; generated in a
   temporary directory at run time, skipped when the tools are absent.
+  The other direction sweeps this crate's encoders — every lossless
+  entry point × profile × block size × width × content, float, 32-bit
+  integer, 3..8 channels, and hybrid across bitrate × shaping × stereo
+  coding × profile × correction × format × layout — and requires an
+  outside reader to verify each stream silently and decode it to the
+  source (1768 streams).
 - `SubBlockId` gains the remaining published IDs: `DsdBlock` (`0x0E`),
   `AltHeader` / `AltTrailer` (`0x23` / `0x24`), `AltExtension`
   (`0x28`), `AltMd5Checksum` (`0x29`), `NewConfigBlock` (`0x2A`),
@@ -85,6 +91,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   structure. `fold_hybrid_correction` / `split_hybrid_correction`
   refuse a cross-flagged block whose stack carries `-1` / `-2`.
   Pins: `foreign_hybrid_pair_cross_js`, `foreign_hybrid_pair_cross_lr`.
+- **Noise shaping applies to every sample.** The pair decode added
+  a coded channel's feedback term only when its word had gone through
+  the §6.5 bracket. The filter runs per output channel and its term is
+  added to every output sample — also when the coded word behind it
+  was read exactly (`error_limit == 0`) or belonged to a zero run. The
+  two readings differ when one coded channel is read exactly while
+  the output channel's error state is non-zero: the side channel of a
+  joint pair resuming after silence, under positive shaping and short
+  blocks, was off by one on scattered frames. Decoder and hybrid
+  encoder now share the output-domain rule (the stereo encode shapes
+  the left/right frame and re-expresses it in the coded domain; a
+  zero run spans only samples whose shaped residual is zero) — before
+  this, 69 of 768 shaped pairs this crate wrote over content with
+  silence were rejected by an outside reader (one block failing its
+  CRC each); now 768 / 768 verify. Pin:
+  `foreign_hybrid_pair_shaped_resume`.
 - **Term `-3` seed words.** The two `0x04` words of a `-3` pass are
   the stored predictor *for* channel A (the previous B sample) and
   the predictor for channel B, in that order; they were assigned the

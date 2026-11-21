@@ -679,21 +679,29 @@ impl<'a> WavPackBlock<'a> {
     /// pairs across no-shaping / static-shaping / dynamic-noise-shaping
     /// encodes.
     ///
-    /// **Joint (mid/side) stereo pairs** (round 415): the raw `0x0B`
-    /// correction fold stays in the coded (joint) domain — the §5.4
-    /// undo runs after it — but the noise-shaping filter operates per
-    /// **output** channel (left/right) with the same per-channel
-    /// recurrence the mono path pins. Because the side channel's
-    /// applied temp depends on the output-domain mid value
-    /// (`t_s = t_r + ((mid + t_m) >> 1) - (mid >> 1)`, with
-    /// `t_m = t_l - t_r`), which is only known after decorrelation,
-    /// the joint path decodes the unshaped bracket values first
-    /// ([`crate::decode_packed_samples_stereo_hybrid_lossless_raw`]),
-    /// decorrelates, then applies the temps and folds the filter's
-    /// error state with the **effective** per-output deltas — all
-    /// black-box pinned bit-exact against reference joint pairs across
-    /// no / static-positive / dynamic shaping, 16- and 24-bit, single-
-    /// and multi-block.
+    /// **Stereo pairs — the shaping filter lives in the output domain**
+    /// (round 415, restated round 493): the raw `0x0B` correction fold
+    /// stays in the coded domain — on a joint block the §5.4 undo runs
+    /// after it — and the noise-shaping filter then operates per
+    /// **output** channel (left/right) with the per-channel recurrence
+    /// the mono path pins: each frame's two feedback terms are added to
+    /// the two output samples and the error states fold the lossless
+    /// against the lossy output. The terms apply to **every** sample —
+    /// a word read through the §6.5 bracket, a word read exactly
+    /// because its channel's `error_limit` is zero, a zero-run member.
+    /// (On a joint block that is the same thing as coded-domain terms
+    /// `t_m = t_l - t_r`, `t_s = t_r + ((mid + t_m) >> 1) - (mid >> 1)`;
+    /// an earlier reading applied a coded channel's term only when its
+    /// word was bracketed, which is wrong whenever one coded channel is
+    /// read exactly while the output channel's error state is non-zero
+    /// — the side channel of a joint pair resuming after silence, for
+    /// one.) The stereo path therefore decodes the unshaped values
+    /// first ([`crate::decode_packed_samples_stereo_hybrid_lossless_raw`]),
+    /// decorrelates, undoes the joint coding and then shapes — pinned
+    /// bit-exact against outside pairs across no / static / dynamic
+    /// shaping, 16- and 24-bit, single- and multi-block, and confirmed
+    /// in the other direction by an outside reader verifying this
+    /// crate's own shaped pairs.
     ///
     /// **Float / int32 pairs** (round 415): the scaled-integer stream
     /// decodes through the same coarse+correction machinery, and the
@@ -876,19 +884,11 @@ impl<'a> WavPackBlock<'a> {
         Ok((self.expand_false_stereo(pcm), crc_ok))
     }
 
-    /// Joint (mid/side) leg of [`Self::decode_samples_with_correction`]
-    /// (round-415 black-box pin — see the public method's docs).
-    ///
-    /// The raw `0x0B` fold stays in the coded domain, but the shaping
-    /// filter runs per **output** channel: per frame, `t_l` / `t_r`
-    /// come from the two [`crate::ShapingState`] channels, the coded
-    /// temps are `t_m = t_l - t_r` (mid) and
-    /// `t_s = t_r + ((mid_out + t_m) >> 1) - (mid_out >> 1)` (side),
-    /// each applied only when its sample was §6.5-bracketed, and the
-    /// error states fold the *effective* per-output deltas
-    /// (`d_r = t_s - ((mid_out + t_m) >> 1) + (mid_out >> 1)`,
-    /// `d_l = t_m + d_r` — equal to `t_l` / `t_r` when both channels
-    /// are bracketed) against the post-undo left/right values.
+    /// Stereo leg of [`Self::decode_samples_with_correction`], for
+    /// left/right and joint coding alike (see the public method's docs):
+    /// decode the unshaped values, decorrelate (carrying the correction
+    /// through the cross passes under `CROSS_DECORR`), undo the joint
+    /// coding, then run the shaping filter per output channel.
     #[allow(clippy::too_many_arguments)]
     fn decode_stereo_samples_with_correction(
         &self,
@@ -899,10 +899,9 @@ impl<'a> WavPackBlock<'a> {
         hybrid: &mut crate::HybridState,
         shaping: &mut crate::ShapingState,
     ) -> Result<Vec<i32>> {
-        let (raw, coarse, bracketed) =
-            crate::samples::decode_packed_samples_stereo_hybrid_lossless_raw(
-                packed, corr_data, medians, count, hybrid,
-            )?;
+        let (raw, coarse) = crate::samples::decode_packed_samples_stereo_hybrid_lossless_raw(
+            packed, corr_data, medians, count, hybrid,
+        )?;
         // Decorrelate the coarse residuals (the lossy prediction
         // history). `fold` starts as the raw exact-minus-coarse
         // residual difference and ends as the lossless-minus-lossy
@@ -929,49 +928,39 @@ impl<'a> WavPackBlock<'a> {
                 decorrelate_stereo(&mut passes, &mut decor)?;
             }
         }
+        // Noise shaping runs per OUTPUT channel, after the joint undo:
+        // each frame's two feedback terms come from the error states
+        // as the frame starts, and each is added to its output channel
+        // unconditionally — whether the coded words behind the frame
+        // were bracketed, read exactly (`error_limit == 0`) or members
+        // of a zero run. The error state then folds the lossless
+        // against the lossy output sample.
         let joint = self.header.flags.joint_stereo;
         let mut out = Vec::with_capacity(decor.len());
-        for f in 0..count {
-            let i = 2 * f;
-            // Coded-domain values after the correction fold, before
-            // shaping temps.
-            let mid = decor[i].wrapping_add(fold[i]);
-            let side = decor[i + 1].wrapping_add(fold[i + 1]);
+        for (lossy, fold) in decor
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(fold.as_chunks::<2>().0.iter())
+        {
+            let coded = [
+                lossy[0].wrapping_add(fold[0]),
+                lossy[1].wrapping_add(fold[1]),
+            ];
+            let (unshaped, lossy_out) = if joint {
+                (
+                    crate::crc::undo_joint_stereo(coded[0], coded[1]),
+                    crate::crc::undo_joint_stereo(lossy[0], lossy[1]),
+                )
+            } else {
+                ((coded[0], coded[1]), (lossy[0], lossy[1]))
+            };
             let t_l = shaping.advance(0);
             let t_r = shaping.advance(1);
-            if !joint {
-                // Left/right coding: the coded channels are the output
-                // channels, so each takes its own temp directly.
-                let t_a = if bracketed[i] { t_l } else { 0 };
-                let t_b = if bracketed[i + 1] { t_r } else { 0 };
-                let left = mid.wrapping_add(t_a);
-                let right = side.wrapping_add(t_b);
-                shaping.update(0, left, decor[i], t_a);
-                shaping.update(1, right, decor[i + 1], t_b);
-                out.push(left);
-                out.push(right);
-                continue;
-            }
-            let t_m = if bracketed[i] {
-                t_l.wrapping_sub(t_r)
-            } else {
-                0
-            };
-            let mid_shaped = mid.wrapping_add(t_m);
-            let half_step = (mid_shaped >> 1).wrapping_sub(mid >> 1);
-            let t_s = if bracketed[i + 1] {
-                t_r.wrapping_add(half_step)
-            } else {
-                0
-            };
-            let side_shaped = side.wrapping_add(t_s);
-            // Effective per-output deltas the shaping actually caused.
-            let d_r = t_s.wrapping_sub(half_step);
-            let d_l = t_m.wrapping_add(d_r);
-            let (left, right) = crate::crc::undo_joint_stereo(mid_shaped, side_shaped);
-            let (left_lossy, right_lossy) = crate::crc::undo_joint_stereo(decor[i], decor[i + 1]);
-            shaping.update(0, left, left_lossy, d_l);
-            shaping.update(1, right, right_lossy, d_r);
+            let left = unshaped.0.wrapping_add(t_l);
+            let right = unshaped.1.wrapping_add(t_r);
+            shaping.update(0, left, lossy_out.0, t_l);
+            shaping.update(1, right, lossy_out.1, t_r);
             out.push(left);
             out.push(right);
         }

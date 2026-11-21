@@ -1062,6 +1062,33 @@ fn foreign_hybrid() {
             }
         }
     }
+    // Shaping across silence stretches and short blocks: zero runs,
+    // and channels whose error limit drops to zero (read exactly)
+    // while the shaping filter still carries error.
+    for shaping in ["-s0.5", "-s1", "-s-0.5", "-s-1", "--use-dns"] {
+        for channels in [1usize, 2] {
+            for coding in ["", "-j0", "-cc", "-h"] {
+                for block in ["--blocksize=700", "--blocksize=1100"] {
+                    let mut args = vec!["-b4", "-c", shaping, block];
+                    if !coding.is_empty() {
+                        if coding == "-cc" {
+                            args.retain(|a| *a != "-c");
+                        }
+                        args.push(coding);
+                    }
+                    cases.push(
+                        Case::new(
+                            format!("bursts{shaping}-{channels}ch{coding}{block}"),
+                            Format::int(16, channels, 44_100),
+                            6_000,
+                            Content::Bursts,
+                        )
+                        .args(&args),
+                    );
+                }
+            }
+        }
+    }
     run_family("hybrid", cases);
 }
 
@@ -1177,4 +1204,581 @@ fn foreign_hybrid_formats() {
         }
     }
     run_family("hybrid-formats", cases);
+}
+
+// ---------------------------------------------------------------------
+// Ours → foreign
+// ---------------------------------------------------------------------
+
+use oxideav_wavpack::{
+    DecorrProfile, HybridOptions, HybridShaping, encode_multichannel_stream,
+    encode_multichannel_stream_best, encode_multichannel_stream_float,
+    encode_multichannel_stream_hybrid, encode_multichannel_stream_hybrid_float,
+    encode_multichannel_stream_hybrid_int32, encode_multichannel_stream_int32,
+    encode_multichannel_stream_smallest, encode_stream_mono, encode_stream_mono_best,
+    encode_stream_mono_float, encode_stream_mono_hybrid, encode_stream_mono_hybrid_float,
+    encode_stream_mono_hybrid_int32, encode_stream_mono_int32, encode_stream_mono_smallest,
+    encode_stream_stereo, encode_stream_stereo_best, encode_stream_stereo_float,
+    encode_stream_stereo_hybrid, encode_stream_stereo_hybrid_float,
+    encode_stream_stereo_hybrid_int32, encode_stream_stereo_int32, encode_stream_stereo_smallest,
+    set_stream_sample_rate,
+};
+
+const PROFILES: [DecorrProfile; 4] = [
+    DecorrProfile::Fast,
+    DecorrProfile::Normal,
+    DecorrProfile::High,
+    DecorrProfile::Extra,
+];
+
+/// One stream this crate wrote, with what a reader must get from it.
+struct Emitted {
+    name: String,
+    fmt: Format,
+    wv: Vec<u8>,
+    wvc: Option<Vec<u8>>,
+    /// The exact samples a lossless (or pair) decode must return.
+    exact: Vec<i32>,
+    /// Hybrid: the `.wv` alone is lossy.
+    hybrid: bool,
+}
+
+/// Feed one emitted stream to the outside reader. It must verify the
+/// stream without a word on stderr and decode it to the expected
+/// samples: the source for a lossless stream or a pair, this crate's
+/// own lossy decode for a hybrid `.wv` alone.
+fn check_emitted(scratch: &Scratch, e: &Emitted) -> Result<(), String> {
+    let wv = scratch.path("ours.wv");
+    let wvc = scratch.path("ours.wvc");
+    let _ = std::fs::remove_file(&wvc);
+    std::fs::write(&wv, &e.wv).map_err(|x| format!("write: {x}"))?;
+
+    let quiet = |cmd: &mut Command| -> Result<(), String> {
+        let out = cmd.output().map_err(|x| format!("spawn: {x}"))?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() || !err.trim().is_empty() {
+            return Err(format!(
+                "outside reader complained (exit {:?}): {}",
+                out.status.code(),
+                err.trim()
+            ));
+        }
+        Ok(())
+    };
+    let decode = |ignore_correction: bool| -> Result<Vec<i32>, String> {
+        let raw = scratch.path("ours.raw");
+        let _ = std::fs::remove_file(&raw);
+        let mut cmd = Command::new("wvunpack");
+        cmd.args(["-q", "-y", "--raw"]);
+        if ignore_correction {
+            cmd.arg("-i");
+        }
+        cmd.arg(&wv).arg("-o").arg(&raw);
+        quiet(&mut cmd)?;
+        let bytes = std::fs::read(&raw).map_err(|x| format!("read raw: {x}"))?;
+        Ok(raw_to_samples(&e.fmt, &bytes))
+    };
+
+    // Single file: verify, then decode.
+    quiet(
+        Command::new("wvunpack")
+            .args(["-q", "-y", "-v", "-i"])
+            .arg(&wv),
+    )?;
+    let theirs = decode(true)?;
+    let (mine, _) = ours(&e.fmt, &e.wv, None)?;
+    if theirs != mine {
+        return Err(format!(
+            "outside decode differs from this crate's: {}",
+            first_diff(&theirs, &mine)
+        ));
+    }
+    if !e.hybrid && theirs != e.exact {
+        return Err(format!(
+            "outside decode differs from the source: {}",
+            first_diff(&theirs, &e.exact)
+        ));
+    }
+    // Pair: verify and decode with the correction file alongside.
+    if let Some(c) = &e.wvc {
+        std::fs::write(&wvc, c).map_err(|x| format!("write wvc: {x}"))?;
+        quiet(Command::new("wvunpack").args(["-q", "-y", "-v"]).arg(&wv))?;
+        let theirs = decode(false)?;
+        if theirs != e.exact {
+            return Err(format!(
+                "outside pair decode differs from the source: {}",
+                first_diff(&theirs, &e.exact)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_emitted(tag: &str, streams: Vec<Emitted>) {
+    let scratch = Scratch::new(tag);
+    let total = streams.len();
+    let mut failures = Vec::new();
+    for e in &streams {
+        let verdict = check_emitted(&scratch, e);
+        if verbose() {
+            eprintln!(
+                "{tag}: {:<52} {}",
+                e.name,
+                match &verdict {
+                    Ok(()) => "ok".to_string(),
+                    Err(x) => format!("FAIL {x}"),
+                }
+            );
+        }
+        if let Err(x) = verdict {
+            if let Some(dir) = std::env::var_os("WAVPACK_MATRIX_KEEP") {
+                let dir = PathBuf::from(dir);
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join(format!("{tag}-{}.wv", e.name)), &e.wv);
+                if let Some(c) = &e.wvc {
+                    let _ = std::fs::write(dir.join(format!("{tag}-{}.wvc", e.name)), c);
+                }
+            }
+            failures.push(format!("{}: {x}", e.name));
+        }
+    }
+    eprintln!(
+        "blackbox_matrix {tag}: {}/{} emitted streams accepted",
+        total - failures.len(),
+        total
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {total} emitted streams failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+fn floats(bits: &[i32]) -> Vec<f32> {
+    bits.iter().map(|&b| f32::from_bits(b as u32)).collect()
+}
+
+/// Lossless integer encoders: every entry point × profile × block size
+/// × width × content, mono and stereo, plus stamped sample rates.
+#[test]
+fn ours_lossless_integer() {
+    if !tools_present() {
+        return;
+    }
+    let mut out = Vec::new();
+    for bits in [8u32, 16, 24, 12, 20] {
+        for channels in [1usize, 2] {
+            for kind in [
+                Content::Music,
+                Content::Noise,
+                Content::Rails,
+                Content::Bursts,
+                Content::Silence,
+            ] {
+                let fmt = Format::int(bits, channels, 44_100);
+                let pcm = quantize(&fmt, &content(kind, 5_000, channels, 44_100, 11));
+                let bytes = fmt.container_bytes() as u8;
+                for block in [0usize, 1_000, 4_096] {
+                    let stem = format!("int{bits}-{channels}ch-{kind:?}-blk{block}");
+                    let mut push = |name: String, wv: oxideav_wavpack::Result<Vec<u8>>| {
+                        out.push(Emitted {
+                            name,
+                            fmt,
+                            wv: wv.expect("encode"),
+                            wvc: None,
+                            exact: pcm.clone(),
+                            hybrid: false,
+                        });
+                    };
+                    if channels == 1 {
+                        push(
+                            format!("{stem}-raw"),
+                            encode_stream_mono(&pcm, block, bytes),
+                        );
+                        for p in PROFILES {
+                            push(
+                                format!("{stem}-best-{p:?}"),
+                                encode_stream_mono_best(&pcm, block, bytes, p),
+                            );
+                        }
+                        if kind == Content::Music {
+                            push(
+                                format!("{stem}-smallest"),
+                                encode_stream_mono_smallest(&pcm, block, bytes),
+                            );
+                        }
+                    } else {
+                        push(
+                            format!("{stem}-raw"),
+                            encode_stream_stereo(&pcm, block, bytes),
+                        );
+                        for p in PROFILES {
+                            push(
+                                format!("{stem}-best-{p:?}"),
+                                encode_stream_stereo_best(&pcm, block, bytes, p),
+                            );
+                        }
+                        if kind == Content::Music {
+                            push(
+                                format!("{stem}-smallest"),
+                                encode_stream_stereo_smallest(&pcm, block, bytes),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Lengths, including a single frame.
+    for frames in [1usize, 2, 3, 17, 129] {
+        for channels in [1usize, 2] {
+            let fmt = Format::int(16, channels, 44_100);
+            let pcm = quantize(&fmt, &content(Content::Music, frames, channels, 44_100, 3));
+            let wv = if channels == 1 {
+                encode_stream_mono_best(&pcm, 0, 2, DecorrProfile::High)
+            } else {
+                encode_stream_stereo_best(&pcm, 0, 2, DecorrProfile::High)
+            };
+            out.push(Emitted {
+                name: format!("len{frames}-{channels}ch"),
+                fmt,
+                wv: wv.expect("encode"),
+                wvc: None,
+                exact: pcm,
+                hybrid: false,
+            });
+        }
+    }
+    // Stamped sample rates: table entries and custom ones.
+    for rate in [
+        6_000u32, 8_000, 22_050, 48_000, 96_000, 192_000, 12_345, 1, 352_800, 16_777_215,
+    ] {
+        let fmt = Format::int(16, 2, rate);
+        let pcm = quantize(&fmt, &content(Content::Music, 3_000, 2, rate, 5));
+        let wv = encode_stream_stereo_best(&pcm, 1_000, 2, DecorrProfile::Normal).expect("encode");
+        let wv = set_stream_sample_rate(&wv, rate).expect("stamp rate");
+        if stream_sample_rate(&wv).expect("rate") != Some(rate) {
+            panic!("stamped rate {rate} does not read back");
+        }
+        out.push(Emitted {
+            name: format!("rate{rate}"),
+            fmt,
+            wv,
+            wvc: None,
+            exact: pcm,
+            hybrid: false,
+        });
+    }
+    run_emitted("ours-lossless-int", out);
+}
+
+/// Lossless float / 32-bit integer / multichannel encoders.
+#[test]
+fn ours_lossless_formats_and_layouts() {
+    if !tools_present() {
+        return;
+    }
+    let mut out = Vec::new();
+    for channels in [1usize, 2] {
+        for kind in [
+            Content::Music,
+            Content::Noise,
+            Content::Rails,
+            Content::Bursts,
+        ] {
+            for p in PROFILES {
+                for block in [0usize, 1_500] {
+                    let fmt = Format::float(channels, 48_000);
+                    let pcm = quantize(&fmt, &content(kind, 4_000, channels, 48_000, 13));
+                    let f = floats(&pcm);
+                    let wv = if channels == 1 {
+                        encode_stream_mono_float(&f, block, p)
+                    } else {
+                        encode_stream_stereo_float(&f, block, p)
+                    };
+                    out.push(Emitted {
+                        name: format!("float-{channels}ch-{kind:?}-{p:?}-blk{block}"),
+                        fmt,
+                        wv: wv.expect("encode"),
+                        wvc: None,
+                        exact: pcm,
+                        hybrid: false,
+                    });
+                    let fmt = Format::int(32, channels, 48_000);
+                    let pcm = quantize(&fmt, &content(kind, 4_000, channels, 48_000, 17));
+                    let wv = if channels == 1 {
+                        encode_stream_mono_int32(&pcm, block, p)
+                    } else {
+                        encode_stream_stereo_int32(&pcm, block, p)
+                    };
+                    out.push(Emitted {
+                        name: format!("int32-{channels}ch-{kind:?}-{p:?}-blk{block}"),
+                        fmt,
+                        wv: wv.expect("encode"),
+                        wvc: None,
+                        exact: pcm,
+                        hybrid: false,
+                    });
+                }
+            }
+        }
+    }
+    for channels in 3usize..=8 {
+        for block in [0usize, 1_200] {
+            let fmt = Format::int(16, channels, 48_000);
+            let pcm = quantize(&fmt, &content(Content::Music, 3_000, channels, 48_000, 19));
+            let mut push =
+                |name: &str, fmt: Format, exact: &[i32], wv: oxideav_wavpack::Result<Vec<u8>>| {
+                    out.push(Emitted {
+                        name: format!("{channels}ch-{name}-blk{block}"),
+                        fmt,
+                        wv: wv.expect("encode"),
+                        wvc: None,
+                        exact: exact.to_vec(),
+                        hybrid: false,
+                    });
+                };
+            push(
+                "members",
+                fmt,
+                &pcm,
+                encode_multichannel_stream(&pcm, channels, block, 2),
+            );
+            push(
+                "best",
+                fmt,
+                &pcm,
+                encode_multichannel_stream_best(&pcm, channels, block, 2, DecorrProfile::High),
+            );
+            push(
+                "smallest",
+                fmt,
+                &pcm,
+                encode_multichannel_stream_smallest(&pcm, channels, block, 2),
+            );
+            let fmt24 = Format::int(24, channels, 48_000);
+            let pcm24 = quantize(
+                &fmt24,
+                &content(Content::Music, 3_000, channels, 48_000, 23),
+            );
+            push(
+                "best24",
+                fmt24,
+                &pcm24,
+                encode_multichannel_stream_best(&pcm24, channels, block, 3, DecorrProfile::Normal),
+            );
+            let ffmt = Format::float(channels, 48_000);
+            let fpcm = quantize(&ffmt, &content(Content::Music, 3_000, channels, 48_000, 29));
+            push(
+                "float",
+                ffmt,
+                &fpcm,
+                encode_multichannel_stream_float(
+                    &floats(&fpcm),
+                    channels,
+                    block,
+                    DecorrProfile::Normal,
+                ),
+            );
+            let ifmt = Format::int(32, channels, 48_000);
+            let ipcm = quantize(&ifmt, &content(Content::Music, 3_000, channels, 48_000, 31));
+            push(
+                "int32",
+                ifmt,
+                &ipcm,
+                encode_multichannel_stream_int32(&ipcm, channels, block, DecorrProfile::Normal),
+            );
+        }
+    }
+    run_emitted("ours-lossless-formats", out);
+}
+
+/// Hybrid encoders: bitrate × shaping × stereo coding × profile ×
+/// correction, in every sample format and layout.
+#[test]
+fn ours_hybrid() {
+    if !tools_present() {
+        return;
+    }
+    let mut out = Vec::new();
+    let shapings = [
+        ("s0", HybridShaping::Off),
+        ("s+0.5", HybridShaping::from_weight(0.5)),
+        ("s-0.5", HybridShaping::from_weight(-0.5)),
+        ("s+1", HybridShaping::from_weight(1.0)),
+        ("s-1", HybridShaping::from_weight(-1.0)),
+        (
+            "ramp",
+            HybridShaping::Ramp {
+                weight: -300,
+                delta: 4_000,
+            },
+        ),
+    ];
+    for channels in [1usize, 2] {
+        for bits_per_sample in [2.0f64, 3.0, 4.5, 8.0, 12.0] {
+            for (sname, shaping) in shapings {
+                for joint in [false, true] {
+                    if channels == 1 && joint {
+                        continue;
+                    }
+                    for profile in [
+                        None,
+                        Some(DecorrProfile::Fast),
+                        Some(DecorrProfile::Normal),
+                        Some(DecorrProfile::Extra),
+                    ] {
+                        for correction in [false, true] {
+                            let kind = if joint {
+                                Content::Music
+                            } else {
+                                Content::Bursts
+                            };
+                            let fmt = Format::int(16, channels, 44_100);
+                            let pcm = quantize(&fmt, &content(kind, 3_000, channels, 44_100, 37));
+                            let opts = HybridOptions::from_bits_per_sample(bits_per_sample)
+                                .with_correction(correction)
+                                .with_joint(joint)
+                                .with_profile(profile)
+                                .with_shaping(shaping);
+                            let enc = if channels == 1 {
+                                encode_stream_mono_hybrid(&pcm, 1_100, 2, &opts)
+                            } else {
+                                encode_stream_stereo_hybrid(&pcm, 1_100, 2, &opts)
+                            }
+                            .expect("encode");
+                            out.push(Emitted {
+                                name: format!(
+                                    "{channels}ch-b{bits_per_sample}-{sname}-j{}-{profile:?}-c{}",
+                                    u8::from(joint),
+                                    u8::from(correction)
+                                ),
+                                fmt,
+                                wv: enc.wv,
+                                wvc: enc.wvc,
+                                exact: pcm,
+                                hybrid: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Other widths and content, float / int32, multichannel.
+    for bits in [8u32, 24] {
+        for channels in [1usize, 2] {
+            for kind in [
+                Content::Music,
+                Content::Noise,
+                Content::Rails,
+                Content::Silence,
+            ] {
+                let fmt = Format::int(bits, channels, 44_100);
+                let pcm = quantize(&fmt, &content(kind, 3_000, channels, 44_100, 41));
+                let opts = HybridOptions::from_bits_per_sample(3.0)
+                    .with_shaping(HybridShaping::from_weight(-0.4));
+                let bytes = fmt.container_bytes() as u8;
+                let enc = if channels == 1 {
+                    encode_stream_mono_hybrid(&pcm, 1_000, bytes, &opts)
+                } else {
+                    encode_stream_stereo_hybrid(&pcm, 1_000, bytes, &opts)
+                }
+                .expect("encode");
+                out.push(Emitted {
+                    name: format!("int{bits}-{channels}ch-{kind:?}"),
+                    fmt,
+                    wv: enc.wv,
+                    wvc: enc.wvc,
+                    exact: pcm,
+                    hybrid: true,
+                });
+            }
+        }
+    }
+    for channels in [1usize, 2] {
+        for kind in [Content::Music, Content::Noise] {
+            let opts = HybridOptions::from_bits_per_sample(5.0);
+            let fmt = Format::float(channels, 44_100);
+            let pcm = quantize(&fmt, &content(kind, 3_000, channels, 44_100, 43));
+            let f = floats(&pcm);
+            let enc = if channels == 1 {
+                encode_stream_mono_hybrid_float(&f, 1_000, &opts)
+            } else {
+                encode_stream_stereo_hybrid_float(&f, 1_000, &opts)
+            }
+            .expect("encode");
+            out.push(Emitted {
+                name: format!("float-{channels}ch-{kind:?}"),
+                fmt,
+                wv: enc.wv,
+                wvc: enc.wvc,
+                exact: pcm,
+                hybrid: true,
+            });
+            let fmt = Format::int(32, channels, 44_100);
+            let pcm = quantize(&fmt, &content(kind, 3_000, channels, 44_100, 47));
+            let enc = if channels == 1 {
+                encode_stream_mono_hybrid_int32(&pcm, 1_000, &opts)
+            } else {
+                encode_stream_stereo_hybrid_int32(&pcm, 1_000, &opts)
+            }
+            .expect("encode");
+            out.push(Emitted {
+                name: format!("int32-{channels}ch-{kind:?}"),
+                fmt,
+                wv: enc.wv,
+                wvc: enc.wvc,
+                exact: pcm,
+                hybrid: true,
+            });
+        }
+    }
+    for channels in 3usize..=8 {
+        for (sname, shaping) in [
+            ("s0", HybridShaping::Off),
+            ("s-0.5", HybridShaping::from_weight(-0.5)),
+        ] {
+            let opts = HybridOptions::from_bits_per_sample(4.0).with_shaping(shaping);
+            let fmt = Format::int(16, channels, 48_000);
+            let pcm = quantize(&fmt, &content(Content::Music, 2_500, channels, 48_000, 53));
+            let enc =
+                encode_multichannel_stream_hybrid(&pcm, channels, 1_000, 2, &opts).expect("encode");
+            out.push(Emitted {
+                name: format!("{channels}ch-{sname}"),
+                fmt,
+                wv: enc.wv,
+                wvc: enc.wvc,
+                exact: pcm,
+                hybrid: true,
+            });
+        }
+        let opts = HybridOptions::from_bits_per_sample(5.0);
+        let fmt = Format::float(channels, 48_000);
+        let pcm = quantize(&fmt, &content(Content::Music, 2_500, channels, 48_000, 59));
+        let enc = encode_multichannel_stream_hybrid_float(&floats(&pcm), channels, 1_000, &opts)
+            .expect("encode");
+        out.push(Emitted {
+            name: format!("{channels}ch-float"),
+            fmt,
+            wv: enc.wv,
+            wvc: enc.wvc,
+            exact: pcm,
+            hybrid: true,
+        });
+        let fmt = Format::int(32, channels, 48_000);
+        let pcm = quantize(&fmt, &content(Content::Music, 2_500, channels, 48_000, 61));
+        let enc =
+            encode_multichannel_stream_hybrid_int32(&pcm, channels, 1_000, &opts).expect("encode");
+        out.push(Emitted {
+            name: format!("{channels}ch-int32"),
+            fmt,
+            wv: enc.wv,
+            wvc: enc.wvc,
+            exact: pcm,
+            hybrid: true,
+        });
+    }
+    run_emitted("ours-hybrid", out);
 }
