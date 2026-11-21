@@ -81,6 +81,8 @@
 //! | `foreign_hybrid_clip16_b2`     | `-b2`        | clipping-adjacent 16-bit mono — the lossy output clamps at ±2^15 after the (unclamped) CRC fold (round 418) |
 //! | `foreign_hybrid_int32_ones_b4` | `-b4`        | 32-bit int hybrid, trailing-ones content (`0x09` sent 2 / ones 4) — the lossy fill zero-fills the whole window (round 418) |
 //! | `foreign_hybrid_int32_ones_only_b4` | `-b4`   | 32-bit int hybrid, redundancy-only profile (sent 0 / ones 4) — zero-filled lossy window with no literal bits (round 418) |
+//! | `foreign_lag_seed_mono`        | `-x4`        | 16-bit mono whose leading wire term is a fixed lag of 2 — pins the oldest-first `0x04` seed order (round 493) |
+//! | `foreign_lag_seed_stereo`      | `-x4`        | 16-bit stereo, leading wire term lag 2 — pins the interleaved A/B `0x04` seed layout of fixed-lag stereo passes (round 493) |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -237,6 +239,8 @@ foreign_fixture!(
     "foreign_hybrid_false_stereo_b4",
     2
 );
+foreign_fixture!(lag_seed_mono_is_bit_exact, "foreign_lag_seed_mono", 1);
+foreign_fixture!(lag_seed_stereo_is_bit_exact, "foreign_lag_seed_stereo", 2);
 
 /// Hybrid-specific shape assertions on top of the bit-exact battery:
 /// the lossy decode carries real coding error against the WAV source

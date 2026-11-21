@@ -12,6 +12,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   plus `with_bitrate_word` / `with_correction` / `with_joint` /
   `with_profile`.
 
+### Fixed
+
+- **Fixed-lag `0x04` seed order.** A block whose leading wire term is
+  a fixed lag of 2..8 mis-decoded from its first sample (the stored
+  CRC caught it, so the muted paths zeroed the block): the seed words
+  of a fixed-lag pass are stored **oldest first** (the first word
+  predicts the block's first sample), and a stereo fixed-lag pass
+  stores them **interleaved** (`A[0], B[0], A[1], B[1], …`) rather
+  than channel A's group then channel B's. The assemblers and the
+  serializers now use that layout. The outside encoder's `-x4`..`-x6`
+  filter search produces such blocks routinely; its fixed presets
+  lead with an extrapolator or lag 1, which is why earlier batteries
+  never met one. Two committed pins (`foreign_lag_seed_mono`,
+  `foreign_lag_seed_stereo`).
+
 ### Changed
 
 - API hygiene: `#[non_exhaustive]` on the enums `Error`,

@@ -755,9 +755,9 @@ impl DecorrPass {
     ///
     /// Spec §3.6: terms `17`/`18` are primed with 2 seeds per channel,
     /// terms `1..8` with `term` seeds per channel, and cross terms with
-    /// 1 seed per channel. The seeds arrive newest-first per the spec's
-    /// history convention (`s[n-1]` first); they are placed so that the
-    /// predictor's first read sees the correct lag. `seed_b` is ignored
+    /// 1 seed per channel. The seeds are given in ring-slot order:
+    /// fixed lags oldest-first (`s[n-t]` first), extrapolators
+    /// newest-first (`s[n-1]`, `s[n-2]`). `seed_b` is ignored
     /// on a mono pass (pass it `&[]`).
     ///
     /// An **empty** `seed_a` builds an unprimed pass (all-zero history):
@@ -815,19 +815,19 @@ const fn seed_count(term: i8) -> usize {
 
 /// Place the `0x04` seed samples for `term` into a fresh history ring.
 ///
-/// Seeds arrive **newest-first** (`s[-1]`, `s[-2]`, …), matching the
-/// `0x04` decorr-samples wire order. The placement depends on how the
-/// loop reads the ring:
+/// The placement depends on how the loop reads the ring:
 ///
 /// * **Fixed lag `1..8`**: the loop reads slot `m` (starting at `m=0`)
 ///   and writes to `(m+t)&7`, so the first `t` reads consume slots
-///   `0..t-1` *before* any written value returns. Those slots must hold
-///   the seeds oldest-first — slot `0` = `s[-t]` (read first), …,
-///   slot `t-1` = `s[-1]`. Newest-first seeds are therefore reversed
-///   into slots `0..t-1`.
+///   `0..t-1` *before* any written value returns. The `0x04` words are
+///   stored in that same read order — **oldest first**: the first word
+///   is `s[-t]` (slot `0`, predicts the block's first sample), the last
+///   is `s[-1]` (slot `t-1`). (Black-box pin, round 493: streams whose
+///   leading wire term is a fixed lag of 2 or more decode bit-exactly
+///   only under this order; a lag of 1 cannot tell the two apart.)
 /// * **Extrapolators `17`/`18`**: the loop reads `history[0]` as `s[-1]`
-///   and `history[1]` as `s[-2]`, so the newest-first seeds drop into
-///   slots `0`/`1` unchanged.
+///   and `history[1]` as `s[-2]`; the words are stored newest-first and
+///   drop into slots `0`/`1` unchanged.
 /// * **Cross terms**: read `history[0]` only; the single seed lands in
 ///   slot `0`.
 fn seed_history(term: i8, seed: &[i32], ring: &mut [i32; MAX_TERM as usize]) -> Result<()> {
@@ -838,18 +838,10 @@ fn seed_history(term: i8, seed: &[i32], ring: &mut [i32; MAX_TERM as usize]) -> 
             supplied: seed.len(),
         });
     }
-    if (1..=MAX_TERM).contains(&term) {
-        // Fixed lag: reverse newest-first seeds into slots 0..t-1 so the
-        // oldest seed (`s[-t]`) is read first.
-        for (i, &s) in seed.iter().take(needed).enumerate() {
-            ring[needed - 1 - i] = s;
-        }
-    } else {
-        // 17/18 (slot0=s[-1], slot1=s[-2]) and cross (slot0) keep order.
-        for (i, &s) in seed.iter().take(needed).enumerate() {
-            ring[i] = s;
-        }
-    }
+    // Every class lands in slot order: fixed lags oldest-first (slot 0
+    // is read first), 17/18 as slot0 = s[-1], slot1 = s[-2], cross terms
+    // in slot 0.
+    ring[..needed].copy_from_slice(&seed[..needed]);
     Ok(())
 }
 
@@ -1416,8 +1408,10 @@ pub fn assemble_mono_passes(
 ///   within the pass. The payload therefore holds `2 * nterms` bytes.
 /// * **Seed samples (`0x04`)**: "per channel", with the per-channel count
 ///   tied to the term class ([`seed_count`]: `17`/`18` → 2, `1..8` → `term`,
-///   cross → 1). A stereo pass stores channel A's seeds followed by
-///   channel B's seeds, so each pass consumes `2 * seed_count(term)` words.
+///   cross → 1). An extrapolator pass stores channel A's two words then
+///   channel B's; a fixed-lag pass stores its words **interleaved**
+///   (`A[0], B[0], A[1], B[1], …`, oldest first — round-493 black-box
+///   pin). Either way each pass consumes `2 * seed_count(term)` words.
 ///
 /// As with mono, the `0x02`/`0x03`/`0x04` metadata stores the passes in
 /// the **reverse** of application order (encoder's last-applied pass
@@ -1503,19 +1497,26 @@ pub fn assemble_stereo_passes(
     // black-box against reference-encoded files via the stored block
     // CRC). A payload that stops inside a pass's A+B group is malformed.
     let seeds = expand_samples(samples_payload)?;
-    let mut seed_a_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
-    let mut seed_b_groups: Vec<&[i32]> = Vec::with_capacity(terms.len());
+    let mut seed_a_groups: Vec<Vec<i32>> = Vec::with_capacity(terms.len());
+    let mut seed_b_groups: Vec<Vec<i32>> = Vec::with_capacity(terms.len());
     let mut cursor = 0usize;
     for &t in &terms {
         let n = seed_count(t);
         if cursor == seeds.samples.len() {
-            seed_a_groups.push(&[]);
-            seed_b_groups.push(&[]);
+            seed_a_groups.push(Vec::new());
+            seed_b_groups.push(Vec::new());
         } else if cursor + 2 * n <= seeds.samples.len() {
-            seed_a_groups.push(&seeds.samples[cursor..cursor + n]);
-            cursor += n;
-            seed_b_groups.push(&seeds.samples[cursor..cursor + n]);
-            cursor += n;
+            let group = &seeds.samples[cursor..cursor + 2 * n];
+            cursor += 2 * n;
+            if stereo_seeds_interleaved(t) {
+                // Fixed lag: `A[0], B[0], A[1], B[1], …` in ring-slot
+                // order (round-493 black-box pin).
+                seed_a_groups.push(group.iter().step_by(2).copied().collect());
+                seed_b_groups.push(group.iter().skip(1).step_by(2).copied().collect());
+            } else {
+                seed_a_groups.push(group[..n].to_vec());
+                seed_b_groups.push(group[n..].to_vec());
+            }
         } else {
             return Err(Error::DecorrelationSampleCountMismatch {
                 expected: cursor + 2 * n,
@@ -1539,8 +1540,8 @@ pub fn assemble_stereo_passes(
             deltas[i],
             weights[2 * i],
             weights[2 * i + 1],
-            seed_a_groups[i],
-            seed_b_groups[i],
+            &seed_a_groups[i],
+            &seed_b_groups[i],
         )?);
     }
     passes.reverse();
@@ -1663,18 +1664,20 @@ fn pack_seed_exact(value: i32) -> Result<[u8; 2]> {
     Ok(word)
 }
 
-/// Read a pass's per-channel seed-history samples back out of its ring,
-/// newest-first — the exact inverse of the [`DecorrPass::new`] /
-/// `seed_history` placement (fixed-lag rings reverse into slots
-/// `0..t-1`; `17`/`18` occupy slots `0`/`1` in order; cross terms slot
-/// `0`).
-fn extract_seeds(term: i8, ring: &[i32; MAX_TERM as usize]) -> Vec<i32> {
-    let n = seed_count(term);
-    if (1..=MAX_TERM).contains(&term) {
-        (0..n).map(|i| ring[n - 1 - i]).collect()
-    } else {
-        ring[..n].to_vec()
-    }
+/// Read a pass's per-channel seed-history samples back out of its ring
+/// in slot order — the exact inverse of the [`DecorrPass::new`] /
+/// `seed_history` placement (fixed-lag rings oldest-first in slots
+/// `0..t-1`; `17`/`18` in slots `0`/`1`; cross terms slot `0`).
+fn extract_seeds(term: i8, ring: &[i32; MAX_TERM as usize]) -> &[i32] {
+    &ring[..seed_count(term)]
+}
+
+/// `true` when a stereo pass stores its `0x04` seeds **interleaved**
+/// (`A[0], B[0], A[1], B[1], …`): the fixed-lag terms `1..8`. The
+/// extrapolators store channel A's two words then channel B's; a cross
+/// term stores one word per channel (the two layouts coincide).
+const fn stereo_seeds_interleaved(term: i8) -> bool {
+    term >= 1 && term <= MAX_TERM
 }
 
 /// Serialize an application-ordered **mono** [`DecorrPass`] list into the
@@ -1718,7 +1721,7 @@ pub fn serialize_mono_passes(passes: &[DecorrPass]) -> Result<(Vec<u8>, Vec<u8>,
     for pass in passes.iter().rev() {
         terms.push(encode_term_byte(pass.term, pass.delta)?);
         weights.push(pack_weight_exact(pass.weight_a)?);
-        for seed in extract_seeds(pass.term, &pass.history_a) {
+        for &seed in extract_seeds(pass.term, &pass.history_a) {
             samples.extend_from_slice(&pack_seed_exact(seed)?);
         }
     }
@@ -1747,11 +1750,17 @@ pub fn serialize_stereo_passes(passes: &[DecorrPass]) -> Result<(Vec<u8>, Vec<u8
         terms.push(encode_term_byte(pass.term, pass.delta)?);
         weights.push(pack_weight_exact(pass.weight_a)?);
         weights.push(pack_weight_exact(pass.weight_b)?);
-        for seed in extract_seeds(pass.term, &pass.history_a) {
-            samples.extend_from_slice(&pack_seed_exact(seed)?);
-        }
-        for seed in extract_seeds(pass.term, &pass.history_b) {
-            samples.extend_from_slice(&pack_seed_exact(seed)?);
+        let seeds_a = extract_seeds(pass.term, &pass.history_a);
+        let seeds_b = extract_seeds(pass.term, &pass.history_b);
+        if stereo_seeds_interleaved(pass.term) {
+            for (&a, &b) in seeds_a.iter().zip(seeds_b) {
+                samples.extend_from_slice(&pack_seed_exact(a)?);
+                samples.extend_from_slice(&pack_seed_exact(b)?);
+            }
+        } else {
+            for &seed in seeds_a.iter().chain(seeds_b) {
+                samples.extend_from_slice(&pack_seed_exact(seed)?);
+            }
         }
     }
     Ok((terms, weights, samples))
@@ -2772,7 +2781,7 @@ mod tests {
         let pcm = [
             100, 132, 90, 75, 210, -40, -33, 12, 255, 300, 280, 260, 0, -1, 5,
         ];
-        // Seeds newest-first; supply 8 so any lag 1..8 is primed.
+        // Seeds in ring-slot order; supply 8 so any lag 1..8 is primed.
         let seed = [50, 40, 30, 20, 10, 0, -10, -20];
         for term in 1..=8i8 {
             round_trip_mono(term, 2, 700, &seed[..term as usize], &pcm);
@@ -3573,7 +3582,8 @@ mod tests {
         let residuals = buf;
 
         // Wire order = reverse of application order. Weights per pass:
-        // channel A then channel B. Seeds per pass: A's seeds then B's.
+        // channel A then channel B. Seeds per pass: interleaved A/B
+        // for a fixed lag, A's words then B's for an extrapolator.
         let mut terms_payload = Vec::new();
         let mut weights_payload = Vec::new();
         let mut samples_payload = Vec::new();
@@ -3582,11 +3592,15 @@ mod tests {
             terms_payload.push(term_byte(t, d));
             weights_payload.push(app_wbytes_a[idx]);
             weights_payload.push(app_wbytes_b[idx]);
-            for &s in &app_seeds_a[idx] {
-                samples_payload.extend_from_slice(&seed_word(s));
-            }
-            for &s in &app_seeds_b[idx] {
-                samples_payload.extend_from_slice(&seed_word(s));
+            if stereo_seeds_interleaved(t) {
+                for (&a, &b) in app_seeds_a[idx].iter().zip(&app_seeds_b[idx]) {
+                    samples_payload.extend_from_slice(&seed_word(a));
+                    samples_payload.extend_from_slice(&seed_word(b));
+                }
+            } else {
+                for &s in app_seeds_a[idx].iter().chain(&app_seeds_b[idx]) {
+                    samples_payload.extend_from_slice(&seed_word(s));
+                }
             }
         }
 
