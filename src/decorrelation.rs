@@ -617,17 +617,14 @@ pub fn apply_weight(weight: i32, sample: i32) -> i32 {
 /// (range `0..=7`).
 #[inline]
 pub fn update_weight(weight: i32, delta: i32, source: i32, result: i32) -> i32 {
-    if source == 0 || result == 0 {
-        return weight;
-    }
-    // Same sign → add delta, opposite sign → subtract delta. Using the
-    // product's sign avoids a separate signum of each operand and
-    // mirrors the spec's `(source ^ result) >> 31` test.
-    if (source ^ result) < 0 {
-        weight.wrapping_sub(delta)
-    } else {
-        weight.wrapping_add(delta)
-    }
+    // Branch-free (this runs once per sample per pass, on data whose
+    // signs are close to random): `sign` is 0 when the two agree and
+    // -1 when they differ, so `(delta ^ sign) - sign` is `±delta`; the
+    // step is then masked off when either operand is zero.
+    let sign = (source ^ result) >> 31;
+    let step = (delta ^ sign).wrapping_sub(sign);
+    let live = -i32::from(source != 0 && result != 0);
+    weight.wrapping_add(step & live)
 }
 
 /// Clipped variant of [`update_weight`] used by the zero-delay
@@ -872,42 +869,227 @@ pub fn decorrelate_mono(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result
             return Err(Error::CrossTermOnMono(pass.term));
         }
     }
-    for pass in passes.iter_mut() {
-        // `m` is the rotating ring index for the 1..8 fixed-lag terms.
-        let mut m = 0usize;
-        for slot in buffer.iter_mut() {
-            let residual = *slot;
-            let pred = match pass.term {
-                17 => pass.history_a[0]
-                    .wrapping_mul(2)
-                    .wrapping_sub(pass.history_a[1]),
-                18 => {
-                    pass.history_a[0]
-                        .wrapping_mul(3)
-                        .wrapping_sub(pass.history_a[1])
-                        >> 1
-                }
-                // Fixed lag: read the current ring slot `m`. A value
-                // written here `t` iterations ago (to `(m'+t)&7`) is read
-                // again when `m` catches up, giving `s[n-t]` (§3.2 step 1
-                // / step 4 `(m+t)&7` write convention).
-                _ => pass.history_a[m & (MAX_TERM as usize - 1)],
-            };
-            let sample = apply_weight(pass.weight_a, pred).wrapping_add(residual);
-            pass.weight_a = update_weight(pass.weight_a, pass.delta, pred, residual);
-            *slot = sample;
-            // Push s[n] into history.
-            if pass.term == 17 || pass.term == 18 {
-                pass.history_a[1] = pass.history_a[0];
-                pass.history_a[0] = sample;
-            } else {
-                let w = (m + pass.term as usize) & (MAX_TERM as usize - 1);
-                pass.history_a[w] = sample;
-                m = m.wrapping_add(1);
-            }
+    // Every pass's output at a sample depends only on that pass's own
+    // state and on the previous pass's output at the same sample, so
+    // the passes can be run over one cache-sized stretch of the buffer
+    // after another instead of over the whole buffer each: the
+    // arithmetic, and every pass's final state, are unchanged.
+    let mut ring_pos = [0usize; MAX_NTERMS];
+    for chunk in buffer.chunks_mut(DECORR_CHUNK) {
+        for (pass, m) in passes.iter_mut().zip(ring_pos.iter_mut()) {
+            mono_pass::<false>(pass, m, chunk);
         }
     }
     Ok(())
+}
+
+/// Samples (mono) or frames (stereo) each pass handles before the next
+/// pass takes over the same stretch — small enough to stay in the
+/// first-level cache across a 16-pass stack.
+const DECORR_CHUNK: usize = 1024;
+
+/// The shared arithmetic of one sample of one pass, in either
+/// direction. Decoding (`FORWARD == false`) takes the residual and
+/// returns `(sample, residual)` with `sample = apply_weight(w, pred) +
+/// residual`; encoding takes the sample and returns the same pair with
+/// `residual = sample − apply_weight(w, pred)`. Either way the history
+/// then takes `sample`, the weight adapts on `(pred, residual)`, and
+/// the buffer receives the other member of the pair.
+#[inline(always)]
+fn pass_step<const FORWARD: bool>(weight: i32, pred: i32, input: i32) -> (i32, i32) {
+    let predicted = apply_weight(weight, pred);
+    if FORWARD {
+        (input, input.wrapping_sub(predicted))
+    } else {
+        (predicted.wrapping_add(input), input)
+    }
+}
+
+/// What the buffer holds after a step: the residual when encoding, the
+/// sample when decoding.
+#[inline(always)]
+fn pass_output<const FORWARD: bool>(sample: i32, residual: i32) -> i32 {
+    if FORWARD { residual } else { sample }
+}
+
+/// One pass of [`decorrelate_mono`] (`FORWARD == false`) or
+/// [`recorrelate_mono`] (`FORWARD == true`) over a stretch of the
+/// buffer. The pass state lives in locals for the duration and is
+/// written back; `ring` is the rotating history index of a fixed-lag
+/// term, carried from stretch to stretch.
+#[inline]
+fn mono_pass<const FORWARD: bool>(pass: &mut DecorrPass, ring: &mut usize, buffer: &mut [i32]) {
+    let delta = pass.delta;
+    let mut weight = pass.weight_a;
+    match pass.term {
+        17 | 18 => {
+            let smoothed = pass.term == 18;
+            let (mut h0, mut h1) = (pass.history_a[0], pass.history_a[1]);
+            for slot in buffer.iter_mut() {
+                let pred = if smoothed {
+                    h0.wrapping_mul(3).wrapping_sub(h1) >> 1
+                } else {
+                    h0.wrapping_mul(2).wrapping_sub(h1)
+                };
+                let (sample, residual) = pass_step::<FORWARD>(weight, pred, *slot);
+                weight = update_weight(weight, delta, pred, residual);
+                *slot = pass_output::<FORWARD>(sample, residual);
+                h1 = h0;
+                h0 = sample;
+            }
+            pass.history_a[0] = h0;
+            pass.history_a[1] = h1;
+        }
+        term => {
+            // Fixed lag: read ring slot `m`; a value written `t`
+            // iterations ago (to `(m' + t) & 7`) comes back when `m`
+            // catches up, giving `s[n - t]` (§3.2 steps 1 and 4).
+            let lag = term as usize;
+            let mask = MAX_TERM as usize - 1;
+            let mut history = pass.history_a;
+            let mut m = *ring;
+            for slot in buffer.iter_mut() {
+                let pred = history[m & mask];
+                let (sample, residual) = pass_step::<FORWARD>(weight, pred, *slot);
+                weight = update_weight(weight, delta, pred, residual);
+                *slot = pass_output::<FORWARD>(sample, residual);
+                history[m.wrapping_add(lag) & mask] = sample;
+                m = m.wrapping_add(1);
+            }
+            pass.history_a = history;
+            *ring = m;
+        }
+    }
+    pass.weight_a = weight;
+}
+
+/// One pass of [`decorrelate_stereo`] / [`recorrelate_stereo`] over a
+/// stretch of frames; see [`mono_pass`].
+#[inline]
+fn stereo_pass<const FORWARD: bool>(
+    pass: &mut DecorrPass,
+    ring: &mut usize,
+    frames: &mut [[i32; 2]],
+) {
+    let delta = pass.delta;
+    let (mut wa, mut wb) = (pass.weight_a, pass.weight_b);
+    match pass.term {
+        // Cross terms: zero-delay, clipped weight update (§3.3).
+        -1 => {
+            // A from stored history, then B from the current A.
+            let mut stored = pass.history_a[0];
+            for frame in frames.iter_mut() {
+                let (a, res_a) = pass_step::<FORWARD>(wa, stored, frame[0]);
+                wa = update_weight_clip(wa, delta, stored, res_a);
+                let (b, res_b) = pass_step::<FORWARD>(wb, a, frame[1]);
+                wb = update_weight_clip(wb, delta, a, res_b);
+                *frame = [
+                    pass_output::<FORWARD>(a, res_a),
+                    pass_output::<FORWARD>(b, res_b),
+                ];
+                stored = b;
+            }
+            pass.history_a[0] = stored;
+        }
+        -2 => {
+            // B from stored history, then A from the current B.
+            let mut stored = pass.history_b[0];
+            for frame in frames.iter_mut() {
+                let (b, res_b) = pass_step::<FORWARD>(wb, stored, frame[1]);
+                wb = update_weight_clip(wb, delta, stored, res_b);
+                let (a, res_a) = pass_step::<FORWARD>(wa, b, frame[0]);
+                wa = update_weight_clip(wa, delta, b, res_a);
+                *frame = [
+                    pass_output::<FORWARD>(a, res_a),
+                    pass_output::<FORWARD>(b, res_b),
+                ];
+                stored = a;
+            }
+            pass.history_b[0] = stored;
+        }
+        -3 => {
+            // Each from the other's stored previous value.
+            let (mut prev_a, mut prev_b) = (pass.history_a[0], pass.history_b[0]);
+            for frame in frames.iter_mut() {
+                let (a, res_a) = pass_step::<FORWARD>(wa, prev_b, frame[0]);
+                wa = update_weight_clip(wa, delta, prev_b, res_a);
+                let (b, res_b) = pass_step::<FORWARD>(wb, prev_a, frame[1]);
+                wb = update_weight_clip(wb, delta, prev_a, res_b);
+                *frame = [
+                    pass_output::<FORWARD>(a, res_a),
+                    pass_output::<FORWARD>(b, res_b),
+                ];
+                prev_a = a;
+                prev_b = b;
+            }
+            pass.history_a[0] = prev_a;
+            pass.history_b[0] = prev_b;
+        }
+        // Per-channel two-sample extrapolators (§3.2).
+        17 | 18 => {
+            let smoothed = pass.term == 18;
+            let (mut a0, mut a1) = (pass.history_a[0], pass.history_a[1]);
+            let (mut b0, mut b1) = (pass.history_b[0], pass.history_b[1]);
+            for frame in frames.iter_mut() {
+                let (pa, pb) = if smoothed {
+                    (
+                        a0.wrapping_mul(3).wrapping_sub(a1) >> 1,
+                        b0.wrapping_mul(3).wrapping_sub(b1) >> 1,
+                    )
+                } else {
+                    (
+                        a0.wrapping_mul(2).wrapping_sub(a1),
+                        b0.wrapping_mul(2).wrapping_sub(b1),
+                    )
+                };
+                let (a, res_a) = pass_step::<FORWARD>(wa, pa, frame[0]);
+                let (b, res_b) = pass_step::<FORWARD>(wb, pb, frame[1]);
+                wa = update_weight(wa, delta, pa, res_a);
+                wb = update_weight(wb, delta, pb, res_b);
+                *frame = [
+                    pass_output::<FORWARD>(a, res_a),
+                    pass_output::<FORWARD>(b, res_b),
+                ];
+                a1 = a0;
+                a0 = a;
+                b1 = b0;
+                b0 = b;
+            }
+            pass.history_a[0] = a0;
+            pass.history_a[1] = a1;
+            pass.history_b[0] = b0;
+            pass.history_b[1] = b1;
+        }
+        // Fixed-lag terms 1..8 (§3.2), per channel.
+        term => {
+            let lag = term as usize;
+            let mask = MAX_TERM as usize - 1;
+            let mut ha = pass.history_a;
+            let mut hb = pass.history_b;
+            let mut m = *ring;
+            for frame in frames.iter_mut() {
+                let rd = m & mask;
+                let (pa, pb) = (ha[rd], hb[rd]);
+                let (a, res_a) = pass_step::<FORWARD>(wa, pa, frame[0]);
+                let (b, res_b) = pass_step::<FORWARD>(wb, pb, frame[1]);
+                wa = update_weight(wa, delta, pa, res_a);
+                wb = update_weight(wb, delta, pb, res_b);
+                *frame = [
+                    pass_output::<FORWARD>(a, res_a),
+                    pass_output::<FORWARD>(b, res_b),
+                ];
+                let wr = m.wrapping_add(lag) & mask;
+                ha[wr] = a;
+                hb[wr] = b;
+                m = m.wrapping_add(1);
+            }
+            pass.history_a = ha;
+            pass.history_b = hb;
+            *ring = m;
+        }
+    }
+    pass.weight_a = wa;
+    pass.weight_b = wb;
 }
 
 /// Run the configured decorrelation passes over an **interleaved stereo**
@@ -926,108 +1108,13 @@ pub fn decorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
     if passes.len() > MAX_NTERMS {
         return Err(Error::TooManyDecorrelationPasses(passes.len()));
     }
-    let pairs = buffer.len() / 2;
-    for pass in passes.iter_mut() {
-        let mut m = 0usize;
-        for p in 0..pairs {
-            let li = 2 * p;
-            let ri = li + 1;
-            let res_a = buffer[li];
-            let res_b = buffer[ri];
-            match pass.term {
-                // Cross terms: zero-delay, clipped weight update (§3.3).
-                -1 => {
-                    // A from stored history, then B from the just-built A.
-                    let pred_a = pass.history_a[0];
-                    let a = apply_weight(pass.weight_a, pred_a).wrapping_add(res_a);
-                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
-                    let b = apply_weight(pass.weight_b, a).wrapping_add(res_b);
-                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, a, res_b);
-                    buffer[li] = a;
-                    buffer[ri] = b;
-                    pass.history_a[0] = b;
-                }
-                -2 => {
-                    // B from stored history, then A from the just-built B.
-                    let pred_b = pass.history_b[0];
-                    let b = apply_weight(pass.weight_b, pred_b).wrapping_add(res_b);
-                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
-                    let a = apply_weight(pass.weight_a, b).wrapping_add(res_a);
-                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, b, res_a);
-                    buffer[li] = a;
-                    buffer[ri] = b;
-                    pass.history_b[0] = a;
-                }
-                -3 => {
-                    // Each from the other's stored previous value, then
-                    // swap the stored history.
-                    let pred_a = pass.history_b[0];
-                    let pred_b = pass.history_a[0];
-                    let a = apply_weight(pass.weight_a, pred_a).wrapping_add(res_a);
-                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
-                    let b = apply_weight(pass.weight_b, pred_b).wrapping_add(res_b);
-                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
-                    buffer[li] = a;
-                    buffer[ri] = b;
-                    pass.history_a[0] = a;
-                    pass.history_b[0] = b;
-                }
-                // Per-channel two-sample extrapolators (§3.2).
-                17 => {
-                    let pa = pass.history_a[0]
-                        .wrapping_mul(2)
-                        .wrapping_sub(pass.history_a[1]);
-                    let pb = pass.history_b[0]
-                        .wrapping_mul(2)
-                        .wrapping_sub(pass.history_b[1]);
-                    let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
-                    let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
-                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
-                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
-                    buffer[li] = a;
-                    buffer[ri] = b;
-                    pass.history_a[1] = pass.history_a[0];
-                    pass.history_a[0] = a;
-                    pass.history_b[1] = pass.history_b[0];
-                    pass.history_b[0] = b;
-                }
-                18 => {
-                    let pa = pass.history_a[0]
-                        .wrapping_mul(3)
-                        .wrapping_sub(pass.history_a[1])
-                        >> 1;
-                    let pb = pass.history_b[0]
-                        .wrapping_mul(3)
-                        .wrapping_sub(pass.history_b[1])
-                        >> 1;
-                    let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
-                    let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
-                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
-                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
-                    buffer[li] = a;
-                    buffer[ri] = b;
-                    pass.history_a[1] = pass.history_a[0];
-                    pass.history_a[0] = a;
-                    pass.history_b[1] = pass.history_b[0];
-                    pass.history_b[0] = b;
-                }
-                // Fixed-lag terms 1..8 (§3.2), per channel.
-                t => {
-                    let rd = m & (MAX_TERM as usize - 1);
-                    let pa = pass.history_a[rd];
-                    let pb = pass.history_b[rd];
-                    let a = apply_weight(pass.weight_a, pa).wrapping_add(res_a);
-                    let b = apply_weight(pass.weight_b, pb).wrapping_add(res_b);
-                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
-                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
-                    buffer[li] = a;
-                    buffer[ri] = b;
-                    let w = (m + t as usize) & (MAX_TERM as usize - 1);
-                    pass.history_a[w] = a;
-                    pass.history_b[w] = b;
-                    m = m.wrapping_add(1);
-                }
-            }
+    // Cache-blocked exactly as in [`decorrelate_mono`]; a trailing odd
+    // sample is left untouched.
+    let even = buffer.len() & !1;
+    let mut ring_pos = [0usize; MAX_NTERMS];
+    for chunk in buffer[..even].chunks_mut(2 * DECORR_CHUNK) {
+        for (pass, m) in passes.iter_mut().zip(ring_pos.iter_mut()) {
+            stereo_pass::<false>(pass, m, chunk.as_chunks_mut::<2>().0);
         }
     }
     Ok(())
@@ -1161,36 +1248,13 @@ pub fn recorrelate_mono(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Result
     }
     // Encode applies passes in the reverse of the decoder's application
     // order: the decoder undoes the encoder's last pass first.
-    for pass in passes.iter_mut().rev() {
-        let mut m = 0usize;
-        for slot in buffer.iter_mut() {
-            let sample = *slot;
-            let pred = match pass.term {
-                17 => pass.history_a[0]
-                    .wrapping_mul(2)
-                    .wrapping_sub(pass.history_a[1]),
-                18 => {
-                    pass.history_a[0]
-                        .wrapping_mul(3)
-                        .wrapping_sub(pass.history_a[1])
-                        >> 1
-                }
-                _ => pass.history_a[m & (MAX_TERM as usize - 1)],
-            };
-            // Inverse of `s[n] = apply_weight(w, pred) + residual`.
-            let residual = sample.wrapping_sub(apply_weight(pass.weight_a, pred));
-            pass.weight_a = update_weight(pass.weight_a, pass.delta, pred, residual);
-            *slot = residual;
-            // Push the ORIGINAL PCM sample into history — the decoder
-            // pushes its reconstructed `s[n]`, which equals this sample.
-            if pass.term == 17 || pass.term == 18 {
-                pass.history_a[1] = pass.history_a[0];
-                pass.history_a[0] = sample;
-            } else {
-                let w = (m + pass.term as usize) & (MAX_TERM as usize - 1);
-                pass.history_a[w] = sample;
-                m = m.wrapping_add(1);
-            }
+    // The encoder applies the passes in the reverse of the decoder's
+    // order; like the decoder it can do so one cache-sized stretch at
+    // a time (see [`decorrelate_mono`]).
+    let mut ring_pos = [0usize; MAX_NTERMS];
+    for chunk in buffer.chunks_mut(DECORR_CHUNK) {
+        for (pass, m) in passes.iter_mut().zip(ring_pos.iter_mut()).rev() {
+            mono_pass::<true>(pass, m, chunk);
         }
     }
     Ok(())
@@ -1219,103 +1283,11 @@ pub fn recorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
     if passes.len() > MAX_NTERMS {
         return Err(Error::TooManyDecorrelationPasses(passes.len()));
     }
-    let pairs = buffer.len() / 2;
-    for pass in passes.iter_mut().rev() {
-        let mut m = 0usize;
-        for p in 0..pairs {
-            let li = 2 * p;
-            let ri = li + 1;
-            let sa = buffer[li];
-            let sb = buffer[ri];
-            match pass.term {
-                -1 => {
-                    let pred_a = pass.history_a[0];
-                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pred_a));
-                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
-                    // B predicted from the original A (decoder uses the
-                    // reconstructed A, which equals `sa`).
-                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, sa));
-                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, sa, res_b);
-                    buffer[li] = res_a;
-                    buffer[ri] = res_b;
-                    pass.history_a[0] = sb;
-                }
-                -2 => {
-                    let pred_b = pass.history_b[0];
-                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pred_b));
-                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
-                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, sb));
-                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, sb, res_a);
-                    buffer[li] = res_a;
-                    buffer[ri] = res_b;
-                    pass.history_b[0] = sa;
-                }
-                -3 => {
-                    let pred_a = pass.history_b[0];
-                    let pred_b = pass.history_a[0];
-                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pred_a));
-                    pass.weight_a = update_weight_clip(pass.weight_a, pass.delta, pred_a, res_a);
-                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pred_b));
-                    pass.weight_b = update_weight_clip(pass.weight_b, pass.delta, pred_b, res_b);
-                    buffer[li] = res_a;
-                    buffer[ri] = res_b;
-                    pass.history_a[0] = sa;
-                    pass.history_b[0] = sb;
-                }
-                17 => {
-                    let pa = pass.history_a[0]
-                        .wrapping_mul(2)
-                        .wrapping_sub(pass.history_a[1]);
-                    let pb = pass.history_b[0]
-                        .wrapping_mul(2)
-                        .wrapping_sub(pass.history_b[1]);
-                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
-                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
-                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
-                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
-                    buffer[li] = res_a;
-                    buffer[ri] = res_b;
-                    pass.history_a[1] = pass.history_a[0];
-                    pass.history_a[0] = sa;
-                    pass.history_b[1] = pass.history_b[0];
-                    pass.history_b[0] = sb;
-                }
-                18 => {
-                    let pa = pass.history_a[0]
-                        .wrapping_mul(3)
-                        .wrapping_sub(pass.history_a[1])
-                        >> 1;
-                    let pb = pass.history_b[0]
-                        .wrapping_mul(3)
-                        .wrapping_sub(pass.history_b[1])
-                        >> 1;
-                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
-                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
-                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
-                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
-                    buffer[li] = res_a;
-                    buffer[ri] = res_b;
-                    pass.history_a[1] = pass.history_a[0];
-                    pass.history_a[0] = sa;
-                    pass.history_b[1] = pass.history_b[0];
-                    pass.history_b[0] = sb;
-                }
-                t => {
-                    let rd = m & (MAX_TERM as usize - 1);
-                    let pa = pass.history_a[rd];
-                    let pb = pass.history_b[rd];
-                    let res_a = sa.wrapping_sub(apply_weight(pass.weight_a, pa));
-                    let res_b = sb.wrapping_sub(apply_weight(pass.weight_b, pb));
-                    pass.weight_a = update_weight(pass.weight_a, pass.delta, pa, res_a);
-                    pass.weight_b = update_weight(pass.weight_b, pass.delta, pb, res_b);
-                    buffer[li] = res_a;
-                    buffer[ri] = res_b;
-                    let w = (m + t as usize) & (MAX_TERM as usize - 1);
-                    pass.history_a[w] = sa;
-                    pass.history_b[w] = sb;
-                    m = m.wrapping_add(1);
-                }
-            }
+    let even = buffer.len() & !1;
+    let mut ring_pos = [0usize; MAX_NTERMS];
+    for chunk in buffer[..even].chunks_mut(2 * DECORR_CHUNK) {
+        for (pass, m) in passes.iter_mut().zip(ring_pos.iter_mut()).rev() {
+            stereo_pass::<true>(pass, m, chunk.as_chunks_mut::<2>().0);
         }
     }
     Ok(())

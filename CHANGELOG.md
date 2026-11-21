@@ -79,6 +79,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (55–60 s each) are clean; the `seek_surface` tiling invariant was
   restated for bytes outside the blocks.
 
+### Performance
+
+- **Bit I/O a word at a time.** The bit reader pulled one bit per
+  call — a loop per unary prefix, per mantissa field — and the writer
+  pushed one bit per call. The reader now keeps a 64-bit accumulator
+  (refilled eight bytes at a time; unary runs counted with a trailing-
+  ones scan) and the writer packs whole fields. Same bits, same
+  cursor accessors, same truncation behaviour.
+- **Decorrelation passes: cache-blocked, specialised, branch-free.**
+  Each pass used to walk the whole block buffer (megabytes for a long
+  block) with the term dispatch, the weights and the history ring
+  re-read through memory on every sample. A pass's output at a sample
+  depends only on that pass's own state and the previous pass's output
+  at the same sample, so the stack now runs over 1024-frame stretches,
+  each pass a loop specialised for its term class with its state in
+  locals, shared by the decode and encode directions; the weight
+  update is branch-free. Output is unchanged: encoder streams are
+  byte-identical across every profile, mono / stereo, hybrid pairs,
+  float and multichannel (7.9 MB compared), and the decode matrix is
+  unchanged.
+- Measured on 20 s of 44.1 kHz stereo (synthesised plucked strings,
+  swept tone, faint pink noise; one thread, old and new binaries run
+  alternately, medians): decode of outside-encoded streams 407 →
+  623 × real time (fast mode), 332 → 532 × (default), 195 → 341 ×
+  (very high); encode 26 → 39 × (`Normal`), 13.7 → 22.5 × (`High`),
+  8.1 → 13 × (`Extra`), 3.5 → 6.5 × (`smallest`).
+  `examples/wvbench` reproduces the figures.
+
 ### Fixed
 
 - **Files with tags did not decode.** Every stream walker stopped

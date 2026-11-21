@@ -192,10 +192,14 @@ pub const GET_MED_FLOOR: u32 = 1;
 pub struct BitReader<'a> {
     bytes: &'a [u8],
     /// Index of the next byte to pull into the accumulator.
-    byte_pos: usize,
-    /// Index of the next bit within the current byte (`0..=7`,
-    /// LSB-first).
-    bit_pos: u8,
+    next: usize,
+    /// Unread bits already pulled from `bytes`, the next one to read
+    /// in bit 0. Only the low `acc_bits` bits are accounted for; bits
+    /// above them, when set, are a preview of stream bits that the
+    /// next refill loads again at the same position.
+    acc: u64,
+    /// Number of accounted bits in `acc` (`0..=63`).
+    acc_bits: u32,
 }
 
 impl<'a> BitReader<'a> {
@@ -203,21 +207,15 @@ impl<'a> BitReader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
-            byte_pos: 0,
-            bit_pos: 0,
+            next: 0,
+            acc: 0,
+            acc_bits: 0,
         }
     }
 
     /// Total number of bits still unread.
     pub fn bits_remaining(&self) -> usize {
-        let whole = self.bytes.len().saturating_sub(self.byte_pos + 1);
-        // Bits left in the current byte plus all bits of the remaining
-        // whole bytes. When byte_pos is past the end this is zero.
-        if self.byte_pos >= self.bytes.len() {
-            0
-        } else {
-            (8 - self.bit_pos as usize) + whole * 8
-        }
+        (self.bytes.len() - self.next) * 8 + self.acc_bits as usize
     }
 
     /// `true` when no bits remain.
@@ -225,7 +223,8 @@ impl<'a> BitReader<'a> {
         self.bits_remaining() == 0
     }
 
-    /// Index of the next byte the reader will pull into the accumulator.
+    /// Index of the byte holding the next unread bit (the buffer length
+    /// once everything is consumed).
     ///
     /// Together with [`Self::bit_position`] this names the reader's
     /// cursor in the underlying byte slice — useful for callers that
@@ -233,41 +232,73 @@ impl<'a> BitReader<'a> {
     /// resume from a known offset against a freshly-constructed reader
     /// over the same bytes.
     pub fn byte_position(&self) -> usize {
-        self.byte_pos
+        self.bits_consumed() / 8
     }
 
     /// Index of the next bit within the current byte (`0..=7`,
     /// LSB-first). Pairs with [`Self::byte_position`] to name the
     /// reader's cursor.
     pub fn bit_position(&self) -> u8 {
-        self.bit_pos
+        (self.bits_consumed() % 8) as u8
     }
 
-    /// Total bits already consumed since the reader was constructed.
-    /// Equivalent to `byte_position() * 8 + bit_position()` but clamped
-    /// at the buffer length when the reader has advanced past the end.
+    /// Total bits already consumed since the reader was constructed —
+    /// `byte_position() * 8 + bit_position()`, at most the buffer
+    /// length in bits.
     pub fn bits_consumed(&self) -> usize {
-        if self.byte_pos >= self.bytes.len() {
-            self.bytes.len() * 8
-        } else {
-            self.byte_pos * 8 + self.bit_pos as usize
+        self.next * 8 - self.acc_bits as usize
+    }
+
+    /// Top the accumulator up from the buffer: to at least 56 bits
+    /// while eight bytes remain, otherwise with whatever is left.
+    #[inline]
+    fn refill(&mut self) {
+        if let Some(word) = self
+            .bytes
+            .get(self.next..)
+            .and_then(|rest| rest.first_chunk::<8>())
+        {
+            // Whole bytes that fit above the accounted bits. The word
+            // is OR-ed in full: the bits of the byte that only partly
+            // fits are stream bits too, and the next refill puts the
+            // same byte at the same place.
+            let take = (63 - self.acc_bits) >> 3;
+            self.acc |= u64::from_le_bytes(*word) << self.acc_bits;
+            self.next += take as usize;
+            self.acc_bits += take * 8;
+            return;
         }
+        while self.acc_bits <= 56 && self.next < self.bytes.len() {
+            self.acc |= u64::from(self.bytes[self.next]) << self.acc_bits;
+            self.next += 1;
+            self.acc_bits += 8;
+        }
+    }
+
+    /// Consume everything: the state every truncated read leaves.
+    #[cold]
+    fn exhaust(&mut self) -> Error {
+        self.next = self.bytes.len();
+        self.acc = 0;
+        self.acc_bits = 0;
+        Error::Truncated
     }
 
     /// Read one bit, LSB-first. Returns the bit value (`0` or `1`).
     ///
     /// [`Error::Truncated`] when the buffer is exhausted.
+    #[inline]
     pub fn get_bit(&mut self) -> Result<u32> {
-        if self.byte_pos >= self.bytes.len() {
-            return Err(Error::Truncated);
+        if self.acc_bits == 0 {
+            self.refill();
+            if self.acc_bits == 0 {
+                return Err(self.exhaust());
+            }
         }
-        let bit = (self.bytes[self.byte_pos] >> self.bit_pos) & 1;
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.bit_pos = 0;
-            self.byte_pos += 1;
-        }
-        Ok(bit as u32)
+        let bit = (self.acc & 1) as u32;
+        self.acc >>= 1;
+        self.acc_bits -= 1;
+        Ok(bit)
     }
 
     /// Read `count` bits LSB-first, assembling them into a `u32` with
@@ -275,14 +306,20 @@ impl<'a> BitReader<'a> {
     ///
     /// `count` must be in `0..=32`. `get_bits(0)` returns `0` without
     /// consuming any bits. [`Error::Truncated`] when the buffer is
-    /// exhausted before `count` bits are read.
+    /// exhausted before `count` bits are read (the bits that were
+    /// available are consumed).
+    #[inline]
     pub fn get_bits(&mut self, count: u32) -> Result<u32> {
         debug_assert!(count <= 32, "get_bits supports up to 32 bits");
-        let mut value = 0u32;
-        for i in 0..count {
-            let bit = self.get_bit()?;
-            value |= bit << i;
+        if self.acc_bits < count {
+            self.refill();
+            if self.acc_bits < count {
+                return Err(self.exhaust());
+            }
         }
+        let value = (self.acc & ((1u64 << count) - 1)) as u32;
+        self.acc >>= count;
+        self.acc_bits -= count;
         Ok(value)
     }
 
@@ -293,14 +330,26 @@ impl<'a> BitReader<'a> {
     /// (i.e. 111110b = 5, 10b = 1)". The terminating `0` is consumed
     /// but not counted. A run that reaches the end of the buffer
     /// without a terminating `0` reports [`Error::Truncated`].
+    #[inline]
     pub fn get_unary(&mut self) -> Result<u32> {
         let mut count = 0u32;
         loop {
-            let bit = self.get_bit()?;
-            if bit == 0 {
-                return Ok(count);
+            if self.acc_bits == 0 {
+                self.refill();
+                if self.acc_bits == 0 {
+                    return Err(self.exhaust());
+                }
             }
-            count += 1;
+            let ones = self.acc.trailing_ones().min(self.acc_bits);
+            if ones < self.acc_bits {
+                // The terminating zero is among the accounted bits.
+                self.acc >>= ones + 1;
+                self.acc_bits -= ones + 1;
+                return Ok(count + ones);
+            }
+            count += ones;
+            self.acc = 0;
+            self.acc_bits = 0;
         }
     }
 
@@ -361,8 +410,24 @@ impl<'a> BitReader<'a> {
     /// field (e.g. a padding region) without holding the assembled
     /// value.
     pub fn skip_bits(&mut self, count: u32) -> Result<()> {
-        for _ in 0..count {
-            self.get_bit()?;
+        if count as usize > self.bits_remaining() {
+            return Err(self.exhaust());
+        }
+        if count <= self.acc_bits {
+            self.acc >>= count;
+            self.acc_bits -= count;
+            return Ok(());
+        }
+        // Drop the accumulator, step over whole bytes, then the odd bits.
+        let beyond = count - self.acc_bits;
+        self.acc = 0;
+        self.acc_bits = 0;
+        self.next += (beyond / 8) as usize;
+        let odd = beyond % 8;
+        if odd > 0 {
+            self.refill();
+            self.acc >>= odd;
+            self.acc_bits -= odd;
         }
         Ok(())
     }
@@ -383,8 +448,10 @@ impl<'a> BitReader<'a> {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BitWriter {
     bytes: Vec<u8>,
-    cur: u8,
-    nbits: u8,
+    /// Bits not yet flushed to `bytes`, first-written in bit 0.
+    /// Always fewer than 8 between calls.
+    pending: u64,
+    nbits: u32,
 }
 
 impl BitWriter {
@@ -396,13 +463,7 @@ impl BitWriter {
     /// Append a single bit (the low bit of `bit`; higher bits are
     /// ignored, mirroring [`BitReader::get_bit`]'s 0/1 return domain).
     pub fn write_bit(&mut self, bit: u32) {
-        self.cur |= ((bit & 1) as u8) << self.nbits;
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.bytes.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
-        }
+        self.write_bits(bit, 1);
     }
 
     /// Append the low `count` bits of `value`, LSB-first — the exact
@@ -410,18 +471,28 @@ impl BitWriter {
     /// bits of `value` at or above `count` are ignored.
     pub fn write_bits(&mut self, value: u32, count: u32) {
         debug_assert!(count <= 32, "write_bits count {count} exceeds 32");
-        for i in 0..count {
-            self.write_bit((value >> i) & 1);
+        let count = count.min(32);
+        let mask = (1u64 << count) - 1;
+        // At most 7 pending bits plus 32 new ones: no overflow.
+        self.pending |= (u64::from(value) & mask) << self.nbits;
+        self.nbits += count;
+        while self.nbits >= 8 {
+            self.bytes.push(self.pending as u8);
+            self.pending >>= 8;
+            self.nbits -= 8;
         }
     }
 
     /// Append `n` `1` bits followed by a single `0` terminator — the
     /// exact inverse of [`BitReader::get_unary`].
     pub fn write_unary(&mut self, n: u32) {
-        for _ in 0..n {
-            self.write_bit(1);
+        let mut ones = n;
+        while ones >= 32 {
+            self.write_bits(u32::MAX, 32);
+            ones -= 32;
         }
-        self.write_bit(0);
+        // The remaining ones and the terminating zero in one field.
+        self.write_bits((1u32 << ones) - 1, ones + 1);
     }
 
     /// Total bits written so far (before any final-byte padding).
@@ -439,7 +510,7 @@ impl BitWriter {
     /// consuming exactly the written bits never sees them).
     pub fn finish(mut self) -> Vec<u8> {
         if self.nbits > 0 {
-            self.bytes.push(self.cur);
+            self.bytes.push(self.pending as u8);
         }
         self.bytes
     }
@@ -719,6 +790,7 @@ pub enum Zone {
 impl Zone {
     /// Construct a [`Zone`] from a raw `ones_count` value, mapping
     /// `0 / 1 / 2 / >=3` onto the four spec §3.2 arms.
+    #[inline]
     pub const fn from_ones_count(ones_count: u32) -> Self {
         match ones_count {
             0 => Zone::Zone0,
@@ -980,6 +1052,7 @@ impl AdaptiveMedians {
     /// where `D` is [`DIV0`] / [`DIV1`] / [`DIV2`] for `idx = 0 / 1 / 2`.
     /// `idx` must be `0`, `1` or `2`; out-of-range indices are a
     /// no-op (debug-assert).
+    #[inline]
     pub fn inc_median(&mut self, idx: usize) {
         debug_assert!(idx < 3, "median index out of range");
         if idx >= 3 {
@@ -1006,6 +1079,7 @@ impl AdaptiveMedians {
     /// at most the median itself, so the decremented value never goes
     /// below `0`. `idx` must be `0`, `1` or `2`; out-of-range indices
     /// are a no-op (debug-assert).
+    #[inline]
     pub fn dec_median(&mut self, idx: usize) {
         debug_assert!(idx < 3, "median index out of range");
         if idx >= 3 {
@@ -1034,6 +1108,7 @@ impl AdaptiveMedians {
     /// unblocks: a single primitive that the per-sample decode loop
     /// will call once per decoded sample, before forming the next
     /// `(low, high)` interval.
+    #[inline]
     pub fn adapt(&mut self, zone: Zone) {
         match zone {
             Zone::Zone0 => self.dec_median(0),
@@ -1091,6 +1166,7 @@ impl AdaptiveMedians {
     /// medians (the spec §3.2 adaptation happens at this point in the
     /// decode loop, but is a separate step; see
     /// [`AdaptiveMedians::adapt`] for the mutation). Round 255.
+    #[inline]
     pub fn sample_interval(&self, zone: Zone) -> SampleInterval {
         let m0 = self.get_med(0);
         let m1 = self.get_med(1);
@@ -1120,6 +1196,7 @@ impl AdaptiveMedians {
     /// [`AdaptiveMedians::sample_interval`] — forms the typed
     /// [`SampleInterval`] directly from a raw `ones_count` value rather
     /// than a typed [`Zone`].
+    #[inline]
     pub fn sample_interval_for_ones_count(&self, ones_count: u32) -> SampleInterval {
         self.sample_interval(Zone::from_ones_count(ones_count))
     }
@@ -1305,6 +1382,7 @@ impl SampleInterval {
     /// consume semantics. Pair with [`Self::low`] (or the
     /// [`Self::decode_value`] convenience wrapper) to recover the
     /// `low + code` magnitude.
+    #[inline]
     pub fn decode_mantissa(&self, reader: &mut BitReader<'_>) -> Result<u32> {
         read_truncated_binary(reader, self.maxcode())
     }
@@ -1319,6 +1397,7 @@ impl SampleInterval {
     /// the sign-bit reconstruction step (§4.2 step 7) before deciding
     /// between `mid` and `!mid`. The sign bit itself is OUT of scope
     /// here — this is the unsigned magnitude, no sign read.
+    #[inline]
     pub fn decode_value(&self, reader: &mut BitReader<'_>) -> Result<u32> {
         let code = self.decode_mantissa(reader)?;
         Ok(self.low.wrapping_add(code))
@@ -1347,6 +1426,7 @@ impl SampleInterval {
     /// On `Error::Truncated` (mid-mantissa or at the missing sign bit)
     /// the reader's cursor follows the [`BitReader::get_bit`] /
     /// [`BitReader::get_bits`] partial-consume semantics.
+    #[inline]
     pub fn decode_signed_value(&self, reader: &mut BitReader<'_>) -> Result<i32> {
         let magnitude = self.decode_value(reader)?;
         read_sign_and_apply(reader, magnitude)
@@ -1788,6 +1868,7 @@ impl DecodeState {
 /// reports `Error::Truncated` — failing loudly instead of overflowing
 /// the `cbits - 1`-bit mantissa assembly (round 278; previously a
 /// shift-overflow debug panic).
+#[inline]
 pub fn read_raw_prefix(reader: &mut BitReader<'_>) -> Result<u32> {
     let raw = reader.get_unary()?;
     if raw < UNARY_ESCAPE {
@@ -1886,6 +1967,7 @@ pub fn emit_end_of_stream_marker(writer: &mut BitWriter) {
 /// short-circuit, then [`read_raw_prefix`] (steps 2 + 3) feeding
 /// [`RunState::fold_prefix`] (step 4) — so the exact bits this routine
 /// consumes ARE the bits the public primitives consume.
+#[inline]
 pub fn read_folded_ones_count(reader: &mut BitReader<'_>, state: &mut RunState) -> Result<u32> {
     // Wiki short-circuit: when last_zero is set, this sample's
     // ones_count is 0 with no bits read; last_zero clears and
@@ -1925,6 +2007,7 @@ fn form_interval(medians: &AdaptiveMedians, ones_count: u32) -> (u32, u32) {
 ///   form `code = (code << 1) - extras + extra_bit` (a full
 ///   `bitcount`-bit phase-in code); else `code` stays as the short
 ///   `(bitcount - 1)`-bit value.
+#[inline]
 fn read_truncated_binary(reader: &mut BitReader<'_>, maxcode: u32) -> Result<u32> {
     if maxcode == 0 {
         return Ok(0);
@@ -1997,6 +2080,7 @@ pub const fn split_sign(value: i32) -> (u32, bool) {
 /// On `Error::Truncated` no bit was consumed (the cursor is unchanged
 /// per [`BitReader::get_bit`] empty-buffer semantics) and the caller's
 /// magnitude is unaffected (taken by value).
+#[inline]
 pub fn read_sign_and_apply(reader: &mut BitReader<'_>, magnitude: u32) -> Result<i32> {
     let sign = reader.get_bit()?;
     Ok(apply_sign(magnitude, sign != 0))
@@ -2096,6 +2180,7 @@ pub fn emit_zero_run_length(writer: &mut BitWriter, run_length: u32) {
 /// (The pre-281 behaviour emitted a `0` sample on the marker too, which
 /// would have made every eligible word decode to `0` forever — no
 /// non-zero sample could ever follow once the gate opened.)
+#[inline]
 fn try_zero_run_path(
     reader: &mut BitReader<'_>,
     medians: &mut AdaptiveMedians,
@@ -2172,6 +2257,7 @@ fn try_zero_run_path(
 ///
 /// Hybrid mode (spec §4.2 step 6 second paragraph, `error_limit != 0`)
 /// is OUT OF SCOPE for this loop. Pure lossless `0x0A` only.
+#[inline]
 pub fn decode_sample_stateful(
     reader: &mut BitReader<'_>,
     medians: &mut AdaptiveMedians,
@@ -2348,6 +2434,7 @@ pub fn decode_packed_samples_stereo_hybrid(
 /// midpoint the lossy decode would emit) still drives the slow-level
 /// update and the shaping error state. A zero `error_limit` is the
 /// lossless dispatch: the word is read exactly and both values agree.
+#[inline]
 fn decode_bracketed_pair(
     interval: &SampleInterval,
     reader: &mut BitReader<'_>,
@@ -2750,6 +2837,7 @@ impl StereoDecodeState {
 /// the marker bit consumed, and the current channel's sample word
 /// follows (the round-281 fall-through correction; see
 /// [`try_zero_run_path`]).
+#[inline]
 fn try_zero_run_path_stereo(
     reader: &mut BitReader<'_>,
     medians: &mut [AdaptiveMedians; 2],
@@ -2805,6 +2893,7 @@ fn try_zero_run_path_stereo(
 /// After a successful emit `state.next_channel` toggles to the other
 /// channel. On error, `state.next_channel` is left unchanged so a
 /// retry sees the same cursor.
+#[inline]
 pub fn decode_sample_stateful_stereo(
     reader: &mut BitReader<'_>,
     medians: &mut [AdaptiveMedians; 2],
