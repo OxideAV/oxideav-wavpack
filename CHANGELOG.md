@@ -6,6 +6,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-wavpack/compare/v0.0.5...v0.0.6) - 2026-11-21
+
+### Other
+
+- DSD, tag skipping and round-493 pins in the reference sections
+- Branch-free mantissa + sign read; 40-bit counters; int32 sent_bits bound
+- measured status — matrix sizes and pass counts, gaps, speed
+- Word-at-a-time bit I/O; cache-blocked, specialised decorrelation passes
+- Long-form 0x0D channel geometry: parse it, write it past 8 member blocks
+- DSD decode: the 0x0E sub-block, stored / fast / high payload modes
+- Scheduled fuzz workflow for the nine fuzz targets
+- Noise shaping applies to every sample, in the output domain; ours-to-foreign matrix
+- Skip tags outside the blocks; published sub-block ID table; live black-box matrix
+- Lossy decode of INT32_DATA blocks in 1..3-byte containers re-inserts the redundancy pattern
+- Pair decode: carry the correction through CROSS_DECORR cross passes; term -3 seed order
+- Decode fixed-lag 0x04 seeds oldest-first, interleaved A/B on stereo
+- clippy 1.100: iterate the shaping delta words instead of indexing
+- API hygiene: #[non_exhaustive] on growable enums and records
+
 ### Added
 
 - `HybridOptions::new(bitrate_word, correction, joint, profile, shaping)`
