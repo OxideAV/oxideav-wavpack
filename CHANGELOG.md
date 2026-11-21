@@ -37,6 +37,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `leading_non_block_bytes`, and
   `UnsupportedBlockFeature::OptimizedInt32Extension`.
 - `examples/wvinfo`: dump a file's blocks, flags and sub-blocks.
+- Scheduled fuzz workflow (`.github/workflows/fuzz.yml`): the nine
+  `fuzz/` targets now run daily. Opening bounded runs of every target
+  (55–60 s each) are clean; the `seek_surface` tiling invariant was
+  restated for bytes outside the blocks.
 
 ### Fixed
 

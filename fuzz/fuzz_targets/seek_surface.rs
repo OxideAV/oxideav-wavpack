@@ -65,14 +65,18 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    // Structural invariants: entries tile the buffer exactly.
+    // Structural invariants: entries tile the buffer, separated only
+    // by bytes that belong to no block (tags before, between or after
+    // the blocks are skipped by every walker).
     let mut offset = 0usize;
     for e in index.entries() {
-        assert_eq!(e.byte_offset, offset, "entries must be contiguous");
+        offset += oxideav_wavpack::leading_non_block_bytes(&bytes[offset..]);
+        assert_eq!(e.byte_offset, offset, "entries start at the next block");
         assert!(e.byte_len >= 32, "a block is at least its fixed header");
         offset += e.byte_len;
     }
-    assert_eq!(offset, bytes.len(), "entries must cover the whole buffer");
+    offset += oxideav_wavpack::leading_non_block_bytes(&bytes[offset..]);
+    assert_eq!(offset, bytes.len(), "nothing but non-block bytes may trail");
 
     // Set invariants: members are in-range audio entries; the frame
     // count is the per-set sum; channel widths agree.
