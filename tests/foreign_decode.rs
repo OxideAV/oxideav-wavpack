@@ -83,6 +83,9 @@
 //! | `foreign_hybrid_int32_ones_only_b4` | `-b4`   | 32-bit int hybrid, redundancy-only profile (sent 0 / ones 4) — zero-filled lossy window with no literal bits (round 418) |
 //! | `foreign_lag_seed_mono`        | `-x4`        | 16-bit mono whose leading wire term is a fixed lag of 2 — pins the oldest-first `0x04` seed order (round 493) |
 //! | `foreign_lag_seed_stereo`      | `-x4`        | 16-bit stereo, leading wire term lag 2 — pins the interleaved A/B `0x04` seed layout of fixed-lag stereo passes (round 493) |
+//! | `foreign_hybrid_cross3_seed`   | `-h -b3.5 -x3 -j0` | hybrid stereo whose leading wire term is `-3` with non-zero seeds — pins the crossed-over seed words of term `-3` (round 493) |
+//! | `foreign_hybrid_pair_cross_js` | `-h -b4 -cc` | joint pair whose stack carries `-1` / `-2` passes under `CROSS_DECORR` — pins the lossless same-sample predictor of the pre-decorrelation fold (round 493) |
+//! | `foreign_hybrid_pair_cross_lr` | `-h -b4 -cc -j0` | left/right pair, same stack shape |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -241,6 +244,11 @@ foreign_fixture!(
 );
 foreign_fixture!(lag_seed_mono_is_bit_exact, "foreign_lag_seed_mono", 1);
 foreign_fixture!(lag_seed_stereo_is_bit_exact, "foreign_lag_seed_stereo", 2);
+foreign_fixture!(
+    hybrid_cross3_seed_is_bit_exact,
+    "foreign_hybrid_cross3_seed",
+    2
+);
 
 /// Hybrid-specific shape assertions on top of the bit-exact battery:
 /// the lossy decode carries real coding error against the WAV source
@@ -312,6 +320,14 @@ hybrid_pair_fixture!(hybrid_pair_int32_is_lossless, "foreign_hybrid_pair_int32")
 hybrid_pair_fixture!(
     hybrid_pair_int32_js_is_lossless,
     "foreign_hybrid_pair_int32_js"
+);
+hybrid_pair_fixture!(
+    hybrid_pair_cross_js_is_lossless,
+    "foreign_hybrid_pair_cross_js"
+);
+hybrid_pair_fixture!(
+    hybrid_pair_cross_lr_is_lossless,
+    "foreign_hybrid_pair_cross_lr"
 );
 
 /// The typed f32 pair twin: bit patterns reinterpret, ±0 signs survive,

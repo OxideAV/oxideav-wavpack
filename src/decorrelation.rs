@@ -1033,6 +1033,94 @@ pub fn decorrelate_stereo(passes: &mut [DecorrPass], buffer: &mut [i32]) -> Resu
     Ok(())
 }
 
+/// [`decorrelate_stereo`] for a hybrid `.wv` + `.wvc` **pair** decode of
+/// a block whose `CROSS_DECORR` flag (bit 5) is set: the spec §4.1
+/// "correction folded in before the decorrelation passes" placement.
+///
+/// Two reconstructions run in lockstep. `coarse` is the lossy chain —
+/// the ordinary [`decorrelate_stereo`] result, which also owns every
+/// pass's history and weight adaptation. `correction` enters holding
+/// the per-sample `exact − coarse` residual difference the `0x0B`
+/// stream supplies and leaves holding the per-sample difference between
+/// the lossless and the lossy **reconstruction**, so
+/// `coarse[i] + correction[i]` is the lossless sample.
+///
+/// A fixed-lag or extrapolator pass predicts from stored (lossy)
+/// history only, so the difference rides through it unchanged. A
+/// zero-delay cross pass (`-1` / `-2`) predicts its second channel from
+/// the first channel's **current** sample, and on a pair decode that
+/// predictor is the *lossless* current sample: the second channel's
+/// difference gains `apply_weight(w, first + d_first) −
+/// apply_weight(w, first)`. Term `-3` predicts both channels from stored
+/// history and leaves the difference unchanged.
+///
+/// Black-box pin (round 493): hybrid pairs written with the
+/// maximum-compression correction mode at the two slower speed modes
+/// carry `-1` / `-2` passes and restore the encoder input bit-exactly
+/// only under this rule; a stack without those passes is unaffected,
+/// which is why the flag looked decorative on such pairs.
+///
+/// `correction` must have `coarse`'s length (the caller builds both
+/// from one decode); errors are those of [`decorrelate_stereo`].
+pub(crate) fn decorrelate_stereo_with_correction(
+    passes: &mut [DecorrPass],
+    coarse: &mut [i32],
+    correction: &mut [i32],
+) -> Result<()> {
+    debug_assert_eq!(correction.len(), coarse.len());
+    if passes.len() > MAX_NTERMS {
+        return Err(Error::TooManyDecorrelationPasses(passes.len()));
+    }
+    for pass in passes.iter_mut() {
+        if pass.term != -1 && pass.term != -2 {
+            decorrelate_stereo(std::slice::from_mut(pass), coarse)?;
+            continue;
+        }
+        // `first` is the channel rebuilt from stored history, `second`
+        // the one predicted from it: (A, B) for -1, (B, A) for -2.
+        let (first, second) = if pass.term == -1 { (0, 1) } else { (1, 0) };
+        let (mut w_first, mut w_second) = if pass.term == -1 {
+            (pass.weight_a, pass.weight_b)
+        } else {
+            (pass.weight_b, pass.weight_a)
+        };
+        let mut stored = if pass.term == -1 {
+            pass.history_a[0]
+        } else {
+            pass.history_b[0]
+        };
+        for (pair, diff) in coarse
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(correction.as_chunks_mut::<2>().0.iter_mut())
+        {
+            let res_first = pair[first];
+            let res_second = pair[second];
+            let x = apply_weight(w_first, stored).wrapping_add(res_first);
+            w_first = update_weight_clip(w_first, pass.delta, stored, res_first);
+            let lossy_pred = apply_weight(w_second, x);
+            let exact_pred = apply_weight(w_second, x.wrapping_add(diff[first]));
+            let y = lossy_pred.wrapping_add(res_second);
+            w_second = update_weight_clip(w_second, pass.delta, x, res_second);
+            pair[first] = x;
+            pair[second] = y;
+            diff[second] = diff[second].wrapping_add(exact_pred.wrapping_sub(lossy_pred));
+            stored = y;
+        }
+        if pass.term == -1 {
+            pass.weight_a = w_first;
+            pass.weight_b = w_second;
+            pass.history_a[0] = stored;
+        } else {
+            pass.weight_b = w_first;
+            pass.weight_a = w_second;
+            pass.history_b[0] = stored;
+        }
+    }
+    Ok(())
+}
+
 /// Run the configured decorrelation passes **forward** (encode side) over a
 /// **mono** PCM buffer in place, turning PCM samples into entropy-ready
 /// residuals — the exact arithmetic inverse of [`decorrelate_mono`].
@@ -1513,6 +1601,15 @@ pub fn assemble_stereo_passes(
                 // order (round-493 black-box pin).
                 seed_a_groups.push(group.iter().step_by(2).copied().collect());
                 seed_b_groups.push(group.iter().skip(1).step_by(2).copied().collect());
+            } else if t == -3 {
+                // The first word is the stored predictor **for** channel
+                // A — the previous B sample — and the second the
+                // predictor for channel B. This crate keeps each
+                // channel's own previous sample (`history_a` = previous
+                // A, read when predicting B), so the two words cross
+                // over (round-493 black-box pin).
+                seed_a_groups.push(group[n..].to_vec());
+                seed_b_groups.push(group[..n].to_vec());
             } else {
                 seed_a_groups.push(group[..n].to_vec());
                 seed_b_groups.push(group[n..].to_vec());
@@ -1756,6 +1853,11 @@ pub fn serialize_stereo_passes(passes: &[DecorrPass]) -> Result<(Vec<u8>, Vec<u8
             for (&a, &b) in seeds_a.iter().zip(seeds_b) {
                 samples.extend_from_slice(&pack_seed_exact(a)?);
                 samples.extend_from_slice(&pack_seed_exact(b)?);
+            }
+        } else if pass.term == -3 {
+            // Predictor-for-A (previous B) first, then predictor-for-B.
+            for &seed in seeds_b.iter().chain(seeds_a) {
+                samples.extend_from_slice(&pack_seed_exact(seed)?);
             }
         } else {
             for &seed in seeds_a.iter().chain(seeds_b) {

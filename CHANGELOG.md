@@ -27,6 +27,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never met one. Two committed pins (`foreign_lag_seed_mono`,
   `foreign_lag_seed_stereo`).
 
+- **`CROSS_DECORR` hybrid pairs with zero-delay cross passes.** The
+  flag is not decorative: it moves the correction fold ahead of the
+  decorrelation passes (spec §4.1). Fixed-lag, extrapolator and `-3`
+  passes predict from stored lossy history, so the fold rides through
+  them unchanged — which is all the earlier fixtures contained — but
+  a `-1` / `-2` pass predicts its second channel from the first
+  channel's current sample, and on a pair decode that is the
+  **lossless** sample. Pairs written in the maximum-compression
+  correction mode at the two slower speed modes carry such passes and
+  used to decode wrongly from the first frame (CRC gate red); the
+  pair decoder now carries the fold through the passes
+  (`decorrelate_stereo_with_correction`), for left/right and joint
+  coding, shaped and unshaped. The left/right pair path now shares
+  the joint path's decode-raw / decorrelate / shape-in-output-domain
+  structure. `fold_hybrid_correction` / `split_hybrid_correction`
+  refuse a cross-flagged block whose stack carries `-1` / `-2`.
+  Pins: `foreign_hybrid_pair_cross_js`, `foreign_hybrid_pair_cross_lr`.
+- **Term `-3` seed words.** The two `0x04` words of a `-3` pass are
+  the stored predictor *for* channel A (the previous B sample) and
+  the predictor for channel B, in that order; they were assigned the
+  other way round, so a block leading with a seeded `-3` pass decoded
+  wrongly. Pin: `foreign_hybrid_cross3_seed`.
+
 ### Changed
 
 - API hygiene: `#[non_exhaustive]` on the enums `Error`,

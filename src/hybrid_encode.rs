@@ -467,15 +467,15 @@ fn derive_hybrid_passes(
     } else {
         crate::encode::derive_stereo_passes(coded, profile)?
     };
-    // Hybrid stacks are cross-free. Round-418 black-box probe: a
-    // hybrid block carrying a `-1` cross pass decodes *differently*
-    // under the reference decoder than under the lossless-identical
-    // decorrelation model (its lossy decode fails the stored CRC),
-    // and reference-encoded hybrid streams never carry cross terms
-    // (their stereo stacks match the mono ones) — so the encode side
-    // stays inside the reference-validated shape. (`-2` additionally
-    // cannot be driven in the encode direction at all — see
-    // [`StereoStepper`].)
+    // This encoder keeps its hybrid stacks cross-free. Outside hybrid
+    // streams do carry cross passes (`-3` freely; `-1` / `-2` under
+    // `CROSS_DECORR`, where a pair decode predicts the second channel
+    // from the lossless first one — see
+    // `decorrelate_stereo_with_correction`), and the decoder handles
+    // them; originating them would need the per-sample stepper to
+    // track both reconstructions, which it does not. (`-2`
+    // additionally cannot be driven in the encode direction at all —
+    // see [`StereoStepper`].)
     passes.retain(|p| !crate::decorrelation::is_cross_term(p.term));
     if passes.is_empty() {
         return Ok((None, Vec::new()));

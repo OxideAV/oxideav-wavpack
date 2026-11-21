@@ -515,12 +515,14 @@ impl<'a> WavPackBlock<'a> {
     /// [`crate::CorrectionFold::PreDecorrelationCross`], and otherwise the
     /// default [`crate::CorrectionFold::PostDecorrelation`] raw add applies.
     /// Both non-shaped placements fold end-to-end via
-    /// [`Self::fold_hybrid_correction`] (round 415: current-version
-    /// reference encoders set `CROSS_DECORR` decoratively — their pairs
-    /// are bit-exact under the post-decorrelation add); the noise-shaped
-    /// placement routes through the `0x07` error-feedback filter and needs
-    /// the full pair decode ([`Self::decode_samples_with_correction`]).
-    /// Round 367; cross placement folded since round 415.
+    /// [`Self::fold_hybrid_correction`] as long as the block's stack
+    /// carries no zero-delay cross pass (`-1` / `-2`): the correction
+    /// rides through every other pass unchanged, so the pre- and
+    /// post-decorrelation placements coincide. A `CROSS_DECORR` block
+    /// *with* such a pass, and the noise-shaped placement (which routes
+    /// through the `0x07` error-feedback filter), need the full pair
+    /// decode ([`Self::decode_samples_with_correction`]).
+    /// Round 367; cross placement round 415, narrowed round 493.
     pub fn hybrid_correction_placement(&self) -> crate::CorrectionFold {
         crate::CorrectionFold::from_flags(self.header.flags.raw)
     }
@@ -557,16 +559,19 @@ impl<'a> WavPackBlock<'a> {
     ///   select [`crate::CorrectionFold::NoiseShaped`]: a shaped fold
     ///   routes each correction through the `0x07` error-feedback filter,
     ///   so it is not a raw add (use
-    ///   [`Self::decode_samples_with_correction`]). `CROSS_DECORR`-flagged
-    ///   blocks are accepted since round 415 — the bit is decorative on
-    ///   current-version files and their pairs fold post-decorrelation.
+    ///   [`Self::decode_samples_with_correction`]). The same refusal
+    ///   covers a `CROSS_DECORR`-flagged block whose stack carries a
+    ///   `-1` / `-2` pass: there the correction is folded in ahead of
+    ///   the passes and the second channel is predicted from the
+    ///   lossless first one, which no after-the-fact add reproduces.
+    ///   Cross-flagged blocks without such a pass fold as a raw add.
     /// * [`Error::HybridCorrectionLengthMismatch`] — `correction.len() !=
     ///   lossy.len()` (the §4.1 fold reads exactly one correction residual
     ///   per decoded sample).
     ///
     /// Round 367.
     pub fn fold_hybrid_correction(&self, lossy: &[i32], correction: &[i32]) -> Result<Vec<i32>> {
-        if !self.hybrid_correction_placement().is_supported_raw_fold() {
+        if !self.correction_folds_as_raw_add() {
             return Err(Error::HybridFoldPlacementUnsupported);
         }
         if lossy.len() != correction.len() {
@@ -595,20 +600,21 @@ impl<'a> WavPackBlock<'a> {
     /// [`Self::decode_samples`] uses (mono, or interleaved `[L0, R0, …]`).
     ///
     /// As with the decode-side fold, this is the raw post-decorrelation
-    /// (spec §4.1) case: the noise-shaped placement is refused
-    /// (`CROSS_DECORR`-flagged blocks are accepted since round 415), and
-    /// the two buffers must be the same length.
+    /// (spec §4.1) case: the noise-shaped placement is refused, as is a
+    /// `CROSS_DECORR`-flagged block whose stack carries a `-1` / `-2`
+    /// pass, and the two buffers must be the same length.
     ///
     /// # Errors
     ///
     /// * [`Error::HybridFoldPlacementUnsupported`] — the block's flags
-    ///   select the noise-shaped placement, which is not a raw add.
+    ///   select the noise-shaped placement, or `CROSS_DECORR` with a
+    ///   `-1` / `-2` pass in the stack — neither is a raw add.
     /// * [`Error::HybridCorrectionLengthMismatch`] — `original.len() !=
     ///   lossy.len()`.
     ///
     /// Round 367.
     pub fn split_hybrid_correction(&self, original: &[i32], lossy: &[i32]) -> Result<Vec<i32>> {
-        if !self.hybrid_correction_placement().is_supported_raw_fold() {
+        if !self.correction_folds_as_raw_add() {
             return Err(Error::HybridFoldPlacementUnsupported);
         }
         if original.len() != lossy.len() {
@@ -624,6 +630,24 @@ impl<'a> WavPackBlock<'a> {
             .collect())
     }
 
+    /// `true` when this block's corrections fold as a plain
+    /// post-decorrelation add: an unshaped placement, and — under
+    /// `CROSS_DECORR` — a stack with no zero-delay cross pass.
+    fn correction_folds_as_raw_add(&self) -> bool {
+        let placement = self.hybrid_correction_placement();
+        if !placement.is_supported_raw_fold() {
+            return false;
+        }
+        if placement != crate::CorrectionFold::PreDecorrelationCross {
+            return true;
+        }
+        let (terms, _, _) = self.decorr_payloads();
+        !terms.iter().any(|&byte| {
+            let (term, _) = crate::decorrelation::decode_term_byte(byte);
+            term == -1 || term == -2
+        })
+    }
+
     /// Decode this hybrid block's **lossless** PCM by combining its
     /// coarse `0x0A` stream with the `0x0B` correction stream carried
     /// by `correction` (the paired `.wvc` block) — the spec §4.1
@@ -637,7 +661,11 @@ impl<'a> WavPackBlock<'a> {
     /// `temp` term. The decorrelation passes run on the **coarse**
     /// values (prediction history and weights adapt on the lossy
     /// stream) and the correction difference is folded in afterward —
-    /// the §4.1 post-decorrelation placement. Validated bit-exact
+    /// the §4.1 post-decorrelation placement. Under `CROSS_DECORR` the
+    /// fold moves ahead of the passes (round 493): the difference is
+    /// carried through them, and a zero-delay cross pass predicts its
+    /// second channel from the *lossless* first one
+    /// (`decorrelate_stereo_with_correction`). Validated bit-exact
     /// against reference decodes for mono and left/right-coded stereo
     /// pairs across no-shaping / static-shaping / dynamic-noise-shaping
     /// encodes.
@@ -759,24 +787,14 @@ impl<'a> WavPackBlock<'a> {
                 crate::samples::AdaptiveMedians::from_seed_values(entropy.medians_right)
                     .ok_or(Error::InvalidEntropyInfoForStereo)?,
             ];
-            if flags.joint_stereo {
-                return self.decode_joint_samples_with_correction(
-                    &packed,
-                    &corr_data,
-                    &mut medians,
-                    count,
-                    &mut hybrid,
-                    &mut shaping,
-                );
-            }
-            crate::samples::decode_packed_samples_stereo_hybrid_lossless(
+            return self.decode_stereo_samples_with_correction(
                 &packed,
                 &corr_data,
                 &mut medians,
                 count,
                 &mut hybrid,
                 &mut shaping,
-            )?
+            );
         } else {
             let mut medians = crate::samples::AdaptiveMedians::from_entropy(&entropy, 0)
                 .ok_or(Error::InvalidEntropyInfoForMono)?;
@@ -796,13 +814,8 @@ impl<'a> WavPackBlock<'a> {
         let mut out = coarse.clone();
         if self.has_decorrelation() {
             let (terms, weights, samples) = self.decorr_payloads();
-            if stereo {
-                let mut passes = assemble_stereo_passes(terms, weights, samples)?;
-                decorrelate_stereo(&mut passes, &mut out)?;
-            } else {
-                let mut passes = assemble_mono_passes(terms, weights, samples)?;
-                decorrelate_mono(&mut passes, &mut out)?;
-            }
+            let mut passes = assemble_mono_passes(terms, weights, samples)?;
+            decorrelate_mono(&mut passes, &mut out)?;
         }
         for (o, (e, c)) in out.iter_mut().zip(exact.iter().zip(coarse.iter())) {
             *o = o.wrapping_add(e.wrapping_sub(*c));
@@ -868,7 +881,7 @@ impl<'a> WavPackBlock<'a> {
     /// `d_l = t_m + d_r` — equal to `t_l` / `t_r` when both channels
     /// are bracketed) against the post-undo left/right values.
     #[allow(clippy::too_many_arguments)]
-    fn decode_joint_samples_with_correction(
+    fn decode_stereo_samples_with_correction(
         &self,
         packed: &crate::PackedSamples<'_>,
         corr_data: &crate::PackedCorrectionData<'_>,
@@ -882,22 +895,54 @@ impl<'a> WavPackBlock<'a> {
                 packed, corr_data, medians, count, hybrid,
             )?;
         // Decorrelate the coarse residuals (the lossy prediction
-        // history) — the §4.1 post-decorrelation placement.
-        let mut decor = coarse.clone();
+        // history). `fold` starts as the raw exact-minus-coarse
+        // residual difference and ends as the lossless-minus-lossy
+        // reconstruction difference: unchanged under the §4.1
+        // post-decorrelation placement, carried through the zero-delay
+        // cross passes when `CROSS_DECORR` selects the
+        // pre-decorrelation placement.
+        let mut decor = coarse;
+        let mut fold: Vec<i32> = raw
+            .iter()
+            .zip(decor.iter())
+            .map(|(e, c)| e.wrapping_sub(*c))
+            .collect();
         if self.has_decorrelation() {
             let (terms, weights, samples) = self.decorr_payloads();
             let mut passes = assemble_stereo_passes(terms, weights, samples)?;
-            decorrelate_stereo(&mut passes, &mut decor)?;
+            if self.header.flags.cross_channel_decorrelation {
+                crate::decorrelation::decorrelate_stereo_with_correction(
+                    &mut passes,
+                    &mut decor,
+                    &mut fold,
+                )?;
+            } else {
+                decorrelate_stereo(&mut passes, &mut decor)?;
+            }
         }
+        let joint = self.header.flags.joint_stereo;
         let mut out = Vec::with_capacity(decor.len());
         for f in 0..count {
             let i = 2 * f;
-            // Output-domain (still joint-coded) values after the raw
-            // correction fold, before shaping temps.
-            let mid = decor[i].wrapping_add(raw[i].wrapping_sub(coarse[i]));
-            let side = decor[i + 1].wrapping_add(raw[i + 1].wrapping_sub(coarse[i + 1]));
+            // Coded-domain values after the correction fold, before
+            // shaping temps.
+            let mid = decor[i].wrapping_add(fold[i]);
+            let side = decor[i + 1].wrapping_add(fold[i + 1]);
             let t_l = shaping.advance(0);
             let t_r = shaping.advance(1);
+            if !joint {
+                // Left/right coding: the coded channels are the output
+                // channels, so each takes its own temp directly.
+                let t_a = if bracketed[i] { t_l } else { 0 };
+                let t_b = if bracketed[i + 1] { t_r } else { 0 };
+                let left = mid.wrapping_add(t_a);
+                let right = side.wrapping_add(t_b);
+                shaping.update(0, left, decor[i], t_a);
+                shaping.update(1, right, decor[i + 1], t_b);
+                out.push(left);
+                out.push(right);
+                continue;
+            }
             let t_m = if bracketed[i] {
                 t_l.wrapping_sub(t_r)
             } else {
@@ -8321,7 +8366,7 @@ mod tests {
 
     #[test]
     fn fold_hybrid_correction_accepts_cross_decorr() {
-        // Round 415: `CROSS_DECORR` is set decoratively by current-version
+        // Round 415: `CROSS_DECORR` (no -1 / -2 pass here) is set by current-version
         // reference encoders — their pairs are bit-exact under the
         // post-decorrelation raw add, so the fold applies to cross-flagged
         // blocks too (only noise shaping is excluded).
@@ -8370,9 +8415,8 @@ mod tests {
 
     #[test]
     fn split_hybrid_correction_refuses_shaped_and_mismatch() {
-        // CROSS_DECORR placement folds as the raw post-decorrelation add
-        // (round 415 — the bit is decorative on current-version files),
-        // so the split accepts it symmetrically.
+        // A CROSS_DECORR block with no -1 / -2 pass folds as the raw
+        // post-decorrelation add, so the split accepts it symmetrically.
         let cross = synthesise_block(2, flags_with((1 << 3) | (1 << 5)), &[]);
         let (cblock, _) = parse_block(&cross).unwrap();
         assert_eq!(
