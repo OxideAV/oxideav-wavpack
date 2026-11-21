@@ -398,6 +398,11 @@ pub enum Error {
     /// after-the-fact raw add). The raw post-decorrelation fold is
     /// correct only for the non-cross, non-shaped case.
     HybridFoldPlacementUnsupported,
+    /// A DSD block (header flag bit 31) is structurally invalid: its
+    /// `0x0E` sub-block is missing or malformed, its range-coded data
+    /// ran out, or the block combines DSD with a PCM-only feature. The
+    /// string names the violated rule of the staged DSD chapter.
+    InvalidDsdBlock(&'static str),
     /// A block-encode was requested with an empty PCM buffer. A WavPack
     /// audio block carries `block_samples >= 1` (the wiki "samples in
     /// this block" field is non-zero for an audio block); an encoder
@@ -735,6 +740,9 @@ impl core::fmt::Display for Error {
             Error::HybridFoldPlacementUnsupported => f.write_str(
                 "oxideav-wavpack: hybrid correction-fold requested on a CROSS_DECORR / noise-shaped block — only the non-cross, non-shaped post-decorrelation raw fold is supported",
             ),
+            Error::InvalidDsdBlock(reason) => {
+                write!(f, "oxideav-wavpack: invalid DSD block — {reason}")
+            }
             Error::EncodeEmptyAudio => f.write_str(
                 "oxideav-wavpack: encode_block: empty PCM buffer (an audio block carries block_samples >= 1)",
             ),

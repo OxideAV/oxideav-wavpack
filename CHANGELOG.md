@@ -14,6 +14,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **DSD decode.** Blocks with header flag bit 31 — until now refused
+  under the orientation wiki's reading of the bit as "low-latency, do
+  not decode" — are DSD (1-bit) audio and decode through the new
+  `dsd` module, written from the staged DSD chapter: the `0x0E`
+  sub-block's rate-shift / mode prefix and all three payload forms —
+  stored, "fast" (byte-alphabet range code over a transmitted static
+  context model, both table transports, the interval-collapse
+  restart) and "high" (bit-level adaptive binary range code driven by
+  the six-stage integer predictor, channels interleaved per bit). A
+  DSD sample is a byte of eight 1-bit samples, most-significant bit
+  first, returned as `0..=255`; the block CRC is the mono recurrence
+  over the interleaved bytes; a failed block mutes to DSD silence
+  (`0x55`); `sample_rate` reports the byte rate (header rate × the
+  payload multiplier) and `dsd_native_sample_rate` the 1-bit rate.
+  Multichannel DSD rides the ordinary member sets. New surface:
+  `Flags::is_dsd`, `WavPackBlock::{is_dsd, dsd_header,
+  dsd_native_sample_rate}`, `DsdHeader`, `parse_dsd_header`,
+  `decode_dsd_payload`, the `DSD_*` constants, `Error::InvalidDsdBlock`.
+  The matrix's DSD family (90 outside-encoded streams from DSDIFF
+  sources: both compression settings, 1..6 channels, five rates,
+  lengths around the 280-byte coded threshold; 57 stored / 83 fast /
+  55 high blocks) decodes byte-exactly with every CRC matching —
+  the first decode of that chapter against real streams. Pins:
+  `foreign_dsd_fast_mono`, `foreign_dsd_high_stereo`,
+  `foreign_dsd_stored_stereo`. There is no DSD encoder.
 - **Live black-box matrix** (`tests/blackbox_matrix.rs`): streams
   written by an outside encoder across its option space — every
   speed mode × extra-processing level × stereo coding, 14 integer

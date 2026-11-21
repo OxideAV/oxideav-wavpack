@@ -813,6 +813,7 @@ mod block_header;
 mod correction;
 mod crc;
 mod decorrelation;
+mod dsd;
 mod encode;
 mod entropy;
 mod error;
@@ -875,6 +876,10 @@ pub use crate::block_header::{
     Flags, HEADER_LEN, MAGIC, MAX_VERSION, MIN_CK_SIZE, MIN_VERSION, SAMPLE_RATE_INDEX_CUSTOM,
     STANDARD_SAMPLE_RATES, TOTAL_SAMPLES_UNKNOWN, WavPackBlockHeader, leading_non_block_bytes,
     parse_block_header, sample_rate_index_for,
+};
+pub use crate::dsd::{
+    DSD_MAX_RATE_SHIFT, DSD_MODE_FAST, DSD_MODE_HIGH, DSD_MODE_STORED, DSD_SILENCE, DsdHeader,
+    decode_dsd_payload, parse_dsd_header,
 };
 // Typed sub-block views that appear in `WavPackBlock` accessor signatures
 // stay on the stable surface; their expanders/finders are internal (below).

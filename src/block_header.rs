@@ -177,9 +177,10 @@ pub struct Flags {
     /// Bit 30: false stereo (the stream is stereo, but this specific
     /// block carries mono data). Wiki marks this as version >= 0x410.
     pub false_stereo: bool,
-    /// Bit 31: wiki "low-latency block (experimental, do not decode
-    /// if encountered)". Stored verbatim; gating is the decode
-    /// layer's job.
+    /// Bit 31: the block carries **DSD** (1-bit) audio (stream format
+    /// 5.0+, published file-format description §2.0). The field keeps
+    /// the name of the orientation wiki's older reading of the bit
+    /// ("low-latency block, do not decode"); prefer [`Self::is_dsd`].
     pub low_latency_block: bool,
 }
 
@@ -344,11 +345,18 @@ impl Flags {
             .copied()
     }
 
-    /// `true` when the wiki bit 31 "low-latency block (experimental,
-    /// **do not decode if encountered**)" is set. The wiki gates the
-    /// decode-time response on this bit explicitly; the parser preserves
-    /// the flag and this accessor surfaces the wiki contract for the
-    /// decode layer.
+    /// `true` when bit 31 is set: the block carries DSD (1-bit) audio
+    /// in a `0x0E` sub-block (published file-format description §2.0;
+    /// staged spec `wavpack-dsd.md` §1.1). Its samples are bytes of
+    /// eight 1-bit samples, most-significant bit first.
+    pub fn is_dsd(&self) -> bool {
+        self.low_latency_block
+    }
+
+    /// Bit 31 under the orientation wiki's older reading ("low-latency
+    /// block, do not decode"). The bit marks a DSD block, which this
+    /// crate decodes; the accessor is kept for callers of the earlier
+    /// surface and simply reports the bit — use [`Self::is_dsd`].
     pub fn should_skip_decode(&self) -> bool {
         self.low_latency_block
     }

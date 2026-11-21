@@ -1782,3 +1782,258 @@ fn ours_hybrid() {
     }
     run_emitted("ours-hybrid", out);
 }
+
+// ---------------------------------------------------------------------
+// DSD: foreign → ours
+// ---------------------------------------------------------------------
+
+/// 1-bit content for one channel, packed eight samples per byte, most
+/// significant bit first.
+fn dsd_channel(kind: Content, bytes: usize, native_rate: u32, channel: usize) -> Vec<u8> {
+    let mut rng = Lcg(0xD5D ^ (channel as u64) << 8);
+    let mut integrators = (0.0f64, 0.0f64);
+    let mut out = Vec::with_capacity(bytes);
+    for n in 0..bytes {
+        let mut byte = 0u8;
+        for k in 0..8 {
+            let index = n * 8 + k;
+            let bit = match kind {
+                // DSD silence: the alternating pattern.
+                Content::Silence => index & 1 == 1,
+                Content::Noise => rng.next() & 0x8000 != 0,
+                _ => {
+                    // Second-order sigma-delta modulation of a tone
+                    // (with silent stretches for the burst kind).
+                    let t = index as f64 / f64::from(native_rate);
+                    let quiet = kind == Content::Bursts && (n / 3_000) % 2 == 1;
+                    let x = if quiet {
+                        0.0
+                    } else {
+                        0.5 * (std::f64::consts::TAU * 1_000.0 * (channel + 1) as f64 * t).sin()
+                    };
+                    let y = if integrators.1 >= 0.0 { 1.0 } else { -1.0 };
+                    integrators.0 += x - y;
+                    integrators.1 += integrators.0 - y;
+                    y > 0.0
+                }
+            };
+            byte = (byte << 1) | u8::from(bit);
+        }
+        out.push(byte);
+    }
+    out
+}
+
+/// Write a DSDIFF container around interleaved DSD bytes.
+fn write_dff(path: &Path, channels: usize, native_rate: u32, interleaved: &[u8]) {
+    fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut c = id.to_vec();
+        c.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        c.extend_from_slice(body);
+        if body.len() & 1 == 1 {
+            c.push(0);
+        }
+        c
+    }
+    let mut chnl = (channels as u16).to_be_bytes().to_vec();
+    for ch in 0..channels {
+        let id: [u8; 4] = match (channels, ch) {
+            (2, 0) => *b"SLFT",
+            (2, 1) => *b"SRGT",
+            _ => {
+                let s = format!("C{ch:03}");
+                s.as_bytes().try_into().expect("four bytes")
+            }
+        };
+        chnl.extend_from_slice(&id);
+    }
+    let mut cmpr = b"DSD ".to_vec();
+    cmpr.push(14);
+    cmpr.extend_from_slice(b"not compressed");
+    cmpr.push(0);
+    let mut prop = b"SND ".to_vec();
+    prop.extend(chunk(b"FS  ", &native_rate.to_be_bytes()));
+    prop.extend(chunk(b"CHNL", &chnl));
+    prop.extend(chunk(b"CMPR", &cmpr));
+    let mut body = b"DSD ".to_vec();
+    body.extend(chunk(b"FVER", &0x0105_0000u32.to_be_bytes()));
+    body.extend(chunk(b"PROP", &prop));
+    body.extend(chunk(b"DSD ", interleaved));
+    let mut file = b"FRM8".to_vec();
+    file.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    file.extend(body);
+    std::fs::write(path, file).expect("write dff");
+}
+
+/// One DSD case: content kind, channel count, bytes per channel, the
+/// 1-bit sample rate and the encoder options.
+struct DsdCase {
+    name: String,
+    kind: Content,
+    channels: usize,
+    bytes: usize,
+    rate: u32,
+    mode: &'static [&'static str],
+}
+
+/// DSD streams from the outside encoder — both compression modes, the
+/// stored fallback (noise and tiny blocks), 1..6 channels, three
+/// rates, lengths around the 280-byte coded-block threshold — must
+/// decode to the source bytes with every block CRC matching.
+#[test]
+fn foreign_dsd() {
+    if !tools_present() {
+        return;
+    }
+    let scratch = Scratch::new("dsd");
+    let mut cases: Vec<DsdCase> = Vec::new();
+    let mut push = |stem: String, kind, channels, bytes, rate| {
+        for mode in [&[][..], &["-h"][..]] {
+            cases.push(DsdCase {
+                name: format!("{stem}{}", mode.first().copied().unwrap_or("")),
+                kind,
+                channels,
+                bytes,
+                rate,
+                mode,
+            });
+        }
+    };
+    for kind in [
+        Content::Music,
+        Content::Bursts,
+        Content::Noise,
+        Content::Silence,
+    ] {
+        for channels in [1usize, 2, 3, 6] {
+            push(
+                format!("{kind:?}-{channels}ch"),
+                kind,
+                channels,
+                24_000,
+                2_822_400,
+            );
+        }
+    }
+    for bytes in [
+        1usize, 2, 139, 140, 141, 279, 280, 281, 4_095, 4_096, 4_097, 90_000,
+    ] {
+        for channels in [1usize, 2] {
+            push(
+                format!("len{bytes}-{channels}ch"),
+                Content::Music,
+                channels,
+                bytes,
+                2_822_400,
+            );
+        }
+    }
+    for rate in [5_644_800u32, 11_289_600, 3_072_000, 1_000_000, 2_822_408] {
+        push(format!("rate{rate}"), Content::Music, 2, 12_000, rate);
+    }
+    let total = cases.len();
+    let mut failures = Vec::new();
+    let mut modes_seen = [0usize; 4];
+    for DsdCase {
+        name,
+        kind,
+        channels,
+        bytes,
+        rate,
+        mode,
+    } in &cases
+    {
+        let verdict = (|| -> Result<(), String> {
+            let per_channel: Vec<Vec<u8>> = (0..*channels)
+                .map(|ch| dsd_channel(*kind, *bytes, *rate, ch))
+                .collect();
+            let mut source = Vec::with_capacity(bytes * channels);
+            for n in 0..*bytes {
+                for ch in &per_channel {
+                    source.push(ch[n]);
+                }
+            }
+            let dff = scratch.path("in.dff");
+            let wv = scratch.path("out.wv");
+            let raw = scratch.path("ref.raw");
+            let _ = std::fs::remove_file(&wv);
+            let _ = std::fs::remove_file(&raw);
+            write_dff(&dff, *channels, *rate, &source);
+            let mut cmd = Command::new("wavpack");
+            cmd.args(["-q", "-y"])
+                .args(*mode)
+                .arg(&dff)
+                .arg("-o")
+                .arg(&wv);
+            run(&mut cmd).map_err(|e| format!("encoder refused the case: {e}"))?;
+            let mut cmd = Command::new("wvunpack");
+            cmd.args(["-q", "-y", "--raw"]).arg(&wv).arg("-o").arg(&raw);
+            run(&mut cmd)?;
+            let reference = std::fs::read(&raw).map_err(|e| format!("read raw: {e}"))?;
+            if reference != source {
+                return Err("the outside decoder does not return the source bytes".to_string());
+            }
+            let wv_bytes = std::fs::read(&wv).map_err(|e| format!("read wv: {e}"))?;
+            for block in oxideav_wavpack::iter_blocks(&wv_bytes) {
+                let block = block.map_err(|e| format!("block parse: {e}"))?;
+                if let Some(header) = block
+                    .dsd_header()
+                    .map_err(|e| format!("0x0E prefix: {e}"))?
+                {
+                    modes_seen[usize::from(header.mode)] += 1;
+                }
+            }
+            let (decoded, ok) = decode_multichannel_stream_muted(&wv_bytes)
+                .map_err(|e| format!("decode error: {e}"))?;
+            if !ok {
+                return Err("a stored block CRC did not match".to_string());
+            }
+            if decoded.channels != *channels {
+                return Err(format!("channel count {}", decoded.channels));
+            }
+            let want: Vec<i32> = source.iter().map(|&b| i32::from(b)).collect();
+            if decoded.samples != want {
+                return Err(format!(
+                    "decode differs from the source: {}",
+                    first_diff(&decoded.samples, &want)
+                ));
+            }
+            // The stream rate is the byte rate: one eighth of the 1-bit rate.
+            let byte_rate = stream_sample_rate(&wv_bytes).map_err(|e| format!("rate: {e}"))?;
+            if byte_rate != Some(rate / 8) {
+                return Err(format!("byte rate {byte_rate:?}, expected {}", rate / 8));
+            }
+            Ok(())
+        })();
+        if verbose() {
+            eprintln!(
+                "dsd: {name:<32} {}",
+                match &verdict {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("FAIL {e}"),
+                }
+            );
+        }
+        if let Err(e) = verdict {
+            failures.push(format!("{name}: {e}"));
+        }
+    }
+    eprintln!(
+        "blackbox_matrix dsd: {}/{} cases decode to the source (blocks seen: {} stored, {} fast, {} high)",
+        total - failures.len(),
+        total,
+        modes_seen[0],
+        modes_seen[1],
+        modes_seen[3]
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {total} DSD cases failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert!(
+        modes_seen[0] > 0 && modes_seen[1] > 0 && modes_seen[3] > 0,
+        "the sweep must reach all three payload modes"
+    );
+}

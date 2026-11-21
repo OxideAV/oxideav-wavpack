@@ -757,10 +757,9 @@ impl<'a> WavPackBlock<'a> {
         if !self.header.is_audio_block() {
             return Err(Error::BlockHasNoAudio);
         }
-        if flags.low_latency_block {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::LowLatencyBlock,
-            ));
+        if flags.is_dsd() {
+            // DSD is never hybrid (DSD chapter §7.1).
+            return Err(Error::InvalidDsdBlock("hybrid flag on a DSD block"));
         }
         // A correction twin without an 0x0B sub-block is legal when the
         // main block spends no bracket bits (e.g. an all-silence block
@@ -879,7 +878,7 @@ impl<'a> WavPackBlock<'a> {
             crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
         } else {
             // Spec §5.6: mute (zero) the block on a CRC mismatch.
-            pcm.iter_mut().for_each(|s| *s = 0);
+            self.mute(&mut pcm);
         }
         Ok((self.expand_false_stereo(pcm), crc_ok))
     }
@@ -1072,15 +1071,36 @@ impl<'a> WavPackBlock<'a> {
     /// [`Error::SampleRatePayloadLength`] for a malformed `0x27`
     /// payload. Round 405.
     pub fn sample_rate(&self) -> Result<Option<u32>> {
-        if let Some(rate) = self.header.flags.standard_sample_rate() {
-            return Ok(Some(rate));
+        let reduced = if let Some(rate) = self.header.flags.standard_sample_rate() {
+            Some(rate)
+        } else {
+            match crate::metadata::find_non_standard_sample_rate(&self.sub_blocks) {
+                Some(sub) => Some(crate::metadata::parse_non_standard_sample_rate(
+                    sub.payload,
+                )?),
+                None => None,
+            }
+        };
+        // A DSD block's header carries a *reduced* rate; the byte rate
+        // — the rate block indices and seeking run in — is that times
+        // the `0x0E` payload's power-of-two multiplier (DSD chapter
+        // §2.3). A product past `u32` is reported as unknown.
+        match (reduced, self.dsd_header()?) {
+            (Some(rate), Some(dsd)) => Ok(rate
+                .checked_shl(u32::from(dsd.rate_shift))
+                .filter(|scaled| scaled >> dsd.rate_shift == rate)),
+            (rate, _) => Ok(rate),
         }
-        match crate::metadata::find_non_standard_sample_rate(&self.sub_blocks) {
-            Some(sub) => Ok(Some(crate::metadata::parse_non_standard_sample_rate(
-                sub.payload,
-            )?)),
-            None => Ok(None),
+    }
+
+    /// The native 1-bit sample rate of a DSD block — eight times the
+    /// byte rate [`Self::sample_rate`] reports (2 822 400 Hz for
+    /// DSD64) — or `None` for a PCM block or an unknown rate.
+    pub fn dsd_native_sample_rate(&self) -> Result<Option<u64>> {
+        if !self.is_dsd() {
+            return Ok(None);
         }
+        Ok(self.sample_rate()?.map(|rate| u64::from(rate) * 8))
     }
 
     /// Locate the `0x0D` multichannel-information sub-block and parse
@@ -1258,6 +1278,65 @@ impl<'a> WavPackBlock<'a> {
     /// A no-op for every other shape (true mono bit 2, or real
     /// stereo). Runs AFTER the CRC fold and the sample-format / shift
     /// fixups — those all operate on the coded single channel.
+    /// Overwrite a block's samples with silence — the spec §5.6 mute.
+    /// PCM silence is zero; DSD silence is the alternating bit pattern
+    /// `0x55` (a zero byte would be full-scale negative, DSD chapter
+    /// §1.4).
+    fn mute(&self, pcm: &mut [i32]) {
+        let silence = if self.header.flags.is_dsd() {
+            i32::from(crate::dsd::DSD_SILENCE)
+        } else {
+            0
+        };
+        pcm.fill(silence);
+    }
+
+    /// `true` when the block carries DSD (1-bit) audio — header flag
+    /// bit 31. Its decoded samples are byte values `0..=255`, each
+    /// holding eight 1-bit samples most-significant bit first.
+    pub fn is_dsd(&self) -> bool {
+        self.header.flags.is_dsd()
+    }
+
+    /// The parsed two-byte prefix of a DSD block's `0x0E` payload
+    /// (rate shift + mode), or `None` when the block is not DSD.
+    pub fn dsd_header(&self) -> Result<Option<crate::DsdHeader>> {
+        if !self.is_dsd() {
+            return Ok(None);
+        }
+        let sub = self
+            .find_sub_block(SubBlockId::DsdBlock)
+            .ok_or(Error::InvalidDsdBlock("no 0x0E sub-block"))?;
+        crate::dsd::parse_dsd_header(sub.payload).map(Some)
+    }
+
+    /// Decode a DSD block's coded channel(s): `block_samples` bytes per
+    /// coded channel, interleaved, as values `0..=255` (DSD chapter
+    /// §§3–6). The flag-word constraints of §1.2 are enforced: a DSD
+    /// block is never hybrid, float or wide-integer.
+    fn decode_dsd_bytes(&self) -> Result<Vec<i32>> {
+        let flags = &self.header.flags;
+        if flags.hybrid {
+            return Err(Error::InvalidDsdBlock("hybrid flag on a DSD block"));
+        }
+        if flags.float_data || flags.int32_mode {
+            return Err(Error::InvalidDsdBlock(
+                "PCM sample-format flag on a DSD block",
+            ));
+        }
+        if flags.mono && flags.false_stereo {
+            return Err(Error::InvalidDsdBlock("both mono and false-stereo set"));
+        }
+        if self.header.block_samples > MAX_DECODE_SAMPLES_PER_BLOCK {
+            return Err(Error::BlockSamplesTooLarge(self.header.block_samples));
+        }
+        let sub = self
+            .find_sub_block(SubBlockId::DsdBlock)
+            .ok_or(Error::InvalidDsdBlock("no 0x0E sub-block"))?;
+        let channels = if flags.is_block_data_mono() { 1 } else { 2 };
+        crate::dsd::decode_dsd_payload(sub.payload, self.header.block_samples as usize, channels)
+    }
+
     fn expand_false_stereo(&self, pcm: Vec<i32>) -> Vec<i32> {
         let flags = &self.header.flags;
         if !flags.false_stereo || flags.mono {
@@ -1344,15 +1423,15 @@ impl<'a> WavPackBlock<'a> {
         // reference-encoded files carry it on every block, so refusing
         // it rejected every real file. Only bit 31 (below) carries the
         // wiki's "do not decode" instruction.
-        if flags.low_latency_block {
-            return Err(Error::UnsupportedBlockFeature(
-                UnsupportedBlockFeature::LowLatencyBlock,
-            ));
-        }
         if flags.is_multichannel_member() && !allow_member {
             return Err(Error::UnsupportedBlockFeature(
                 UnsupportedBlockFeature::MultichannelMember,
             ));
+        }
+        // Bit 31 marks a DSD block: its audio is the `0x0E` sub-block,
+        // decoded on its own path (staged spec `wavpack-dsd.md`).
+        if flags.is_dsd() {
+            return self.decode_dsd_bytes();
         }
         // Decorrelation: both the mono and the stereo lossless paths are
         // wired. The decorrelation-spec doc §3 specifies the per-channel
@@ -1584,7 +1663,7 @@ impl<'a> WavPackBlock<'a> {
         if crc_ok {
             crate::fixup::apply_left_shift_buffer(&mut pcm, self.header.flags.left_shift);
         } else {
-            pcm.iter_mut().for_each(|s| *s = 0);
+            self.mute(&mut pcm);
         }
         Ok((self.expand_false_stereo(pcm), crc_ok))
     }
@@ -1638,7 +1717,9 @@ impl<'a> WavPackBlock<'a> {
     /// produces (the §5.4 mid/side undo already applied), so the plain
     /// stereo CRC step is correct for both joint and non-joint blocks.
     fn crc_of_decoded(&self, pcm: &[i32]) -> u32 {
-        if self.header.flags.is_block_data_mono() {
+        // A DSD block folds the mono recurrence over its bytes in
+        // interleaved order, stereo included (DSD chapter §2.4).
+        if self.header.flags.is_block_data_mono() || self.header.flags.is_dsd() {
             crate::crc::crc_mono(pcm)
         } else {
             crate::crc::crc_stereo_interleaved(pcm)
@@ -1929,7 +2010,7 @@ impl<'a> WavPackBlock<'a> {
         } else {
             // Spec §5.6: mute (zero) the block on a CRC mismatch. A zeroed
             // buffer is shift-invariant, so no fixup is needed.
-            pcm.iter_mut().for_each(|s| *s = 0);
+            self.mute(&mut pcm);
         }
         Ok((self.expand_false_stereo(pcm), crc_ok))
     }
@@ -5312,17 +5393,78 @@ mod tests {
     }
 
     #[test]
-    fn decode_samples_rejects_low_latency_block() {
+    fn dsd_block_without_its_sub_block_is_invalid() {
+        // Bit 31 marks a DSD block; its audio is the 0x0E sub-block and
+        // a PCM bitstream in its place does not make it decodable.
         let mut payload = Vec::new();
         append_entropy_info_mono_zero(&mut payload);
         append_packed_samples(&mut payload, &[0x00, 0x00]);
         let bytes = synthesise_block(1, flags_with((1 << 2) | (1 << 31)), &payload);
         let (block, _) = parse_block(&bytes).expect("parse block");
-        let err = block.decode_samples().expect_err("must refuse low-latency");
+        assert!(block.is_dsd());
         assert_eq!(
-            err,
-            Error::UnsupportedBlockFeature(UnsupportedBlockFeature::LowLatencyBlock)
+            block.decode_samples().expect_err("no 0x0E sub-block"),
+            Error::InvalidDsdBlock("no 0x0E sub-block")
         );
+    }
+
+    /// A stored-mode (`0x0E` mode 0) stereo DSD block: bytes come back
+    /// verbatim as 0..=255, the block CRC is the mono recurrence over
+    /// the interleaved bytes, a failed CRC mutes to DSD silence, and
+    /// the byte rate is the header rate times the payload multiplier.
+    #[test]
+    fn dsd_stored_block_decodes_checks_and_mutes() {
+        let data = [0x69u8, 0x96, 0xFF, 0x00, 0x55, 0xAA];
+        let mut dsd = vec![2u8, 0]; // rate shift 2, stored
+        dsd.extend_from_slice(&data);
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x0E, &dsd);
+        // Stereo, DSD, standalone, rate index 12 (88 200 Hz).
+        let flags = (1u32 << 31) | (12 << 23) | (0b11 << 11);
+        let mut bytes = synthesise_block(3, flags, &payload);
+        let expected: Vec<i32> = data.iter().map(|&b| i32::from(b)).collect();
+        let crc = crate::crc::crc_mono(&expected);
+        bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(block.decode_samples().unwrap(), expected);
+        assert_eq!(
+            block.decode_samples_muted().unwrap(),
+            (expected.clone(), true)
+        );
+        assert_eq!(block.sample_rate().unwrap(), Some(352_800));
+        assert_eq!(block.dsd_native_sample_rate().unwrap(), Some(2_822_400));
+        assert_eq!(decode_stream(&bytes).unwrap(), expected);
+
+        // A wrong stored CRC mutes the block to 0x55, not to zero.
+        bytes[28] ^= 1;
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(
+            block.decode_samples_muted().unwrap(),
+            (vec![0x55; 6], false)
+        );
+
+        // False stereo: one coded channel, duplicated after the CRC.
+        let mut dsd = vec![0u8, 0];
+        dsd.extend_from_slice(&data[..4]);
+        let mut payload = Vec::new();
+        append_small_sub_block(&mut payload, 0x0E, &dsd);
+        let flags = (1u32 << 31) | (1 << 30) | (0b11 << 11);
+        let mut bytes = synthesise_block(4, flags, &payload);
+        let coded: Vec<i32> = data[..4].iter().map(|&b| i32::from(b)).collect();
+        bytes[28..32].copy_from_slice(&crate::crc::crc_mono(&coded).to_le_bytes());
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert_eq!(
+            block.decode_samples_muted().unwrap(),
+            (vec![0x69, 0x69, 0x96, 0x96, 0xFF, 0xFF, 0x00, 0x00], true)
+        );
+        // A PCM-only flag on a DSD block is malformed.
+        let flags = (1u32 << 31) | (1 << 3) | (0b11 << 11);
+        let bytes = synthesise_block(2, flags, &payload);
+        let (block, _) = parse_block(&bytes).expect("parse block");
+        assert!(matches!(
+            block.decode_samples(),
+            Err(Error::InvalidDsdBlock(_))
+        ));
     }
 
     #[test]

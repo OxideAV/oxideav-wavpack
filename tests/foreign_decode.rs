@@ -90,6 +90,9 @@
 //! | `foreign_tagged_md5_stereo`    | `-m -w …`    | 16-bit stereo with an MD5 sub-block and a trailing APEv2 tag (whose text names the block magic) — pins the walkers skipping bytes outside the blocks (round 493) |
 //! | `foreign_optimized_int32`      | `--optimize-int32` | 32-bit int stereo whose extension stream rides the reserved `0x2C` sub-block form — pins the typed refusal (round 493; no expected PCM) |
 //! | `foreign_hybrid_pair_shaped_resume` | `-b4 -c -s0.5 -x0` | joint pair, static positive shaping, signal resuming after 250 silent frames: the side channel is read exactly (`error_limit == 0`) while the right output's shaping error is non-zero — pins the feedback term applying to every sample (round 493) |
+//! | `foreign_dsd_fast_mono`        | default (DSDIFF source) | DSD64 mono, `0x0E` mode 1 — byte-alphabet range code over the transmitted context model (round 493; expected bytes in the `.dsd` sidecar) |
+//! | `foreign_dsd_high_stereo`      | `-h` (DSDIFF source) | DSD64 stereo, `0x0E` mode 3 — bit-level adaptive range code, channels interleaved per bit |
+//! | `foreign_dsd_stored_stereo`    | default (DSDIFF source) | DSD64 stereo below the 280-byte coded threshold, `0x0E` mode 0 — stored |
 //!
 //! The 8-bit expectation is in signed container values (the WAV source is
 //! unsigned 8-bit; WavPack codes the signed offset-removed value, which
@@ -768,3 +771,62 @@ fn foreign_5dot1_channel_info_declares_count_and_mask() {
             .is_none()
     );
 }
+
+/// DSD fixtures (round 493): the outside encoder fed a DSDIFF source.
+/// The `.dsd` sidecar is the source's interleaved byte stream — eight
+/// 1-bit samples per byte, most-significant bit first — which is also
+/// what the outside decoder returns for the file.
+macro_rules! dsd_fixture {
+    ($name:ident, $stem:literal, $channels:expr_2021, $mode:expr_2021) => {
+        #[test]
+        fn $name() {
+            let wv = include_bytes!(concat!("data/", $stem, ".wv"));
+            let expected: Vec<i32> = include_bytes!(concat!("data/", $stem, ".dsd"))
+                .iter()
+                .map(|&b| i32::from(b))
+                .collect();
+            let (decoded, all_ok) = decode_multichannel_stream_muted(wv).expect("DSD decode");
+            assert!(all_ok, "stored block CRC(s) must match");
+            assert_eq!(decoded.channels, $channels);
+            assert_eq!(decoded.samples, expected, "byte-exact DSD");
+            let block = oxideav_wavpack::first_audio_block(wv).unwrap().unwrap();
+            assert!(block.is_dsd());
+            assert_eq!(block.dsd_header().unwrap().unwrap().mode, $mode);
+            // DSD64: 352 800 bytes per second, 2 822 400 one-bit samples.
+            assert_eq!(
+                oxideav_wavpack::stream_sample_rate(wv).unwrap(),
+                Some(352_800)
+            );
+            assert_eq!(block.dsd_native_sample_rate().unwrap(), Some(2_822_400));
+            assert!(StreamIndex::scan(wv).unwrap().is_seekable());
+            // Corrupting the coded payload must not get past the CRC:
+            // the block is refused or muted to DSD silence (0x55).
+            let mut bad = wv.to_vec();
+            let at = bad.len() - 12;
+            bad[at] ^= 0x10;
+            if let Ok((muted, ok)) = decode_multichannel_stream_muted(&bad) {
+                assert!(!ok, "a flipped payload bit must fail the block CRC");
+                assert!(muted.samples.iter().all(|&s| s == 0x55));
+            }
+        }
+    };
+}
+
+dsd_fixture!(
+    dsd_fast_mono_is_byte_exact,
+    "foreign_dsd_fast_mono",
+    1,
+    oxideav_wavpack::DSD_MODE_FAST
+);
+dsd_fixture!(
+    dsd_high_stereo_is_byte_exact,
+    "foreign_dsd_high_stereo",
+    2,
+    oxideav_wavpack::DSD_MODE_HIGH
+);
+dsd_fixture!(
+    dsd_stored_stereo_is_byte_exact,
+    "foreign_dsd_stored_stereo",
+    2,
+    oxideav_wavpack::DSD_MODE_STORED
+);
