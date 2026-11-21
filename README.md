@@ -7,45 +7,118 @@ Pure-Rust WavPack lossless audio codec for the
 
 ## Status
 
-The crate parses the WavPack block container and decodes the
-modified-Rice entropy stream to PCM, with a matching exact-inverse
-encoder on the write side. **Arbitrary reference-encoded lossless AND
-hybrid files — including every `.wv`+`.wvc` hybrid-lossless pair
-shape — decode bit-exactly** (rounds 405/408/415): 16/24/32-bit
-integer, 32-bit float (every documented `0x08` profile shape, inf/NaN
-included), mono / stereo (left-right and joint) / false-stereo /
-multichannel, every standard encoder effort mode, the hybrid `-b`
-bitrate range, and the `-c`/`-cc` correction-file modes — validated
-black-box against the reference decoder on a 59-fixture battery
-committed under `tests/data/`. Since round 418 the encoder
-**originates every axis it decodes**: `FLOAT_DATA` and `INT32_DATA`
-streams (data-derived `0x08`/`0x09` profiles + `0x0C` extension
-streams), and **hybrid encoding** — a lossy `.wv` at a caller-chosen
-§6.5 bitrate word plus the `.wvc` correction twin that restores the
-input bit-exactly. Round 420 adds **noise-shaping origination**
-(`0x07` emission: static and ramping weights, per-output-channel
-joint transform, quantized state carried across blocks) and wires
-**float / hybrid encoding through the framework registry** (typed
-options: `mode`, `bits_per_sample`, `shaping`, `joint`; `F32` and
-full-range `S32` input, lossless). Every emitted stream/pair decodes
-byte-identically through this crate's own decoder *and* the reference
-decoder binary (30-case round-420 black-box battery on top of the
-round-418 35-case one: mono/stereo × joint/left-right × shaping
-off/static ±/full-scale/ramp × bitrate words 0..2000 × int/float/int32
-× multi-block × silence × delta-clamp imbalance × clipping-adjacent
-content). Round 447 pins the noise-shaping recurrence to the staged
-spec §4.4/§4.4.1 (the former negative-weight gap, now closed: the
-nudge is an **equality test** gated on `NEW_SHAPING`, the compact
-2-byte `0x07` form parses, and out-of-rail trajectories legitimately
-diverge into the mute gate instead of being clamped) and **closes the
-multichannel origination matrix**: wider-than-stereo layouts encode
-with real per-member compression (stereo-pair members through the
-full mode search — 50.8–61.1 % of the raw-member size on correlated
-content), in every sample format (16/24-bit, full-range int32, float)
-and every mode (lossless and hybrid, lossy `.wv` or bit-exact
-`.wv`+`.wvc` pair), in-crate and through the framework registry — 62
-black-box checks this round, all bit-exact under the reference
-decoder binary.
+A WavPack decoder and encoder: the block container, the modified-Rice
+entropy coder, the decorrelation stack, hybrid (lossy) mode with its
+correction file and noise shaping, float and 32-bit integer sample
+formats, multichannel member sets, DSD, seeking, and registration in
+the oxideav framework.
+
+**Decode** — lossless, hybrid lossy, hybrid `.wv` + `.wvc` pairs and
+DSD, for 1..=32-bit integer and 32-bit float PCM at 1..256 channels.
+**Encode** — lossless, hybrid lossy and hybrid pairs (with noise
+shaping), integer / float / 32-bit integer, 1..256 channels. There is
+no DSD encoder.
+
+### Verified against outside tools
+
+`tests/blackbox_matrix.rs` drives an outside encoder and an outside
+decoder as black boxes over generated content; nothing in it is a
+committed fixture, and it skips at run time when the tools are absent.
+
+**Outside encoder → this decoder: 1431 streams.** Each is decoded here
+and compared sample-for-sample with the outside decoder's output of
+the same file (and with the source where the path is lossless; a
+hybrid `.wv` decoded alone must equal the outside *lossy* decode bit
+for bit, which the format's integer arithmetic determines).
+
+| Family | Sweep | Streams |
+| --- | --- | --- |
+| lossless modes | 4 speed modes × 7 extra-processing levels × stereo coding, mono + stereo | 112 |
+| lossless formats | 14 integer depths (1..32 bits, odd ones included) + float × 4 modes × mono / stereo × 3–4 content kinds | 368 |
+| channels and rates | 1..18, 24, 32, 33, 64, 255, 256 channels with speaker masks; 27 sample rates, 1 Hz to 16 777 215 Hz | 185 |
+| lengths and blocks | 1 frame to 60 s; 11 block-size option shapes | 67 |
+| container options | MD5, tags, header stripping, pre-quantisation, unassigned-channel pairing, 32-bit optimisation | 29 |
+| hybrid | 14 bitrates; 4 modes × 5 extra levels × 3 codings × 3 correction kinds; 7 shaping options; shaping over silence and short blocks | 400 |
+| hybrid formats | 8 integer depths + float, 3..8 channels, lengths, long files with silence | 180 |
+| DSD | both compression settings, 1..6 channels, 5 rates, lengths around the 280-byte coded threshold | 90 |
+
+**1423 decode exactly.** The other 8 are 32-bit streams written with
+the outside encoder's 32-bit optimisation option, whose extension
+stream uses a sub-block form (`0x2C`) the staged documents do not
+describe; they are refused with a typed error rather than decoded at
+reduced resolution. In 5 of the 1423, the lossy half of a
+correction-file encode over content with silent stretches is muted by
+the outside decoder itself (it rejects blocks of its own stream); this
+crate's decode of those blocks satisfies their stored CRC, and the pair
+decode matches.
+
+**This encoder → outside reader: 1797 streams**, every one verified
+silently by the outside reader and decoded by it to the source (or,
+for a hybrid `.wv` alone, to this crate's own lossy decode): 800
+lossless integer streams (every entry point × 4 profiles × 3 block
+sizes × 5 widths × 5 content kinds, lengths from one frame, stamped
+sample rates), 221 float / 32-bit integer / multichannel streams up to
+256 channels, 768 hybrid streams and pairs (5 bitrates × 6 shaping
+settings × stereo coding × 4 profiles × correction on/off, plus other
+widths, float, 32-bit integer and 3..8 channels), and 8 streams
+written packet by packet through the framework encoder.
+
+The matrix found, and this round fixed, decode errors that the earlier
+self-written fixtures could not: seed order of fixed-lag passes
+(any stream from the outside encoder's filter search could decode
+wrongly from its first sample), the seed words of term `-3`, hybrid
+pairs with zero-delay cross passes under `CROSS_DECORR`, the lossy
+decode of redundancy-stripped 8..24-bit blocks, noise shaping on
+samples that were not bracketed, files carrying tags, and the RIFF
+sub-block IDs; and on the encode side, shaped hybrid pairs over
+content with silence that an outside reader rejected.
+
+Compression on 20 s of 44.1 kHz stereo (synthesised plucked strings, a
+swept tone and faint pink noise), stream size as a share of the PCM
+bytes: this encoder 52.9 % (`Fast` / `Normal`), 52.8 % (`High` /
+`Extra`), 52.2 % (`smallest`); the outside encoder 54.7 % (fast),
+53.0 % (default), 52.5 % (high), 52.0 % (very high), 51.8 % (very
+high with extra processing 3).
+
+### Not verified, not supported
+
+* Streams older than version `0x410` (the outside encoder writes only
+  the current version): parsed, never decoded against an outside
+  stream.
+* The 32-bit optimisation extension form (`0x2C`) — refused, see
+  above.
+* The per-block mute limit the outside decoder applies from the
+  header's maximum-magnitude field: not described by the staged
+  documents, not applied here.
+* The block checksum sub-block (`0x2F`) and the MD5 sub-block are
+  parsed but not verified; the encoder writes neither, nor RIFF
+  headers or tags.
+* Header bytes 10–11 carry the upper 8 bits of the 40-bit sample
+  counters in version 5 streams; this crate reads the 32-bit fields
+  only (files past 2³² frames).
+* DSD: decode only; the mode-1 interval-collapse restart and the
+  verbatim model-table form are implemented from the staged chapter
+  but no outside stream exercised them.
+
+### Speed
+
+One thread, 20 s of 44.1 kHz 16-bit stereo, as a multiple of real
+time (medians; old and new binaries run alternately on a busy shared
+host — `examples/wvbench` reproduces them):
+
+| | before | after |
+| --- | --- | --- |
+| decode, outside-encoded fast mode | 407 × | 623 × |
+| decode, outside-encoded default mode | 332 × | 532 × |
+| decode, outside-encoded very-high mode | 195 × | 341 × |
+| encode `Normal` | 26 × | 39 × |
+| encode `High` | 13.7 × | 22.5 × |
+| encode `Extra` | 8.1 × | 13 × |
+| encode `smallest` | 3.5 × | 6.5 × |
+
+The gains come from word-at-a-time bit I/O and from running the
+decorrelation stack over cache-sized stretches with per-term loops;
+encoder output is byte-identical.
 
 Working surface:
 
@@ -393,7 +466,10 @@ Working surface:
 * **`0x0D` first-member channel geometry** — `parse_channel_info` /
   `ChannelInfo` (staged §6 erratum pin: `[count, mask]` with a
   little-endian Microsoft speaker mask; zero-length mask = "no
-  assignment"; the extended >32-channel form is a typed refusal),
+  assignment"), plus the long form streams with more than 8 member
+  blocks per set carry (`[count − 1, streams − 1, 0, mask]`, read off
+  outside-encoded 9..256-channel streams; `parse_channel_geometry` /
+  `ChannelGeometry` / `stream_channel_geometry`),
   exposed via `WavPackBlock::channel_info` and `stream_channel_info` —
   the reference 5.1 fixture declares `count 6`, mask `0x3F`, matching
   the decoded interleave width.
@@ -574,13 +650,16 @@ let frames = reader.read_frames(1024)?; // == window
 
 ## Not yet supported
 
-`WavPackBlock::decode_samples` refuses only low-latency block layouts
-(wiki bit 31, "do not decode") with a typed
-`Error::UnsupportedBlockFeature`. **Hybrid (lossy) blocks are decoded**
-(round 408 — see below). **Float and 32-bit-int sample data are
-decoded in full** (rounds 405/408 — every documented `0x08` /
-`0x09` profile shape, see the working-surface bullets), with the
-`crc_x` extension-CRC verdict wired into the §5.6 mute gate. **Multichannel members** are
+`WavPackBlock::decode_samples` decodes every block shape the matrix
+above covers. Header flag bit 31 — which the orientation wiki calls a
+"low-latency block, do not decode" — marks **DSD** audio and is decoded
+by the `dsd` module (the `0x0E` sub-block: stored, byte-alphabet range
+coded, and predicted bit-level range coded payloads; samples are bytes
+of eight 1-bit samples, returned as `0..=255`). **Hybrid (lossy) blocks
+are decoded** (round 408 — see below). **Float and 32-bit-int sample
+data are decoded** (rounds 405/408 — every documented `0x08` / `0x09`
+profile shape except the `0x2C` extension form), with the `crc_x`
+extension-CRC verdict wired into the §5.6 mute gate. **Multichannel members** are
 handled at stream level: `decode_samples` still refuses a grouped
 member (its per-block shape can't stitch the set), but
 `WavPackBlock::decode_member_samples` decodes one and
@@ -628,27 +707,25 @@ the `NEW_SHAPING`-gated IIR/FIR error-update arms; undocumented
 payload lengths are a typed refusal, and out-of-rail trajectories
 diverge into the §5.6 mute gate as §4.4.1 specifies rather than
 being clamped).
-**Joint (mid/side) stereo pairs** — the reference encoder's default
-stereo hybrid coding — are a round-415 black-box pin: the raw `0x0B`
-fold stays in the coded domain (ahead of the §5.4 undo), but the
-shaping filter's two channels are **output** (left/right) channels;
-per frame the coded temps are `t_m = t_l - t_r` and
-`t_s = t_r + ((mid + t_m) >> 1) - (mid >> 1)` on the output-domain
-mid (bracketed samples only), with the effective per-output deltas
-folded back into the error states
-(`decode_packed_samples_stereo_hybrid_lossless_raw` + the
-post-decorrelation shaping leg). Ten pair fixtures reproduce the
-original encoder input bit-exactly across no-shaping / static
-negative / static positive / dynamic-noise-shaping encodes,
-left/right + joint coding, 16- and 24-bit, single- and multi-block
-with silence stretches. `CROSS_DECORR`-flagged pairs (the reference
-maximum-compression hybrid mode) are a further round-415 pin: the bit
-is decorative on current-version files — three cross-flagged fixtures
-(joint dynamic / joint unshaped / left-right dynamic) decode
-bit-exactly under the same post-decorrelation fold, so
-`fold_hybrid_correction` / `split_hybrid_correction` accept the cross
-placement and only the noise-shaped placement still routes through
-the full pair decode. **Float and int32 pairs decode losslessly**
+**Stereo pairs**: the raw `0x0B` fold stays in the coded domain
+(ahead of the §5.4 undo on a joint block) and the shaping filter's two
+channels are the **output** (left/right) channels. Each frame's two
+feedback terms are added to the two output samples — on every sample,
+whether the coded word behind it was bracketed, read exactly
+(`error_limit == 0`) or part of a zero run — and the error states fold
+the lossless against the lossy output (round 493; an earlier reading
+gated a coded channel's term on its word being bracketed, which was
+off by one on scattered frames whenever a channel was read exactly
+while its output still carried shaping error).
+**`CROSS_DECORR` pairs** (the maximum-compression correction mode)
+fold the correction in *ahead of* the decorrelation passes, as the
+staged spec §4.1 says: fixed-lag, extrapolator and `-3` passes predict
+from stored lossy history, so the fold rides through them unchanged —
+which is why such pairs without zero-delay cross passes decode as a
+plain post-decorrelation add — but a `-1` / `-2` pass predicts its
+second channel from the *lossless* first one
+(`decorrelate_stereo_with_correction`, round 493).
+**Float and int32 pairs decode losslessly**
 (round 415): a pair encode carries the `0x0C` wvx extension stream in
 the `.wvc` twin alongside `0x07`/`0x0B` (structural pin), so the
 sample-format fixup on a pair decode reads its literal
@@ -676,17 +753,19 @@ header-only scan of the `.wvc`; uncovered sets fall back lossy), and
 `StreamReader::new_with_correction` is the playback-shaped cursor over
 the same machinery — windows and chunked reads are pinned bit-equal
 to the whole-stream pair decode for joint, multi-block, and 5.1
-shapes. Every hybrid shape the reference encoder produces now
-decodes: no hybrid gaps remain. Three round-418 conformance pins
+shapes. Three round-418 conformance pins
 harden the §6.5 model further, each backed by a committed edge-probe
 fixture: the stereo redistribution **delta clamps to `±bitrate`**
 (extreme-imbalance joint content; erratum to the round-408 pin, which
 never left the near-balanced regime), the lossy reconstruction
 **saturates to the effective bit-depth range** (±2^15 on 16-bit,
 container-minus-total-shift on int32) as a final pass *after* the
-unclamped §5 CRC fold, and the `.wv`-only int32 fill **zero-fills the
-whole reduced window** (`ones`/`dups` patterns are only restored on
-the pair path).
+unclamped §5 CRC fold, and the `.wv`-only int32 fill of a 4-byte
+container **zero-fills the whole reduced window** (`ones`/`dups`
+patterns are only restored on the pair path). In a 1..3-byte container
+— the outside encoder strips shared low-bit patterns from ordinary
+8..24-bit material too — the lossy decode *does* re-insert the pattern
+and saturates afterwards (round 493).
 
 Both round-404 docs gaps are closed (round 405): **foreign
 reference-encoded files decode bit-exactly** via the staged
@@ -720,9 +799,8 @@ twin stores the lossless §5 CRC. A hybrid float encode raises the
 exponent anchor one (coarse-overshoot head-room) and sends inf/NaN
 through the `ZEROS_SENT` literal path so the lossy `.wv` stays
 decodable alone; a pair encode moves the `0x0C` extension stream to
-the `.wvc`. Hybrid decorrelation stacks are cross-free (the reference
-shape — a cross pass in a hybrid block decodes differently under the
-reference decoder).
+the `.wvc`. This encoder keeps its hybrid stacks cross-free (outside
+hybrid streams do carry cross passes, and the decoder handles them).
 
 **Noise-shaping origination + registry float/hybrid wiring**
 (round 420): `HybridOptions::shaping` selects the `0x07` axis
@@ -819,9 +897,10 @@ them, with the minimized input kept as a corpus regression seed; a
 round-415 campaign did the same for two overflow sites in the `0x07`
 shaping-state recurrence (accumulator add / temp bias / seed
 negation, all now 32-bit wrapping);
-1159 unit tests plus a 74-test
-foreign-decode integration battery (59 reference-encoded fixtures
-under `tests/data/` — including 18 hybrid-lossless `wv+wvc` pairs and
+1167 unit tests plus an 87-test
+foreign-decode integration battery (71 outside-encoded fixtures
+under `tests/data/` — including 21 hybrid-lossless `wv+wvc` pairs,
+three DSD streams, and
 the round-418 hybrid edge probes (delta clamp / output clamp /
 implied-fill) — all pinned bit-exact with matching stored CRCs,
 plus corruption trip-wires through both CRC gates) synthesise

@@ -2102,3 +2102,124 @@ fn foreign_dsd() {
         "the sweep must reach all three payload modes"
     );
 }
+
+/// The framework path: frames pushed through the registered encoder in
+/// uneven pieces, the packets concatenated into one file. An outside
+/// reader must accept the result like any stream the crate-level
+/// encoders write (the total length is unknown when a stream is
+/// written packet by packet, so the header says so).
+#[test]
+fn ours_framework_encoder() {
+    use oxideav_core::{
+        AudioFrame, CodecId, CodecParameters, Error as CoreError, Frame, SampleFormat,
+    };
+
+    if !tools_present() {
+        return;
+    }
+    let mut out = Vec::new();
+    for (name, sample_format, fmt, options) in [
+        (
+            "s16-stereo",
+            SampleFormat::S16,
+            Format::int(16, 2, 48_000),
+            &[][..],
+        ),
+        (
+            "s8-mono",
+            SampleFormat::S8,
+            Format::int(8, 1, 22_050),
+            &[][..],
+        ),
+        (
+            "s24-5.1",
+            SampleFormat::S24,
+            Format::int(24, 6, 96_000),
+            &[][..],
+        ),
+        (
+            "s32-mono",
+            SampleFormat::S32,
+            Format::int(32, 1, 44_100),
+            &[][..],
+        ),
+        (
+            "f32-stereo",
+            SampleFormat::F32,
+            Format::float(2, 12_345),
+            &[][..],
+        ),
+        (
+            "f32-quad",
+            SampleFormat::F32,
+            Format::float(4, 48_000),
+            &[][..],
+        ),
+        (
+            "s16-stereo-hybrid",
+            SampleFormat::S16,
+            Format::int(16, 2, 44_100),
+            &[
+                ("mode", "hybrid"),
+                ("bits_per_sample", "3.5"),
+                ("shaping", "-0.5"),
+            ][..],
+        ),
+        (
+            "s16-5.1-hybrid",
+            SampleFormat::S16,
+            Format::int(16, 6, 48_000),
+            &[("mode", "hybrid"), ("joint", "false")][..],
+        ),
+    ] {
+        let pcm = quantize(
+            &fmt,
+            &content(Content::Bursts, 5_000, fmt.channels, fmt.rate, 73),
+        );
+        let mut params = CodecParameters::audio(CodecId::new("wavpack"));
+        params.channels = Some(fmt.channels as u16);
+        params.sample_format = Some(sample_format);
+        params.sample_rate = Some(fmt.rate);
+        for (key, value) in options {
+            params.options.insert(*key, *value);
+        }
+        let mut encoder = oxideav_wavpack::encoder::make_encoder(&params).expect("encoder");
+        let width = fmt.container_bytes();
+        let mut wv = Vec::new();
+        let mut at = 0usize;
+        // Uneven frame sizes, a one-frame piece among them.
+        for frames in [1_700usize, 1, 2_048, 1_251] {
+            let slice = &pcm[at * fmt.channels..(at + frames) * fmt.channels];
+            let mut data = Vec::with_capacity(slice.len() * width);
+            for s in slice {
+                data.extend_from_slice(&s.to_le_bytes()[..width]);
+            }
+            encoder
+                .send_frame(&Frame::Audio(AudioFrame {
+                    samples: frames as u32,
+                    pts: Some(at as i64),
+                    data: vec![data],
+                }))
+                .expect("send frame");
+            at += frames;
+        }
+        encoder.flush().expect("flush");
+        loop {
+            match encoder.receive_packet() {
+                Ok(packet) => wv.extend_from_slice(&packet.data),
+                Err(CoreError::Eof) | Err(CoreError::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e}"),
+            }
+        }
+        let hybrid = !options.is_empty();
+        out.push(Emitted {
+            name: name.to_string(),
+            fmt,
+            wv,
+            wvc: None,
+            exact: pcm,
+            hybrid,
+        });
+    }
+    run_emitted("ours-framework", out);
+}

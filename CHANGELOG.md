@@ -54,7 +54,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   integer, 3..8 channels, and hybrid across bitrate × shaping × stereo
   coding × profile × correction × format × layout — and requires an
   outside reader to verify each stream silently and decode it to the
-  source (1789 streams).
+  source (1797 streams, eight of them written packet by packet
+  through the framework encoder).
 - **Long-form channel geometry.** A stream whose sets have more than
   8 member blocks (13+ assigned channels, 9+ unassigned ones) states
   its geometry in a 6- or 7-byte `0x0D` payload — `[count − 1,
