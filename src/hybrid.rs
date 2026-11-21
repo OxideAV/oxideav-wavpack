@@ -667,8 +667,8 @@ impl ShapingState {
             out.extend_from_slice(&pack(self.acc[ch]));
         }
         if with_delta {
-            for ch in 0..channels {
-                out.extend_from_slice(&pack(self.delta[ch]));
+            for &delta in self.delta.iter().take(channels) {
+                out.extend_from_slice(&pack(delta));
             }
         }
         out
