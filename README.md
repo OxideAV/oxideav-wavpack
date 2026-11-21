@@ -138,6 +138,21 @@ Working surface:
   payloads (`PackedSamples` `0x0A`, `PackedCorrectionData` `0x0B`,
   `PackedOverflowBits` `0x0C`, entropy info `0x05`, MD5, RIFF
   header/trailer, multichannel info).
+* **DSD decode** — a block with header flag bit 31 carries 1-bit
+  audio in a `0x0E` sub-block (`dsd` module, from the staged DSD
+  chapter): a rate-shift / mode prefix, then the bytes stored, coded
+  with a byte-alphabet range coder over a transmitted static context
+  model, or coded bit by bit with an adaptive binary range coder
+  driven by a six-stage integer predictor (stereo channels interleaved
+  per bit). Samples are bytes of eight 1-bit samples, MSB first,
+  returned as `0..=255`; the CRC is the mono recurrence over the
+  interleaved bytes; a failed block mutes to DSD silence (`0x55`).
+  `sample_rate` reports the byte rate, `dsd_native_sample_rate` the
+  1-bit rate.
+* **Tags and other bytes outside the blocks** — an APEv2 / ID3v1 tag
+  after the last block (or anything before or between blocks) is
+  skipped by every walker, as the published file-format description
+  prescribes; `leading_non_block_bytes` is the primitive.
 * **Stream iteration** — `BlockIter` / `iter_blocks` walk a chained
   multi-block buffer lazily; `decode_stream` / `iter_decoded_blocks`
   decode every audio block and concatenate the PCM. Stream-level
@@ -862,7 +877,15 @@ round-447 multichannel hybrid placements (`0x0D` after the first
 member's `0x06`, no `0x0D` in the `.wvc` twin) are pinned by
 inspection of the committed reference pair fixture's wire bytes. No external
 library source, archived prior history, or online resources were
-consulted at any phase. A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
+consulted at any phase. Round 493 added the pins listed in the
+CHANGELOG — fixed-lag and `-3` seed layouts, the zero-delay cross
+passes of a `CROSS_DECORR` pair, the narrow-container lossy int32
+fill, unconditional output-domain shaping, the long `0x0D` form —
+each established from input/output facts of outside tools and carried
+by a committed fixture, and the DSD module, written from the staged
+DSD chapter and confirmed on 90 outside-encoded streams. The nine
+`cargo-fuzz` targets run daily (`.github/workflows/fuzz.yml`).
+A `cargo-fuzz` harness in `fuzz/` fuzzes the `decode_stream`
 and `decode_multichannel_stream` (plus its CRC-muted and `multichannel_layout`
 twins) entry points, carries an `encode_roundtrip` **round-trip
 oracle** target (fuzz bytes → PCM + mode-grid control → `*_best` encode
